@@ -117,6 +117,50 @@ self-service unless `IAM_REGISTRATION_ALLOW_NEW_ORGS=false`.
 short-lived token for that user. It refuses cross-tenant targets and scope
 escalation and audits every exchange. Tier 2 must use this instead of forwarding a
 Tier-3 HMAC token plus one shared service key.
+API keys: `scopes` are action patterns (`*`, `storage:*`, `workflow:Execute`). A key
+created with `userId` is **owner-bound** and inherits that user's permissions; without
+an owner it is an account-level key bounded by its scopes alone. Keys record
+`last_used_at` and can be rotated (`POST /v1/keys/:id/rotate {graceSeconds}` — the old
+secret stays valid for the grace window, 0 = revoked immediately). Users can list and
+revoke their own sessions (`GET/DELETE /v1/auth/sessions[/:id]`).
+
+## Organization administrators
+
+The first user of an organization becomes its administrator (`is_org_admin`, AWS
+"root"-like): full access inside its own org unless a policy explicitly denies. Later
+users start with **no permissions**. Admins manage admins with
+`PUT /v1/users/:userId/org-admin {isOrgAdmin}`; the last admin cannot be demoted.
+
+## Managed policies
+
+`GET /v1/managed-policies` lists ready-made documents — `AdministratorAccess`,
+`PowerUserAccess` (all but `iam:*`), `ReadOnlyAccess` (`*:Read|Get|List|Describe`),
+`StorageFullAccess`, `StorageReadOnlyAccess`, `DataFullAccess` (Base, Faststore, Queue,
+Stream, Storage). Instantiate one in an account with
+`POST /v1/accounts/:accountId/policies {slug, managed: "ReadOnlyAccess"}` and attach it
+to a role like any other policy. Service accounts can hold roles too
+(`POST /v1/service-accounts/:id/roles {roleId}`).
+
+## Central enforcement at the gateway
+
+With `AUTHZ_MODE=audit|enforce`, every authenticated request on a route that declares
+a `service` is mapped to an action and an ARN and decided by IAM for the verified
+principal:
+
+```
+GET /v1/storage/objects/reports/q3.pdf   (user in org O)
+  → action   storage:Read
+  → resource arn:synapseone:O:-:storage:objects/reports/q3.pdf
+  → allowed = scopes(credential) ∧ (org admin ∨ identity policies Allow) ∧ ¬explicit Deny
+```
+
+`GET`/`HEAD` → `Read`, `DELETE` → `Delete`, other methods → `Write`; routes override
+RPC-style POSTs (`…/query` → `base:Read`, `…/execute` → `workflow:Execute`,
+`/v1/ai/*` → `ai:Invoke`). `audit` only logs
+(response header `x-synapseone-authz: would-deny; …`), `enforce` answers
+`403 {error:"access_denied", action, resource, reason}`. Denials are written to the
+audit log (`GET /v1/audit?allowed=false`). Decisions are cached for
+`AUTHZ_CACHE_TTL_MS` (30 s).
 
 ## OIDC (Authentik / Keycloak)
 

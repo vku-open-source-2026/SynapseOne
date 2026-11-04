@@ -231,7 +231,7 @@ describe('verifyApiKeyUpstream', () => {  it('forwards the internal secret so IA
       const addr = iam.address();
       const iamBase = `http://127.0.0.1:${typeof addr === 'object' && addr ? addr.port : 0}`;
       const out = await verifyApiKeyUpstream('k', iamBase, 's3cret');
-      assert.deepEqual(out, { account_id: 'a1', org_id: 'o1', scopes: ['*'] });
+      assert.deepEqual(out, { id: undefined, account_id: 'a1', org_id: 'o1', user_id: null, scopes: ['*'] });
       assert.equal(seenInternal, 's3cret');
       const out2 = await verifyApiKeyUpstream('k', iamBase, undefined);
       assert.ok(out2);

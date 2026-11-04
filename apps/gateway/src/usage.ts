@@ -38,6 +38,7 @@ const FEATURE_ROUTES: Array<[prefix: string, feature: string]> = [
   ['/v1/users', 'iam'],
   ['/v1/service-accounts', 'iam'],
   ['/v1/policies', 'iam'],
+  ['/v1/managed-policies', 'iam'],
   ['/v1/keys', 'iam'],
   ['/v1/authorize', 'iam'],
   ['/v1/audit', 'iam'],
@@ -51,6 +52,7 @@ const FEATURE_ROUTES: Array<[prefix: string, feature: string]> = [
   ['/v1/base', 'base'],
   ['/v1/faststore', 'faststore'],
   ['/v1/queue', 'queue'],
+  ['/v1/storage', 'storage'],
   ['/v1/usage', 'usage'],
 ];
 

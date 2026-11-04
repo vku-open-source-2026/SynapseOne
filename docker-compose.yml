@@ -475,6 +475,9 @@ services:
       SYNAPSEONE_INTERNAL_SECRET: ${SYNAPSEONE_INTERNAL_SECRET:-${SYNAPSEDX_INTERNAL_SECRET:-}}
       HSTS_ENABLED: ${HSTS_ENABLED:-false}
       GATEWAY_VERIFY_APIKEY: ${GATEWAY_VERIFY_APIKEY:-true}
+      # Central policy enforcement (off|audit|enforce); see docs/iam-model.md.
+      AUTHZ_MODE: ${AUTHZ_MODE:-off}
+      AUTHZ_CACHE_TTL_MS: ${AUTHZ_CACHE_TTL_MS:-30000}
       PROXY_TIMEOUT_MS: ${PROXY_TIMEOUT_MS:-30000}
       CORS_ORIGIN: ${CORS_ORIGIN:-}
     ports:

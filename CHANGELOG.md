@@ -5,6 +5,26 @@ Format based on Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — AWS-style token management & central authorization
+- **Central policy enforcement at the gateway** (`AUTHZ_MODE=off|audit|enforce`,
+  `AUTHZ_CACHE_TTL_MS`): every authenticated request on a route with a `service:` in
+  `routes.yaml` is mapped to `<service>:<Verb>` (GET/HEAD=Read, DELETE=Delete, else
+  Write; RPC overrides such as `POST …/query` → `base:Read`) on
+  `arn:synapseone:<org>:<account>:<service>:<path>` and decided by IAM
+  (`POST /internal/authorize`, gateway-only). `enforce` → `403 access_denied`
+  (fail-closed `503` when IAM is down); `audit` → `x-synapseone-authz: would-deny`
+  header. Denials are audited. Default is `off`.
+- **IAM**: organization administrators (first user of an org; migration `0004`
+  backfills existing users), `PUT /v1/users/:id/org-admin`; AWS-style managed policies
+  (`GET /v1/managed-policies`, `POST …/policies {managed}`); service-account roles
+  (`GET/POST/DELETE /v1/service-accounts/:id/roles`); API keys: scopes enforced,
+  owner-bound keys inherit their user's policies, `last_used_at`, rotation with grace
+  period (`POST /v1/keys/:id/rotate`).
+- **Clients**: token-management methods in the JS/Python/Go SDKs (`RotateAPIKey`, …);
+  CLI `org-admin`, `managed-policies`, `keys rotate`, `sa grant`; Console key
+  rotation/scopes/owner/last-used on *API Keys*, managed-policy picker on *Policies*.
+- **Tests**: IAM principal authorization suite and gateway authz suite.
+
 ## [0.7.1] - 2026-11-04
 
 ### Fixed

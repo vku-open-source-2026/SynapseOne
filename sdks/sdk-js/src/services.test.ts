@@ -743,3 +743,42 @@ describe('error mapping', () => {
     }
   });
 });
+
+describe('IAM token management', () => {
+  it('rotation, org admins, managed policies and service-account roles', async () => {
+    const hits: Array<{ method: string; path: string; body: Buffer }> = [];
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (c) => chunks.push(Buffer.from(c)));
+      req.on('end', () => {
+        hits.push({ method: req.method || 'GET', path: req.url || '/', body: Buffer.concat(chunks) });
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ ok: true }));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const a = server.address();
+    const c = new SynapseOneClient({ baseUrl: `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`, token: 'T' });
+    const last = () => hits[hits.length - 1];
+    try {
+      await c.iam.rotateApiKey('k1', 300);
+      assert.equal(last().path, '/v1/keys/k1/rotate');
+      assert.deepEqual(JSON.parse(last().body.toString()), { graceSeconds: 300 });
+      await c.iam.setOrgAdmin('u1', true);
+      assert.equal(last().method, 'PUT');
+      assert.deepEqual(JSON.parse(last().body.toString()), { isOrgAdmin: true });
+      await c.iam.managedPolicies();
+      assert.equal(last().path, '/v1/managed-policies');
+      await c.iam.createManagedPolicy('acc1', 'readers', 'ReadOnlyAccess');
+      assert.deepEqual(JSON.parse(last().body.toString()), { slug: 'readers', managed: 'ReadOnlyAccess' });
+      await c.iam.assignServiceAccountRole('sa1', 'r1');
+      assert.equal(last().path, '/v1/service-accounts/sa1/roles');
+      await c.iam.unassignServiceAccountRole('sa1', 'r1');
+      assert.equal(last().path, '/v1/service-accounts/sa1/roles/r1');
+      await c.iam.serviceAccountRoles('sa1');
+      assert.equal(last().method, 'GET');
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});

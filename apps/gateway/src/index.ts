@@ -22,6 +22,7 @@ import {
   startUsageTelemetry,
 } from './usage';
 import { scopeAllows } from './scopes';
+import { authzMiddleware, registerAuthzMetrics, authzMode, type ActionOverride } from './authz';
 
 dotenv.config();
 
@@ -76,6 +77,7 @@ const httpCounter = new client.Counter({
   labelNames: ['route', 'status'],
   registers: [register],
 });
+registerAuthzMetrics(register);
 
 export interface RouteRule {
   path: string;
@@ -84,6 +86,11 @@ export interface RouteRule {
   /** Per-route proxy timeout (ms). LLM-backed routes legitimately need longer
    *  than the 30s default (retried model calls); unset = global default. */
   timeoutMs?: number;
+  /** Service namespace for central authorization (`<service>:<Verb>` actions,
+   *  `arn:synapseone:...:<service>:...` resources). Unset = not policy-checked. */
+  service?: string;
+  /** Per-path action overrides for RPC-style endpoints (POST query → Read). */
+  actions?: ActionOverride[];
   /** Compiled matcher cache (set by loadRoutes / createApp validation). */
   compiled?: { match: (pathname: string) => boolean; specificity: number };
 }
@@ -231,6 +238,8 @@ function authMiddleware(mode: RouteRule['auth']) {
                 account: info.account_id,
                 org: (info as any).org_id,
                 scopes: info.scopes,
+                keyId: info.id,
+                owner: info.user_id,
               };
               return next();
             },
@@ -262,7 +271,7 @@ export async function verifyApiKeyUpstream(
   apiKey: string,
   iamBase?: string,
   internalSecret: string | undefined = INTERNAL_SECRET,
-): Promise<{ account_id: string; org_id?: string; scopes: string[] } | null> {
+): Promise<{ id?: string; account_id: string; org_id?: string; user_id?: string | null; scopes: string[] } | null> {
   const iam = (iamBase || process.env.IAM_SERVICE_URL || 'http://iam:4001').replace(/\/$/, '');
   const ctl = new AbortController();
   const to = setTimeout(() => ctl.abort(), 5000);
@@ -283,7 +292,7 @@ export async function verifyApiKeyUpstream(
     if (!r.ok) return null;
     const j: any = await r.json();
     if (!j.valid) return null;
-    return { account_id: j.account_id, ...(j.org_id ? { org_id: j.org_id } : {}), scopes: j.scopes || [] };
+    return { id: j.id, account_id: j.account_id, ...(j.org_id ? { org_id: j.org_id } : {}), user_id: j.user_id ?? null, scopes: j.scopes || [] };
   } catch {
     clearTimeout(to);
     throw new Error('iam_unreachable');
@@ -603,7 +612,17 @@ export function createApp(): express.Express {
     if (r.timeoutMs !== undefined && (!Number.isInteger(r.timeoutMs) || r.timeoutMs < 1000 || r.timeoutMs > 300000)) {
       throw new Error(`[gateway] invalid timeoutMs '${r.timeoutMs}' for path '${r.path}' (want 1000..300000)`);
     }
+    if (r.service !== undefined && !/^[a-z][a-z0-9-]{0,31}$/.test(String(r.service))) {
+      throw new Error(`[gateway] invalid service '${r.service}' for path '${r.path}'`);
+    }
+    for (const o of r.actions || []) {
+      if (!o || typeof o.path !== 'string' || !o.path.startsWith('/') || typeof o.action !== 'string' || !/^[a-z][a-z0-9-]*:[A-Za-z]+$/.test(o.action)) {
+        throw new Error(`[gateway] invalid action override on '${r.path}': ${JSON.stringify(o)}`);
+      }
+    }
   }
+  const authz = authzMiddleware({ iamBase: IAM_SERVICE_URL, internalSecret: INTERNAL_SECRET });
+  console.log(`[gateway] central authorization mode: ${authzMode()}`);
   console.log(`[gateway] loaded ${routes.length} routes: ${routes.map((r) => `${r.path}->${expandEnv(r.target)}[${r.auth}]`).join(', ')}`);
 
   app.get('/', (_req, res) =>
@@ -657,7 +676,7 @@ export function createApp(): express.Express {
         }
       }
       propagatePrincipal(req);
-      return next();
+      return authz(req, res, next);
     });
   }) as any);
 
