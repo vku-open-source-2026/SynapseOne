@@ -10,7 +10,7 @@
 | [faststore.md](faststore.md) | Synapse Faststore — cache, key/value, hashes, lists, sets, locks |
 | [queue.md](queue.md) | SynapseQueue — publish, consume, leases, retries, dead letters |
 | [configuration.md](configuration.md) | Environment table for the whole stack |
-| [object-storage.md](object-storage.md) | SynapseOCS bucket/object API + S3/MinIO backends |
+| [object-storage.md](object-storage.md) | SynapseOCS bucket/object API, SeaweedFS backend, object backups |
 | [notifications.md](notifications.md) | SynapseNotifications — outbox, templates, preferences, delivery, retries |
 | [troubleshooting.md](troubleshooting.md) | Busy ports, Windows curl, gateway 404s, backup/restore, OIDC errors |
 | [console.md](console.md) | Management UI (run, configure, SSO, frontend dev) |

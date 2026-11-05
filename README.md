@@ -24,8 +24,8 @@ standard OIDC. Everything else is SynapseOne code, pure Apache-2.0.
 |---|---|
 | **API Gateway** | Single entry point: JWT/API-key auth, principal propagation (`x-synapseone-*`), edge rate limiting, tracing, aggregate `/ready`, Prometheus `/metrics` |
 | **AWS-style IAM** | Organization → Account → User → Role → JSON Policy (Allow/Deny + Condition), enforced per-route scopes, `authorize` API + dry-run simulator, mutation audit trail, tenant isolation on every write (role-based, same-org fallback) |
-| **Flexible identity** | First-party password lifecycle (register/login/change/reset/verify), short-lived JWT, atomic rotating refresh tokens, API keys, service accounts, delegated user-token exchange for Tier 2, and real OIDC Authorization Code flow (Authentik/Keycloak) with shadow users |
-| **Core data** | Postgres (source of truth) + Redis + tenant-scoped S3-compatible object storage, versioned schema, idempotent seed |
+| **Flexible identity** | First-party password lifecycle (register/login/change/reset/verify), TOTP MFA with recovery codes, sign-in lockout, short-lived JWT, atomic rotating refresh tokens, API keys, service accounts, delegated user-token exchange for Tier 2, and real OIDC Authorization Code flow (Authentik/Keycloak) with shadow users |
+| **Core data** | Postgres (source of truth) + Redis + SeaweedFS (S3-compatible, Apache-2.0) object storage, versioned schema, idempotent seed, daily Postgres dumps and incremental object snapshots with restore |
 | **SynapseBase** | Self-managed document database: collections, object↔data mapping with validation, filters/cursors, optimistic concurrency, atomic counters, batches and a change feed (`/v1/base`) |
 | **Synapse Faststore** | Redis-backed cache/KV and data structures: TTL strings, counters, hashes, lists, sets, sorted sets, scans, batches and distributed locks (`/v1/faststore`) |
 | **SynapseQueue** | At-least-once messaging: delayed/deduplicated publishing, visibility-timeout leases, ack/nack/heartbeat, retries, dead letters and replay (`/v1/queue`) |
@@ -141,7 +141,8 @@ Client → Gateway :8080 ─┬─► IAM :4001           (Org/Account/Role/Poli
                          ├─► Stream :4009        (event log / consumer groups)
                          ├─► Storage :4010       (objects, multipart, presign)
                          └─► Notifications :4011 (outbox + delivery)
-                         Postgres :5432 / Redis :6379 / S3-compatible :9090
+                         Postgres :5432 / Redis :6379 / SeaweedFS (S3) :9090
+                         pg-backup + s3-backup → volumes pgbackups / s3backups
 ```
 
 Authentik (or Keycloak) acts purely as a federated IdP over OIDC; IAM keeps the shadow
@@ -165,6 +166,7 @@ sdks/sdk-js                @synapseone/sdk (TypeScript, zero runtime deps)
 sdks/sdk-python            synapseone-sdk (Python, requests only)
 sdks/sdk-go                synapseone-sdk-go (Go, stdlib only)
 tools/cli                  synapseone CLI (zero deps, Node 18+) + install.sh
+tools/backup               pg-backup.sh / pg-restore.sh / s3-backup.mjs (backup + restore)
 infra/prod                 Production edge: nginx + Certbot overlay
 infra/monitoring           Prometheus (scrape gateway/PG/Redis + alert rules)
 infra/k8s/base             Kustomize manifests for Kubernetes
@@ -185,9 +187,9 @@ docs                       Start at docs/README.md
 | `docs/queue.md` | SynapseQueue — publish, consume, leases, retries, dead letters |
 | `docs/iam-model.md` | Authorization model with examples |
 | `docs/configuration.md` | Every environment variable |
-| `docs/production.md` | Production checklist (secrets, TLS, edge) |
+| `docs/production.md` | Production checklist (secrets, TLS, edge, backups) |
 | `docs/console.md` | Operating the Console |
-| `docs/object-storage.md` | SynapseOCS bucket/object API + S3/MinIO backends |
+| `docs/object-storage.md` | SynapseOCS bucket/object API, SeaweedFS backend, object backups |
 | `docs/notifications.md` | SynapseNotifications — templates, preferences, delivery, retries |
 | `docs/troubleshooting.md` | Common failures and fixes |
 

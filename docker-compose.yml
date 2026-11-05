@@ -33,28 +33,42 @@ services:
       retries: 5
     networks: [synapseone-net]
 
-  # Object storage S3-compatible (mac dinh S3Mock nhe, du cho MVP).
-  # Production: thay image bang MinIO (quay.io/minio/minio) hoac AWS S3 that,
-  # giu nguyen S3_ENDPOINT/S3_BUCKET/S3_REGION/S3 keys.
+  # Object storage: SeaweedFS (Apache-2.0) with its S3 API on :9090, in dev
+  # and production alike. Data persists in the `seaweeddata` volume. The only
+  # S3 identity is STORAGE_S3_ACCESS_KEY / STORAGE_S3_SECRET_KEY (letters and
+  # digits), the same credentials SynapseOCS signs with.
   s3:
-    image: adobe/s3mock:latest
+    image: chrislusf/seaweedfs:4.48
     restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        printf '{"identities":[{"name":"synapseone","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":["Admin","Read","List","Tagging","Write"]}]}'
+        "$$S3_ADMIN_ACCESS_KEY" "$$S3_ADMIN_SECRET_KEY" > /tmp/s3.json &&
+        exec weed server -dir=/data -ip=s3 -ip.bind=0.0.0.0 -volume.max=0
+        -master.volumeSizeLimitMB=1024 -s3 -s3.port=9090 -s3.config=/tmp/s3.json
     environment:
-      COM_ADOBE_TESTING_S3MOCK_STORE_FILESYSTEM_ROOT: /data
+      S3_ADMIN_ACCESS_KEY: ${STORAGE_S3_ACCESS_KEY:-${S3_ACCESS_KEY:-test}}
+      S3_ADMIN_SECRET_KEY: ${STORAGE_S3_SECRET_KEY:-${S3_SECRET_KEY:-test}}
     volumes:
-      - s3data:/data
+      - seaweeddata:/data
     ports:
       - "${S3_HOST_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9333/cluster/status >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
     networks: [synapseone-net]
 
   s3-init:
     image: amazon/aws-cli:latest
-    entrypoint: ["sh", "-c", "for i in $(seq 1 30); do aws --endpoint-url http://s3:9090 --region $${AWS_DEFAULT_REGION:-us-east-1} s3 mb s3://$${S3_BUCKET:-synapseone-core} && break || sleep 2; done; aws --endpoint-url http://s3:9090 --region $${AWS_DEFAULT_REGION:-us-east-1} s3 ls || true"]
+    entrypoint: ["sh", "-c", "for i in $(seq 1 30); do aws --endpoint-url http://s3:9090 s3api head-bucket --bucket $${S3_BUCKET} >/dev/null 2>&1 && break; aws --endpoint-url http://s3:9090 s3 mb s3://$${S3_BUCKET} && break; sleep 2; done; aws --endpoint-url http://s3:9090 s3 ls || true"]
     environment:
-      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-test}
-      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-test}
-      AWS_DEFAULT_REGION: ${S3_REGION:-us-east-1}
-      S3_BUCKET: ${S3_BUCKET:-synapseone-core}
+      AWS_ACCESS_KEY_ID: ${STORAGE_S3_ACCESS_KEY:-${S3_ACCESS_KEY:-test}}
+      AWS_SECRET_ACCESS_KEY: ${STORAGE_S3_SECRET_KEY:-${S3_SECRET_KEY:-test}}
+      AWS_DEFAULT_REGION: ${STORAGE_S3_REGION:-${S3_REGION:-us-east-1}}
+      S3_BUCKET: ${STORAGE_S3_BUCKET:-${S3_BUCKET:-synapseone-core}}
     depends_on:
       - s3
     networks: [synapseone-net]
@@ -426,6 +440,58 @@ services:
       synapseone-net:
         aliases: [storage]
 
+  # Nightly logical Postgres backups (pg_dump custom format of the platform and
+  # Authentik databases, sha256, BACKUP_RETENTION_DAYS) in the pgbackups volume.
+  # Restore: tools/backup/pg-restore.sh <file.dump>.
+  pg-backup:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/backup/pg-backup.sh"]
+    command: ["--loop"]
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER:-synapseone}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-synapseone_password_change_me}
+      BACKUP_DATABASES: ${BACKUP_DATABASES:-${POSTGRES_DB:-synapseone} authentik}
+      BACKUP_DIR: /backups
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-7}
+    volumes:
+      - ./tools/backup/pg-backup.sh:/backup/pg-backup.sh:ro
+      - pgbackups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [synapseone-net]
+
+  # Daily incremental snapshots of the object store (SynapseOCS files): content
+  # stored once per SHA-256, Content-Type kept, BACKUP_RETENTION_DAYS. Runs in
+  # the OCS image. Restore: docker compose run --rm --no-deps s3-backup restore latest
+  s3-backup:
+    build:
+      context: ./apps/ocs-service
+    image: synapseone/ocs:0.7.1
+    restart: unless-stopped
+    entrypoint: ["node", "/app/s3-backup.mjs"]
+    command: ["loop"]
+    environment:
+      STORAGE_S3_ENDPOINT: ${STORAGE_S3_ENDPOINT:-http://s3:9090}
+      STORAGE_S3_BUCKET: ${STORAGE_S3_BUCKET:-${S3_BUCKET:-synapseone-core}}
+      STORAGE_S3_REGION: ${STORAGE_S3_REGION:-${S3_REGION:-us-east-1}}
+      STORAGE_S3_ACCESS_KEY: ${STORAGE_S3_ACCESS_KEY:-${S3_ACCESS_KEY:-test}}
+      STORAGE_S3_SECRET_KEY: ${STORAGE_S3_SECRET_KEY:-${S3_SECRET_KEY:-test}}
+      STORAGE_S3_PATH_STYLE: ${STORAGE_S3_PATH_STYLE:-true}
+      BACKUP_DIR: /backups
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-7}
+    volumes:
+      - ./tools/backup/s3-backup.mjs:/app/s3-backup.mjs:ro
+      - s3backups:/backups
+    depends_on:
+      s3:
+        condition: service_healthy
+    networks: [synapseone-net]
+
   notifications:
     build:
       context: ./apps/notifications-service
@@ -486,6 +552,9 @@ services:
       SYNAPSEONE_INTERNAL_SECRET: ${SYNAPSEONE_INTERNAL_SECRET:-${SYNAPSEDX_INTERNAL_SECRET:-}}
       HSTS_ENABLED: ${HSTS_ENABLED:-false}
       GATEWAY_VERIFY_APIKEY: ${GATEWAY_VERIFY_APIKEY:-true}
+      # Central policy enforcement (off|audit|enforce); see docs/iam-model.md.
+      AUTHZ_MODE: ${AUTHZ_MODE:-off}
+      AUTHZ_CACHE_TTL_MS: ${AUTHZ_CACHE_TTL_MS:-30000}
       PROXY_TIMEOUT_MS: ${PROXY_TIMEOUT_MS:-30000}
       CORS_ORIGIN: ${CORS_ORIGIN:-}
     ports:
@@ -585,7 +654,9 @@ volumes:
   pgdata:
   redisdata:
   storagedata:
-  s3data:
+  seaweeddata:
+  pgbackups:
+  s3backups:
   prometheusdata:
 
 networks:

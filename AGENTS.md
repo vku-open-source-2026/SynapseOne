@@ -35,7 +35,7 @@ Skip: `node_modules/`, `apps/*/dist/`, `.pytest_cache/`, `.ruff_cache/`,
 - React 18 + Vite + Tailwind Console (plain JSX, not TypeScript).
 - Python 3.11 FastAPI inference service (local embeddings/decision model +
   OpenRouter-compatible LLM proxy).
-- Postgres 16 (pgvector image), Redis 7, S3Mock (S3-compatible) in Compose.
+- Postgres 16 (pgvector image), Redis 7, SeaweedFS (S3-compatible) in Compose.
 - Every stateful service has an in-memory fallback for dev/tests; production
   boot fails if the real backend or internal secret is missing.
 
@@ -56,13 +56,15 @@ Skip: `node_modules/`, `apps/*/dist/`, `.pytest_cache/`, `.ruff_cache/`,
 | `apps/notifications-service` | SynapseNotifications outbox, templates, preferences, delivery | 4011 | Postgres / memory + queue |
 | `apps/inference-service` | Python FastAPI LLM proxy + embeddings + decision | 4008 | local models / OpenRouter |
 | `apps/console` | Admin UI | 3000 (nginx :80) | calls gateway |
+| `pg-backup` (compose) | daily pg_dump of platform + Authentik DBs (`tools/backup/pg-backup.sh`) | — | volume `pgbackups` |
+| `s3-backup` (compose) | daily incremental object snapshots (`tools/backup/s3-backup.mjs`, OCS image) | — | volume `s3backups` |
 | `sdks/sdk-js`, `sdks/sdk-python`, `sdks/sdk-go` | Client SDKs | — | — |
 | `tools/cli` | `synapseone` CLI (zero deps, Node 18+) | — | — |
 
-Infra: Postgres 5432, Redis 6379, S3 9090, Prometheus 9091. In production only
-the gateway (and TLS edge) is public; service ports stay internal. Object
-storage requires `STORAGE_BACKEND` explicitly in production (`s3` with
-S3/MinIO credentials, or `fs` with a durable volume).
+Infra: Postgres 5432, Redis 6379, S3 9090 (SeaweedFS), Prometheus 9091. In
+production only the gateway (and TLS edge) is public; service ports stay
+internal. Object storage requires `STORAGE_BACKEND` explicitly in production
+(`s3` with real `STORAGE_S3_*` keys, or `fs` with a durable volume).
 
 ## Request path
 

@@ -14,14 +14,14 @@ the upstream project's own `LICENSE` file.
 | Keycloak | Apache-2.0 | OIDC (alternative IdP) | Supported as alternative upstream IdP; no image pinned in compose. |
 | PostgreSQL (`postgres:16-alpine`) | PostgreSQL Licence (permissive) | Container image + `pg` driver (MIT) | System of record for IAM. |
 | Redis (`redis:7-alpine`) | RSALv2/SSPL depending on distribution | Container image + `ioredis` (MIT) | Rate-limit store + Authentik cache. Check your Redis distribution's license. |
-| Adobe S3Mock (`adobe/s3mock`) | Apache-2.0 | Container image (local/dev object storage) | Default S3-compatible backend for local/dev; production may point at MinIO/AWS S3 instead. |
+| SeaweedFS (`chrislusf/seaweedfs:4.48`) | Apache-2.0 | Container image (object storage) | S3 API backend for SynapseOCS in Compose (dev and prod); runs as a separate service over the network. |
 | Prometheus (`prom/prometheus`) | Apache-2.0 | Container image + scrape API | Metrics store for `infra/monitoring` (scrapes gateway/PG/Redis). |
 | postgres-exporter (`prometheuscommunity/postgres-exporter`) | Apache-2.0 | Container image | PG metrics for Prometheus. |
 | redis-exporter (`oliver006/redis_exporter`) | MIT | Container image | Redis metrics for Prometheus. |
 | nginx (`nginx:alpine`, prod edge) | BSD-2-Clause-like | Container image | TLS terminator in `infra/prod`. |
 | certbot (`certbot/certbot`) | Apache-2.0 | Container image (one-shot) | LE certificates in `infra/prod`. |
-| AWS CLI (`amazon/aws-cli`, s3-init) | Apache-2.0 | Container image (one-shot) | Bucket auto-create for S3Mock. |
-| MinIO (`quay.io/minio/minio`, optional prod S3 backend) | **AGPL-3.0** | Container image (optional, opt-in) | Only if you choose MinIO per `docs/object-storage.md`; it runs as a separate service over the network (never linked). AWS S3 avoids the question entirely. |
+| AWS CLI (`amazon/aws-cli`, s3-init) | Apache-2.0 | Container image (one-shot) | Bucket auto-create in the object store. |
+| MinIO (`quay.io/minio/minio`, not shipped) | **AGPL-3.0** | Not used | The stack ships SeaweedFS (Apache-2.0) instead; MinIO stopped publishing community images. Pointing OCS at AWS S3 or another S3 service is also supported. |
 
 ## Runtime dependencies (linked / installed from registries)
 
@@ -45,7 +45,7 @@ BSD-2-Clause 1, CC-BY-4.0 1 (+1 dual CC-BY-4.0 AND MIT), Python-2.0 1.
 source-available/ethical/NC licenses (no SSPL/RSAL/BUSL/SUL/Hippocratic/
 Commons-Clause/Elastic/PolyForm/Prosperity) in the npm tree.**
 Scope note: the gate scans the npm tree only. Python (`certifi` MPL-2.0, above),
-Go (stdlib only) and container images (MinIO AGPL-3.0 if opted in, above) are
+Go (stdlib only) and container images (all permissive in the default and prod stacks, above) are
 inventoried manually in this file.
 CI re-verifies on every push (`license-check.cjs` + SBOM artifact, `pip-licenses
 --fail-on` for Python, `npm audit --audit-level=critical`).

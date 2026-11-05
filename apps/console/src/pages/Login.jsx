@@ -17,7 +17,10 @@ export default function Login() {
   const [mode, setMode] = useState('email');
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState(false);
-  const { auth, login, loginWithKey } = useAuth();
+  const [mfa, setMfa] = useState(null); // { token } after 401 mfa_required
+  const [mfaCode, setMfaCode] = useState('');
+  const [useRecovery, setUseRecovery] = useState(false);
+  const { auth, login, loginWithKey, completeMfa } = useAuth();
   const nav = useNavigate();
 
   if (auth) return <Navigate to="/dashboard" replace />;
@@ -48,6 +51,26 @@ export default function Login() {
       }
       nav('/dashboard', { replace: true });
     } catch (ex) {
+      if (ex?.status === 401 && ex.body?.error === 'mfa_required' && ex.body.mfaToken) {
+        setMfa({ token: ex.body.mfaToken });
+        setMfaCode('');
+      } else {
+        setErr(ex);
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+  const submitMfa = async (e) => {
+    e.preventDefault();
+    setErr(null);
+    setBusy(true);
+    try {
+      const code = mfaCode.trim();
+      await completeMfa(mfa.token, useRecovery ? undefined : code, useRecovery ? code : undefined);
+      nav('/dashboard', { replace: true });
+    } catch (ex) {
+      if (ex?.body?.error === 'invalid_mfa_token') setMfa(null);
       setErr(ex);
     } finally {
       setBusy(false);
@@ -78,6 +101,31 @@ export default function Login() {
           ))}
         </div>
         <Err e={err} />
+        {mfa ? (
+          <form onSubmit={submitMfa}>
+            <Field label={useRecovery ? 'Recovery code' : 'Authenticator code'}>
+              <Input
+                value={mfaCode}
+                onChange={(e) => setMfaCode(e.target.value)}
+                placeholder={useRecovery ? 'xxxx-xxxx' : '123456'}
+                inputMode={useRecovery ? 'text' : 'numeric'}
+                autoComplete="one-time-code"
+                autoFocus
+              />
+            </Field>
+            <Btn type="submit" loading={busy} className="w-full">
+              <span className="block w-full text-center">Verify</span>
+            </Btn>
+            <div className="flex justify-between mt-3 text-xs">
+              <button type="button" className="text-main-blue" onClick={() => { setUseRecovery(!useRecovery); setMfaCode(''); }}>
+                {useRecovery ? 'Use authenticator code' : 'Use a recovery code'}
+              </button>
+              <button type="button" className="text-normal-text" onClick={() => { setMfa(null); setErr(null); }}>
+                Back
+              </button>
+            </div>
+          </form>
+        ) : (
         <form onSubmit={submit}>
           {mode === 'email' ? (
             <>
@@ -104,6 +152,7 @@ export default function Login() {
             <span className="block w-full text-center">Sign in</span>
           </Btn>
         </form>
+        )}
         <div className="flex items-center gap-3 my-4">
           <div className="flex-1 h-px bg-slate-200" />
           <span className="text-xs text-normal-text">or</span>

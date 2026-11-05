@@ -121,6 +121,32 @@ Dev login. Saves token + refresh token to config.
 synapseone login --email demo@acme.local
 synapseone login --email alice@acme.local --org acme
 ```
+#### `login`
+```bash
+synapseone login --email <email> [--org <slug>] [--password <pw>] [--code <123456> | --recovery-code <code>] [--base <url>]
+```
+Signs in and saves token + refresh token to config. Without `--password` it uses the
+dev login (disabled when `IAM_ALLOW_DEV_LOGIN=false`). When the account has MFA, pass
+the authenticator code (or a recovery code); otherwise the command explains that MFA
+is required.
+
+```bash
+synapseone login --email demo@acme.local
+synapseone login --email alice@acme.local --org acme --password '...' --code 492039
+```
+
+#### `mfa`
+```bash
+synapseone mfa [status]                      # enabled? recovery codes left
+synapseone mfa setup                         # prints the secret + otpauth:// URL
+synapseone mfa enable <code>                 # turns MFA on, prints 10 recovery codes once
+synapseone mfa recovery-codes <code>         # replaces the recovery codes
+synapseone mfa disable --code <code>         # or --recovery-code <code>
+synapseone mfa reset <user-id>               # org admins: lost device
+synapseone mfa unlock <user-id>              # org admins: clear a sign-in lockout
+```
+One-time secrets (TOTP secret, recovery codes, new API keys) are written once to
+stdout, never to a log.
 
 #### `refresh`
 ```bash

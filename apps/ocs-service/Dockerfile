@@ -9,7 +9,8 @@ COPY src ./src
 RUN npm run build \
   && rm -f dist/*.test.js dist/*.test.d.ts \
   && npm prune --omit=dev \
-  && chown -R node:node /app
+  && chown -R node:node /app \
+  && mkdir -p /backups && chown node:node /backups
 ENV PORT=4010
 EXPOSE 4010
 USER node

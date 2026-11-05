@@ -806,3 +806,42 @@ def test_webhook_still_module_level():
         assert _seen["auth"] is None, _seen
     finally:
         srv.shutdown()
+
+
+def test_iam_mfa_methods():
+    srv = _server()
+    try:
+        c = _client(srv)
+        seen = []
+
+        def call(fn, *args, **kwargs):
+            fn(*args, **kwargs)
+            body = json.loads(_seen["body"]) if _seen["body"] else None
+            seen.append((_seen["method"], _seen["path"], body))
+
+        call(c.iam.verify_mfa, "m", code="123456")
+        call(c.iam.verify_mfa, "m", recovery_code="abcd-efgh")
+        call(c.iam.mfa_status)
+        call(c.iam.setup_totp)
+        call(c.iam.enable_totp, "111111")
+        call(c.iam.regenerate_recovery_codes, "222222")
+        call(c.iam.disable_mfa, code="333333")
+        call(c.iam.reset_user_mfa, "u/1")
+        call(c.iam.unlock_user, "u1")
+        assert seen == [
+            ("POST", "/v1/auth/mfa/verify", {"mfaToken": "m", "code": "123456"}),
+            (
+                "POST",
+                "/v1/auth/mfa/verify",
+                {"mfaToken": "m", "recoveryCode": "abcd-efgh"},
+            ),
+            ("GET", "/v1/auth/mfa", None),
+            ("POST", "/v1/auth/mfa/totp/setup", {}),
+            ("POST", "/v1/auth/mfa/totp/enable", {"code": "111111"}),
+            ("POST", "/v1/auth/mfa/recovery-codes", {"code": "222222"}),
+            ("POST", "/v1/auth/mfa/disable", {"code": "333333"}),
+            ("DELETE", "/v1/users/u%2F1/mfa", None),
+            ("POST", "/v1/users/u1/unlock", {}),
+        ], seen
+    finally:
+        srv.shutdown()

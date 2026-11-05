@@ -20,6 +20,7 @@ import {
   faFlask,
   faBook,
   faCode,
+  faLock,
 } from '@fortawesome/free-solid-svg-icons';
 
 const CORE_ITEMS = [
@@ -33,6 +34,7 @@ const CORE_ITEMS = [
   { to: '/service-accounts', label: 'Service Accts', icon: faRobot, match: (p) => p.startsWith('/service-accounts') },
   { to: '/authorize', label: 'Authorize', icon: faFlask, match: (p) => p.startsWith('/authorize') },
   { to: '/audit', label: 'Audit Log', icon: faListCheck, match: (p) => p.startsWith('/audit') },
+  { to: '/security', label: 'Security', icon: faLock, match: (p) => p.startsWith('/security') },
 ];
 
 const DOC_ITEMS = [

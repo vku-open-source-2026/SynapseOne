@@ -5,6 +5,32 @@ Format based on Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added — MFA, sign-in lockout, production object storage and backups
+- **TOTP multi-factor authentication** (RFC 6238, no new dependencies): enrol with
+  `POST /v1/auth/mfa/totp/setup` + `/enable` (10 single-use recovery codes),
+  `GET /v1/auth/mfa`, `/recovery-codes`, `/disable`. Password and dev logins of an
+  enrolled user return `401 mfa_required` with a 5-minute `mfaToken` and finish at
+  `POST /v1/auth/mfa/verify`. Secrets are sealed with AES-256-GCM
+  (`IAM_MFA_ENCRYPTION_KEY`), each TOTP step is accepted once, and the challenge
+  token can never be used as an access token. IAM migration `0006_mfa_lockout`.
+- **Sign-in lockout**: `IAM_LOGIN_MAX_FAILURES` (5) wrong passwords or MFA codes lock
+  the user for `IAM_LOGIN_LOCKOUT_SECONDS` (900) → `429 account_locked` + `Retry-After`.
+  Org admins: `DELETE /v1/users/:id/mfa` (lost device) and `POST /v1/users/:id/unlock`.
+- Clients: JS/Python/Go SDK MFA methods, CLI `login --password/--code/--recovery-code`
+  and `mfa …`, Console *Security* page, MFA step on sign-in and admin actions on *Users*.
+- **Object storage**: Compose runs SeaweedFS 4.48 (Apache-2.0) instead of S3Mock on
+  the same `s3:9090` endpoint, in dev and production (S3Mock deleted its files on
+  every container stop). Data lives in the `seaweeddata` volume.
+- **Backups** (docker-compose.yml): `pg-backup` (daily pg_dump of the platform and
+  Authentik databases, checksums, retention, `tools/backup/pg-restore.sh`) and
+  `s3-backup` (daily incremental object-store snapshots deduplicated by SHA-256, with
+  Content-Type, retention and `restore`).
+
+### Fixed
+- OCS S3 client decodes XML character references in listed keys, ETags,
+  continuation tokens and multipart upload IDs. On SeaweedFS, keys containing `&`
+  were listed as `&amp;` and ETags as `&#34;…&#34;`.
+
 ### Added
 - Durable human tasks / wait-for-signal (`/v1/human-tasks`, `humanTask` node)
   with claim, complete/reject/expire, SLA deadlines and exactly-once resume.
@@ -28,6 +54,29 @@ Format based on Keep a Changelog; versioning follows SemVer.
   review, actionlint, Dependabot and PR template.
 - Tier-1 roadmap issues for durable human tasks, SCIM, search, secrets, audit
   export and release signing (#44–#49).
+
+### Added — AWS-style token management & central authorization
+- **Central policy enforcement at the gateway** (`AUTHZ_MODE=off|audit|enforce`,
+  `AUTHZ_CACHE_TTL_MS`): every authenticated request on a route with a `service:` in
+  `routes.yaml` is mapped to `<service>:<Verb>` (GET/HEAD=Read, DELETE=Delete, else
+  Write; RPC overrides such as `POST …/query` → `base:Read`) on
+  `arn:synapseone:<org>:<account>:<service>:<path>` and decided by IAM
+  (`POST /internal/authorize`, gateway-only). `enforce` → `403 access_denied`
+  (fail-closed `503` when IAM is down); `audit` → `x-synapseone-authz: would-deny`
+  header. Denials are audited. Default is `off`.
+- **IAM**: organization administrators (first user of an org; migration `0005`
+  backfills existing users), `PUT /v1/users/:id/org-admin`; AWS-style managed policies
+  (`GET /v1/managed-policies`, `POST …/policies {managed}`); service-account roles
+  (`GET/POST/DELETE /v1/service-accounts/:id/roles`); API keys: scopes enforced,
+  owner-bound keys inherit their user's policies, `last_used_at`, rotation with grace
+  period (`POST /v1/keys/:id/rotate`).
+- **Clients**: token-management methods in the JS/Python/Go SDKs (`RotateAPIKey`, …);
+  CLI `org-admin`, `managed-policies`, `keys rotate`, `sa grant`; Console key
+  rotation/scopes/owner/last-used on *API Keys*, managed-policy picker on *Policies*.
+- **Tests**: IAM principal authorization suite and gateway authz suite.
+- Gateway routes for human tasks, search, secrets, SCIM tokens and the legacy
+  storage API declare their authorization service (`workflow`, `base`, `secrets`,
+  `iam`, `storage`); `POST /v1/search` and `POST /v1/secrets/*/read` map to `Read`.
 
 ## [0.7.1] - 2026-11-04
 

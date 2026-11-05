@@ -39,6 +39,7 @@ const SynapseInference = React.lazy(() => import('./pages/SynapseInference.jsx')
 const LinkedData = React.lazy(() => import('./pages/LinkedData.jsx'));
 const Authorize = React.lazy(() => import('./pages/Authorize.jsx'));
 const Audit = React.lazy(() => import('./pages/Audit.jsx'));
+const Security = React.lazy(() => import('./pages/Security.jsx'));
 const ApiDocs = React.lazy(() => import('./pages/ApiDocs.jsx'));
 const Docs = React.lazy(() => import('./pages/Docs.jsx'));
 
@@ -157,6 +158,7 @@ export default function App() {
           <Route path="/lds" element={<Guard><ConsoleLayout><LinkedData /></ConsoleLayout></Guard>} />
           <Route path="/authorize" element={<Guard><ConsoleLayout><Authorize /></ConsoleLayout></Guard>} />
           <Route path="/audit" element={<Guard><ConsoleLayout><Audit /></ConsoleLayout></Guard>} />
+          <Route path="/security" element={<Guard><ConsoleLayout><Security /></ConsoleLayout></Guard>} />
           <Route path="*" element={<Landing />} />
         </Routes>
       </Suspense>

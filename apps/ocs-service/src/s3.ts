@@ -4,7 +4,7 @@
  * Copyright 2026 SynapseOne Contributors
  * Licensed under the Apache License, Version 2.0 (the "License");
  * Minimal S3-compatible client (SigV4) used by SynapseOCS in
- * production. No SDK dependency: AWS S3, MinIO and S3Mock all implement the
+ * production. No SDK dependency: AWS S3, SeaweedFS and other S3 services implement the
  * same HTTP contract.
  */
 import { createHash, createHmac } from 'crypto';
@@ -25,6 +25,21 @@ export interface S3Object {
   size: number;
   lastModified?: string;
   metadata?: Record<string, string>;
+}
+
+/**
+ * Decode XML character references in an S3 response field. Backends differ:
+ * AWS escapes `&` as `&amp;`, SeaweedFS also writes `"` as `&#34;`. Without
+ * this, keys with `&`, `<`, `>` and quoted ETags come back still escaped.
+ */
+export function xmlDecode(s: string): string {
+  return s.replace(/&(#x[0-9a-fA-F]+|#[0-9]+|amp|lt|gt|quot|apos);/g, (_m, ref: string) => {
+    if (ref[0] === '#') {
+      const code = ref[1] === 'x' || ref[1] === 'X' ? parseInt(ref.slice(2), 16) : parseInt(ref.slice(1), 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : _m;
+    }
+    return ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" } as Record<string, string>)[ref];
+  });
 }
 
 function sha256Hex(data: Buffer | string): string {
@@ -182,14 +197,15 @@ export class S3Client {
     const objects: Array<{ key: string; size: number; etag: string; lastModified?: string }> = [];
     for (const m of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)) {
       const block = m[1];
-      const key = /<Key>([\s\S]*?)<\/Key>/.exec(block)?.[1] || '';
+      const key = xmlDecode(/<Key>([\s\S]*?)<\/Key>/.exec(block)?.[1] || '');
       const size = Number(/<Size>([\s\S]*?)<\/Size>/.exec(block)?.[1] || 0);
-      const etag = (/<ETag>([\s\S]*?)<\/ETag>/.exec(block)?.[1] || '').replace(/&quot;|"/g, '');
+      const etag = xmlDecode(/<ETag>([\s\S]*?)<\/ETag>/.exec(block)?.[1] || '').replace(/"/g, '');
       const lastModified = /<LastModified>([\s\S]*?)<\/LastModified>/.exec(block)?.[1];
       if (key) objects.push({ key, size, etag, lastModified });
     }
     const truncated = /<IsTruncated>true<\/IsTruncated>/.test(xml);
-    const next = truncated ? (/<NextContinuationToken>([\s\S]*?)<\/NextContinuationToken>/.exec(xml)?.[1] || undefined) : undefined;
+    const rawNext = truncated ? /<NextContinuationToken>([\s\S]*?)<\/NextContinuationToken>/.exec(xml)?.[1] : undefined;
+    const next = rawNext ? xmlDecode(rawNext) : undefined;
     return { objects, next };
   }
 
@@ -201,7 +217,8 @@ export class S3Client {
     const res = await this.call('POST', key, { uploads: '' }, { 'content-type': contentType });
     if (!res.ok) throw new Error(`s3 create multipart ${res.status}: ${(await res.text()).slice(0, 300)}`);
     const xml = await res.text();
-    const id = /<UploadId>([\s\S]*?)<\/UploadId>/.exec(xml)?.[1];
+    const rawId = /<UploadId>([\s\S]*?)<\/UploadId>/.exec(xml)?.[1];
+    const id = rawId ? xmlDecode(rawId) : undefined;
     if (!id) throw new Error('s3 create multipart: missing UploadId');
     return id;
   }

@@ -153,6 +153,8 @@ function Row({ u, headers, onUnassign, tick }) {
   const [assigned, setAssigned] = useState(null);
   const [rtick, setRtick] = useState(0);
   const [unassigning, setUnassigning] = useState(null);
+  const [secBusy, setSecBusy] = useState(null);
+  const [secMsg, setSecMsg] = useState(null);
   // Policy count + assigned roles refetch on: mount, session/token change,
   // parent assign (tick), and local unassign (rtick). Live flags prevent
   // setState after unmount or user switch.
@@ -174,6 +176,25 @@ function Row({ u, headers, onUnassign, tick }) {
   }, [expanded, tick, rtick, u.id, headers]);
 
   const toggle = () => setExpanded((v) => !v);
+
+  // Org admins: lost authenticator / locked-out user.
+  const security = async (kind) => {
+    setSecBusy(kind);
+    setSecMsg(null);
+    try {
+      if (kind === 'mfa') {
+        const r = await api.resetUserMfa(u.id, headers);
+        setSecMsg(r.removed ? 'MFA removed — the user can enrol again.' : 'This user had no MFA.');
+      } else {
+        await api.unlockUser(u.id, headers);
+        setSecMsg('Sign-in lockout cleared.');
+      }
+    } catch (e) {
+      setSecMsg(e?.body?.message || e?.message || 'Request failed');
+    } finally {
+      setSecBusy(null);
+    }
+  };
 
   const unassign = async (roleId) => {
     if (unassigning) return;
@@ -215,6 +236,15 @@ function Row({ u, headers, onUnassign, tick }) {
             ) : (
               <p className="text-xs text-normal-text">No roles assigned</p>
             )}
+            <div className="mt-2 flex flex-wrap items-center gap-3 text-xs">
+              <button onClick={() => security('mfa')} disabled={!!secBusy} className="text-main-blue disabled:opacity-50">
+                {secBusy === 'mfa' ? 'Resetting…' : 'Reset MFA'}
+              </button>
+              <button onClick={() => security('unlock')} disabled={!!secBusy} className="text-main-blue disabled:opacity-50">
+                {secBusy === 'unlock' ? 'Unlocking…' : 'Unlock sign-in'}
+              </button>
+              {secMsg && <span className="text-normal-text">{secMsg}</span>}
+            </div>
           </td>
         </tr>
       )}

@@ -94,6 +94,24 @@ for msg in batch["messages"]:
 (default 15s). `tenant` is sent as `x-synapseone-tenant` and is only required by
 platform callers of the tenant-scoped services (faststore/queue).
 
+## Sign-in with MFA
+
+```python
+from synapseone_sdk import SynapseOneError
+
+try:
+    s = c.iam.login_with_password(email, password, "acme")
+except SynapseOneError as e:
+    if e.status != 401 or e.body.get("error") != "mfa_required":
+        raise
+    s = c.iam.verify_mfa(e.body["mfaToken"], code="492039")  # or recovery_code=
+c.set_token(s["accessToken"])
+```
+
+Enrol with `c.iam.setup_totp()` + `c.iam.enable_totp(code)`; also `mfa_status`,
+`regenerate_recovery_codes`, `disable_mfa`, and for org admins `reset_user_mfa` /
+`unlock_user`.
+
 ## Deprecated flat API
 
 The old flat methods (`c.login(...)`, `c.list_templates()`,

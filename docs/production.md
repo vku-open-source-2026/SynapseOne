@@ -48,10 +48,22 @@ Use when taking SynapseOne off your laptop. Every item already has a mechanism â
 
 ## 3. Data
 
-- [ ] Postgres: durable volume + periodic backups (`pg_dump`, see `docs/troubleshooting.md`).
-- [ ] Object storage: set `STORAGE_BACKEND=s3` plus `STORAGE_S3_*` credentials and
-      replace S3Mock with MinIO/real S3 (`docs/object-storage.md`). Set
+- [ ] Backups run from `docker-compose.yml`, so every deploy path starts them:
+      `pg-backup` (pg_dump custom format of `synapseone` and `authentik`, daily, each
+      dump with a `.sha256`, volume `pgbackups`) and `s3-backup` (incremental object
+      snapshots, volume `s3backups`, `docs/object-storage.md`). Both keep
+      `BACKUP_RETENTION_DAYS`=7. Run them now with
+      `docker compose -f docker-compose.yml run --rm --no-deps pg-backup --once` and
+      `... run --rm --no-deps s3-backup once`, and rehearse `tools/backup/pg-restore.sh <file.dump>`
+      and `s3-backup restore latest --dry-run` (`pg-restore.sh` asks you to type the database
+      name, verifies the `.sha256` and restores in one transaction; stop the services
+      using that database first). Both volumes live on the same host:
+      copying them elsewhere is the operator's choice.
+- [ ] Object storage: set `STORAGE_BACKEND=s3` plus `STORAGE_S3_*` credentials (they are
+      also the SeaweedFS identity, `docs/object-storage.md`). Set
       `STORAGE_MAX_OBJECT_BYTES`/`STORAGE_TENANT_QUOTA_BYTES` for your plan.
+- [ ] IAM: set `IAM_MFA_ENCRYPTION_KEY` (`openssl rand -hex 32`) before users enrol MFA;
+      keep `IAM_LOGIN_MAX_FAILURES`/`IAM_LOGIN_LOCKOUT_SECONDS` at their defaults or stricter.
 - [ ] Notifications: set `DATABASE_URL`, `NOTIFICATIONS_QUEUE_URL`,
       `NOTIFICATIONS_EMAIL_RELAY_URL`/`_SMS_`/`_PUSH_` as needed; the service
       refuses to boot without the DB, internal secret and CORS origin

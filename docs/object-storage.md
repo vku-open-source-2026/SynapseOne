@@ -6,7 +6,7 @@
 SynapseOCS (Object Cloud Storage) is the Tier-1 bucket-aware object store. It
 speaks its own `/v1/ocs` API at the gateway and keeps the original
 `/v1/storage` API as the default-bucket compatibility surface. Bytes live in an
-S3-compatible backend (MinIO, AWS S3 or S3Mock) in production and on a local
+S3-compatible backend (SeaweedFS in Compose, or AWS S3) in production and on a local
 filesystem for development/single-node deployments.
 
 ## Capabilities
@@ -69,7 +69,7 @@ curl "https://api.synapseone.space/v1/ocs/buckets/city-assets/objects/2026/10/ph
 ## Multipart
 
 Create an upload, PUT numbered parts (max 10,000), then complete with the
-returned ETags. The filesystem backend assembles the parts; S3/MinIO uses
+returned ETags. The filesystem backend assembles the parts; the S3 backend (SeaweedFS/AWS) uses
 native multipart. Abort removes the temporary upload directory.
 
 ## Presigned URLs
@@ -86,14 +86,50 @@ tenant/bucket/key/method; hand it only to the intended client. The legacy
 | --- | --- | --- |
 | `STORAGE_BACKEND` | `fs` | `s3` (required by the boot guard) |
 | `STORAGE_FS_ROOT` | `/data` (volume) | — |
-| `STORAGE_S3_ENDPOINT` | `http://s3:9090` | MinIO or AWS S3 HTTPS endpoint |
+| `STORAGE_S3_ENDPOINT` | `http://s3:9090` | `http://s3:9090` (SeaweedFS in the prod overlay) or an AWS S3 HTTPS endpoint |
 | `STORAGE_S3_BUCKET` | `synapseone-core` | dedicated bucket |
 | `STORAGE_S3_ACCESS_KEY` / `_SECRET_KEY` | `test`/`test` | scoped credentials |
 | `STORAGE_S3_REGION` | `us-east-1` | backend region |
 | `STORAGE_S3_PATH_STYLE` | `true` | `false` for AWS virtual-host style |
 
-Compose ships S3Mock for local development. For a MinIO-like local stack, point
-`STORAGE_S3_ENDPOINT` at MinIO and keep `STORAGE_S3_PATH_STYLE=true`. The bucket
+Compose runs **SeaweedFS** (`chrislusf/seaweedfs:4.48`, Apache-2.0) as the `s3`
+service in development and production: OCS uses `STORAGE_S3_ENDPOINT=http://s3:9090`
+with `STORAGE_S3_PATH_STYLE=true`. SeaweedFS uses `STORAGE_S3_ACCESS_KEY` /
+`STORAGE_S3_SECRET_KEY` as its only identity (letters and digits; `test`/`test` in
+dev), keeps data in the `seaweeddata` volume, and the prod overlay requires real
+keys and removes the host port.
+
+Earlier releases used S3Mock, which deletes its files whenever the container stops,
+so a deployment upgrading from it has no durable objects to carry over: OCS buckets
+are recreated on demand (SynapseDX does this automatically for `synapsedx-files`).
+
+## Backups
+
+The `s3-backup` service (docker-compose.yml) takes a daily snapshot of the bucket
+into the `s3backups` volume with `tools/backup/s3-backup.mjs`, run in the OCS image:
+
+- content is stored once per SHA-256 under `blobs/`; each snapshot is a manifest
+  (`snapshots/<UTC stamp>.json`) of key, size, ETag, Content-Type and SHA-256;
+- unchanged objects (same key, size and ETag) are not downloaded again;
+- snapshots older than `BACKUP_RETENTION_DAYS` (7) are removed, the newest is always
+  kept, and blobs no snapshot uses are deleted.
+
+```bash
+C="docker compose -f docker-compose.yml"
+$C run --rm --no-deps s3-backup once                        # snapshot now
+$C run --rm --no-deps s3-backup list                        # snapshots with object counts
+$C run --rm --no-deps s3-backup restore latest --dry-run    # what would change
+$C run --rm --no-deps s3-backup restore 20261106T020000Z --prefix tenants/org_x/
+```
+
+`--no-deps` keeps `run` from recreating the `s3` service when its running config
+differs from the file.
+
+Restore writes objects back with their original Content-Type after checking the
+blob SHA-256, skips objects that are already identical and never deletes objects
+from the store. Postgres dumps are covered in `docs/production.md`.
+
+The bucket
 policy should allow only SynapseOCS credentials to read/write the backend;
 clients should use the OCS API/presigned URLs, not the backend directly.
 
@@ -124,4 +160,4 @@ API (`/v1/storage`).
 Tier 2 wraps SynapseOCS as the files capability and stores bucket/key metadata
 in Base; it does not store base64 payloads in documents. Tier 3 uploads evidence
 and stores the returned bucket/key or presigned URL. Neither Tier 2 nor Tier 3
-talks to the backend S3/MinIO credentials directly.
+talks to the backend S3 credentials directly.

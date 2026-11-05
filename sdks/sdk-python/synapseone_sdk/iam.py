@@ -98,6 +98,56 @@ class IamService:
         """Revoke one session by id."""
         return self._req("DELETE", f"/v1/auth/sessions/{quote(session_id, safe='')}")
 
+    # ---- multi-factor authentication (TOTP) ----
+    def verify_mfa(
+        self,
+        mfa_token: str,
+        code: str | None = None,
+        recovery_code: str | None = None,
+    ) -> dict:
+        """Finish a login that failed with 401 ``mfa_required``."""
+        body: dict = {"mfaToken": mfa_token}
+        if code:
+            body["code"] = code
+        if recovery_code:
+            body["recoveryCode"] = recovery_code
+        return self._req("POST", "/v1/auth/mfa/verify", body)
+
+    def mfa_status(self) -> dict:
+        """Current user's MFA status."""
+        return self._req("GET", "/v1/auth/mfa")
+
+    def setup_totp(self) -> dict:
+        """Start TOTP enrolment: returns ``secret`` and ``otpauthUrl``."""
+        return self._req("POST", "/v1/auth/mfa/totp/setup", {})
+
+    def enable_totp(self, code: str) -> dict:
+        """Confirm enrolment; returns recovery codes (shown once)."""
+        return self._req("POST", "/v1/auth/mfa/totp/enable", {"code": code})
+
+    def regenerate_recovery_codes(self, code: str) -> dict:
+        """Replace the recovery codes (needs a TOTP code)."""
+        return self._req("POST", "/v1/auth/mfa/recovery-codes", {"code": code})
+
+    def disable_mfa(
+        self, code: str | None = None, recovery_code: str | None = None
+    ) -> dict:
+        """Turn MFA off with a TOTP or recovery code."""
+        body: dict = {}
+        if code:
+            body["code"] = code
+        if recovery_code:
+            body["recoveryCode"] = recovery_code
+        return self._req("POST", "/v1/auth/mfa/disable", body)
+
+    def reset_user_mfa(self, user_id: str) -> dict:
+        """Org admins: remove a user's second factor after a lost device."""
+        return self._req("DELETE", f"/v1/users/{quote(user_id, safe='')}/mfa")
+
+    def unlock_user(self, user_id: str) -> dict:
+        """Org admins: clear a sign-in lockout."""
+        return self._req("POST", f"/v1/users/{quote(user_id, safe='')}/unlock", {})
+
     def exchange_token(
         self,
         user_id: str,
@@ -335,6 +385,39 @@ class IamService:
         """Check a raw API key via the internal verify endpoint."""
         return self._req("POST", "/v1/keys/verify", {"apiKey": api_key})
 
+    def rotate_api_key(self, key_id: str, grace_seconds: int = 0) -> dict:
+        """Rotate a key: the new secret is returned once; the old key stays
+        valid for ``grace_seconds`` (0 = revoked immediately)."""
+        return self._req(
+            "POST",
+            f"/v1/keys/{quote(key_id, safe='')}/rotate",
+            {"graceSeconds": grace_seconds},
+        )
+
+    # ---- org administrators & managed policies ----
+    def set_org_admin(self, user_id: str, is_org_admin: bool) -> dict:
+        """Grant/revoke organization administrator (org admins only)."""
+        return self._req(
+            "PUT",
+            f"/v1/users/{quote(user_id, safe='')}/org-admin",
+            {"isOrgAdmin": is_org_admin},
+        )
+
+    def managed_policies(self) -> list:
+        """AWS-style managed policy catalog (AdministratorAccess, ReadOnlyAccess, ...)."""
+        return self._req("GET", "/v1/managed-policies")
+
+    def create_managed_policy(
+        self, account_id: str, slug: str, managed: str, description: str | None = None
+    ) -> dict:
+        """Instantiate a managed policy (e.g. ``ReadOnlyAccess``) in an account."""
+        body: dict = {"slug": slug, "managed": managed}
+        if description:
+            body["description"] = description
+        return self._req(
+            "POST", f"/v1/accounts/{quote(account_id, safe='')}/policies", body
+        )
+
     # ---- credentials (account-scoped secrets) ----
     # Secrets are encrypted at rest and NEVER returned — create/rotate accept a
     # ``secret`` once; list/get return metadata only:
@@ -463,4 +546,23 @@ class IamService:
             "POST",
             f"/v1/service-accounts/{quote(sa_id, safe='')}/token",
             body,
+        )
+
+    def service_account_roles(self, sa_id: str) -> list:
+        """Roles granted to a service account."""
+        return self._req("GET", f"/v1/service-accounts/{quote(sa_id, safe='')}/roles")
+
+    def assign_service_account_role(self, sa_id: str, role_id: str) -> dict:
+        """Grant a role (same account) to a service account."""
+        return self._req(
+            "POST",
+            f"/v1/service-accounts/{quote(sa_id, safe='')}/roles",
+            {"roleId": role_id},
+        )
+
+    def unassign_service_account_role(self, sa_id: str, role_id: str) -> dict:
+        """Remove a role from a service account."""
+        return self._req(
+            "DELETE",
+            f"/v1/service-accounts/{quote(sa_id, safe='')}/roles/{quote(role_id, safe='')}",
         )
