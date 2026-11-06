@@ -113,7 +113,10 @@ function httpError(status, p, data) {
   if (status === 404) {
     return new Error(`HTTP 404 ${p}: not found${msg ? ` — ${msg}` : raw && raw !== 'null' ? ` — ${raw}` : ''}`);
   }
-  return new Error(`HTTP ${status} ${p}: ${raw}`);
+  const err = new Error(`HTTP ${status} ${p}: ${raw}`);
+  err.status = status;
+  err.data = data;
+  return err;
 }
 const GET = (p, o) => req('GET', p, undefined, o);
 const POST = (p, b, o) => req('POST', p, b, o);
@@ -261,6 +264,22 @@ function parse(argv) {
       if (!v) throw new Error('missing value for --context-url <url>');
       (opts.contextUrls ??= []).push(v);
     }
+    // Token management flags.
+    else if (a === '--grace') opts.grace = argv[++i];
+    else if (a.startsWith('--grace=')) opts.grace = a.slice(8);
+    else if (a === '--scopes') opts.scopes = argv[++i];
+    else if (a.startsWith('--scopes=')) opts.scopes = a.slice(9);
+    else if (a === '--user') opts.user = argv[++i];
+    else if (a.startsWith('--user=')) opts.user = a.slice(7);
+    else if (a === '--managed') opts.managed = argv[++i];
+    else if (a.startsWith('--managed=')) opts.managed = a.slice(10);
+    // Sign-in and MFA flags.
+    else if (a === '--password') opts.password = argv[++i];
+    else if (a.startsWith('--password=')) opts.password = a.slice(11);
+    else if (a === '--code') opts.code = argv[++i];
+    else if (a.startsWith('--code=')) opts.code = a.slice(7);
+    else if (a === '--recovery-code') opts['recovery-code'] = argv[++i];
+    else if (a.startsWith('--recovery-code=')) opts['recovery-code'] = a.slice(16);
     else args.push(a);
   }
   return { args, opts };
@@ -295,7 +314,20 @@ async function cmdLogin(o) {
   const email = o.email || o._[0];
   need(email, 'email');
   const org = o.org || o._[1] || 'acme';
-  const r = await POST('/v1/auth/login', { email, orgSlug: org }, o);
+  const body = { email, orgSlug: org };
+  if (o.password) body.password = String(o.password);
+  let r;
+  try {
+    r = await POST('/v1/auth/login', body, o);
+  } catch (e) {
+    if (e.status !== 401 || e.data?.error !== 'mfa_required') throw e;
+    const code = o.code ? String(o.code) : '';
+    const recoveryCode = o['recovery-code'] ? String(o['recovery-code']) : '';
+    if (!code && !recoveryCode) {
+      throw new Error('this account uses MFA: run login again with --code <6 digits> or --recovery-code <code>');
+    }
+    r = await POST('/v1/auth/mfa/verify', { mfaToken: e.data.mfaToken, ...(code ? { code } : { recoveryCode }) }, o);
+  }
   const cfg = loadConfig();
   cfg.baseUrl = baseUrl(o);
   cfg.token = r.accessToken;
@@ -428,7 +460,9 @@ async function cmdPolicies(o) {
   const [sub, ...rest] = o._;
   if (sub === 'create') {
     const [account, slug] = rest;
-    need(account, 'account'); need(slug, 'slug'); need(o.file, '--file policy.json');
+    need(account, 'account'); need(slug, 'slug');
+    if (o.managed) return out(await POST(`/v1/accounts/${encodeURIComponent(account)}/policies`, { slug, managed: o.managed }, o), o);
+    need(o.file, '--file policy.json (or --managed NAME)');
     return out(await POST(`/v1/accounts/${encodeURIComponent(account)}/policies`, { slug, document: readJson(o.file) }, o), o);
   }
   if (sub === 'delete') {
@@ -475,9 +509,22 @@ async function cmdKeys(o) {
   const [sub, ...rest] = o._;
   if (sub === 'create') {
     need(rest[0], 'account');
-    const r = await POST(`/v1/accounts/${encodeURIComponent(rest[0])}/keys`, { name: o.name || o.label || 'cli', scopes: ['*'] }, o);
-    if (!o.json) console.log(`SAVE THIS KEY (shown once):\n${r.apiKey}\nid: ${r.id}`);
-    else console.log(JSON.stringify(r, null, 2));
+    const scopes = o.scopes ? String(o.scopes).split(',').map((x) => x.trim()).filter(Boolean) : ['*'];
+    const body = { name: o.name || o.label || 'cli', scopes, ...(o.user ? { userId: o.user } : {}) };
+    const r = await POST(`/v1/accounts/${encodeURIComponent(rest[0])}/keys`, body, o);
+    // The new secret is printed to stdout once, on purpose (never to a log).
+    if (!o.json) process.stdout.write(`SAVE THIS KEY (shown once):\n${r.apiKey}\nid: ${r.id}\n`);
+    else process.stdout.write(`${JSON.stringify(r, null, 2)}\n`);
+    return;
+  }
+  if (sub === 'rotate') {
+    need(rest[0], 'key-id');
+    const graceSeconds = o.grace === undefined ? 0 : Number(o.grace);
+    if (!Number.isInteger(graceSeconds) || graceSeconds < 0) throw new Error('--grace must be a non-negative integer (seconds)');
+    const r = await POST(`/v1/keys/${encodeURIComponent(rest[0])}/rotate`, { graceSeconds }, o);
+    // The new secret is printed to stdout once, on purpose (never to a log).
+    if (!o.json) process.stdout.write(`SAVE THIS KEY (shown once):\n${r.apiKey}\nid: ${r.id}\nold key ${r.rotatedFrom} expires at ${r.oldKeyExpiresAt}\n`);
+    else process.stdout.write(`${JSON.stringify(r, null, 2)}\n`);
     return;
   }
   if (sub === 'revoke' || sub === 'delete') {
@@ -491,9 +538,9 @@ async function cmdKeys(o) {
   if (sub === 'list') {
     need(rest[0], 'account');
     const r = await GET(`/v1/accounts/${encodeURIComponent(rest[0])}/keys`, o);
-    return out(Array.isArray(r) ? r : [], o, ['id', 'name', 'prefix', 'revoked_at']);
+    return out(Array.isArray(r) ? r : [], o, ['id', 'name', 'prefix', 'scopes', 'user_id', 'last_used_at', 'revoked_at']);
   }
-  throw new Error(`usage: keys create <account> [--name N] | keys list <account> | keys revoke <key-id> | keys verify <api-key>`);
+  throw new Error(`usage: keys create <account> [--name N] [--scopes a,b] [--user USER_ID] | keys list <account> | keys rotate <key-id> [--grace SECONDS] | keys revoke <key-id> | keys verify <api-key>`);
 }
 async function cmdSa(o) {
   const [sub, ...rest] = o._;
@@ -508,9 +555,78 @@ async function cmdSa(o) {
     else console.log(JSON.stringify(r, null, 2));
     return;
   }
+  if (sub === 'roles') {
+    need(rest[0], 'sa-id');
+    return out(await GET(`/v1/service-accounts/${encodeURIComponent(rest[0])}/roles`, o), o, ['slug', 'id']);
+  }
+  if (sub === 'grant') {
+    need(rest[0], 'sa-id'); need(rest[1], 'role-id');
+    return out(await POST(`/v1/service-accounts/${encodeURIComponent(rest[0])}/roles`, { roleId: rest[1] }, o), o);
+  }
+  if (sub === 'revoke-role') {
+    need(rest[0], 'sa-id'); need(rest[1], 'role-id');
+    return out(await DEL(`/v1/service-accounts/${encodeURIComponent(rest[0])}/roles/${encodeURIComponent(rest[1])}`, o), o);
+  }
   need(sub, 'account');
   return out(await GET(`/v1/accounts/${encodeURIComponent(sub)}/service-accounts`, o), o, ['slug', 'id']);
 }
+
+// ---------- token management: sessions, org admins, managed policies ----------
+async function cmdSessions(o) {
+  const [sub, ...rest] = o._;
+  if (sub === 'revoke') {
+    need(rest[0], 'session-id');
+    return out(await DEL(`/v1/auth/sessions/${encodeURIComponent(rest[0])}`, o), o);
+  }
+  if (sub && sub !== 'list') throw new Error('usage: sessions [list] | sessions revoke <session-id>');
+  return out(await GET('/v1/auth/sessions', o), o, ['id', 'created_at', 'expires_at']);
+}
+async function cmdMfa(o) {
+  const [sub, arg] = o._;
+  const code = o.code ? String(o.code) : undefined;
+  const recoveryCode = o['recovery-code'] ? String(o['recovery-code']) : undefined;
+  if (!sub || sub === 'status') return out(await GET('/v1/auth/mfa', o), o);
+  if (sub === 'setup') {
+    const r = await POST('/v1/auth/mfa/totp/setup', {}, o);
+    if (o.json) return out(r, o);
+    process.stdout.write(`Add this account to your authenticator app, then run: mfa enable <code>\n  secret: ${r.secret}\n  url:    ${r.otpauthUrl}\n`);
+    return;
+  }
+  if (sub === 'enable') {
+    need(arg || code, 'code');
+    const r = await POST('/v1/auth/mfa/totp/enable', { code: arg || code }, o);
+    if (o.json) return out(r, o);
+    process.stdout.write(`MFA enabled. Store these recovery codes safely (shown once):\n  ${r.recoveryCodes.join('\n  ')}\n`);
+    return;
+  }
+  if (sub === 'recovery-codes') {
+    need(arg || code, 'code');
+    return out(await POST('/v1/auth/mfa/recovery-codes', { code: arg || code }, o), o);
+  }
+  if (sub === 'disable') {
+    if (!code && !recoveryCode) throw new Error('usage: mfa disable --code <6 digits> | --recovery-code <code>');
+    return out(await POST('/v1/auth/mfa/disable', code ? { code } : { recoveryCode }, o), o);
+  }
+  if (sub === 'reset') {
+    need(arg, 'user-id');
+    return out(await DEL(`/v1/users/${encodeURIComponent(arg)}/mfa`, o), o);
+  }
+  if (sub === 'unlock') {
+    need(arg, 'user-id');
+    return out(await POST(`/v1/users/${encodeURIComponent(arg)}/unlock`, {}, o), o);
+  }
+  throw new Error('usage: mfa [status] | mfa setup | mfa enable <code> | mfa recovery-codes <code> | mfa disable --code C | mfa reset <user-id> | mfa unlock <user-id>');
+}
+async function cmdOrgAdmin(o) {
+  const [userId, flag] = o._;
+  need(userId, 'user-id');
+  if (flag !== 'on' && flag !== 'off') throw new Error('usage: org-admin <user-id> on|off');
+  return out(await req('PUT', `/v1/users/${encodeURIComponent(userId)}/org-admin`, { isOrgAdmin: flag === 'on' }, o), o);
+}
+async function cmdManagedPolicies(o) {
+  return out(await GET('/v1/managed-policies', o), o, ['name', 'description']);
+}
+
 async function cmdWorkflows(o) {
   const [sub, ...rest] = o._;
   if (!sub || sub === 'list') {
@@ -942,7 +1058,8 @@ async function baseQuery(o, args) {
 }
 
 const COMMANDS = {
-  login: { fn: cmdLogin, use: 'login --email E [--org ORG] [--base URL]', doc: 'Dev login, save token + refresh' },
+  login: { fn: cmdLogin, use: 'login --email E [--org ORG] [--password P] [--code 123456 | --recovery-code C] [--base URL]', doc: 'Sign in (password or dev login, with MFA code when enabled), save token + refresh' },
+  mfa: { fn: cmdMfa, use: 'mfa [status] | mfa setup | mfa enable <code> | mfa recovery-codes <code> | mfa disable --code C | mfa reset <user-id> | mfa unlock <user-id>', doc: 'Multi-factor authentication (TOTP) and sign-in lockout' },
   refresh: { fn: cmdRefresh, use: 'refresh [refresh-token]', doc: 'Rotate access token (atomic server-side)' },
   'logout-all': { fn: cmdLogoutAll, use: 'logout-all [refresh-token]', doc: 'Revoke ALL sessions of token owner' },
   verify: { fn: cmdVerify, use: 'verify', doc: 'Check current Bearer / API key' },
@@ -955,7 +1072,10 @@ const COMMANDS = {
   accounts: { fn: cmdAccounts, use: 'accounts [org] [list] | accounts create [org] <slug> [name]', doc: 'Accounts' },
   users: { fn: cmdUsers, use: 'users [org] | users create <org> <email> [name] | users policies <user-id>', doc: 'Users + effective policies' },
   roles: { fn: cmdRoles, use: 'roles <account> [list] | roles create <account> <slug> | roles delete <id>', doc: 'Roles' },
-  policies: { fn: cmdPolicies, use: 'policies <account> [list] | policies create <account> <slug> --file p.json | policies delete <id>', doc: 'Policies' },
+  policies: { fn: cmdPolicies, use: 'policies <account> [list] | policies create <account> <slug> (--file p.json | --managed ReadOnlyAccess) | policies delete <id>', doc: 'Policies' },
+  'managed-policies': { fn: cmdManagedPolicies, use: 'managed-policies', doc: 'AWS-style managed policies (AdministratorAccess, ReadOnlyAccess, ...)' },
+  'org-admin': { fn: cmdOrgAdmin, use: 'org-admin <user-id> on|off', doc: 'Grant/revoke organization administrator' },
+  sessions: { fn: cmdSessions, use: 'sessions [list] | sessions revoke <session-id>', doc: 'Your login sessions (refresh tokens)' },
   attach: { fn: cmdAttach, use: 'attach <role-id> <policy-id>', doc: 'Attach policy to role' },
   detach: { fn: cmdDetach, use: 'detach <role-id> <policy-id>', doc: 'Detach policy from role' },
   assign: { fn: cmdAssign, use: 'assign <user-id> <role-id>', doc: 'Assign role to user' },
@@ -963,8 +1083,8 @@ const COMMANDS = {
   authz: { fn: cmdAuthz, use: 'authz <user> <action> <resource> [--context k=v]', doc: 'Authorize check' },
   sim: { fn: cmdSim, use: 'sim --file policy.json <action> <resource> [--context k=v]', doc: 'Policy simulator' },
   audit: { fn: cmdAudit, use: 'audit [--limit N] [--actor ID]', doc: 'Audit log' },
-  keys: { fn: cmdKeys, use: 'keys create <account> [--name N] | keys list <account> | keys revoke <key-id> | keys verify <api-key>', doc: 'API keys' },
-  sa: { fn: cmdSa, use: 'sa <account> [list] | sa create <account> <slug> | sa token <sa-id>', doc: 'Service accounts' },
+  keys: { fn: cmdKeys, use: 'keys create <account> [--name N] [--scopes a,b] [--user USER_ID] | keys list <account> | keys rotate <key-id> [--grace SECONDS] | keys revoke <key-id> | keys verify <api-key>', doc: 'API keys (scoped, owner-bound, rotatable)' },
+  sa: { fn: cmdSa, use: 'sa <account> [list] | sa create <account> <slug> | sa token <sa-id> | sa roles <sa-id> | sa grant <sa-id> <role-id> | sa revoke-role <sa-id> <role-id>', doc: 'Service accounts + their roles' },
   credentials: { fn: cmdCredentials, use: 'credentials create <account> --name N --type bearer|basic|apiKey|oauth2 (--secret S | --secret-file F) [--expires-at ISO] | credentials [list] <account> | credentials get|delete <id> | credentials rotate <id> (--secret S | --secret-file F)', doc: 'Account credentials, secrets write-only (PROPOSED: backend in progress)' },
   call: { fn: cmdCall, use: 'call <METHOD> <path> [--data \'{...}\'|body.json] [--file body.json]', doc: 'Generic gateway call (escape hatch for new endpoints)' },
   workflows: { fn: cmdWorkflows, use: 'workflows [list] | workflows create --template T [--name N] | workflows create --file def.json [--name N] | workflows get|activate|deactivate <id> | workflows exec|execute <id> [--data \'{...}\'|input.json] [--file payload.json] | workflows update [--name N] [--file def.json] <id> | workflows delete <id> | workflows test-run --file def.json [--input input.json|\'{...}\'] [--workflow-id ID]', doc: 'Workflows (local engine)' },

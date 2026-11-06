@@ -4,8 +4,34 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Public site tokens (Home, About, header, footer). Dark values below; Tailwind maps them as s1-* colours. */
+:root {
+  --s1-bg: #f6f8fb;
+  --s1-surface: #ffffff;
+  --s1-fg: #0f1b2d;
+  --s1-muted: #566275;
+  --s1-line: #e2e7ef;
+  --s1-accent: #0a72c4;
+  --s1-accent-soft: #e9f3fc;
+  --s1-code: #0c1626;
+  --s1-code-fg: #d3deec;
+  --s1-code-muted: #7d8da3;
+}
+html.dark {
+  --s1-bg: #0a111d;
+  --s1-surface: #101a2a;
+  --s1-fg: #e4ebf5;
+  --s1-muted: #97a4b7;
+  --s1-line: #1e2a3d;
+  --s1-accent: #5db2fb;
+  --s1-accent-soft: #11253d;
+  --s1-code: #060c16;
+  --s1-code-fg: #d3deec;
+  --s1-code-muted: #6f7f95;
+}
+
 body {
-  font-family: 'Poppins', ui-sans-serif, system-ui, sans-serif;
+  font-family: 'Be Vietnam Pro', 'Noto Sans', ui-sans-serif, system-ui, sans-serif;
   background: #f6f7fb;
   color: #4b5563;
 }
@@ -219,3 +245,109 @@ button:disabled {
   }
 }
 
+
+/* ---------- Dark theme ----------
+   html.dark is set by the inline script in index.html and src/lib/theme.jsx.
+   Pages share a small set of colour utilities, so dark mode remaps those
+   tokens here once instead of adding dark: variants to every page. */
+html.dark body,
+html.dark #boot-splash {
+  background: #0b1220;
+  color: #cbd5e1;
+}
+
+html.dark .bg-white { background-color: #111a2e; }
+html.dark .bg-white\/70 { background-color: rgba(17, 26, 46, 0.7); }
+html.dark .bg-white\/80 { background-color: rgba(17, 26, 46, 0.8); }
+html.dark .bg-white\/90 { background-color: rgba(17, 26, 46, 0.9); }
+html.dark .bg-white\/60 { background-color: rgba(17, 26, 46, 0.6); }
+html.dark .bg-background,
+html.dark .bg-slate-100 { background-color: #18233a; }
+html.dark .bg-background\/50,
+html.dark .bg-background\/70,
+html.dark .bg-background\/80,
+html.dark .bg-slate-50\/70,
+html.dark .bg-slate-50,
+html.dark .bg-slate-50\/50 { background-color: #0f1729; }
+html.dark .bg-slate-200 { background-color: #22304a; }
+html.dark .bg-slate-300 { background-color: #2c3b57; }
+html.dark .from-white { --tw-gradient-from: #111a2e var(--tw-gradient-from-position); --tw-gradient-to: rgba(17, 26, 46, 0) var(--tw-gradient-to-position); --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to); }
+
+html.dark .hover\:bg-background:hover,
+html.dark .hover\:bg-background\/80:hover,
+html.dark .hover\:bg-slate-50:hover,
+html.dark .hover\:bg-slate-100:hover,
+html.dark .hover\:bg-slate-50\/50:hover { background-color: #1b2742; }
+html.dark .hover\:bg-slate-200:hover,
+html.dark .hover\:bg-slate-300:hover { background-color: #26355a; }
+html.dark .focus\:bg-white:focus { background-color: #111a2e; }
+
+html.dark .text-main-text,
+html.dark .text-slate-700,
+html.dark .text-slate-800,
+html.dark .text-slate-900 { color: #e2e8f0; }
+html.dark .text-normal-text,
+html.dark .text-slate-600 { color: #94a3b8; }
+/* Greys used for meta text: lift them so they keep contrast on the dark surfaces. */
+html.dark .text-slate-500 { color: #8b9ab0; }
+html.dark .text-slate-400 { color: #7a889e; }
+html.dark .text-slate-300 { color: #5d6b82; }
+html.dark .hover\:text-main-text:hover,
+html.dark .hover\:text-slate-800:hover { color: #f1f5f9; }
+
+html.dark .border-slate-100,
+html.dark .divide-slate-100 > :not([hidden]) ~ :not([hidden]) { border-color: #1e2a40; }
+html.dark .border-slate-200,
+html.dark .hover\:border-slate-200:hover { border-color: #26344d; }
+html.dark .border-slate-300 { border-color: #33435f; }
+
+html.dark .shadow-md,
+html.dark .shadow-sm,
+html.dark .shadow-xl { --tw-shadow-color: rgba(0, 0, 0, 0.45); --tw-shadow: var(--tw-shadow-colored); }
+
+html.dark input::placeholder,
+html.dark textarea::placeholder { color: #64748b; }
+
+html.dark .sdx-skeleton {
+  background-color: #18233a;
+  background-image: linear-gradient(90deg, rgba(255, 255, 255, 0) 0%, rgba(255, 255, 255, 0.06) 50%, rgba(255, 255, 255, 0) 100%);
+}
+
+/* Inline code inside the docs pages. */
+.s1-prose :where(p, li) code {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 0.85em;
+  padding: 0.1em 0.35em;
+  border-radius: 0.3rem;
+  background: var(--s1-bg);
+  border: 1px solid var(--s1-line);
+  color: var(--s1-fg);
+}
+
+/* Console top bar: same colour as the page so it reads as part of it, solid so content scrolls under. */
+.console-topbar-band { background: #f6f7fb; }
+html.dark .console-topbar-band { background: #0b1220; }
+
+/* Slim scrollbar for the sidebars, so a short window does not show a heavy grey bar. */
+.s1-thin-scroll { scrollbar-width: thin; scrollbar-color: #cbd5e1 transparent; }
+.s1-thin-scroll::-webkit-scrollbar { width: 6px; }
+.s1-thin-scroll::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 999px; }
+.s1-thin-scroll::-webkit-scrollbar-track { background: transparent; }
+html.dark .s1-thin-scroll { scrollbar-color: #2c3b57 transparent; }
+html.dark .s1-thin-scroll::-webkit-scrollbar-thumb { background: #2c3b57; }
+
+/* Thin, quiet scrollbars everywhere: no arrow buttons, a rounded thumb that darkens on hover. */
+* { scrollbar-width: thin; scrollbar-color: #cbd5e1 transparent; }
+html.dark * { scrollbar-color: #2a3852 transparent; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background-color: #94a3b8; }
+::-webkit-scrollbar-corner { background: transparent; }
+html.dark ::-webkit-scrollbar-thumb { background-color: #2a3852; }
+html.dark ::-webkit-scrollbar-thumb:hover { background-color: #3b4d6e; }
+
+/* Scrollable rows that should not show a bar (code tabs); still swipeable on phones. */
+.s1-no-scrollbar { scrollbar-width: none; }
+.s1-no-scrollbar::-webkit-scrollbar { display: none; }

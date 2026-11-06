@@ -4,7 +4,7 @@
  * Copyright 2026 SynapseOne Contributors
  * Licensed under the Apache License, Version 2.0 (the "License");
  * OIDC callback page: the IdP redirects here with ?code&state (or ?error).
- * The single-use code is POSTed to the API for exchange — tokens never
+ * The single-use code is POSTed to the API for exchange, tokens never
  * appear in the URL, so nothing leaks via history or logs.
  */
 import React, { useEffect, useRef, useState } from 'react';

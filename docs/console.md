@@ -67,6 +67,11 @@ dangling/duplicate validation blocking Save, true/false edge labels, test-run wi
 sample input + per-node status/input/output + history, activate/deactivate/execute +
 webhook URL + next-run display + executions with status filter and per-node I/O +
 import/export + delete) · Authorize (simulator + live authorize) · Audit Log.
+**Security** (`/security`): turn on two-factor authentication (shows the TOTP secret
+and `otpauth://` link, confirms with a code, then shows 10 recovery codes once),
+replace recovery codes or turn MFA off. **Users** rows also offer *Reset MFA* and
+*Unlock sign-in* for org administrators. When an account has MFA, the Login page asks
+for the authenticator code (or a recovery code) after the email step.
 Public pages: Landing (`/`, install instructions), API Docs (try-it explorer +
 auth-gated AI chatbot bubble), Docs (SDK/CLI snippets), Login, OIDC callback.
 Signed-in users get the sidebar layout on API Docs/Docs too.

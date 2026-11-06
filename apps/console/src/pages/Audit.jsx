@@ -38,7 +38,7 @@ export default function Audit() {
 
   const fmtTime = (t) => {
     const d = new Date(t);
-    return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString();
+    return Number.isNaN(d.getTime()) ? '–' : d.toLocaleString();
   };
 
   return (
@@ -64,7 +64,7 @@ export default function Audit() {
             {rows.map((a) => (
               <tr key={a.id} className="border-t border-slate-100">
                 <td className="py-2 pr-4 text-xs whitespace-nowrap">{fmtTime(a.created_at)}</td>
-                <td className="py-2 pr-4 text-xs font-mono">{a.actor_type || '?'}:{a.actor_id ? String(a.actor_id).slice(0, 8) : '—'}</td>
+                <td className="py-2 pr-4 text-xs font-mono">{a.actor_type || '?'}:{a.actor_id ? String(a.actor_id).slice(0, 8) : '–'}</td>
                 <td className="py-2 pr-4 text-xs font-mono">{a.action}</td>
                 <td className="py-2 pr-4 text-xs font-mono max-w-48 truncate">{a.resource}</td>
                 <td className="py-2 pr-4">

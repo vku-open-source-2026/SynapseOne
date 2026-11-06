@@ -15,7 +15,7 @@ const METHOD_TONE = { GET: 'blue', POST: 'green', PUT: 'amber', DELETE: 'red' };
 
 // Floating chatbot: guides API testing on the docs page.
 // The agent endpoint (/v1/ai/agent) is intentionally NOT in the public
-// catalog — the bot only explains and pre-fills try-it forms, and it
+// catalog, the bot only explains and pre-fills try-it forms, and it
 // requires a signed-in session (gateway auth: either).
 export default function Chatbot({ auth, headers, onOpenInDocs }) {
   const [open, setOpen] = useState(false);
@@ -69,9 +69,9 @@ export default function Chatbot({ auth, headers, onOpenInDocs }) {
       const st = e?.status;
       const text =
         st === 401
-          ? 'Session expired — sign in again, then ask away.'
+          ? 'Session expired. Sign in again, then ask away.'
           : st === 429
-            ? 'Slow down a little — then try again.'
+            ? 'Slow down a little, then try again.'
             : 'Sorry, I could not answer that. Try again.';
       setMsgs((m) => [...m, { role: 'ai', text }]);
     } finally {
@@ -85,7 +85,7 @@ export default function Chatbot({ auth, headers, onOpenInDocs }) {
     if (!sug || sBusy) return;
     // The agent generates the call (not the user picking a documented
     // endpoint), so destructive methods get an explicit confirm.
-    if ((sug.method === 'PUT' || sug.method === 'PATCH' || sug.method === 'DELETE') && !window.confirm(`${sug.method} ${sug.path} — proceed?`)) {
+    if ((sug.method === 'PUT' || sug.method === 'PATCH' || sug.method === 'DELETE') && !window.confirm(`${sug.method} ${sug.path}: proceed?`)) {
       return;
     }
     setSErr(null);

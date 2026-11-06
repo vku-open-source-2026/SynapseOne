@@ -10,6 +10,7 @@
                     │ IAM service (:4001)                     │
                     │ Org→Account→User→Role→Policy (AWS-style)│
                     │ token: JWT + refresh + API key + SA     │
+                    │ MFA (TOTP) + sign-in lockout            │
                     │ Postgres (orgs/accounts/... tables)     │
                     └──────┬──────────────────────┬───────────┘
                            │ verify                │ authorize()
@@ -29,7 +30,7 @@
                            │                 │ (OpenRouter)│ JSON-LD
                     ┌───────▼───────┐      ┌──▼─────────┐ ┌─▼──────────┐
                     │ Postgres/Redis│      │  Postgres  │ │  Postgres  │
-                    │ S3Mock (S3)   │      │ workflows+ │ │ lds_*      │
+                    │ SeaweedFS (S3)│      │ workflows+ │ │ lds_*      │
                     └───────────────┘      │ executions │ │ tables     │
                                            └────────────┘ └────────────┘
 ```
@@ -40,6 +41,14 @@ Data services (same gateway, same tenant model):
  Gateway ──┬──▶ Base      :4005  documents + object↔data mapping ──▶ Postgres
            ├──▶ Faststore :4006  cache / KV / data structures    ──▶ Redis
            └──▶ Queue     :4007  at-least-once messaging         ──▶ Redis
+```
+
+Backups (no extra dependency, data stays on the host):
+
+```
+ pg-backup  ── pg_dump (custom format, sha256, retention) ──▶ volume pgbackups
+ s3-backup  ── incremental SHA-256 snapshots + manifests   ──▶ volume s3backups
+             (OCS image, restore keeps Content-Type)
 ```
 
 ## Tier 1 = PaaS
@@ -56,9 +65,10 @@ Data services (same gateway, same tenant model):
 - **Tokens**: short-lived JWT (Bearer), rotating opaque refresh tokens, long-lived
   `synapseone_...` API keys (hash + prefix), service accounts for workloads.
 - **Core data cluster**: Postgres 16 (source of truth), Redis (cache/rate-limit/session,
-  and the Faststore/Queue backends), S3Mock (S3-compatible object storage, bucket
-  `synapseone-core`; the storage service exposes it at `/v1/storage`; swap to
-  MinIO/real S3 in production via `STORAGE_S3_*`).
+  and the Faststore/Queue backends), SeaweedFS (S3-compatible object storage, bucket
+  `synapseone-core`; OCS exposes it at `/v1/ocs` and legacy `/v1/storage`; point
+  `STORAGE_S3_*` at AWS S3 instead if wanted). Daily `pg-backup` dumps and
+  `s3-backup` object snapshots stay on the host volumes.
 - **Workflow**: local built-in engine (Apache-2.0, no external dependency); `workflow-service` owns
   workflows + executions in Postgres: DAG runner (webhook/cron/manual/http/code/set/if/noOp),
   sandboxed code, public webhooks, cron scheduler, definition editor.

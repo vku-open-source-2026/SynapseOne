@@ -98,6 +98,25 @@ services:
       SYNAPSEONE_INTERNAL_SECRET: ${SYNAPSEONE_INTERNAL_SECRET:?SYNAPSEONE_INTERNAL_SECRET must be set in production}
     ports: !reset []
 
+  # Object storage (SeaweedFS, defined in docker-compose.yml): production
+  # requires real credentials and keeps the S3 port off the host.
+  s3:
+    environment:
+      S3_ADMIN_ACCESS_KEY: ${STORAGE_S3_ACCESS_KEY:?STORAGE_S3_ACCESS_KEY must be set in production}
+      S3_ADMIN_SECRET_KEY: ${STORAGE_S3_SECRET_KEY:?STORAGE_S3_SECRET_KEY must be set in production}
+    ports: !reset []
+
+  s3-init:
+    environment:
+      AWS_ACCESS_KEY_ID: ${STORAGE_S3_ACCESS_KEY:?STORAGE_S3_ACCESS_KEY must be set in production}
+      AWS_SECRET_ACCESS_KEY: ${STORAGE_S3_SECRET_KEY:?STORAGE_S3_SECRET_KEY must be set in production}
+      S3_BUCKET: ${STORAGE_S3_BUCKET:?STORAGE_S3_BUCKET must be set in production}
+
+  # Backups (pg-backup, s3-backup) are defined in docker-compose.yml.
+  pg-backup:
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in production}
+
   inference:
     environment:
       NODE_ENV: production

@@ -58,7 +58,9 @@ tenant. Platform calls without a tenant fail with `400 tenant_required`.
 - `POST /v1/auth/logout {refreshToken}` → `{ok}`
 - `POST /v1/auth/logout-all {refreshToken}` → `{ok, revoked}` (revokes all of your own sessions)
 - `GET /v1/auth/verify` (Bearer or X-API-Key) → `{valid, ...}`
-- `GET /v1/auth/me` (Bearer) → `{user, kind}`
+- `GET /v1/auth/me` (Bearer) → `{user, kind}` (`user.is_org_admin` tells whether the caller administers its org)
+- `GET /v1/auth/sessions` (user Bearer) → `[{id, created_at, expires_at}]` — your active sessions (one per live refresh token), newest first
+- `DELETE /v1/auth/sessions/:id` (user Bearer) → `{ok}` — revoke one session (its refresh token stops working); other users' ids → `404`
 - `GET /v1/auth/oidc/config` → `{issuer, clientId, redirectUri, codeExchange, ...}`
 - `GET /v1/auth/oidc/start?org=acme` → `{authorizeUrl, state}` (state is HMAC-signed, 10-minute expiry)
 - `POST /v1/auth/oidc/callback {code, state}` → token set (**real** Authorization Code
@@ -68,6 +70,36 @@ tenant. Platform calls without a tenant fail with `400 tenant_required`.
 - `POST /v1/auth/oidc/callback {email, orgSlug}` → token set (**demo** mode: trusts the
   caller-supplied email — dev only; set `IAM_ALLOW_OIDC_DEMO_CALLBACK=false` in
   production, which then requires a real IdP `code`)
+
+### Multi-factor authentication (TOTP) and lockout
+
+When a user has MFA enabled, `POST /v1/auth/login` (password or dev login) never
+returns a session. It answers `401 {error: "mfa_required", mfaToken, expiresIn: 300,
+methods: ["totp","recovery"]}` and the client finishes with:
+
+- `POST /v1/auth/mfa/verify {mfaToken, code}` or `{mfaToken, recoveryCode}` → token set
+  plus `mfa: {method, recoveryCodesRemaining}`. A TOTP code is accepted once (replay
+  protection); each recovery code is single-use. `mfaToken` is not an access token.
+
+Self-service (user Bearer; API keys, service accounts and delegated tokens get `403`):
+
+- `GET /v1/auth/mfa` → `{enabled, pending, methods, recoveryCodesRemaining, enabledAt}`
+- `POST /v1/auth/mfa/totp/setup` → `{secret, otpauthUrl, period: 30, digits: 6, algorithm: "SHA1"}`
+  (`409 mfa_already_enabled` while a factor is active)
+- `POST /v1/auth/mfa/totp/enable {code}` → `{enabled: true, recoveryCodes: [10 codes, shown once]}`
+- `POST /v1/auth/mfa/recovery-codes {code}` → `{recoveryCodes}` (old codes stop working)
+- `POST /v1/auth/mfa/disable {code | recoveryCode}` → `{enabled: false}`
+
+Administration (org admins of the same org; `403 org_admin_required` otherwise):
+
+- `DELETE /v1/users/:userId/mfa` → `{ok, removed}` — lost device: removes the factor and clears the lockout
+- `POST /v1/users/:userId/unlock` → `{ok}` — clears a sign-in lockout
+
+Lockout: `IAM_LOGIN_MAX_FAILURES` (default 5) consecutive wrong passwords or second-factor
+codes lock the user for `IAM_LOGIN_LOCKOUT_SECONDS` (default 900): `429 account_locked`
+with `Retry-After`. Unknown emails are never locked or reported. TOTP secrets are sealed
+with AES-256-GCM using `IAM_MFA_ENCRYPTION_KEY` (32 bytes, hex/base64; derived from
+`IAM_JWT_SECRET` when unset). OIDC sign-ins rely on the identity provider's own MFA.
 
 ## Orgs / Accounts
 
@@ -79,6 +111,52 @@ tenant. Platform calls without a tenant fail with `400 tenant_required`.
 - `POST /v1/orgs/:orgId/users {email, displayName}`
 
 ## Roles / Policies / Authorize
+
+Organization administrators: the **first user of an organization** (the one whose
+login creates it, or the first login into an org without admins) becomes its
+administrator — AWS "root"-like, full access inside its own org unless a policy
+explicitly denies. Every later user starts with **no permissions** and is granted
+roles. Existing users are backfilled as admins by IAM migration `0005`.
+
+- `PUT /v1/users/:userId/org-admin {isOrgAdmin}` → user — only an admin of the same
+  org may call it (`403 org_admin_required`); demoting the last admin → `409 last_admin`
+- `GET /v1/managed-policies` → `[{name, description, document}]` — AWS-style managed
+  policies: `AdministratorAccess`, `PowerUserAccess` (everything except `iam:*`),
+  `ReadOnlyAccess`, `StorageFullAccess`, `StorageReadOnlyAccess`, `DataFullAccess`
+- `POST /v1/accounts/:accountId/policies {slug, managed: "ReadOnlyAccess"}` — instantiate
+  a managed policy in an account (send `managed` **or** `document`, not both)
+
+### Central enforcement (gateway, `AUTHZ_MODE`)
+
+With `AUTHZ_MODE=audit|enforce` the gateway authorizes **every authenticated request**
+on a route that declares a `service` in `apps/gateway/routes.yaml`:
+
+| Request | Action | Resource |
+|---|---|---|
+| `GET` / `HEAD` | `<service>:Read` | `arn:synapseone:<org>:<account>:<service>:<path after /v1/<service>/>` |
+| `DELETE` | `<service>:Delete` | same (`-` when the principal has no org/account) |
+| other methods | `<service>:Write` | same |
+| RPC-style overrides | `POST …/query` → `base:Read`, `POST /v1/workflows/:id/execute` → `workflow:Execute`, `POST /v1/ai/*` → `ai:Invoke`, … | same |
+
+Services: `iam`, `workflow`, `ai`, `inference`, `lds`, `base`, `faststore`, `queue`,
+`stream`, `storage`, `notifications`. The decision combines three layers, all of which must allow:
+
+1. **Credential scopes** — API-key / service-account token scopes are action patterns
+   (`*`, `storage:*`, `workflow:Execute`) that cap the credential (like an AWS session policy).
+2. **Identity policies** — policies on the roles of the owning user / service account
+   (explicit `Deny` > `Allow` > default deny). An API key created with `userId`
+   inherits that user's permissions; a key without an owner, and a service account
+   without roles, are bounded by their scopes alone (backward compatible).
+3. **Org administrators** — allowed unless explicitly denied.
+
+`enforce` returns `403 {error:"access_denied", action, resource, reason}` and fails
+closed (`503 authz_unavailable`) when IAM is unreachable; `audit` lets the request
+through and adds `x-synapseone-authz: would-deny; action=…; reason=…`. Both modes write
+denials to `GET /v1/audit` (`actor_type` = `user|service-account|apikey`,
+`context.enforcement = "gateway"`). Decisions are cached per principal/action/resource
+for `AUTHZ_CACHE_TTL_MS` (default 30 s). `reason` is one of `org-admin`,
+`policy-allow`, `scope-only`, `explicit-deny`, `implicit-deny`, `scope-deny`,
+`unknown-principal`.
 
 - `POST /v1/accounts/:accountId/roles {slug, description}`
 - `GET /v1/accounts/:accountId/roles`
@@ -108,14 +186,23 @@ tenant. Platform calls without a tenant fail with `400 tenant_required`.
 
 - `POST /v1/accounts/:accountId/keys {name, scopes?, userId?, expiresInSeconds?}` → `{apiKey (shown once), id, prefix}`. `scopes` defaults to least-privilege `["*:read"]`; pass `["*"]` explicitly for an admin key. Scopes outside the caller's authority → `403 scope_escalation`.
 - `GET /v1/accounts/:accountId/keys` → key metadata list (id/name/prefix/scopes/expiry/revoked — never secret values)
-- `POST /v1/keys/verify {apiKey}` → `{valid, account_id, org_id, scopes}`
+- `POST /v1/keys/verify {apiKey}` → `{valid, id, account_id, org_id, user_id, scopes}`
 - `DELETE /v1/keys/:id` → revokes the key
+- `POST /v1/keys/:id/rotate {graceSeconds?}` → `{id, apiKey (shown once), prefix, rotatedFrom, oldKeyExpiresAt}` (201) —
+  the new key keeps the owner, name, scopes and expiry; the old key is revoked immediately
+  (`graceSeconds` 0, default) or stays valid for up to 7 days for a zero-downtime switch;
+  revoked/expired keys → `409 key_inactive`
+- Key listings include `user_id` (owner, null for account-level keys) and `last_used_at`
+  (stamped on verification, at most once per minute)
 
 ## Service accounts (machine identity)
 
 - `POST /v1/accounts/:accountId/service-accounts {slug, description}` → service account
 - `GET /v1/accounts/:accountId/service-accounts` → list
 - `POST /v1/service-accounts/:id/token {scopes?}` → `{accessToken (kind=service-account), expiresIn}`
+- `GET /v1/service-accounts/:id/roles` → roles granted to the service account
+- `POST /v1/service-accounts/:id/roles {roleId}` → `{ok}` (role must be in the SA's account — `403 cross_account`)
+- `DELETE /v1/service-accounts/:id/roles/:roleId` → `{ok}` (`404 assignment_not_found` when not granted)
 
 ## Credentials (workflow node secrets — implemented)
 

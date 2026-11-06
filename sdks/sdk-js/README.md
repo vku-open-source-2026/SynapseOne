@@ -59,6 +59,25 @@ for (const msg of batch.messages) await c.queue.ack('emails', msg.receipt);
 Legacy flat methods (`c.login(...)`, `c.listTemplates(...)`, ...) still work but
 emit a `DeprecationWarning` pointing at the namespaced replacement.
 
+## Sign-in with MFA
+
+```ts
+import { SynapseOneError } from '@synapseone/sdk';
+
+try {
+  await c.iam.loginWithPassword({ email, password, orgSlug: 'acme' });
+} catch (e) {
+  const body = e instanceof SynapseOneError ? (e.body as { error?: string; mfaToken?: string }) : undefined;
+  if (body?.error !== 'mfa_required') throw e;
+  const s = await c.iam.verifyMfa({ mfaToken: body.mfaToken!, code: '492039' });
+  c.setToken(s.accessToken);
+}
+```
+
+Enrol with `c.iam.setupTotp()` + `c.iam.enableTotp(code)`; also `mfaStatus`,
+`regenerateRecoveryCodes`, `disableMfa`, and for org admins `resetUserMfa` /
+`unlockUser`.
+
 ## Full documentation
 
 See **[docs/sdk-js.md](../../docs/sdk-js.md)** for the complete API reference —

@@ -4,7 +4,7 @@
  * Copyright 2026 SynapseOne Contributors
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
-// SynapseLDS console — licensed NGSI-LD datasources. Users create a
+// SynapseLDS console, licensed NGSI-LD datasources. Users create a
 // datasource (open-data license required), register a dynamic attribute
 // schema with per-field visibility, ingest records, and preview the
 // structural-allowlist NGSI-LD export. `_core` metadata never leaves the
@@ -164,7 +164,7 @@ export default function LinkedData() {
       loadDetail(detail.id, { keepAttrMsg: true });
     } catch (ex) {
       setErr(ex);
-      if (ex?.body?.reserved) setAttrMsg({ ok: false, text: `Reserved names rejected: ${ex.body.reserved.join(', ')} — map them via sourceField instead` });
+      if (ex?.body?.reserved) setAttrMsg({ ok: false, text: `Reserved names rejected: ${ex.body.reserved.join(', ')}, map them via sourceField instead` });
     } finally {
       setAttrBusy(false);
     }
@@ -254,7 +254,7 @@ export default function LinkedData() {
     <>
       <PageTitle
         title="Linked Data"
-        sub="SynapseLDS — publish licensed NGSI-LD datasets; dynamic fields only leave the API once the schema marks them public"
+        sub="SynapseLDS, publish licensed NGSI-LD datasets; dynamic fields only leave the API once the schema marks them public"
         right={<Btn onClick={() => setOpen(true)}>+ New datasource</Btn>}
       />
       <Err e={err} />
@@ -282,7 +282,7 @@ export default function LinkedData() {
                 <td className="py-2 pr-4">
                   <Badge tone={d.license === 'LicenseRef-Proprietary' ? 'gray' : 'blue'}>{d.license}</Badge>
                 </td>
-                <td className="py-2 pr-4 text-xs text-normal-text">{selId === d.id && detail?.stats ? detail.stats.records : '—'}</td>
+                <td className="py-2 pr-4 text-xs text-normal-text">{selId === d.id && detail?.stats ? detail.stats.records : '–'}</td>
                 <td className="py-2 text-right whitespace-nowrap">
                   <button onClick={() => select(d.id)} className="text-xs text-main-blue mr-3">Open</button>
                   <button onClick={() => remove(d.id)} disabled={deletingId === d.id} className="text-xs text-red-500 disabled:opacity-50 inline-flex items-center gap-1.5">
@@ -295,7 +295,7 @@ export default function LinkedData() {
           </Table>
         ) : (
           <Empty
-            text="No datasources yet — create one to publish your first NGSI-LD dataset"
+            text="No datasources yet, create one to publish your first NGSI-LD dataset"
             action={<Btn onClick={() => setOpen(true)}>+ New datasource</Btn>}
           />
         )}
@@ -333,7 +333,7 @@ export default function LinkedData() {
                 </p>
                 <p className="sm:col-span-2">Contexts: <span className="font-mono">{detail.contexts?.length ? detail.contexts.join(', ') : 'core context only'}</span></p>
                 <p className="sm:col-span-2 truncate">
-                  NGSI-LD export (public — no sign-in needed):{' '}
+                  NGSI-LD export (public, no sign-in needed):{' '}
                   <a href={exportUrl} target="_blank" rel="noreferrer" className="font-mono text-main-blue hover:underline">{exportUrl}</a>{' '}
                   <button onClick={copyExport} className="text-xs text-main-blue ml-1">{copied ? 'copied!' : 'copy'}</button>
                 </p>
@@ -414,9 +414,9 @@ export default function LinkedData() {
                 <Btn kind="ghost" onClick={() => loadEntities(detail.id)} loading={entitiesLoading}>Load export</Btn>
               </div>
               {entities === null ? (
-                <p className="text-xs text-normal-text">Nothing loaded yet — the same projection the public export URL serves will show here.</p>
+                <p className="text-xs text-normal-text">Nothing loaded yet, the same projection the public export URL serves will show here.</p>
               ) : entities.length === 0 ? (
-                <Empty text="No entities yet (or nothing is public — check the schema visibility)" />
+                <Empty text="No entities yet (or nothing is public, check the schema visibility)" />
               ) : (
                 <Code data={entities} limit={4000} />
               )}
@@ -431,7 +431,7 @@ export default function LinkedData() {
             <Field label="Name">
               <Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Business Registry" required />
             </Field>
-            <Field label="Slug (optional — derived from the name)">
+            <Field label="Slug (optional, derived from the name)">
               <Input value={form.slug} onChange={(e) => setForm({ ...form, slug: e.target.value })} placeholder="business-registry" className={`${selCls} font-mono`} />
             </Field>
             <Field label="Entity type">
@@ -440,7 +440,7 @@ export default function LinkedData() {
             <Field label="Open-data license (shown on every export via Link rel=license)">
               <select value={form.license} onChange={(e) => setForm({ ...form, license: e.target.value })} className={selCls}>
                 {licenses.map((l) => (
-                  <option key={l.id} value={l.id}>{l.id}{l.openData ? '' : ' — not open data'}</option>
+                  <option key={l.id} value={l.id}>{l.id}{l.openData ? '' : ', not open data'}</option>
                 ))}
                 <option value={CUSTOM_LICENSE}>Custom (LicenseRef-…)</option>
               </select>
@@ -465,7 +465,7 @@ export default function LinkedData() {
               </select>
             </Field>
             <Field label="Description (optional)">
-              <Input value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} placeholder="Danang business registry — open data" />
+              <Input value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} placeholder="Danang business registry, open data" />
             </Field>
             <Btn type="submit" loading={busy} disabled={!form.name.trim() || (form.license === CUSTOM_LICENSE && (!form.customLicense.trim() || !form.licenseUrl.trim()))}>Create datasource</Btn>
           </form>

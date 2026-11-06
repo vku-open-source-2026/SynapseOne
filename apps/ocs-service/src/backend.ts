@@ -4,7 +4,7 @@
  * Copyright 2026 SynapseOne Contributors
  * Licensed under the Apache License, Version 2.0 (the "License");
  * Object storage backends: local filesystem (dev/single-node) and S3-compatible
- * (MinIO / AWS S3 / S3Mock) in production.
+ * (SeaweedFS / AWS S3 / any S3 API) in production.
  */
 import fs from 'fs';
 import fsp from 'fs/promises';

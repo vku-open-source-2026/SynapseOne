@@ -133,6 +133,23 @@ func (c *Client) Me() (map[string]any, error)
 ```
 Returns the user record behind the current Bearer token.
 
+### Multi-factor authentication
+
+When an account has MFA, password login returns an `*APIError` with `StatusCode`
+`401`; its `Body` is the JSON `{"error":"mfa_required","mfaToken":"…"}`. Finish with
+that `mfaToken`.
+
+```go
+s, err := c.VerifyMFA(mfaToken, "492039", "")        // or ("", "", recoveryCode)
+setup, _ := c.SetupTOTP()                            // secret, otpauthUrl
+on, _ := c.EnableTOTP("123456")                      // recoveryCodes (shown once)
+status, _ := c.MFAStatus()
+_, _ = c.RegenerateRecoveryCodes("123456")
+_, _ = c.DisableMFA("123456", "")                    // or ("", recoveryCode)
+_, _ = c.ResetUserMFA(userID)                        // org admins: lost device
+_, _ = c.UnlockUser(userID)                          // org admins: clear a lockout
+```
+
 ### Organizations
 
 #### `ListOrgs() ([]any, error)`

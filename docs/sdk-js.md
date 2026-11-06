@@ -147,6 +147,32 @@ me(): Promise<any>
 ```
 Returns the user record behind the current Bearer token.
 
+### Multi-factor authentication (`c.iam`)
+
+When an account has MFA, `loginWithPassword` (or dev `login`) rejects with a
+`SynapseOneError` whose `status` is `401` and `body.error` is `'mfa_required'`;
+finish with the `mfaToken` from that body.
+
+```ts
+try {
+  await c.iam.loginWithPassword({ email, password, orgSlug: 'acme' });
+} catch (e) {
+  const body = e instanceof SynapseOneError ? (e.body as { error?: string; mfaToken?: string }) : undefined;
+  if (e instanceof SynapseOneError && e.status === 401 && body?.error === 'mfa_required') {
+    const s = await c.iam.verifyMfa({ mfaToken: body.mfaToken!, code: '492039' }); // or recoveryCode
+    c.setToken(s.accessToken);
+  } else throw e;
+}
+
+const { secret, otpauthUrl } = await c.iam.setupTotp();     // show otpauthUrl as a QR code
+const { recoveryCodes } = await c.iam.enableTotp('123456'); // shown once
+await c.iam.mfaStatus();                                    // {enabled, recoveryCodesRemaining, ...}
+await c.iam.regenerateRecoveryCodes('123456');
+await c.iam.disableMfa({ code: '123456' });                 // or { recoveryCode }
+await c.iam.resetUserMfa(userId);                           // org admins: lost device
+await c.iam.unlockUser(userId);                             // org admins: clear a lockout
+```
+
 ### Organizations
 
 #### `listOrgs()`

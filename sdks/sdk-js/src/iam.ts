@@ -244,6 +244,67 @@ export class IamService {
   verifyApiKey(apiKey: string) {
     return this.http.req(`/v1/keys/verify`, { method: 'POST', body: JSON.stringify({ apiKey }) });
   }
+  /** Rotate a key: returns the new secret once; the old key stays valid for `graceSeconds` (0 = revoke now). */
+  rotateApiKey(keyId: string, graceSeconds = 0) {
+    return this.http.req<{ id: string; apiKey: string; prefix: string; rotatedFrom: string; oldKeyExpiresAt: string }>(
+      `/v1/keys/${encodeURIComponent(keyId)}/rotate`,
+      { method: 'POST', body: JSON.stringify({ graceSeconds }) },
+    );
+  }
+
+  // ---- multi-factor authentication (TOTP) ----
+  /**
+   * Finish a login that failed with 401 `mfa_required`: pass the `mfaToken`
+   * from that error body plus a TOTP `code` or a `recoveryCode`.
+   */
+  verifyMfa(input: { mfaToken: string; code?: string; recoveryCode?: string }) {
+    return this.http.req<{ accessToken: string; refreshToken: string; user: any; mfa: { method: 'totp' | 'recovery'; recoveryCodesRemaining: number } }>(
+      '/v1/auth/mfa/verify',
+      { method: 'POST', body: JSON.stringify(input) },
+    );
+  }
+  mfaStatus() {
+    return this.http.req<{ enabled: boolean; pending: boolean; methods: string[]; recoveryCodesRemaining: number; enabledAt: string | null }>('/v1/auth/mfa');
+  }
+  /** Start TOTP enrolment: show `otpauthUrl` as a QR code, then call enableTotp. */
+  setupTotp() {
+    return this.http.req<{ secret: string; otpauthUrl: string; period: number; digits: number; algorithm: string }>(
+      '/v1/auth/mfa/totp/setup',
+      { method: 'POST', body: '{}' },
+    );
+  }
+  /** Confirm enrolment; returns 10 recovery codes that are shown only once. */
+  enableTotp(code: string) {
+    return this.http.req<{ enabled: true; recoveryCodes: string[] }>('/v1/auth/mfa/totp/enable', { method: 'POST', body: JSON.stringify({ code }) });
+  }
+  regenerateRecoveryCodes(code: string) {
+    return this.http.req<{ recoveryCodes: string[] }>('/v1/auth/mfa/recovery-codes', { method: 'POST', body: JSON.stringify({ code }) });
+  }
+  disableMfa(input: { code?: string; recoveryCode?: string }) {
+    return this.http.req<{ enabled: false }>('/v1/auth/mfa/disable', { method: 'POST', body: JSON.stringify(input) });
+  }
+  /** Org admins: remove a user's second factor after a lost device. */
+  resetUserMfa(userId: string) {
+    return this.http.req<{ ok: boolean; removed: boolean }>(`/v1/users/${encodeURIComponent(userId)}/mfa`, { method: 'DELETE' });
+  }
+  /** Org admins: clear a sign-in lockout. */
+  unlockUser(userId: string) {
+    return this.http.req<{ ok: boolean }>(`/v1/users/${encodeURIComponent(userId)}/unlock`, { method: 'POST', body: '{}' });
+  }
+
+  // ---- org administrators & managed policies ----
+  setOrgAdmin(userId: string, isOrgAdmin: boolean) {
+    return this.http.req(`/v1/users/${encodeURIComponent(userId)}/org-admin`, { method: 'PUT', body: JSON.stringify({ isOrgAdmin }) });
+  }
+  managedPolicies() {
+    return this.http.req<Array<{ name: string; description: string; document: any }>>('/v1/managed-policies');
+  }
+  /** Instantiate an AWS-style managed policy (e.g. `ReadOnlyAccess`) in an account. */
+  createManagedPolicy(accountId: string, slug: string, managed: string, description?: string) {
+    return this.http.req(`/v1/accounts/${encodeURIComponent(accountId)}/policies`, {
+      method: 'POST', body: JSON.stringify({ slug, managed, ...(description ? { description } : {}) }),
+    });
+  }
 
   // ---- service accounts ----
   createServiceAccount(accountId: string, slug: string, description = '') {
@@ -257,6 +318,16 @@ export class IamService {
       method: 'POST',
       body: JSON.stringify(scopes === undefined ? {} : { scopes }),
     });
+  }
+
+  serviceAccountRoles(saId: string) {
+    return this.http.req(`/v1/service-accounts/${encodeURIComponent(saId)}/roles`);
+  }
+  assignServiceAccountRole(saId: string, roleId: string) {
+    return this.http.req(`/v1/service-accounts/${encodeURIComponent(saId)}/roles`, { method: 'POST', body: JSON.stringify({ roleId }) });
+  }
+  unassignServiceAccountRole(saId: string, roleId: string) {
+    return this.http.req(`/v1/service-accounts/${encodeURIComponent(saId)}/roles/${encodeURIComponent(roleId)}`, { method: 'DELETE' });
   }
 
   // ---- usage & telemetry ----

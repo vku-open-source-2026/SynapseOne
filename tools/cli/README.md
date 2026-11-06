@@ -35,6 +35,10 @@ synapseone audit --limit 20
 
 For local container development: add `--base http://localhost:8080` (or `export SYNAPSEONE_BASE_URL=http://localhost:8080`).
 
+Accounts with MFA: `synapseone login --email … --password … --code 123456`.
+Manage it with `synapseone mfa status|setup|enable|recovery-codes|disable`
+(org admins: `mfa reset|unlock <user-id>`).
+
 ## Full documentation
 
 See **[docs/cli.md](../../docs/cli.md)** for the complete CLI reference —

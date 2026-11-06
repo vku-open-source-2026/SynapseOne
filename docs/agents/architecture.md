@@ -179,7 +179,7 @@ edit an applied migration; add a new one.
 ### Object storage
 
 `SynapseOCS` exposes bucket-aware object storage at `/v1/ocs` (legacy `/v1/storage` remains the default bucket)
-(direct + multipart upload, presigned URLs, checksums, quotas) over S3Mock in
+(direct + multipart upload, presigned URLs, checksums, quotas) over SeaweedFS in
 dev and MinIO/AWS S3 in production. Tier-3 products upload files and store the
 returned key instead of embedding base64 data URLs.
 

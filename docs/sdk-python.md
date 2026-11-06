@@ -137,6 +137,31 @@ def me(self) -> dict
 ```
 Returns the user record behind the current Bearer token.
 
+### Multi-factor authentication (`c.iam`)
+
+When an account has MFA, `login_with_password` raises `SynapseOneError` with
+`status == 401` and `body["error"] == "mfa_required"`; finish with its `mfaToken`.
+
+```python
+from synapseone_sdk import SynapseOneError
+
+try:
+    s = c.iam.login_with_password(email, password, "acme")
+except SynapseOneError as e:
+    if e.status == 401 and e.body.get("error") == "mfa_required":
+        s = c.iam.verify_mfa(e.body["mfaToken"], code="492039")  # or recovery_code=
+    else:
+        raise
+
+setup = c.iam.setup_totp()                  # {"secret", "otpauthUrl", ...}
+codes = c.iam.enable_totp("123456")["recoveryCodes"]
+c.iam.mfa_status()
+c.iam.regenerate_recovery_codes("123456")
+c.iam.disable_mfa(code="123456")            # or recovery_code=
+c.iam.reset_user_mfa(user_id)               # org admins: lost device
+c.iam.unlock_user(user_id)                  # org admins: clear a lockout
+```
+
 ### Organizations
 
 #### `list_orgs()`

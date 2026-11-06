@@ -19,7 +19,7 @@ export function PageTitle({ title, sub, right }) {
   return (
     <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-6">
       <div className="min-w-0">
-        <h2 className="text-xl sm:text-2xl font-semibold text-main-text truncate">{title}</h2>
+        <h1 className="text-xl sm:text-2xl font-semibold text-main-text truncate">{title}</h1>
         {sub && <p className="text-normal-text text-sm mt-1">{sub}</p>}
       </div>
       {right && <div className="flex flex-wrap items-center justify-end gap-2 shrink-0">{right}</div>}
@@ -44,7 +44,7 @@ export function Btn({ children, onClick, kind = 'primary', type = 'button', disa
       className={`px-4 py-2 rounded-2xl text-sm font-medium shadow-sm disabled:opacity-60 disabled:cursor-wait whitespace-nowrap inline-flex items-center justify-center gap-2 transition-opacity ${styles} ${className}`}
     >
       {loading && <Spinner size="sm" className="sdx-spinner-on-dark" label="Loading" />}
-      <span className={loading ? 'opacity-90' : ''}>{children}</span>
+      <span className={`inline-flex items-center gap-2 ${loading ? 'opacity-90' : ''}`}>{children}</span>
     </button>
   );
 }
@@ -116,7 +116,7 @@ export function Skeleton({ className = '' }) {
 
 export function StatValue({ loading, value }) {
   if (loading) return <Skeleton className="h-9 w-16" />;
-  return <p className="text-3xl font-semibold text-main-text tabular-nums">{value ?? '—'}</p>;
+  return <p className="text-3xl font-semibold text-main-text tabular-nums">{value ?? '–'}</p>;
 }
 
 export function Err({ e }) {
@@ -187,7 +187,7 @@ export function Modal({ title, onClose, children, open }) {
   );
   // Portal to <body>: a `fixed inset-0` overlay must never be trapped by an
   // ancestor with a transform or overflow (page-enter animations, scroll
-  // containers) — it always needs to cover the full viewport and centre
+  // containers), it always needs to cover the full viewport and centre
   // against it, not against the page column.
   if (typeof document === 'undefined') return overlay; // SSR safety (ssr-smoke)
   return createPortal(overlay, document.body);
@@ -202,7 +202,7 @@ async function copyText(text) {
     await navigator.clipboard.writeText(text);
     return;
   } catch {
-    /* clipboard API unavailable (permissions/insecure ctx) — fall back below */
+    /* clipboard API unavailable (permissions/insecure ctx), fall back below */
   }
   const ta = document.createElement('textarea');
   ta.value = text;

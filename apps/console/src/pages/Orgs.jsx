@@ -45,7 +45,7 @@ export default function Orgs() {
 
   return (
     <>
-      <PageTitle title="Organizations" sub="Root tenants — like AWS Organizations" right={<Btn onClick={() => setOpen(true)}>+ New</Btn>} />
+      <PageTitle title="Organizations" sub="Root tenants, like AWS Organizations" right={<Btn onClick={() => setOpen(true)}>+ New</Btn>} />
       <Err e={err} />
       <Card>
         {!loaded ? (

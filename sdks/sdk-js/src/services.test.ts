@@ -743,3 +743,80 @@ describe('error mapping', () => {
     }
   });
 });
+
+describe('IAM token management', () => {
+  it('rotation, org admins, managed policies and service-account roles', async () => {
+    const hits: Array<{ method: string; path: string; body: Buffer }> = [];
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (c) => chunks.push(Buffer.from(c)));
+      req.on('end', () => {
+        hits.push({ method: req.method || 'GET', path: req.url || '/', body: Buffer.concat(chunks) });
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ ok: true }));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const a = server.address();
+    const c = new SynapseOneClient({ baseUrl: `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`, token: 'T' });
+    const last = () => hits[hits.length - 1];
+    try {
+      await c.iam.rotateApiKey('k1', 300);
+      assert.equal(last().path, '/v1/keys/k1/rotate');
+      assert.deepEqual(JSON.parse(last().body.toString()), { graceSeconds: 300 });
+      await c.iam.setOrgAdmin('u1', true);
+      assert.equal(last().method, 'PUT');
+      assert.deepEqual(JSON.parse(last().body.toString()), { isOrgAdmin: true });
+      await c.iam.managedPolicies();
+      assert.equal(last().path, '/v1/managed-policies');
+      await c.iam.createManagedPolicy('acc1', 'readers', 'ReadOnlyAccess');
+      assert.deepEqual(JSON.parse(last().body.toString()), { slug: 'readers', managed: 'ReadOnlyAccess' });
+      await c.iam.assignServiceAccountRole('sa1', 'r1');
+      assert.equal(last().path, '/v1/service-accounts/sa1/roles');
+      await c.iam.unassignServiceAccountRole('sa1', 'r1');
+      assert.equal(last().path, '/v1/service-accounts/sa1/roles/r1');
+      await c.iam.serviceAccountRoles('sa1');
+      assert.equal(last().method, 'GET');
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it('MFA enrolment, sign-in step and admin actions', async () => {
+    const hits: Array<{ method: string; path: string; body: Buffer }> = [];
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (c) => chunks.push(Buffer.from(c)));
+      req.on('end', () => {
+        hits.push({ method: req.method || 'GET', path: req.url || '/', body: Buffer.concat(chunks) });
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ ok: true }));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const a = server.address();
+    const c = new SynapseOneClient({ baseUrl: `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`, token: 'T' });
+    const last = () => hits[hits.length - 1];
+    const body = () => JSON.parse(last().body.toString() || 'null');
+    try {
+      await c.iam.verifyMfa({ mfaToken: 'm', code: '123456' });
+      assert.deepEqual([last().method, last().path, body()], ['POST', '/v1/auth/mfa/verify', { mfaToken: 'm', code: '123456' }]);
+      await c.iam.mfaStatus();
+      assert.deepEqual([last().method, last().path], ['GET', '/v1/auth/mfa']);
+      await c.iam.setupTotp();
+      assert.equal(last().path, '/v1/auth/mfa/totp/setup');
+      await c.iam.enableTotp('111111');
+      assert.deepEqual([last().path, body()], ['/v1/auth/mfa/totp/enable', { code: '111111' }]);
+      await c.iam.regenerateRecoveryCodes('222222');
+      assert.deepEqual([last().path, body()], ['/v1/auth/mfa/recovery-codes', { code: '222222' }]);
+      await c.iam.disableMfa({ recoveryCode: 'abcd-efgh' });
+      assert.deepEqual([last().path, body()], ['/v1/auth/mfa/disable', { recoveryCode: 'abcd-efgh' }]);
+      await c.iam.resetUserMfa('u/1');
+      assert.deepEqual([last().method, last().path], ['DELETE', '/v1/users/u%2F1/mfa']);
+      await c.iam.unlockUser('u1');
+      assert.deepEqual([last().method, last().path], ['POST', '/v1/users/u1/unlock']);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});

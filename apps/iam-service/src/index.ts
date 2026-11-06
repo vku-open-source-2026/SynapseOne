@@ -7,6 +7,7 @@
 import './env-compat';
 import express from 'express';
 import cors from 'cors';
+import expressRateLimit from 'express-rate-limit';
 import morgan from 'morgan';
 import dotenv from 'dotenv';
 import { createHmac } from 'crypto';
@@ -22,6 +23,8 @@ import {
   policiesForRole, rolesForUser, ensureTables,
   setUserPassword, markEmailVerified, storeOneTimeToken, consumeOneTimeToken,
   setUserActive, updateUserProfile,
+  setOrgAdmin, orgHasAdmin, assignRoleToServiceAccount, unassignRoleFromServiceAccount, rolesForServiceAccount,
+  type User,
 } from './db';
 import {
   createScimToken, listScimTokens, revokeScimToken, verifyScimToken,
@@ -33,8 +36,14 @@ import {
   signAccess, newRefreshToken, storeRefresh, consumeRefresh, revokeRefresh, revokeAllRefresh,
   consumeAndRevokeRefresh, findRefreshOwner, refreshExpiry, revokeApiKey, createApiKeyRecord,
   verifyApiKey, verifyAccess, listApiKeys, findApiKeyById, signDelegated,
-  listRefreshSessions, revokeRefreshById, revokeApiKeysForUser,
+  listRefreshSessions, revokeRefreshById, revokeApiKeysForUser, rotateApiKey,
 } from './tokens';
+import {
+  beginTotpEnrolment, checkSecondFactor, clearLoginFailures, enableTotp, getMfa, lockRemaining, mfaEnabled,
+  otpauthUrl, recordLoginFailure, regenerateRecoveryCodes, removeMfa, signMfaChallenge, verifyMfaChallenge,
+  TOTP_DIGITS, TOTP_PERIOD,
+} from './mfa';
+import { decideForPrincipal, managedPolicyList, MANAGED_POLICIES, type PrincipalInput } from './authz';
 import { secretsEqual, hashCandidates } from './db';
 import { ingestUsageEvents, listUsageEvents, purgeUsage, usageSummary, type UsageFilter } from './usage';
 import { assertOidcConfig, isPublicHttpsUrl, signState, exchangeCode, authorizationEndpoint, oidcSettings, OidcError } from './oidc';
@@ -189,6 +198,23 @@ async function canActForAccount(req: express.Request, trustStamped: boolean, acc
   return !!acc && acc.org_id === org;
 }
 
+/** Bootstrap rule: the first user of an organization becomes its
+ *  administrator (AWS root-like). Later users start with no permissions and
+ *  are granted roles/managed policies by an admin. */
+async function bootstrapOrgAdmin(user: User): Promise<User> {
+  if (user.is_org_admin) return user;
+  if (await orgHasAdmin(user.org_id)) return user;
+  return (await setOrgAdmin(user.id, true)) || user;
+}
+
+/** Is the caller an administrator of `orgId`? Machine identities never are. */
+async function callerIsOrgAdmin(req: express.Request, trustStamped: boolean, orgId: string): Promise<boolean> {
+  const uid = await resolveCallerUser(req, trustStamped);
+  if (!uid) return false;
+  const u = await getUserById(uid);
+  return !!u && u.org_id === orgId && !!u.is_org_admin;
+}
+
 /** May the caller act for `orgId`? Same stamped-trust rule; service-account
  *  tokens are account-scoped, never org-scoped. */
 async function canActForOrg(req: express.Request, trustStamped: boolean, orgId: string): Promise<boolean> {
@@ -270,6 +296,73 @@ async function issueSession(user: { id: string; email: string; org_id: string })
   const rt = newRefreshToken();
   await storeRefresh(user.id, rt.hash, refreshExpiry());
   return { accessToken: token, expiresIn, refreshToken: rt.value, user };
+}
+
+function sendLocked(res: express.Response, seconds: number) {
+  res.setHeader('Retry-After', String(seconds));
+  return res.status(429).json({
+    error: 'account_locked',
+    message: 'Too many failed sign-in attempts. Try again later or ask an administrator to unlock the account.',
+    retryAfter: seconds,
+  });
+}
+
+function sendMfaChallenge(res: express.Response, userId: string, method: string) {
+  noStore(res);
+  return res.status(401).json({
+    error: 'mfa_required',
+    message: 'Enter the code from your authenticator app',
+    ...signMfaChallenge(userId, method),
+    methods: ['totp', 'recovery'],
+  });
+}
+
+/** Self-service MFA calls need a real user session (not a key or delegated token). */
+async function requireUserCaller(req: express.Request, res: express.Response): Promise<User | null> {
+  const h = firstHeader(req.headers.authorization as any);
+  if (!h.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'unauthorized', message: 'Bearer token required' });
+    return null;
+  }
+  let claims: any;
+  try {
+    claims = verifyAccess(h.slice(7));
+  } catch {
+    res.status(401).json({ error: 'invalid_token' });
+    return null;
+  }
+  if (claims.kind && claims.kind !== 'user') {
+    res.status(403).json({ error: 'mfa_requires_user', message: 'Only a signed-in user can manage their own MFA' });
+    return null;
+  }
+  const user = await getUserById(claims.sub);
+  if (!user) {
+    res.status(404).json({ error: 'user_not_found' });
+    return null;
+  }
+  return user;
+}
+
+/** Resolve the security subject of an org-admin action on another user. */
+async function orgAdminTarget(req: express.Request, res: express.Response, trustStamped: boolean): Promise<User | null> {
+  if (!isUuid(req.params.userId)) {
+    res.status(400).json({ error: 'invalid_id', message: 'userId must be a UUID' });
+    return null;
+  }
+  const user = await getUserById(req.params.userId);
+  if (!user) {
+    res.status(404).json({ error: 'user_not_found' });
+    return null;
+  }
+  if (!(await canActForOrg(req, trustStamped, user.org_id))) {
+    res.status(403).json({ error: 'forbidden', message: 'user belongs to another tenant' });
+    return null;
+  }
+  if (!(await callerIsOrgAdmin(req, trustStamped, user.org_id))) {
+    res.status(403).json({ error: 'org_admin_required', message: 'only an organization administrator can do this' });
+    return null;
+  }
+  return user;
 }
 
 /** Resolve a service identity from a Bearer service-account token or API key.
@@ -572,6 +665,18 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (p === '/v1/usage/ingest' || p === '/v1/audit/ingest') return next();
     // SCIM carries its own scoped bearer token (never a user session).
     if (p.startsWith('/scim/')) return next();
+    // Gateway-only endpoints (central authorization). There is no gateway
+    // route for /internal/*, so clients cannot reach them through the edge;
+    // the shared secret authenticates the gateway itself.
+    if (p.startsWith('/internal/')) {
+      if (INTERNAL_SECRET) {
+        const got = firstHeader((req.headers['x-synapseone-internal'] ?? req.headers['x-synapsedx-internal']) as any);
+        if (!got || !secretsEqual(got, INTERNAL_SECRET)) {
+          return res.status(401).json({ error: 'unauthorized', message: 'Missing or invalid internal credential' });
+        }
+      }
+      return next();
+    }
     if (INTERNAL_SECRET) {
       const got = firstHeader((req.headers['x-synapseone-internal'] ?? req.headers['x-synapsedx-internal']) as any);
       if (!got || !secretsEqual(got, INTERNAL_SECRET)) {
@@ -648,6 +753,23 @@ async function auditMutation(req: express.Request, action: string, resource: str
   // SCIM is machine-to-machine but still needs a brute-force / abuse ceiling.
   const scimLimiter = rateLimit(120, 60_000);
   app.use('/scim/', scimLimiter as any);
+  // Per-route ceiling for second-factor and account-recovery endpoints
+  // (per-user lockout in mfa.ts is the primary brute-force defence).
+  const mfaLimiter = expressRateLimit({
+    windowMs: 60_000,
+    limit: Math.max(1, Number(process.env.IAM_MFA_RATE_LIMIT_PER_MIN) || 60),
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { error: 'rate_limited', message: 'Too many requests, slow down' },
+  });
+  // Same ceiling on password/dev sign-in (per-user lockout lives in mfa.ts).
+  const loginLimiter = expressRateLimit({
+    windowMs: 60_000,
+    limit: Math.max(1, Number(process.env.IAM_LOGIN_RATE_LIMIT_PER_MIN) || 60),
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { error: 'rate_limited', message: 'Too many sign-in attempts, slow down' },
+  });
 
   // ---------- OIDC discovery (Authentik, Keycloak, or any OIDC IdP) ----------
   app.get('/v1/auth/oidc/config', (_req, res) => {
@@ -713,7 +835,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
           if ('error' in resolved) {
             return res.status(403).json({ error: resolved.error, message: resolved.message });
           }
-          const user = resolved.user;
+          const user = await bootstrapOrgAdmin(resolved.user);
           const { token, expiresIn } = signAccess({ sub: user.id, email: user.email, org: user.org_id });
           const rt = newRefreshToken();
           await storeRefresh(user.id, rt.hash, refreshExpiry());
@@ -748,7 +870,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       if ('error' in resolved) {
         return res.status(403).json({ error: resolved.error, message: resolved.message });
       }
-      const user = resolved.user;
+      const user = await bootstrapOrgAdmin(resolved.user);
       const { token, expiresIn } = signAccess({ sub: user.id, email: user.email, org: user.org_id });
       const rt = newRefreshToken();
       await storeRefresh(user.id, rt.hash, refreshExpiry());
@@ -1108,7 +1230,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
     res.json({ ok: true });
   });
 
-  app.post('/v1/auth/login', async (req, res) => {
+  app.post('/v1/auth/login', loginLimiter, async (req, res) => {
     const schema = z.object({
       email: z.string().trim().toLowerCase().email().max(320),
       password: z.string().max(PASSWORD_MAX).optional(),
@@ -1122,18 +1244,27 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (password !== undefined) {
       const org = await getOrgBySlug(slug);
       const user = org ? await findUserByOrgEmail(org.id, email) : null;
+      if (user) {
+        const left = await lockRemaining(user.id);
+        if (left > 0) return sendLocked(res, left);
+      }
       // Constant-ish work for unknown users; never reveal whether the account exists.
       const ok = user ? await verifyPassword(password, user.password_hash) : false;
       if (user && user.active === false) {
         return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated by an administrator.' });
       }
       if (!user || !ok) {
+        const lockedFor = user ? await recordLoginFailure(user.id) : 0;
         await logAudit({
           actor_type: 'user', actor_id: user?.id || '', action: 'iam:auth:login', resource: `org:${org?.id || slug}`,
-          decision: false, context: { method: 'password', email, ...(org ? { org: org.id } : {}) },
+          decision: false, context: { method: 'password', email, ...(org ? { org: org.id } : {}), ...(lockedFor ? { lockedForSeconds: lockedFor } : {}) },
         }).catch(() => undefined);
         return res.status(401).json({ error: 'invalid_credentials', message: 'Email or password is incorrect' });
       }
+      // Second factor: the password alone never yields a session. Failures
+      // keep counting until the whole login succeeds.
+      if (await mfaEnabled(user.id)) return sendMfaChallenge(res, user.id, 'pwd');
+      await clearLoginFailures(user.id);
       const session = await issueSession(user);
       await logAudit({
         actor_type: 'user', actor_id: user.id, action: 'iam:auth:login', resource: `org:${user.org_id}`,
@@ -1150,13 +1281,140 @@ async function auditMutation(req: express.Request, action: string, resource: str
       });
     }
     const org = (await getOrgBySlug(slug)) || (await createOrganization(slug, slug));
-    const user = await upsertUser(org.id, email, email);
+    const user = await bootstrapOrgAdmin(await upsertUser(org.id, email, email));
     if (user.active === false) {
       return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated by an administrator.' });
+    }
+    if (await mfaEnabled(user.id)) {
+      const left = await lockRemaining(user.id);
+      if (left > 0) return sendLocked(res, left);
+      return sendMfaChallenge(res, user.id, 'dev');
     }
     const session = await issueSession(user);
     noStore(res);
     res.json(session);
+  });
+
+  // ---------- Multi-factor authentication (TOTP) ----------
+  // Step 2 of a login that returned 401 mfa_required.
+  app.post('/v1/auth/mfa/verify', mfaLimiter, async (req, res) => {
+    const parsed = z.object({
+      mfaToken: z.string().min(1).max(4096),
+      code: z.string().trim().max(16).nullish(),
+      recoveryCode: z.string().trim().max(32).nullish(),
+    }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    const { mfaToken, code, recoveryCode } = parsed.data;
+    if (!code && !recoveryCode) return res.status(400).json({ error: 'invalid_body', message: 'code or recoveryCode required' });
+    const challenge = verifyMfaChallenge(mfaToken);
+    if (!challenge) return res.status(401).json({ error: 'invalid_mfa_token', message: 'The sign-in challenge expired. Sign in again.' });
+    const user = await getUserById(challenge.sub);
+    if (!user) return res.status(401).json({ error: 'invalid_mfa_token' });
+    if (user.active === false) {
+      return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated by an administrator.' });
+    }
+    const left = await lockRemaining(user.id);
+    if (left > 0) return sendLocked(res, left);
+    const result = await checkSecondFactor(user.id, { code, recoveryCode });
+    if (!result.ok) {
+      const lockedFor = await recordLoginFailure(user.id);
+      await logAudit({
+        actor_type: 'user', actor_id: user.id, action: 'iam:auth:mfa', resource: `user:${user.id}`,
+        decision: false, context: { org: user.org_id, method: recoveryCode ? 'recovery' : 'totp', ...(lockedFor ? { lockedForSeconds: lockedFor } : {}) },
+      }).catch(() => undefined);
+      return res.status(401).json({ error: 'invalid_mfa_code', message: 'The verification code is incorrect' });
+    }
+    await clearLoginFailures(user.id);
+    const session = await issueSession(user);
+    await logAudit({
+      actor_type: 'user', actor_id: user.id, action: 'iam:auth:login', resource: `org:${user.org_id}`,
+      decision: true, context: { method: challenge.amr[0] || 'pwd', mfa: result.method, org: user.org_id, recoveryCodesRemaining: result.remainingRecovery },
+    }).catch(() => undefined);
+    noStore(res);
+    res.json({ ...session, mfa: { method: result.method, recoveryCodesRemaining: result.remainingRecovery } });
+  });
+
+  app.get('/v1/auth/mfa', mfaLimiter, async (req, res) => {
+    const caller = await requireUserCaller(req, res);
+    if (!caller) return;
+    const rec = await getMfa(caller.id);
+    noStore(res);
+    res.json({
+      enabled: !!rec?.enabled,
+      pending: !!rec && !rec.enabled,
+      methods: rec?.enabled ? ['totp', 'recovery'] : [],
+      recoveryCodesRemaining: rec?.enabled ? rec.recovery_hashes.length : 0,
+      enabledAt: rec?.enabled_at ?? null,
+    });
+  });
+
+  app.post('/v1/auth/mfa/totp/setup', mfaLimiter, async (req, res) => {
+    const caller = await requireUserCaller(req, res);
+    if (!caller) return;
+    const started = await beginTotpEnrolment(caller.id);
+    if (!started) return res.status(409).json({ error: 'mfa_already_enabled', message: 'Disable the current authenticator before enrolling a new one' });
+    noStore(res);
+    res.json({ secret: started.secret, otpauthUrl: otpauthUrl(started.secret, caller.email), period: TOTP_PERIOD, digits: TOTP_DIGITS, algorithm: 'SHA1' });
+  });
+
+  app.post('/v1/auth/mfa/totp/enable', mfaLimiter, async (req, res) => {
+    const caller = await requireUserCaller(req, res);
+    if (!caller) return;
+    const parsed = z.object({ code: z.string().trim().max(16) }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: 'code required' });
+    const rec = await getMfa(caller.id);
+    if (!rec) return res.status(409).json({ error: 'mfa_not_started', message: 'Call /v1/auth/mfa/totp/setup first' });
+    if (rec.enabled) return res.status(409).json({ error: 'mfa_already_enabled' });
+    const check = await checkSecondFactor(caller.id, { code: parsed.data.code }, false);
+    if (!check.ok) return res.status(400).json({ error: 'invalid_mfa_code', message: 'The verification code is incorrect' });
+    const recoveryCodes = await enableTotp(caller.id);
+    await logAudit({
+      actor_type: 'user', actor_id: caller.id, action: 'iam:mfa:enable', resource: `user:${caller.id}`,
+      decision: true, context: { org: caller.org_id, method: 'totp' },
+    }).catch(() => undefined);
+    noStore(res);
+    res.json({ enabled: true, recoveryCodes });
+  });
+
+  app.post('/v1/auth/mfa/recovery-codes', mfaLimiter, async (req, res) => {
+    const caller = await requireUserCaller(req, res);
+    if (!caller) return;
+    const parsed = z.object({ code: z.string().trim().max(16) }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: 'code required' });
+    if (!(await mfaEnabled(caller.id))) return res.status(409).json({ error: 'mfa_not_enabled' });
+    const check = await checkSecondFactor(caller.id, { code: parsed.data.code });
+    if (!check.ok) return res.status(401).json({ error: 'invalid_mfa_code', message: 'The verification code is incorrect' });
+    const recoveryCodes = await regenerateRecoveryCodes(caller.id);
+    await logAudit({
+      actor_type: 'user', actor_id: caller.id, action: 'iam:mfa:recovery-codes', resource: `user:${caller.id}`,
+      decision: true, context: { org: caller.org_id },
+    }).catch(() => undefined);
+    noStore(res);
+    res.json({ recoveryCodes });
+  });
+
+  app.post('/v1/auth/mfa/disable', mfaLimiter, async (req, res) => {
+    const caller = await requireUserCaller(req, res);
+    if (!caller) return;
+    const parsed = z.object({
+      code: z.string().trim().max(16).nullish(),
+      recoveryCode: z.string().trim().max(32).nullish(),
+    }).safeParse(req.body);
+    if (!parsed.success || (!parsed.data.code && !parsed.data.recoveryCode)) {
+      return res.status(400).json({ error: 'invalid_body', message: 'code or recoveryCode required' });
+    }
+    if (!(await mfaEnabled(caller.id))) {
+      await removeMfa(caller.id); // drop an unfinished enrolment
+      return res.json({ enabled: false });
+    }
+    const check = await checkSecondFactor(caller.id, parsed.data);
+    if (!check.ok) return res.status(401).json({ error: 'invalid_mfa_code', message: 'The verification code is incorrect' });
+    await removeMfa(caller.id);
+    await logAudit({
+      actor_type: 'user', actor_id: caller.id, action: 'iam:mfa:disable', resource: `user:${caller.id}`,
+      decision: true, context: { org: caller.org_id },
+    }).catch(() => undefined);
+    res.json({ enabled: false });
   });
 
   // ---------- First-party credential lifecycle (#22) ----------
@@ -1204,7 +1462,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (existing?.password_hash) {
       return res.status(409).json({ error: 'account_exists', message: 'An account with this email already has a password. Sign in or reset it.' });
     }
-    const user = await upsertUser(org.id, email, displayName || email);
+    const user = await bootstrapOrgAdmin(await upsertUser(org.id, email, displayName || email));
     await setUserPassword(user.id, await hashPassword(password));
     const verify = newOneTimeToken('verify');
     await storeOneTimeToken(user.id, verify.hash, 'verify', verifyTokenExpiry());
@@ -1669,7 +1927,16 @@ async function auditMutation(req: express.Request, action: string, resource: str
 
   app.post('/v1/accounts/:accountId/policies', async (req, res) => {
     if (!isUuid(req.params.accountId)) return res.status(400).json({ error: 'invalid_id', message: 'accountId must be a UUID' });
-    const { slug, description, document } = (req.body || {}) as any;
+    const { slug, description, managed } = (req.body || {}) as any;
+    let { document } = (req.body || {}) as any;
+    // `managed: "ReadOnlyAccess"` instantiates a managed policy in this account.
+    if (managed != null) {
+      if (typeof managed !== 'string' || !Object.prototype.hasOwnProperty.call(MANAGED_POLICIES, managed)) {
+        return res.status(400).json({ error: 'invalid_managed_policy', message: `managed must be one of ${Object.keys(MANAGED_POLICIES).join(', ')}` });
+      }
+      if (document) return res.status(400).json({ error: 'invalid_body', message: 'send either document or managed, not both' });
+      document = MANAGED_POLICIES[managed].document;
+    }
     if (!slug || !document) return res.status(400).json({ error: 'slug+document required' });
     if (typeof slug !== 'string' || !/^[a-z0-9-]{1,64}$/.test(slug)) {
       return res.status(400).json({ error: 'invalid_slug', message: 'slug must match ^[a-z0-9-]{1,64}$' });
@@ -1680,8 +1947,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!(await canActForAccount(req, TRUST_STAMPED, req.params.accountId))) {
       return res.status(403).json({ error: 'forbidden', message: 'account belongs to another tenant' });
     }
-    const created = await createPolicy(req.params.accountId, slug, sanitizeName(description || ''), document);
-    await auditMutation(req, 'iam:policy:create', `policy:${created.id}`, { account: req.params.accountId, slug });
+    const desc = description || (managed ? `${managed} (managed): ${MANAGED_POLICIES[managed].description}` : '');
+    const created = await createPolicy(req.params.accountId, slug, sanitizeName(desc), document);
+    await auditMutation(req, 'iam:policy:create', `policy:${created.id}`, { account: req.params.accountId, slug, ...(managed ? { managed } : {}) });
     res.status(201).json(created);
   });
 
@@ -1781,6 +2049,55 @@ async function auditMutation(req: express.Request, action: string, resource: str
   // ---------- Authorize (policy evaluation) ----------
   // context: caller cung cấp thêm (vd {hour, sourceIp}); server luôn ép
   // user/org/email từ DB (caller không override được) để Condition đáng tin.
+  // Central enforcement (gateway → IAM). Decides for the verified principal the
+  // gateway authenticated; deny decisions are audited. Gateway-only route.
+  const principalSchema = z.object({
+    principal: z.object({
+      kind: z.enum(['user', 'service-account', 'apikey']),
+      // Any verified JWT subject; non-UUID subjects resolve to unknown-principal (deny), never 400.
+      sub: z.string().min(1).max(128).nullish(),
+      org: z.string().max(128).nullish(),
+      account: z.string().max(128).nullish(),
+      scopes: z.array(z.string().min(1).max(200)).max(100).nullish(),
+      keyId: z.string().uuid().nullish(),
+    }),
+    action: z.string().min(1).max(512),
+    resource: z.string().min(1).max(2048),
+    context: z.record(z.any()).nullish(),
+  });
+  app.post('/internal/authorize', async (req, res) => {
+    const parsed = principalSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    const { principal, action, resource, context } = parsed.data;
+    const p: PrincipalInput = {
+      kind: principal.kind,
+      sub: principal.sub || undefined,
+      org: principal.org || undefined,
+      account: principal.account || undefined,
+      scopes: principal.scopes || undefined,
+      keyId: principal.keyId || undefined,
+    };
+    const d = await decideForPrincipal(p, action, resource, capContext(context));
+    if (!d.allowed) {
+      // Attribute the row to the identity's own tenant so org-scoped
+      // GET /v1/audit shows the denial to that org's admins.
+      const account = d.account || p.account;
+      const org = d.org || p.org || (account && isUuid(account) ? (await getAccountById(account))?.org_id : undefined);
+      await logAudit({
+        actor_type: p.kind, actor_id: d.principal, action, resource, decision: false,
+        context: { reason: d.reason, enforcement: 'gateway', ...(org ? { org } : {}), ...(account ? { account } : {}) },
+      }).catch(() => undefined);
+    }
+    noStore(res);
+    res.json(d);
+  });
+
+  // AWS-style managed policies (read-only catalog; copy one into an account
+  // with POST /v1/accounts/:accountId/policies {slug, managed}).
+  app.get('/v1/managed-policies', (_req, res) => {
+    res.json(managedPolicyList());
+  });
+
   app.post('/v1/authorize', async (req, res) => {
     const { userId, action, resource, context } = (req.body || {}) as any;
     if (!userId || !action || !resource) return res.status(400).json({ error: 'userId+action+resource required' });
@@ -1996,6 +2313,29 @@ async function auditMutation(req: express.Request, action: string, resource: str
     res.json({ ok: true });
   });
 
+  // Rotate: cấp key mới cùng owner/scopes, key cũ còn sống `graceSeconds`
+  // (mặc định 0 = thu hồi ngay; tối đa 7 ngày) để deploy không gián đoạn.
+  app.post('/v1/keys/:id/rotate', async (req, res) => {
+    if (!isUuid(req.params.id)) return res.status(400).json({ error: 'invalid_id', message: 'key id must be a UUID' });
+    const grace = (req.body || {}).graceSeconds ?? 0;
+    if (!Number.isInteger(grace) || grace < 0 || grace > 604800) {
+      return res.status(400).json({ error: 'invalid_grace', message: 'graceSeconds must be an integer 0..604800' });
+    }
+    const rec = await findApiKeyById(req.params.id);
+    if (!rec) return res.status(404).json({ error: 'key_not_found' });
+    if (!(await canActForAccount(req, TRUST_STAMPED, rec.account_id))) {
+      return res.status(403).json({ error: 'forbidden', message: 'key belongs to another tenant' });
+    }
+    const next = await rotateApiKey(req.params.id, grace);
+    if (!next) return res.status(409).json({ error: 'key_inactive', message: 'revoked or expired keys cannot be rotated' });
+    noStore(res);
+    res.status(201).json({
+      id: next.id, apiKey: next.value, prefix: next.prefix,
+      rotatedFrom: req.params.id, oldKeyExpiresAt: next.oldKeyExpiresAt,
+      warning: 'Save this apiKey now — it is shown only once.',
+    });
+  });
+
   // ---------- Service accounts (machine identity) ----------
   app.post('/v1/accounts/:accountId/service-accounts', async (req, res) => {
     if (!isUuid(req.params.accountId)) return res.status(400).json({ error: 'invalid_id', message: 'accountId must be a UUID' });
@@ -2081,6 +2421,85 @@ async function auditMutation(req: express.Request, action: string, resource: str
     await auditMutation(req, 'iam:token:mint', `service-account:${sa.id}`, { account: sa.account_id, scopes });
     noStore(res);
     res.json({ accessToken: token, expiresIn, serviceAccount: sa });
+  });
+
+  // Service-account roles: quyền của machine identity đến từ role/policy như
+  // user (role phải cùng account với SA). SA chưa có role → chỉ giới hạn bởi scopes.
+  async function saForCaller(req: express.Request, res: express.Response) {
+    if (!isUuid(req.params.id)) { res.status(400).json({ error: 'invalid_id', message: 'service account id must be a UUID' }); return null; }
+    const sa = await getServiceAccount(req.params.id);
+    if (!sa) { res.status(404).json({ error: 'service_account_not_found' }); return null; }
+    if (!(await canActForAccount(req, TRUST_STAMPED, sa.account_id))) {
+      res.status(403).json({ error: 'forbidden', message: 'service account belongs to another tenant' });
+      return null;
+    }
+    return sa;
+  }
+  app.get('/v1/service-accounts/:id/roles', async (req, res) => {
+    const sa = await saForCaller(req, res);
+    if (!sa) return;
+    res.json(await rolesForServiceAccount(sa.id));
+  });
+  app.post('/v1/service-accounts/:id/roles', async (req, res) => {
+    const roleId = (req.body || {}).roleId;
+    if (typeof roleId !== 'string' || !isUuid(roleId)) return res.status(400).json({ error: 'invalid_roleId', message: 'roleId must be a UUID' });
+    const sa = await saForCaller(req, res);
+    if (!sa) return;
+    const role = await getRoleById(roleId);
+    if (!role) return res.status(404).json({ error: 'role_not_found' });
+    if (role.account_id !== sa.account_id) {
+      return res.status(403).json({ error: 'cross_account', message: "role must belong to the service account's account" });
+    }
+    await assignRoleToServiceAccount(sa.id, roleId);
+    res.json({ ok: true });
+  });
+  app.delete('/v1/service-accounts/:id/roles/:roleId', async (req, res) => {
+    if (!isUuid(req.params.roleId)) return res.status(400).json({ error: 'invalid_id', message: 'roleId must be a UUID' });
+    const sa = await saForCaller(req, res);
+    if (!sa) return;
+    const ok = await unassignRoleFromServiceAccount(sa.id, req.params.roleId);
+    if (!ok) return res.status(404).json({ error: 'assignment_not_found' });
+    res.json({ ok: true });
+  });
+
+  // Org administrators: only an existing admin of the same org may grant or
+  // revoke; the last admin cannot demote themself (org would be unmanageable).
+  app.put('/v1/users/:userId/org-admin', async (req, res) => {
+    if (!isUuid(req.params.userId)) return res.status(400).json({ error: 'invalid_id', message: 'userId must be a UUID' });
+    const flag = (req.body || {}).isOrgAdmin;
+    if (typeof flag !== 'boolean') return res.status(400).json({ error: 'invalid_body', message: 'isOrgAdmin (boolean) required' });
+    const user = await getUserById(req.params.userId);
+    if (!user) return res.status(404).json({ error: 'user_not_found' });
+    if (!(await canActForOrg(req, TRUST_STAMPED, user.org_id))) {
+      return res.status(403).json({ error: 'forbidden', message: 'user belongs to another tenant' });
+    }
+    if (!(await callerIsOrgAdmin(req, TRUST_STAMPED, user.org_id))) {
+      return res.status(403).json({ error: 'org_admin_required', message: 'only an organization administrator can change administrators' });
+    }
+    if (!flag && user.is_org_admin) {
+      const admins = (await listUsers(user.org_id)).filter((u) => u.is_org_admin);
+      if (admins.length <= 1) return res.status(409).json({ error: 'last_admin', message: 'an organization needs at least one administrator' });
+    }
+    res.json(await setOrgAdmin(user.id, flag));
+  });
+
+  // Lost authenticator: an org administrator removes the user's second
+  // factor (the user enrols again) and clears any login lockout.
+  app.delete('/v1/users/:userId/mfa', mfaLimiter, async (req, res) => {
+    const user = await orgAdminTarget(req, res, TRUST_STAMPED);
+    if (!user) return;
+    const removed = await removeMfa(user.id);
+    await clearLoginFailures(user.id);
+    await auditMutation(req, 'iam:mfa:reset', `user:${user.id}`, { org: user.org_id, removed });
+    res.json({ ok: true, removed });
+  });
+
+  app.post('/v1/users/:userId/unlock', mfaLimiter, async (req, res) => {
+    const user = await orgAdminTarget(req, res, TRUST_STAMPED);
+    if (!user) return;
+    await clearLoginFailures(user.id);
+    await auditMutation(req, 'iam:user:unlock', `user:${user.id}`, { org: user.org_id });
+    res.json({ ok: true });
   });
 
   // Liệt kê policy của user (hữu ích khi debug authorize).

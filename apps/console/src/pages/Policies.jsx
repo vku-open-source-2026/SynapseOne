@@ -33,6 +33,19 @@ export default function Policies() {
   const [view, setView] = useState(null);
   const [slug, setSlug] = useState('');
   const [doc, setDoc] = useState(SAMPLE);
+  const [managed, setManaged] = useState([]);
+
+  useEffect(() => {
+    if (!open || managed.length) return;
+    api.managedPolicies(headers).then((v) => setManaged(Array.isArray(v) ? v : []), () => setManaged([]));
+  }, [open, headers]);
+
+  const pickManaged = (name) => {
+    const m = managed.find((x) => x.name === name);
+    if (!m) return;
+    setDoc(JSON.stringify(m.document, null, 2));
+    if (!slug) setSlug(name.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase());
+  };
 
   const load = async () => {
     if (!scope.accountId) {
@@ -119,6 +132,16 @@ export default function Policies() {
       {open && (
         <Modal title="New policy" onClose={() => setOpen(false)}>
           <form onSubmit={create}>
+            {managed.length > 0 && (
+              <Field label="Start from an AWS-style managed policy (optional)">
+                <select defaultValue="" onChange={(e) => pickManaged(e.target.value)} className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm outline-none focus:border-main-blue">
+                  <option value="">Custom document</option>
+                  {managed.map((m) => (
+                    <option key={m.name} value={m.name}>{m.name}: {m.description}</option>
+                  ))}
+                </select>
+              </Field>
+            )}
             <Field label="Slug">
               <Input value={slug} onChange={(e) => setSlug(e.target.value)} placeholder="run-only" />
             </Field>

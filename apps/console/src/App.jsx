@@ -11,6 +11,8 @@ import Sidebar from './components/Sidebar.jsx';
 import ServicesSidebar from './components/ServicesSidebar.jsx';
 import Topbar from './components/Topbar.jsx';
 import PublicHeader from './components/PublicHeader.jsx';
+import PublicFooter from './components/PublicFooter.jsx';
+import ConsoleFooter from './components/ConsoleFooter.jsx';
 import ErrorBoundary from './components/ErrorBoundary.jsx';
 import { ScopeProvider } from './components/Scope.jsx';
 import { PageSkeleton, RouteProgress, ScrollToTop } from './components/loading.jsx';
@@ -39,10 +41,13 @@ const SynapseInference = React.lazy(() => import('./pages/SynapseInference.jsx')
 const LinkedData = React.lazy(() => import('./pages/LinkedData.jsx'));
 const Authorize = React.lazy(() => import('./pages/Authorize.jsx'));
 const Audit = React.lazy(() => import('./pages/Audit.jsx'));
+const Security = React.lazy(() => import('./pages/Security.jsx'));
 const ApiDocs = React.lazy(() => import('./pages/ApiDocs.jsx'));
 const Docs = React.lazy(() => import('./pages/Docs.jsx'));
 
 import { appLoginUrl, isCanonicalAppHost } from './lib/site.js';
+import { LanguageProvider } from './lib/i18n.jsx';
+import { ThemeProvider } from './lib/theme.jsx';
 
 function Guard({ children }) {
   const { auth } = useAuth();
@@ -61,9 +66,10 @@ function Guard({ children }) {
 // Public pages: primary navigation via the header above.
 function PublicLayout({ children }) {
   return (
-    <div className="min-h-screen">
+    <div className="min-h-screen bg-s1-bg text-s1-fg">
       <PublicHeader />
-      <main className="mx-auto max-w-6xl px-4 pt-24 pb-12 sdx-page-enter">{children}</main>
+      <main className="mx-auto max-w-6xl px-4 pt-28 pb-16 sdx-page-enter">{children}</main>
+      <PublicFooter />
     </div>
   );
 }
@@ -101,10 +107,12 @@ function ConsoleLayout({ children }) {
         <main
           className={`transition-all duration-200 ${
             servicesOpen ? 'console-layout-dual' : 'console-layout-single'
-          } px-4 lg:px-6 pt-20 pb-12 min-w-0 sdx-page-enter`}
+          } px-4 lg:px-6 pt-20 pb-8 min-w-0 min-h-screen flex flex-col sdx-page-enter`}
         >
-          <div className="max-w-6xl mx-auto w-full">
-            {children}
+          {/* Column fills the window so the footer sits at the bottom even on short pages. */}
+          <div className="max-w-6xl mx-auto w-full flex-1 flex flex-col">
+            <div className="flex-1">{children}</div>
+            <ConsoleFooter />
           </div>
         </main>
       </ScopeProvider>
@@ -126,6 +134,16 @@ function ResettingBoundary({ children }) {
 }
 
 export default function App() {
+  return (
+    <ThemeProvider>
+      <LanguageProvider>
+        <AppRoutes />
+      </LanguageProvider>
+    </ThemeProvider>
+  );
+}
+
+function AppRoutes() {
   return (
     <ResettingBoundary>
       <ScrollToTop />
@@ -157,6 +175,7 @@ export default function App() {
           <Route path="/lds" element={<Guard><ConsoleLayout><LinkedData /></ConsoleLayout></Guard>} />
           <Route path="/authorize" element={<Guard><ConsoleLayout><Authorize /></ConsoleLayout></Guard>} />
           <Route path="/audit" element={<Guard><ConsoleLayout><Audit /></ConsoleLayout></Guard>} />
+          <Route path="/security" element={<Guard><ConsoleLayout><Security /></ConsoleLayout></Guard>} />
           <Route path="*" element={<Landing />} />
         </Routes>
       </Suspense>

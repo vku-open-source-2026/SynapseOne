@@ -71,6 +71,13 @@ export function AuthProvider({ children }) {
     return r;
   }, []);
 
+  // Second sign-in step when the account has MFA (login threw 401 mfa_required).
+  const completeMfa = useCallback(async (mfaToken, code, recoveryCode) => {
+    const r = await api.verifyMfa(mfaToken, code, recoveryCode);
+    setAuth({ token: r.accessToken, refreshToken: r.refreshToken, user: r.user, email: r.user?.email });
+    return r;
+  }, []);
+
   const loginWithKey = useCallback((apiKey) => setAuth({ apiKey }), []);
   // Server-side logout: revoke the refresh token so it can't be reused after
   // the browser session is gone (best-effort — local state clears regardless).
@@ -81,7 +88,7 @@ export function AuthProvider({ children }) {
   }, [auth?.refreshToken]);
 
   return (
-    <AuthCtx.Provider value={{ auth, headers, login, loginWithKey, loginWithOidc, logout, setAuth }}>
+    <AuthCtx.Provider value={{ auth, headers, login, loginWithKey, loginWithOidc, completeMfa, logout, setAuth }}>
       {children}
     </AuthCtx.Provider>
   );

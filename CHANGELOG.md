@@ -5,6 +5,70 @@ Format based on Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Changed: Console public pages and shell
+- Vietnamese/English switch and light/dark/system theme on the public pages, sign-in
+  and the console top bar. The choice is saved per browser and applied before first
+  paint. Vietnamese is the default.
+- Dark theme for the whole Console through shared colour tokens in `index.css`.
+- Home and About use a quieter layout: left-aligned headings, terminal panels for the
+  CLI and self-host commands, and a drawn tier stack instead of ASCII art. Platform
+  features on Home and About share one set of numbered cards with blue icon tiles
+  (lucide icons). About lists the team and partner organisations, and every public
+  page has a full footer (product, project, support and licence links).
+- Home explains the product in three new sections: where a request goes (client,
+  gateway, services, storage), one task in five clients (JavaScript, Python, Go, CLI
+  and cURL tabs) and the products running on SynapseOne as a tier stack (SynapseCity
+  and SynapseCitySOS on SynapseDX), with room for more Tier-3 apps.
+- About focuses on the project instead of repeating Home: why SynapseOne exists
+  (problem and answer), four principles with where each shows up in the repo, a
+  release timeline from this CHANGELOG with in-progress and roadmap items, larger
+  team cards and the partner list. The feature grid and tier stack moved to Home.
+- Accessibility: console pages have a real h1, icon-only buttons (code copy, request
+  pager) have labels, and footer links have a larger tap area on phones.
+- Docs and API Docs use one docs layout: section navigation on the left, an
+  "On this page" list, dark code panels with a copy button, method labels and
+  translated page chrome. API Docs gains a filter, highlighted path parameters and a
+  cleaner try-it panel; public docs pages have the full footer.
+- Dashboard request timeline: bars fit the card without a scrollbar, the time axis
+  sits on its own row and the tooltip is no longer clipped.
+- Console top bar is a solid band, so page content no longer shows between the
+  controls while scrolling. Console pages end with a footer (licence, docs, GitHub,
+  issues) that stays at the bottom of short pages.
+- Console polish: stat cards keep a minimum width (no wrapped labels on wide
+  screens), thin scrollbars, readable dark colours for translucent rows and grey
+  text, icon spacing in buttons, aligned inline forms (Users, Roles), the sidebar
+  title on one line at 1024px and no long dashes in console text.
+- Font changed to Be Vietnam Pro (JetBrains Mono for code), which renders stacked
+  Vietnamese diacritics correctly.
+- Navigation labels keep the width of their longest translation, so switching the
+  language no longer moves the header buttons.
+
+### Added — MFA, sign-in lockout, production object storage and backups
+- **TOTP multi-factor authentication** (RFC 6238, no new dependencies): enrol with
+  `POST /v1/auth/mfa/totp/setup` + `/enable` (10 single-use recovery codes),
+  `GET /v1/auth/mfa`, `/recovery-codes`, `/disable`. Password and dev logins of an
+  enrolled user return `401 mfa_required` with a 5-minute `mfaToken` and finish at
+  `POST /v1/auth/mfa/verify`. Secrets are sealed with AES-256-GCM
+  (`IAM_MFA_ENCRYPTION_KEY`), each TOTP step is accepted once, and the challenge
+  token can never be used as an access token. IAM migration `0006_mfa_lockout`.
+- **Sign-in lockout**: `IAM_LOGIN_MAX_FAILURES` (5) wrong passwords or MFA codes lock
+  the user for `IAM_LOGIN_LOCKOUT_SECONDS` (900) → `429 account_locked` + `Retry-After`.
+  Org admins: `DELETE /v1/users/:id/mfa` (lost device) and `POST /v1/users/:id/unlock`.
+- Clients: JS/Python/Go SDK MFA methods, CLI `login --password/--code/--recovery-code`
+  and `mfa …`, Console *Security* page, MFA step on sign-in and admin actions on *Users*.
+- **Object storage**: Compose runs SeaweedFS 4.48 (Apache-2.0) instead of S3Mock on
+  the same `s3:9090` endpoint, in dev and production (S3Mock deleted its files on
+  every container stop). Data lives in the `seaweeddata` volume.
+- **Backups** (docker-compose.yml): `pg-backup` (daily pg_dump of the platform and
+  Authentik databases, checksums, retention, `tools/backup/pg-restore.sh`) and
+  `s3-backup` (daily incremental object-store snapshots deduplicated by SHA-256, with
+  Content-Type, retention and `restore`).
+
+### Fixed
+- OCS S3 client decodes XML character references in listed keys, ETags,
+  continuation tokens and multipart upload IDs. On SeaweedFS, keys containing `&`
+  were listed as `&amp;` and ETags as `&#34;…&#34;`.
+
 ### Added
 - Durable human tasks / wait-for-signal (`/v1/human-tasks`, `humanTask` node)
   with claim, complete/reject/expire, SLA deadlines and exactly-once resume.
@@ -28,6 +92,29 @@ Format based on Keep a Changelog; versioning follows SemVer.
   review, actionlint, Dependabot and PR template.
 - Tier-1 roadmap issues for durable human tasks, SCIM, search, secrets, audit
   export and release signing (#44–#49).
+
+### Added — AWS-style token management & central authorization
+- **Central policy enforcement at the gateway** (`AUTHZ_MODE=off|audit|enforce`,
+  `AUTHZ_CACHE_TTL_MS`): every authenticated request on a route with a `service:` in
+  `routes.yaml` is mapped to `<service>:<Verb>` (GET/HEAD=Read, DELETE=Delete, else
+  Write; RPC overrides such as `POST …/query` → `base:Read`) on
+  `arn:synapseone:<org>:<account>:<service>:<path>` and decided by IAM
+  (`POST /internal/authorize`, gateway-only). `enforce` → `403 access_denied`
+  (fail-closed `503` when IAM is down); `audit` → `x-synapseone-authz: would-deny`
+  header. Denials are audited. Default is `off`.
+- **IAM**: organization administrators (first user of an org; migration `0005`
+  backfills existing users), `PUT /v1/users/:id/org-admin`; AWS-style managed policies
+  (`GET /v1/managed-policies`, `POST …/policies {managed}`); service-account roles
+  (`GET/POST/DELETE /v1/service-accounts/:id/roles`); API keys: scopes enforced,
+  owner-bound keys inherit their user's policies, `last_used_at`, rotation with grace
+  period (`POST /v1/keys/:id/rotate`).
+- **Clients**: token-management methods in the JS/Python/Go SDKs (`RotateAPIKey`, …);
+  CLI `org-admin`, `managed-policies`, `keys rotate`, `sa grant`; Console key
+  rotation/scopes/owner/last-used on *API Keys*, managed-policy picker on *Policies*.
+- **Tests**: IAM principal authorization suite and gateway authz suite.
+- Gateway routes for human tasks, search, secrets, SCIM tokens and the legacy
+  storage API declare their authorization service (`workflow`, `base`, `secrets`,
+  `iam`, `storage`); `POST /v1/search` and `POST /v1/secrets/*/read` map to `Read`.
 
 ## [0.7.1] - 2026-11-04
 

@@ -58,6 +58,11 @@ export const users = pgTable(
     emailVerified: boolean('email_verified').notNull().default(false),
     active: boolean('active').notNull().default(true),
     passwordUpdatedAt: timestamp('password_updated_at', { withTimezone: true }),
+    /** Org administrator (AWS "root"-like): full access inside its own org. */
+    isOrgAdmin: boolean('is_org_admin').notNull().default(false),
+    /** Consecutive failed password / second-factor attempts (login lockout). */
+    failedLoginCount: integer('failed_login_count').notNull().default(0),
+    lockedUntil: timestamp('locked_until', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
@@ -147,6 +152,7 @@ export const apiKeys = pgTable(
     scopes: text('scopes').array().notNull().default(sql`'{}'::text[]`),
     expiresAt: timestamp('expires_at', { withTimezone: true }),
     revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
@@ -170,6 +176,16 @@ export const serviceAccounts = pgTable(
     uniqueIndex('service_accounts_account_id_slug_key').on(t.accountId, t.slug),
     index('idx_service_accounts_account').on(t.accountId),
   ],
+);
+
+/** Roles granted to a service account (machine identity), like user_roles. */
+export const serviceAccountRoles = pgTable(
+  'service_account_roles',
+  {
+    serviceAccountId: uuid('service_account_id').notNull().references(() => serviceAccounts.id, { onDelete: 'cascade' }),
+    roleId: uuid('role_id').notNull().references(() => roles.id, { onDelete: 'cascade' }),
+  },
+  (t) => [primaryKey({ columns: [t.serviceAccountId, t.roleId] })],
 );
 
 export const refreshTokens = pgTable(
@@ -295,3 +311,15 @@ export const scimGroups = pgTable(
     index('idx_scim_groups_org').on(t.orgId),
   ],
 );
+
+/** TOTP second factor: AES-256-GCM sealed secret, hashed recovery codes. */
+export const userMfa = pgTable('user_mfa', {
+  userId: uuid('user_id').primaryKey().references(() => users.id, { onDelete: 'cascade' }),
+  secretEnc: text('secret_enc').notNull(),
+  enabled: boolean('enabled').notNull().default(false),
+  recoveryHashes: jsonb('recovery_hashes').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+  /** Last accepted TOTP time step (replay protection). */
+  lastStep: integer('last_step'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  enabledAt: timestamp('enabled_at', { withTimezone: true }),
+});
