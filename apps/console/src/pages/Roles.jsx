@@ -88,7 +88,7 @@ export default function Roles() {
   // Sequence guard: rapid expand A→B must not let A's slow response
   // overwrite B's list (same pattern as Scope provider).
   const attSeq = useRef(0);
-  // In-flight detach key (`roleId:policyId`) — per-item busy so concurrent
+  // In-flight detach key (`roleId:policyId`), per-item busy so concurrent
   // detaches on other rows stay enabled; double-clicks on one button block.
   const [detaching, setDetaching] = useState(null);
 
@@ -166,10 +166,10 @@ export default function Roles() {
       <ScopeBar scope={scope} />
       {scope.accountId && rows.length > 0 && policies.length > 0 && (
         <Card className="mb-4">
-          <form onSubmit={doAttach} className="flex flex-wrap items-end gap-2">
+          <form onSubmit={doAttach} className="flex flex-wrap items-end gap-2 [&>label]:mb-0">
             <Field label="Role">
               <select value={attachRole} onChange={(e) => setAttachRole(e.target.value)} className="px-3 py-2 rounded-2xl border border-slate-200 text-sm bg-white outline-none">
-                <option value="">— pick —</option>
+                <option value="">Pick…</option>
                 {rows.map((r) => (
                   <option key={r.id} value={r.id}>{r.slug}</option>
                 ))}
@@ -177,7 +177,7 @@ export default function Roles() {
             </Field>
             <Field label="Policy">
               <select value={attachPolicy} onChange={(e) => setAttachPolicy(e.target.value)} className="px-3 py-2 rounded-2xl border border-slate-200 text-sm bg-white outline-none">
-                <option value="">— pick —</option>
+                <option value="">Pick…</option>
                 {policies.map((p) => (
                   <option key={p.id} value={p.id}>{p.slug}</option>
                 ))}

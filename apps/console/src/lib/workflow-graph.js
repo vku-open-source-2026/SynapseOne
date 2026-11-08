@@ -279,7 +279,7 @@ export function validateGraph(nodes, connections, opts = {}) {
   }
   if (opts.requireTrigger === true && nodes.length > 0) {
     if (!nodes.some((n) => isTriggerType(n.type))) {
-      return 'add a trigger node (Webhook, Schedule or Manual) — a workflow without a trigger cannot run';
+      return 'add a trigger node (Webhook, Schedule or Manual), a workflow without a trigger cannot run';
     }
   }
   return null;
@@ -583,12 +583,12 @@ export function ifWarnings(nodes, connections) {
     const hasFalse = (mains[1] || []).some((e) => e && typeof e.node === 'string' && !isAuxEdge(e));
     if (!hasTrue || !hasFalse) {
       const missing = [!hasTrue && 'true', !hasFalse && 'false'].filter(Boolean).join(' + ');
-      out.push(`If node '${from}' has no ${missing} branch — runs down that side stop at '${from}'`);
+      out.push(`If node '${from}' has no ${missing} branch, runs down that side stop at '${from}'`);
     }
   }
   for (const n of nodes || []) {
     if (isIfType(n?.type) && !connections?.[n.name]) {
-      out.push(`If node '${n.name}' has no branches wired — both sides stop at '${n.name}'`);
+      out.push(`If node '${n.name}' has no branches wired, both sides stop at '${n.name}'`);
     }
   }
   return out;
@@ -602,7 +602,7 @@ export function decisionWarnings(nodes, connections) {
     const mains = Array.isArray(connections?.[n.name]?.main) ? connections[n.name].main : [];
     routes.forEach((r, i) => {
       if (!(mains[i] || []).some((e) => e && typeof e.node === 'string' && !isAuxEdge(e))) {
-        out.push(`Decision '${n.name}': route ${i} “${r.name}” is not wired — it stops this run`);
+        out.push(`Decision '${n.name}': route ${i} “${r.name}” is not wired, it stops this run`);
       }
     });
     const fb = Number(n.parameters?.fallbackBranch);
@@ -674,24 +674,24 @@ export const INTEGRATION_SERVICES = {
 
 /** Curated local-engine node types for the palette (free-form type still allowed). */
 export const NODE_TYPES = [
-  { type: 'n8n-nodes-base.webhook', label: 'Webhook', hint: 'Trigger via HTTP request — starts the run with the body', category: 'triggers', placeholder: 'Receives {"hello":"world"} → passes it downstream' },
-  { type: 'n8n-nodes-base.cron', label: 'Schedule', hint: 'Trigger on a timer — fires with {scheduledAt}', category: 'triggers', placeholder: 'Every 24h → fetches and transforms' },
-  { type: 'n8n-nodes-base.manualTrigger', label: 'Manual', hint: 'Trigger by hand — run from Console with any JSON input', category: 'triggers', placeholder: 'Click Execute with {"value": 21}' },
+  { type: 'n8n-nodes-base.webhook', label: 'Webhook', hint: 'Trigger via HTTP request, starts the run with the body', category: 'triggers', placeholder: 'Receives {"hello":"world"} → passes it downstream' },
+  { type: 'n8n-nodes-base.cron', label: 'Schedule', hint: 'Trigger on a timer, fires with {scheduledAt}', category: 'triggers', placeholder: 'Every 24h → fetches and transforms' },
+  { type: 'n8n-nodes-base.manualTrigger', label: 'Manual', hint: 'Trigger by hand, run from Console with any JSON input', category: 'triggers', placeholder: 'Click Execute with {"value": 21}' },
   { type: 'synapseflow.aiAgent', label: 'AI Agent', hint: 'Autonomous agent with built-in tools + any workflow node wired into its Tools socket', category: 'ai', placeholder: 'Prompt: "Triage this ticket using the knowledge base"' },
-  { type: 'synapseflow.decision', label: 'Decision Engine', hint: 'Multi-route classification with Decision-2.0-Eos-0.8B — one output port per route', category: 'ai', placeholder: 'Routes: billing / technical / account / sales' },
-  { type: 'synapseflow.model', label: 'Model Core', hint: 'Model provider config for an AI Agent — wire into its Model socket', category: 'ai', placeholder: 'Synapse Inference · liquid/lfm-2.5-2.6b:free' },
-  { type: 'n8n-nodes-base.httpRequest', label: 'HTTP Request', hint: 'Call a public API — GET/POST with headers + JSON body', category: 'actions', placeholder: 'GET https://api.example.com/health' },
-  { type: 'n8n-nodes-base.code', label: 'Code', hint: 'Run sandboxed JavaScript — $input in, return value out', category: 'actions', placeholder: 'return { doubled: ($input.value ?? 0) * 2 }' },
-  { type: 'n8n-nodes-base.set', label: 'Set Fields', hint: 'Add/overwrite fields — supports {{ $json.x }} templating', category: 'actions', placeholder: 'Set tag = processed, keep the rest' },
-  { type: 'n8n-nodes-base.if', label: 'If / Branch', hint: 'Two outputs — true (top) and false (bottom)', category: 'logic', placeholder: '$input.value > 10 → Big / Small' },
+  { type: 'synapseflow.decision', label: 'Decision Engine', hint: 'Multi-route classification with Decision-2.0-Eos-0.8B, one output port per route', category: 'ai', placeholder: 'Routes: billing / technical / account / sales' },
+  { type: 'synapseflow.model', label: 'Model Core', hint: 'Model provider config for an AI Agent, wire into its Model socket', category: 'ai', placeholder: 'Synapse Inference · liquid/lfm-2.5-2.6b:free' },
+  { type: 'n8n-nodes-base.httpRequest', label: 'HTTP Request', hint: 'Call a public API, GET/POST with headers + JSON body', category: 'actions', placeholder: 'GET https://api.example.com/health' },
+  { type: 'n8n-nodes-base.code', label: 'Code', hint: 'Run sandboxed JavaScript, $input in, return value out', category: 'actions', placeholder: 'return { doubled: ($input.value ?? 0) * 2 }' },
+  { type: 'n8n-nodes-base.set', label: 'Set Fields', hint: 'Add/overwrite fields, supports {{ $json.x }} templating', category: 'actions', placeholder: 'Set tag = processed, keep the rest' },
+  { type: 'n8n-nodes-base.if', label: 'If / Branch', hint: 'Two outputs, true (top) and false (bottom)', category: 'logic', placeholder: '$input.value > 10 → Big / Small' },
   { type: 'synapseone.iam', label: 'Synapse IAM', hint: 'Identity & authorization: orgs, users, roles, policies, permissions, audit', category: 'integrations', placeholder: 'authorize.check for user + action' },
   { type: 'synapseone.base', label: 'SynapseBase', hint: 'JSON document store: query, insert, fetch and delete documents', category: 'integrations', placeholder: 'Query support_kb where category = billing' },
   { type: 'synapseone.faststore', label: 'Faststore', hint: 'Ultra-fast cache/KV: get, set with TTL, counters, hashes', category: 'integrations', placeholder: 'GET session:42 or SET with 1h TTL' },
   { type: 'synapseone.queue', label: 'SynapseQueue', hint: 'Reliable message queue: publish, consume, ack', category: 'integrations', placeholder: 'Publish ticket.escalated to support-jobs' },
   { type: 'synapseone.lds', label: 'SynapseLDS', hint: 'Linked Data Store (NGSI-LD): datasources, records, entities', category: 'integrations', placeholder: 'Publish a smart-city observation' },
   { type: 'synapseone.inference', label: 'Synapse Inference', hint: 'LLM chat, embeddings, decision evaluation and semantic routing', category: 'integrations', placeholder: 'Route a query or generate an embedding' },
-  { type: 'synapseone.flow', label: 'SynapseFlow', hint: 'Workflows & execution history — list, inspect or run another workflow', category: 'integrations', placeholder: 'Run workflow "enrichment" with this payload' },
-  { type: 'n8n-nodes-base.noOp', label: 'NoOp', hint: 'Do nothing — passes input through (useful log point)', category: 'utils', placeholder: 'Passthrough for debugging' },
+  { type: 'synapseone.flow', label: 'SynapseFlow', hint: 'Workflows & execution history, list, inspect or run another workflow', category: 'integrations', placeholder: 'Run workflow "enrichment" with this payload' },
+  { type: 'n8n-nodes-base.noOp', label: 'NoOp', hint: 'Do nothing, passes input through (useful log point)', category: 'utils', placeholder: 'Passthrough for debugging' },
 ];
 
 /** Palette groups in display order. */
@@ -938,7 +938,7 @@ export function describeCron(parameters) {
     return { text: `Daily at ${wall.label}${wall.tz === 'UTC' ? '' : ` (${wall.tz})`}`, nextRun: wall.at };
   }
   const ms = cronIntervalMsLocal(parameters || {});
-  if (!ms) return { text: 'No schedule detected — set an interval or cron expression.', nextRun: null };
+  if (!ms) return { text: 'No schedule detected, set an interval or cron expression.', nextRun: null };
   const mins = Math.round(ms / 60000);
   const text = mins >= 60 && mins % 60 === 0 ? `Every ${mins / 60}h` : mins >= 1440 && mins % 1440 === 0 ? `Every ${mins / 1440}d` : `Every ${mins}m`;
   return { text, nextRun: new Date(Date.now() + ms).toISOString() };

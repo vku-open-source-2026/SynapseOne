@@ -6,100 +6,87 @@
  */
 import React from 'react';
 import { Link } from 'react-router-dom';
-import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import {
-  faBolt,
-  faKey,
-  faLayerGroup,
-  faRobot,
-  faShieldHalved,
-  faWandMagicSparkles,
-} from '@fortawesome/free-solid-svg-icons';
+import { Bot, KeyRound, Layers, ShieldCheck, WandSparkles, Zap } from 'lucide-react';
 import PublicHeader from '../components/PublicHeader.jsx';
+import PublicFooter from '../components/PublicFooter.jsx';
+import FeatureGrid from '../components/FeatureGrid.jsx';
+import { BuiltOn, ClientTabs, RequestFlow } from '../components/HomeSections.jsx';
+import Terminal from '../components/Terminal.jsx';
+import { PRIMARY_BTN, SECONDARY_BTN } from '../components/public-styles.js';
 import { appDashboardUrl, isCanonicalAppHost } from '../lib/site.js';
+import { useI18n } from '../lib/i18n-context.js';
 
-const FEATURES = [
-  { icon: faShieldHalved, title: 'AWS-style IAM', text: 'Organization → Account → User → Role → JSON Policy (Allow/Deny, Condition), authorize + simulator + audit log.' },
-  { icon: faKey, title: 'Flexible tokens', text: 'Short-lived JWT, atomic rotating refresh, API keys, service accounts, OIDC via Authentik/Keycloak.' },
-  { icon: faBolt, title: 'API Gateway', text: 'Single entry point: auth, edge rate-limiting, principal propagation, tracing, aggregate /ready.' },
-  { icon: faLayerGroup, title: 'Core data cluster', text: 'Postgres + Redis + S3-compatible storage, versioned schema, idempotent seed, backup/restore.' },
-  { icon: faRobot, title: 'Workflows', text: 'Local engine: versioned templates, sandboxed code, activate/execute, webhooks + cron, definition editor.' },
-  { icon: faWandMagicSparkles, title: 'AI assistant + SDKs', text: 'Chatbot on the API Docs pre-fills try-it forms; JS/TS, Python, Go, a zero-dependency CLI and an admin Console — one API.' },
-];
+// Icons in the same order as `landing.features` in src/locales.
+const FEATURE_ICONS = [ShieldCheck, KeyRound, Zap, Layers, Bot, WandSparkles];
 
 export default function Landing() {
+  const { m } = useI18n();
+  const t = m.landing;
   // Web chinh (@): nut Mo Console tro ve canonical app (cloud.*) theo env.
   const offSite = !isCanonicalAppHost();
   const openConsoleHref = appDashboardUrl();
   return (
-    <div className="min-h-screen">
+    <div className="min-h-screen bg-s1-bg text-s1-fg">
       <PublicHeader />
 
-      <main className="mx-auto max-w-6xl px-4 pt-28 sm:pt-32 pb-16 text-center">
-        <h1 className="text-3xl sm:text-4xl md:text-5xl font-bold text-main-text leading-tight">
-          The <span className="bg-gradient-to-b from-main-start to-main-end bg-clip-text text-transparent">open</span>
-          <br />
-          PaaS for your infrastructure
-        </h1>
-        <p className="mt-4 text-normal-text max-w-2xl mx-auto">
-          SynapseOne is an open-source Tier-1 PaaS (Apache-2.0): API gateway, AWS-style IAM,
-          core data cluster and workflows — managed via Console, multi-language SDKs and CLI.
-        </p>
-        <div className="mt-6 flex flex-col sm:flex-row justify-center items-stretch sm:items-center gap-3 max-w-md sm:max-w-none mx-auto">
-          {offSite ? (
-            <a href={openConsoleHref} className="px-6 py-2.5 rounded-2xl text-white font-medium bg-gradient-to-b from-main-start to-main-end shadow-md">
-              Open Console
-            </a>
-          ) : (
-            <Link to="/login" className="px-6 py-2.5 rounded-2xl text-white font-medium bg-gradient-to-b from-main-start to-main-end shadow-md">
-              Open Console
-            </Link>
-          )}
-          <Link to="/api-docs" className="px-6 py-2.5 rounded-2xl bg-white font-medium text-main-text shadow-md">
-            Explore the API
-          </Link>
-        </div>
-        <div className="mt-6 inline-block bg-white rounded-2xl shadow-sm px-4 py-2 text-xs font-mono text-main-text">
-          docker compose up -d --build
-        </div>
-
-        <div className="mt-8 mx-auto max-w-2xl bg-white rounded-3xl shadow-md p-6 text-left">
-          <h2 className="font-semibold text-main-text">Install the CLI</h2>
-          <p className="text-sm text-normal-text mt-1 mb-3">
-            One line, no clone needed — or run it instantly with npx (Node 18+).
-          </p>
-          <pre className="bg-background rounded-2xl p-4 text-xs font-mono overflow-x-auto text-main-text">
-{`curl -fsSL https://synapseone.space/install.sh | sh
-# ..or without installing anything:
-npx -y @synapseone/cli@latest --help`}
-          </pre>
-        </div>
-
-        <div className="mt-14 grid sm:grid-cols-2 md:grid-cols-3 gap-4 text-left">
-          {FEATURES.map((f) => (
-            <div key={f.title} className="bg-white rounded-3xl shadow-md p-6">
-              <div className="w-10 h-10 rounded-2xl flex items-center justify-center text-white bg-gradient-to-b from-main-start to-main-end mb-3">
-                <FontAwesomeIcon icon={f.icon} />
-              </div>
-              <h3 className="font-semibold text-main-text">{f.title}</h3>
-              <p className="text-sm text-normal-text mt-1">{f.text}</p>
+      <main className="mx-auto max-w-6xl px-4 pt-28 sm:pt-32 pb-20">
+        {/* Hero: claim and actions on the left; from 1024px the CLI install sits beside it as the first thing to try. */}
+        <section className="grid items-center gap-10 lg:grid-cols-[1.05fr_1fr] lg:gap-14">
+          <div className="min-w-0">
+            <p className="font-mono text-xs text-s1-muted">Apache-2.0 · api.synapseone.space</p>
+            <h1 className="mt-4 text-4xl font-semibold leading-[1.1] tracking-tight text-balance sm:text-5xl">
+              {t.titleBefore} <span className="text-s1-accent">{t.titleHighlight}</span> {t.titleAfter}
+            </h1>
+            <p className="mt-5 max-w-xl text-lg leading-relaxed text-s1-muted">{t.lead}</p>
+            <div className="mt-8 flex flex-col gap-3 sm:flex-row">
+              {offSite ? (
+                <a href={openConsoleHref} className={PRIMARY_BTN}>
+                  {t.openConsole}
+                </a>
+              ) : (
+                <Link to="/login" className={PRIMARY_BTN}>
+                  {t.openConsole}
+                </Link>
+              )}
+              <Link to="/api-docs" className={SECONDARY_BTN}>
+                {t.exploreApi}
+              </Link>
             </div>
-          ))}
-        </div>
+          </div>
 
-        <div className="mt-14 bg-white rounded-3xl shadow-md p-8 text-left">
-          <h2 className="text-2xl font-semibold text-main-text">Self-host in 3 commands</h2>
-          <pre className="mt-3 bg-background rounded-2xl p-4 text-xs font-mono overflow-x-auto text-main-text">
-{`cp .env.example .env   # then replace every *_change_me_* secret
-docker compose up -d --build
-open http://localhost:3000   # sign in: demo@acme.local / org acme`}
-          </pre>
-        </div>
+          <div className="min-w-0">
+            <Terminal
+              title={t.cliTitle}
+              code={`curl -fsSL https://synapseone.space/install.sh | sh\n${t.cliComment}\nnpx -y @synapseone/cli@latest --help`}
+            />
+            <p className="mt-3 text-sm text-s1-muted">{t.cliText}</p>
+          </div>
+        </section>
+
+        <section className="mt-24">
+          <h2 className="text-2xl font-semibold tracking-tight">{t.featuresHeading}</h2>
+          <FeatureGrid items={t.features} icons={FEATURE_ICONS} />
+        </section>
+
+        <RequestFlow />
+        <ClientTabs />
+        <BuiltOn />
+
+        <section className="mt-24 grid gap-8 lg:grid-cols-[1fr_1.6fr] lg:items-center">
+          <div className="min-w-0">
+            <h2 className="text-2xl font-semibold tracking-tight text-balance">{t.selfHostTitle}</h2>
+            <p className="mt-3 font-mono text-sm text-s1-muted">docker compose up -d --build</p>
+          </div>
+          <div className="min-w-0">
+            <Terminal
+              title="~/SynapseOne"
+              code={`cp .env.example .env   ${t.selfHostEnv}\ndocker compose up -d --build\nopen http://localhost:3000   ${t.selfHostLogin}`}
+            />
+          </div>
+        </section>
       </main>
 
-      <footer className="pb-10 text-center text-xs text-normal-text">
-        synapseone · Apache-2.0 · Tier-1 PaaS
-      </footer>
+      <PublicFooter />
     </div>
   );
 }

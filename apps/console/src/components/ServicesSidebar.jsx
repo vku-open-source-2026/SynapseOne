@@ -20,6 +20,7 @@ import {
   faStream,
   faCloud,
 } from '@fortawesome/free-solid-svg-icons';
+import { useI18n } from '../lib/i18n-context.js';
 
 export const PLATFORM_SERVICES = [
   {
@@ -123,6 +124,9 @@ export const PLATFORM_SERVICES = [
 export default function ServicesSidebar({ open = true, onToggle }) {
   const { pathname } = useLocation();
   const [query, setQuery] = useState('');
+  const { m } = useI18n();
+  // Localised category/description, falling back to the English fields above.
+  const copy = (svc) => m.services[svc.to.slice(1)] || svc;
 
   if (!open) return null;
 
@@ -132,6 +136,8 @@ export default function ServicesSidebar({ open = true, onToggle }) {
     if (svc.label.toLowerCase().includes(q)) return true;
     if (svc.category.toLowerCase().includes(q)) return true;
     if (svc.desc.toLowerCase().includes(q)) return true;
+    if (copy(svc).category.toLowerCase().includes(q)) return true;
+    if (copy(svc).desc.toLowerCase().includes(q)) return true;
     return svc.keywords.some((k) => k.includes(q));
   });
 
@@ -145,17 +151,17 @@ export default function ServicesSidebar({ open = true, onToggle }) {
         <div className="flex items-center justify-between pb-3 border-b border-slate-100">
           <div className="flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-            <h2 className="font-semibold text-sm text-main-text">Platform Services</h2>
+            <h2 className="font-semibold text-sm text-main-text">{m.console.servicesSection}</h2>
           </div>
           <div className="flex items-center gap-1.5">
             <span className="text-[11px] font-medium text-main-blue bg-main-blue/10 px-2 py-0.5 rounded-full">
-              {filtered.length} active
+              {filtered.length} {m.console.active}
             </span>
             {onToggle && (
               <button
                 type="button"
                 onClick={onToggle}
-                title="Collapse services sidebar"
+                title={m.console.collapseServices}
                 className="text-normal-text hover:text-main-text p-1 text-xs"
               >
                 <FontAwesomeIcon icon={faXmark} />
@@ -172,7 +178,7 @@ export default function ServicesSidebar({ open = true, onToggle }) {
           />
           <input
             type="text"
-            placeholder="Search services..."
+            placeholder={m.console.searchServices}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             className="w-full pl-8 pr-7 py-1.5 rounded-2xl border border-slate-200 text-xs text-main-text outline-none focus:border-main-blue transition-colors bg-background/50 focus:bg-white"
@@ -189,16 +195,16 @@ export default function ServicesSidebar({ open = true, onToggle }) {
         </div>
 
         {/* Services List */}
-        <nav className="flex-1 overflow-y-auto space-y-2 pr-1">
+        <nav className="flex-1 overflow-y-auto space-y-2 pr-1 s1-thin-scroll">
           {filtered.length === 0 ? (
             <div className="py-8 text-center text-xs text-normal-text">
-              <p>No services match &ldquo;{query}&rdquo;</p>
+              <p>{m.console.noServices} &ldquo;{query}&rdquo;</p>
               <button
                 type="button"
                 onClick={() => setQuery('')}
                 className="mt-2 text-main-blue underline hover:text-main-end"
               >
-                Clear search
+                {m.console.clearSearch}
               </button>
             </div>
           ) : (
@@ -237,7 +243,7 @@ export default function ServicesSidebar({ open = true, onToggle }) {
                           <span className="w-1.5 h-1.5 rounded-full bg-main-blue shrink-0" />
                         )}
                       </div>
-                      <p className="text-[10px] text-normal-text truncate">{svc.category}</p>
+                      <p className="text-[10px] text-normal-text truncate">{copy(svc).category}</p>
                     </div>
                   </div>
                 </Link>
@@ -248,7 +254,7 @@ export default function ServicesSidebar({ open = true, onToggle }) {
 
         {/* Footer info */}
         <div className="mt-3 pt-3 border-t border-slate-100 text-[11px] text-normal-text flex items-center justify-between">
-          <span>Tier-1 Distributed</span>
+          <span>{m.console.servicesFooter}</span>
           <Link to="/api-docs" className="text-main-blue hover:underline flex items-center gap-1">
             <FontAwesomeIcon icon={faCode} className="text-[10px]" /> API
           </Link>

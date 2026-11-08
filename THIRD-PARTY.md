@@ -31,7 +31,9 @@ the upstream project's own `LICENSE` file.
   each `package-lock.json` (run `npx license-checker --summary` per workspace for a report).
 - Console (`apps/console`): React + Vite + Tailwind — MIT; FontAwesome icons
   (`@fortawesome/*` — MIT, except `free-solid-svg-icons` dual `CC-BY-4.0 AND MIT`:
-  attribution is given here + in `NOTICE`).
+  attribution is given here + in `NOTICE`); Lucide icons (`lucide-react`, ISC) for
+  the language/theme and menu buttons, the same set as the SynapseCity site.
+  Fonts Be Vietnam Pro and JetBrains Mono (SIL OFL 1.1) load from Google Fonts.
 - Python SDK (`sdks/sdk-python`): `requests` — Apache-2.0 (via `urllib3` MIT,
   `idna` BSD-3-Clause, `charset-normalizer` MIT, `certifi` **MPL-2.0** — file-level
   weak copyleft, used unmodified as a CA bundle; no disclosure duty beyond this notice).

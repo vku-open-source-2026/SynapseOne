@@ -22,7 +22,7 @@ function RecoveryCodes({ codes, onDone }) {
   };
   return (
     <div className="mt-4 rounded-2xl border border-amber-400/40 bg-amber-50 p-4">
-      <p className="text-sm font-medium text-main-text">Recovery codes — shown only once</p>
+      <p className="text-sm font-medium text-main-text">Recovery codes, shown only once</p>
       <p className="text-xs text-normal-text mt-1">
         Each code signs you in once if you lose your phone. Store them somewhere safe.
       </p>
@@ -103,7 +103,7 @@ export default function Security() {
         <PageTitle title="Security" sub="Multi-factor authentication" />
         <Card>
           <p className="text-sm text-normal-text">
-            MFA belongs to a user account. You are signed in with an API key — sign in as a user to manage MFA.
+            MFA belongs to a user account. You are signed in with an API key, sign in as a user to manage MFA.
           </p>
         </Card>
       </>

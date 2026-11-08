@@ -10,7 +10,7 @@ import { api } from '../lib/api.js';
 import { Badge, Btn, Card, Code, Empty, Err, Field, Input, Modal, PageTitle, Table, TableSkeleton } from '../components/ui.jsx';
 import { ScopeBar, useScope } from '../components/Scope.jsx';
 
-const when = (v) => (v ? new Date(v).toLocaleString() : '—');
+const when = (v) => (v ? new Date(v).toLocaleString() : '–');
 
 function keyStatus(k) {
   if (k.revoked_at) return { tone: 'gray', label: 'revoked' };
@@ -147,14 +147,14 @@ export default function Keys() {
 
   return (
     <>
-      <PageTitle title="API Keys & Sessions" sub="Scoped, owner-bound, rotatable credentials — secrets are shown only once" right={<Btn onClick={() => setOpen(true)}>+ New key</Btn>} />
+      <PageTitle title="API Keys & Sessions" sub="Scoped, owner-bound, rotatable credentials, secrets are shown only once" right={<Btn onClick={() => setOpen(true)}>+ New key</Btn>} />
       <Err e={err} />
       <ScopeBar scope={scope} />
       <Card>
         <p className="text-sm text-normal-text mb-3">
-          Keys belong to account <b className="text-main-text">{scope.accounts.find((a) => a.id === scope.accountId)?.slug || '—'}</b>.
+          Keys belong to account <b className="text-main-text">{scope.accounts.find((a) => a.id === scope.accountId)?.slug || '–'}</b>.
           A key's <b className="text-main-text">scopes</b> cap what it may do (e.g. <code>storage:*</code>); a key bound to a user also
-          inherits — and can never exceed — that user's policies.
+          inherits, and can never exceed, that user's policies.
         </p>
         {!loaded ? (
           <TableSkeleton rows={4} cols={6} />
@@ -169,7 +169,7 @@ export default function Keys() {
                 <tr key={k.id} className="border-t border-slate-100">
                   <td className="py-2 pr-4 font-medium text-main-text">{k.name}</td>
                   <td className="py-2 pr-4 text-xs text-normal-text font-mono">{k.prefix}…</td>
-                  <td className="py-2 pr-4 text-xs font-mono text-normal-text">{(k.scopes || []).join(', ') || '—'}</td>
+                  <td className="py-2 pr-4 text-xs font-mono text-normal-text">{(k.scopes || []).join(', ') || '–'}</td>
                   <td className="py-2 pr-4 text-xs text-normal-text">
                     {k.user_id ? (k.user_id === me ? 'you' : <span className="font-mono">{k.user_id.slice(0, 8)}…</span>) : 'account'}
                   </td>
@@ -222,7 +222,7 @@ export default function Keys() {
               ))}
             </Table>
           ) : (
-            <Empty text={headers.token ? 'No active sessions' : 'Signed in with an API key — no sessions'} />
+            <Empty text={headers.token ? 'No active sessions' : 'Signed in with an API key, no sessions'} />
           )}
         </Card>
       </div>
@@ -244,7 +244,7 @@ export default function Keys() {
             {me && (
               <label className="flex items-center gap-2 text-sm text-normal-text mb-4">
                 <input type="checkbox" checked={bindToMe} onChange={(e) => setBindToMe(e.target.checked)} />
-                Bind to me — the key inherits my permissions (recommended)
+                Bind to me, the key inherits my permissions (recommended)
               </label>
             )}
             <Btn type="submit" loading={busy}>Create</Btn>

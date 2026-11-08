@@ -96,10 +96,10 @@ export default function Users() {
       <ScopeBar scope={scope} showAccount={false} />
       {scope.accountId && rows.length > 0 && roles.length > 0 && (
         <Card className="mb-4">
-          <form onSubmit={doAssign} className="flex flex-wrap items-end gap-2">
+          <form onSubmit={doAssign} className="flex flex-wrap items-end gap-2 [&>label]:mb-0">
             <Field label="User">
               <select value={assignUser} onChange={(e) => setAssignUser(e.target.value)} className="px-3 py-2 rounded-2xl border border-slate-200 text-sm bg-white outline-none">
-                <option value="">— pick —</option>
+                <option value="">Pick…</option>
                 {rows.map((u) => (
                   <option key={u.id} value={u.id}>{u.email}</option>
                 ))}
@@ -107,7 +107,7 @@ export default function Users() {
             </Field>
             <Field label="Role">
               <select value={assignRole} onChange={(e) => setAssignRole(e.target.value)} className="px-3 py-2 rounded-2xl border border-slate-200 text-sm bg-white outline-none">
-                <option value="">— pick —</option>
+                <option value="">Pick…</option>
                 {roles.map((r) => (
                   <option key={r.id} value={r.id}>{r.slug}</option>
                 ))}
@@ -184,7 +184,7 @@ function Row({ u, headers, onUnassign, tick }) {
     try {
       if (kind === 'mfa') {
         const r = await api.resetUserMfa(u.id, headers);
-        setSecMsg(r.removed ? 'MFA removed — the user can enrol again.' : 'This user had no MFA.');
+        setSecMsg(r.removed ? 'MFA removed, the user can enrol again.' : 'This user had no MFA.');
       } else {
         await api.unlockUser(u.id, headers);
         setSecMsg('Sign-in lockout cleared.');
@@ -210,8 +210,8 @@ function Row({ u, headers, onUnassign, tick }) {
     <React.Fragment>
       <tr className="border-t border-slate-100">
         <td className="py-2 pr-4 font-medium text-main-text">{u.email}</td>
-        <td className="py-2 pr-4">{u.display_name || '—'}</td>
-        <td className="py-2 pr-4 text-xs text-normal-text font-mono">{u.external_sub?.slice(0, 18) || '—'}</td>
+        <td className="py-2 pr-4">{u.display_name || '–'}</td>
+        <td className="py-2 pr-4 text-xs text-normal-text font-mono">{u.external_sub?.slice(0, 18) || '–'}</td>
         <td className="py-2 pr-4">
           {n === null ? <span className="text-xs text-normal-text">…</span> : <Badge tone={n ? 'blue' : 'gray'}>{n} policies</Badge>}{' '}
           <button onClick={toggle} className="text-xs text-main-blue">{expanded ? 'Hide roles' : 'Roles'}</button>

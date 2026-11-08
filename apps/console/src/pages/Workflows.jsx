@@ -141,7 +141,7 @@ export default function Workflows() {
 
   const list = Array.isArray(flows) ? flows : flows?.data || [];
 
-  // P2: file import/export — portable JSON {name, nodes, connections, settings}.
+  // P2: file import/export, portable JSON {name, nodes, connections, settings}.
   const importRef = useRef(null);
   const exportWorkflow = () => {
     if (!detail) return;
@@ -246,7 +246,7 @@ export default function Workflows() {
     setDetailErr(null);
     try {
       const r = await fn();
-      if (selRef.current !== id) return r; // user moved on — don't paint stale detail
+      if (selRef.current !== id) return r; // user moved on, don't paint stale detail
       setActionOut({ label, body: r });
       const d = await api.workflow(id, headers);
       if (selRef.current !== id) return r;
@@ -310,7 +310,7 @@ export default function Workflows() {
       // mapping off node ids; two active workflows must share neither ids
       // nor webhook path, or routing is ambiguous).
       // Sibling paths are scanned so duplicate-of-duplicate gets -copy-2, ….
-      // The copy's trigger URL changes — the UI names it "<name> copy".
+      // The copy's trigger URL changes, the UI names it "<name> copy".
       let siblingPaths = new Set();
       try {
         const all = await api.workflows(headers);
@@ -396,7 +396,7 @@ export default function Workflows() {
 
   return (
     <>
-      <PageTitle title="SynapseFlow" sub="Next-generation workflow & autonomous AI agent automation engine — click a workflow to interact" right={<><Btn onClick={createBlank} disabled={createBusy}>+ Blank</Btn> <Btn onClick={() => setOpen(true)}>+ From template</Btn> <Btn onClick={() => importRef.current?.click()} disabled={createBusy}>Import</Btn><input ref={importRef} type="file" accept="application/json,.json" onChange={importWorkflow} className="hidden" aria-label="Import workflow JSON" /></>} />
+      <PageTitle title="SynapseFlow" sub="Next-generation workflow & autonomous AI agent automation engine, click a workflow to interact" right={<><Btn onClick={createBlank} disabled={createBusy}>+ Blank</Btn> <Btn onClick={() => setOpen(true)}>+ From template</Btn> <Btn onClick={() => importRef.current?.click()} disabled={createBusy}>Import</Btn><input ref={importRef} type="file" accept="application/json,.json" onChange={importWorkflow} className="hidden" aria-label="Import workflow JSON" /></>} />
       <Err e={err} />
       <div className="grid md:grid-cols-2 gap-4">
         <Card>
@@ -455,9 +455,9 @@ export default function Workflows() {
               </span>
             )}
             {webhookTrigger && (
-              <span className="ml-2 text-xs text-normal-text inline-flex items-center gap-1 flex-wrap" title={detail.active ? 'Live — external systems can call this (no auth)' : 'Activate the workflow to make this URL live'}>
+              <span className="ml-2 text-xs text-normal-text inline-flex items-center gap-1 flex-wrap" title={detail.active ? 'Live, external systems can call this (no auth)' : 'Activate the workflow to make this URL live'}>
                 <code className="font-mono text-main-text">{webhookTrigger.method} /webhook/{webhookTrigger.path}</code>
-                {!detail.active && <span>(dormant — activate to serve)</span>}
+                {!detail.active && <span>(dormant, activate to serve)</span>}
                 <WebhookCopy path={webhookTrigger.path} />
                 {detail.active && <WebhookPing path={webhookTrigger.path} method={webhookTrigger.method} onDone={(r) => setActionOut({ label: 'Webhook ping', body: r })} />}
               </span>
@@ -527,7 +527,7 @@ export default function Workflows() {
                 {actionBusy && <Spinner size="xs" className="sdx-spinner-on-dark" />}
                 {actionBusy ? 'Running…' : 'Execute'}
               </button>
-              <p className="text-[11px] text-normal-text mb-3">Execute runs the DAG now with this input — any trigger type, active or not. Activate only gates cron + public webhooks.</p>
+              <p className="text-[11px] text-normal-text mb-3">Execute runs the DAG now with this input, any trigger type, active or not. Activate only gates cron + public webhooks.</p>
               {actionOut && (
                 <div className="mb-3">
                   <Badge tone="blue">{actionOut.label}</Badge>
@@ -556,7 +556,7 @@ export default function Workflows() {
                           {x.status || x.mode || '?'}
                         </Badge>
                       </td>
-                      <td className="py-2 pr-4 text-xs text-normal-text">{x.startedAt || '—'}</td>
+                      <td className="py-2 pr-4 text-xs text-normal-text">{x.startedAt || '–'}</td>
                     </tr>
                   ))}
                 </Table>
@@ -685,7 +685,7 @@ function WebhookPing({ path, method, onDone }) {
     setBusy(true);
     try {
       // Same-origin /webhook/* only works when the edge proxies it (dev vite
-      // does not by default) — the catch block says exactly where to curl.
+      // does not by default), the catch block says exactly where to curl.
       const r = await fetch(`/webhook/${path}`, {
         method: method === 'GET' ? 'GET' : 'POST',
         headers: { 'Content-Type': 'application/json' },

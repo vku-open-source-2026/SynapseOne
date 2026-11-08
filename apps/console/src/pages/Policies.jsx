@@ -135,9 +135,9 @@ export default function Policies() {
             {managed.length > 0 && (
               <Field label="Start from an AWS-style managed policy (optional)">
                 <select defaultValue="" onChange={(e) => pickManaged(e.target.value)} className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm outline-none focus:border-main-blue">
-                  <option value="">— custom document —</option>
+                  <option value="">Custom document</option>
                   {managed.map((m) => (
-                    <option key={m.name} value={m.name}>{m.name} — {m.description}</option>
+                    <option key={m.name} value={m.name}>{m.name}: {m.description}</option>
                   ))}
                 </select>
               </Field>

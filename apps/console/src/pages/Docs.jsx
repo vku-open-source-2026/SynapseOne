@@ -4,35 +4,43 @@
  * Copyright 2026 SynapseOne Contributors
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
-import React from 'react';
+import React, { useEffect } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { Badge, Card, Code, PageTitle, Table } from '../components/ui.jsx';
+import { ArrowLeft, ArrowRight, Boxes, Database, FileCode2, Gauge, Inbox, Zap } from 'lucide-react';
+import DocsShell, { CodeBlock, DocHeader, DocTable, MethodBadge, slugify } from '../components/DocsShell.jsx';
+import { useI18n } from '../lib/i18n-context.js';
 
+// Sidebar order; `group` keys map to m.docsPage.groups.
 const TABS = [
-  { id: 'overview', label: 'Overview' },
-  { id: 'base', label: 'SynapseBase' },
-  { id: 'faststore', label: 'Faststore' },
-  { id: 'queue', label: 'SynapseQueue' },
-  { id: 'javascript', label: 'JavaScript' },
-  { id: 'python', label: 'Python' },
-  { id: 'go', label: 'Go' },
-  { id: 'cli', label: 'CLI' },
+  { id: 'overview', group: 'start' },
+  { id: 'base', group: 'data', label: 'SynapseBase' },
+  { id: 'faststore', group: 'data', label: 'Faststore' },
+  { id: 'queue', group: 'data', label: 'SynapseQueue' },
+  { id: 'javascript', group: 'clients', label: 'JavaScript' },
+  { id: 'python', group: 'clients', label: 'Python' },
+  { id: 'go', group: 'clients', label: 'Go' },
+  { id: 'cli', group: 'clients', label: 'CLI' },
 ];
 
-const METHOD_TONE = { GET: 'blue', POST: 'green', PUT: 'amber', PATCH: 'amber', DELETE: 'red' };
-
+/** One documentation section; its title feeds the "On this page" list. */
 function DocSection({ title, kicker, children }) {
+  const id = slugify(title);
   return (
-    <Card className="mb-4">
-      {kicker && <p className="text-xs font-semibold uppercase tracking-wide text-main-blue mb-1">{kicker}</p>}
-      <h3 className="font-semibold text-main-text mb-3">{title}</h3>
-      <div className="text-sm text-normal-text leading-relaxed space-y-3">{children}</div>
-    </Card>
+    <section className="border-t border-s1-line pt-10 first:border-t-0 first:pt-0">
+      {kicker && <p className="font-mono text-xs text-s1-muted">{kicker}</p>}
+      <h2 id={id} data-toc={title} className="mt-1 scroll-mt-24 text-xl font-semibold tracking-tight text-s1-fg">
+        <a href={`#${id}`} className="group inline-flex items-center gap-2">
+          {title}
+          <span aria-hidden="true" className="text-s1-muted opacity-0 transition group-hover:opacity-100">#</span>
+        </a>
+      </h2>
+      <div className="s1-prose mt-4 space-y-4 text-[15px] leading-7 text-s1-muted">{children}</div>
+    </section>
   );
 }
 
-function DocCode({ limit = 4000, ...props }) {
-  return <Code {...props} limit={limit} wrap />;
+function DocCode({ data }) {
+  return <CodeBlock code={data} />;
 }
 
 function Text({ children }) {
@@ -41,7 +49,7 @@ function Text({ children }) {
 
 function Bullets({ items }) {
   return (
-    <ul className="list-disc pl-5 space-y-1.5">
+    <ul className="list-disc space-y-2 pl-5 marker:text-s1-accent">
       {items.map((item) => (
         <li key={typeof item === 'string' ? item : item.join(' ')}>{item}</li>
       ))}
@@ -51,54 +59,34 @@ function Bullets({ items }) {
 
 function EndpointTable({ rows, columns = ['Method', 'Endpoint', 'Purpose'] }) {
   return (
-    <Table head={columns}>
+    <DocTable head={columns}>
       {rows.map(([method, path, desc]) => (
-        <tr key={`${method}:${path}`} className="border-t border-slate-100 align-top">
-          <td className="py-2 pr-4 whitespace-nowrap">
-            {String(method).includes('/') || String(method).includes('·') ? (
-              <span className="text-xs font-medium text-normal-text">{method}</span>
-            ) : (
-              <Badge tone={METHOD_TONE[method] || 'gray'}>{method}</Badge>
-            )}
+        <tr key={`${method}:${path}`} className="border-t border-s1-line align-top">
+          <td className="whitespace-nowrap px-4 py-2.5">
+            <MethodBadge method={method} />
           </td>
-          <td className="py-2 pr-4 min-w-[14rem]">
-            <code className="text-xs text-main-text break-all">{path}</code>
+          <td className="min-w-[14rem] px-4 py-2.5">
+            <code className="break-all font-mono text-xs text-s1-fg">{path}</code>
           </td>
-          <td className="py-2 text-xs">{desc}</td>
+          <td className="px-4 py-2.5 text-xs">{desc}</td>
         </tr>
       ))}
-    </Table>
+    </DocTable>
   );
 }
 
 function OperatorTable({ rows }) {
   return (
-    <Table head={['Operator', 'Meaning']}>
+    <DocTable head={['Operator', 'Meaning']}>
       {rows.map(([op, meaning]) => (
-        <tr key={op} className="border-t border-slate-100">
-          <td className="py-2 pr-4">
-            <code className="text-xs text-main-text">{op}</code>
+        <tr key={op} className="border-t border-s1-line">
+          <td className="px-4 py-2.5">
+            <code className="font-mono text-xs text-s1-fg">{op}</code>
           </td>
-          <td className="py-2 text-xs">{meaning}</td>
+          <td className="px-4 py-2.5 text-xs">{meaning}</td>
         </tr>
       ))}
-    </Table>
-  );
-}
-
-function TabButton({ tab, active, onClick, children }) {
-  return (
-    <button
-      type="button"
-      role="tab"
-      aria-selected={active}
-      onClick={() => onClick(tab)}
-      className={`px-4 py-2 rounded-2xl text-sm font-medium transition-colors ${
-        active ? 'bg-gradient-to-b from-main-start to-main-end text-white shadow-sm' : 'bg-white text-normal-text shadow-sm hover:text-main-blue'
-      }`}
-    >
-      {children}
-    </button>
+    </DocTable>
   );
 }
 
@@ -1027,7 +1015,7 @@ const QUEUE_INSPECT_ENDPOINTS = [
 ];
 
 const SERVICE_MAP = [
-  ['Gateway', '8080', '—', 'JWT/API-key auth, principal headers, rate limits, routing, /metrics'],
+  ['Gateway', '8080', '/v1/*', 'JWT/API-key auth, principal headers, rate limits, routing, /metrics'],
   ['IAM', '4001', '/v1/auth, /v1/orgs, …', 'Orgs, accounts, users, roles, policies, keys, OIDC'],
   ['Workflow', '4002', '/v1/workflows, /v1/templates', 'Built-in workflow engine, executions, webhooks'],
   ['AI', '4003', '/v1/ai', 'Documentation assistant and model gateway'],
@@ -1037,56 +1025,67 @@ const SERVICE_MAP = [
   ['SynapseQueue', '4007', '/v1/queue', 'At-least-once messaging, retries, dead letters, replay'],
 ];
 
+const GUIDES = [
+  ['base', Database],
+  ['faststore', Gauge],
+  ['queue', Inbox],
+  ['javascript', FileCode2],
+  ['python', FileCode2],
+  ['go', Boxes],
+];
+const GUIDE_CARD =
+  'group flex w-full items-center gap-3 rounded-xl border border-s1-line bg-s1-surface px-4 py-3 text-left text-sm transition hover:-translate-y-0.5 hover:border-sky-300 hover:shadow-md hover:shadow-sky-500/10 dark:hover:border-sky-700';
+const GUIDE_ICON =
+  'flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-sky-400 to-blue-600 text-white';
+
 function Overview({ setTab }) {
+  const { m } = useI18n();
+  const d = m.docsPage;
   return (
-    <div className="space-y-4">
-      <Card className="bg-gradient-to-br from-main-start to-main-end text-white">
-        <p className="text-xs font-semibold uppercase tracking-widest text-white/70 mb-2">SynapseOne platform</p>
-        <h3 className="text-2xl font-semibold mb-2">Documents, cache and messaging — self-managed.</h3>
-        <p className="text-sm text-white/85 max-w-3xl">
-          SynapseBase, Synapse Faststore and SynapseQueue run next to IAM, the workflow engine and SynapseLDS.
-          The gateway is the single public API; every client sees the same tenant-scoped data services.
-        </p>
-        <div className="mt-4 flex flex-wrap gap-2">
-          {[
-            ['base', 'SynapseBase guide'],
-            ['faststore', 'Faststore guide'],
-            ['queue', 'Queue guide'],
-            ['javascript', 'JavaScript SDK'],
-            ['python', 'Python SDK'],
-            ['go', 'Go SDK'],
-          ].map(([id, label]) => (
-            <button
-              key={id}
-              onClick={() => setTab(id)}
-              className="px-3 py-1.5 rounded-2xl text-xs font-medium bg-white/15 text-white hover:bg-white/25"
-            >
-              {label} →
-            </button>
+    <div className="space-y-10">
+      <DocHeader kicker={d.overviewKicker} title={d.overviewTitle}>
+        <p>{d.overviewLead}</p>
+      </DocHeader>
+
+      <section aria-label={d.startHere}>
+        <p className="text-sm font-semibold text-s1-fg">{d.startHere}</p>
+        <ul className="mt-3 grid gap-3 sm:grid-cols-2">
+          {GUIDES.map(([id, Icon]) => (
+            <li key={id}>
+              <button type="button" onClick={() => setTab(id)} className={GUIDE_CARD}>
+                <span className={GUIDE_ICON}><Icon className="h-4 w-4" /></span>
+                <span className="min-w-0 flex-1 font-medium text-s1-fg">{d.guides[id]}</span>
+                <ArrowRight className="h-4 w-4 shrink-0 text-s1-muted transition group-hover:translate-x-0.5 group-hover:text-s1-accent" />
+              </button>
+            </li>
           ))}
-          <Link to="/api-docs" className="px-3 py-1.5 rounded-2xl text-xs font-medium bg-white text-main-blue hover:bg-white/90">
-            Try the API live →
-          </Link>
-        </div>
-      </Card>
+          <li>
+            <Link to="/api-docs" className={GUIDE_CARD}>
+              <span className={GUIDE_ICON}><Zap className="h-4 w-4" /></span>
+              <span className="min-w-0 flex-1 font-medium text-s1-fg">{d.tryApi}</span>
+              <ArrowRight className="h-4 w-4 shrink-0 text-s1-muted transition group-hover:translate-x-0.5 group-hover:text-s1-accent" />
+            </Link>
+          </li>
+        </ul>
+      </section>
 
       <DocSection title="Service map" kicker="Architecture">
-        <Table head={['Service', 'Port', 'Gateway prefix', 'Responsibility']}>
+        <DocTable head={['Service', 'Port', 'Gateway prefix', 'Responsibility']}>
           {SERVICE_MAP.map(([service, port, prefix, desc]) => (
-            <tr key={service} className="border-t border-slate-100 align-top">
-              <td className="py-2 pr-4 text-xs font-medium text-main-text whitespace-nowrap">{service}</td>
-              <td className="py-2 pr-4 text-xs tabular-nums">{port}</td>
-              <td className="py-2 pr-4 text-xs">
-                <code className="text-main-text break-all">{prefix}</code>
+            <tr key={service} className="border-t border-s1-line align-top">
+              <td className="px-4 py-2.5 text-xs font-medium text-s1-fg whitespace-nowrap">{service}</td>
+              <td className="px-4 py-2.5 text-xs tabular-nums">{port}</td>
+              <td className="px-4 py-2.5 text-xs">
+                <code className="text-s1-fg break-all">{prefix}</code>
               </td>
-              <td className="py-2 text-xs">{desc}</td>
+              <td className="px-4 py-2.5 text-xs">{desc}</td>
             </tr>
           ))}
-        </Table>
+        </DocTable>
         <Text>
           Only the gateway is public in production. Direct service calls additionally require
-          <code className="mx-1 text-main-text">x-synapseone-internal</code>
-          when <code className="text-main-text">SYNAPSEONE_INTERNAL_SECRET</code> is configured.
+          <code className="mx-1 text-s1-fg">x-synapseone-internal</code>
+          when <code className="text-s1-fg">SYNAPSEONE_INTERNAL_SECRET</code> is configured.
         </Text>
       </DocSection>
 
@@ -1102,7 +1101,7 @@ function Overview({ setTab }) {
             'Replace every *_change_me_* secret in .env before exposing the stack.',
             'docker compose up -d --build rebuilds the Console, gateway and services after source changes.',
             'Production: use docker-compose.prod.yml with the infra/prod TLS overlay; see docs/production.md in the repository.',
-            'Console: http://localhost:3000 — sign in with demo@acme.local / org acme, or an API key.',
+            'Console: http://localhost:3000; sign in with demo@acme.local / org acme, or an API key.',
           ]}
         />
       </DocSection>
@@ -1110,7 +1109,7 @@ function Overview({ setTab }) {
       <DocSection title="One request per data service" kicker="First flow">
         <DocCode data={OVERVIEW_FLOW} />
         <Text>
-          All snippets use the gateway at <code className="text-main-text">:8080</code>. Swap in your own
+          All snippets use the gateway at <code className="text-s1-fg">:8080</code>. Swap in your own
           token (or an API key) and the examples work unchanged against a Docker deployment.
         </Text>
       </DocSection>
@@ -1129,7 +1128,7 @@ function Overview({ setTab }) {
       </DocSection>
 
       <DocSection title="SDK namespaces at a glance" kicker="Clients">
-        <Table head={['Namespace', 'Covers']}>
+        <DocTable head={['Namespace', 'Covers']}>
           {[
             ['client.iam', 'Auth/OIDC, orgs, accounts, users, roles, policies, keys, service accounts, credentials'],
             ['client.workflow', 'Templates, workflow CRUD/lifecycle, executions, test runs'],
@@ -1138,19 +1137,19 @@ function Overview({ setTab }) {
             ['client.faststore', 'Strings/counters, hashes, lists, sets, sorted sets, scans, locks'],
             ['client.queue', 'Queues, publish/consume, ack/nack/heartbeat, dead letters, replay'],
           ].map(([name, covers]) => (
-            <tr key={name} className="border-t border-slate-100">
-              <td className="py-2 pr-4"><code className="text-xs text-main-text">{name}</code></td>
-              <td className="py-2 text-xs">{covers}</td>
+            <tr key={name} className="border-t border-s1-line">
+              <td className="px-4 py-2.5"><code className="text-xs text-s1-fg">{name}</code></td>
+              <td className="px-4 py-2.5 text-xs">{covers}</td>
             </tr>
           ))}
-        </Table>
+        </DocTable>
         <Text>
           Python and JavaScript use the namespaces above. Go exposes flat methods on one
-          <code className="mx-1 text-main-text">Client</code>
-          (for example <code className="text-main-text">CreateBaseCollection</code>,
-          <code className="mx-1 text-main-text">FaststoreSet</code>
-          and <code className="text-main-text">PublishMessage</code>) plus generic typed
-          <code className="mx-1 text-main-text">BaseCollection[T]</code>.
+          <code className="mx-1 text-s1-fg">Client</code>
+          (for example <code className="text-s1-fg">CreateBaseCollection</code>,
+          <code className="mx-1 text-s1-fg">FaststoreSet</code>
+          and <code className="text-s1-fg">PublishMessage</code>) plus generic typed
+          <code className="mx-1 text-s1-fg">BaseCollection[T]</code>.
         </Text>
       </DocSection>
     </div>
@@ -1159,8 +1158,8 @@ function Overview({ setTab }) {
 
 function BaseDoc() {
   return (
-    <div className="space-y-4">
-      <DocSection title="SynapseBase" kicker="Documents · port 4005 · /v1/base">
+    <div className="space-y-10">
+      <DocHeader title="SynapseBase" kicker="Documents · port 4005 · /v1/base">
         <Text>
           A self-managed document database with server-side validation and a first-class
           object ↔ data mapping. Write logical objects, store raw JSON, and query either view.
@@ -1173,7 +1172,7 @@ function BaseDoc() {
             'Full endpoint reference with try-it forms: open the API Docs page.',
           ]}
         />
-      </DocSection>
+      </DocHeader>
 
       <DocSection title="Mapping objects to stored data" kicker="Core concept">
         <DocCode data={BASE_MAPPING} />
@@ -1199,10 +1198,10 @@ function BaseDoc() {
       <DocSection title="Documents" kicker="API reference">
         <EndpointTable rows={BASE_DOCUMENT_ENDPOINTS} />
         <Text>
-          Document ids allow <code className="text-main-text">[A-Za-z0-9_@.:+-]</code> up to 256
-          characters; <code className="text-main-text">/</code>, <code className="text-main-text">\\</code>,
-          <code className="mx-1 text-main-text">.</code> and <code className="text-main-text">..</code> are rejected.
-          A duplicate create is <code className="text-main-text">409 document_exists</code>.
+          Document ids allow <code className="text-s1-fg">[A-Za-z0-9_@.:+-]</code> up to 256
+          characters; <code className="text-s1-fg">/</code>, <code className="text-s1-fg">\\</code>,
+          <code className="mx-1 text-s1-fg">.</code> and <code className="text-s1-fg">..</code> are rejected.
+          A duplicate create is <code className="text-s1-fg">409 document_exists</code>.
         </Text>
       </DocSection>
 
@@ -1211,11 +1210,11 @@ function BaseDoc() {
         <DocCode data={BASE_QUERY} />
         <OperatorTable rows={BASE_OPERATORS} />
         <Text>
-          <code className="text-main-text">where</code> accepts logical mapping names or dot paths,
-          shorthand <code className="text-main-text">{'{"capacity":{"gte":100}}'}</code>, and groups
-          <code className="mx-1 text-main-text">and/or/not</code>. Document metadata is addressable as
-          <code className="mx-1 text-main-text">$id/$version/$createdAt/$updatedAt</code>.
-          Query responses return <code className="text-main-text">{'{items,total,limit,offset,nextCursor}'}</code>.
+          <code className="text-s1-fg">where</code> accepts logical mapping names or dot paths,
+          shorthand <code className="text-s1-fg">{'{"capacity":{"gte":100}}'}</code>, and groups
+          <code className="mx-1 text-s1-fg">and/or/not</code>. Document metadata is addressable as
+          <code className="mx-1 text-s1-fg">$id/$version/$createdAt/$updatedAt</code>.
+          Query responses return <code className="text-s1-fg">{'{items,total,limit,offset,nextCursor}'}</code>.
         </Text>
         <DocCode data={BASE_WRITES} />
         <Bullets
@@ -1231,10 +1230,10 @@ function BaseDoc() {
       <DocSection title="Limits and errors" kicker="Operations">
         <DocCode data={BASE_LIMITS} />
         <Text>
-          Common errors: <code className="text-main-text">400 mapping_error</code> (missing/typed/unknown field),
-          <code className="mx-1 text-main-text">409 version_conflict</code>,
-          <code className="mx-1 text-main-text">409 ambiguous_collection</code> (platform caller must pass ?orgId/?accountId),
-          <code className="mx-1 text-main-text">413 collection_too_large</code> (narrow the query or raise BASE_QUERY_SCAN_LIMIT).
+          Common errors: <code className="text-s1-fg">400 mapping_error</code> (missing/typed/unknown field),
+          <code className="mx-1 text-s1-fg">409 version_conflict</code>,
+          <code className="mx-1 text-s1-fg">409 ambiguous_collection</code> (platform caller must pass ?orgId/?accountId),
+          <code className="mx-1 text-s1-fg">413 collection_too_large</code> (narrow the query or raise BASE_QUERY_SCAN_LIMIT).
         </Text>
       </DocSection>
     </div>
@@ -1243,8 +1242,8 @@ function BaseDoc() {
 
 function FaststoreDoc() {
   return (
-    <div className="space-y-4">
-      <DocSection title="Synapse Faststore" kicker="Cache · port 4006 · /v1/faststore">
+    <div className="space-y-10">
+      <DocHeader title="Synapse Faststore" kicker="Cache · port 4006 · /v1/faststore">
         <Text>
           A tenant-scoped Redis-backed cache and key/value service: TTL strings, counters,
           hashes, lists, sets, sorted sets, scans, batches and distributed locks. Without a
@@ -1258,7 +1257,7 @@ function FaststoreDoc() {
             '0 TTL clears an existing expiry; valid TTLs are 1..2,592,000 seconds (30 days).',
           ]}
         />
-      </DocSection>
+      </DocHeader>
 
       <DocSection title="Keys, TTL and counters" kicker="Quick start">
         <DocCode data={FASTSTORE_QUICKSTART} />
@@ -1289,8 +1288,8 @@ function FaststoreDoc() {
 
 function QueueDoc() {
   return (
-    <div className="space-y-4">
-      <DocSection title="SynapseQueue" kicker="Messaging · port 4007 · /v1/queue">
+    <div className="space-y-10">
+      <DocHeader title="SynapseQueue" kicker="Messaging · port 4007 · /v1/queue">
         <Text>
           At-least-once queues with delayed and deduplicated publishing, visibility-timeout
           leases, explicit ack/nack/heartbeat, retries, dead letters and replay. Redis is the
@@ -1304,7 +1303,7 @@ function QueueDoc() {
             'Queues are tenant-scoped; platform callers pass x-synapseone-tenant or ?tenant=.',
           ]}
         />
-      </DocSection>
+      </DocHeader>
 
       <DocSection title="Publish, consume and ack" kicker="Quick start">
         <DocCode data={QUEUE_QUICKSTART} />
@@ -1326,7 +1325,7 @@ function QueueDoc() {
       <DocSection title="Delivery semantics and limits" kicker="Operations">
         <DocCode data={QUEUE_SEMANTICS} />
         <Text>
-          Nack returns <code className="text-main-text">{'{state:"retry"|"dead", attempts, availableAt|deadAt}'}</code>.
+          Nack returns <code className="text-s1-fg">{'{state:"retry"|"dead", attempts, availableAt|deadAt}'}</code>.
           Replay moves a dead letter back to ready (or delayed) and optionally resets attempts.
           Purge is destructive: it also clears in-flight and dead messages, while preserving the queue config.
         </Text>
@@ -1335,20 +1334,22 @@ function QueueDoc() {
   );
 }
 
-function SdkDoc({ sections }) {
+function SdkDoc({ title, kicker, sections }) {
   return (
-    <div className="space-y-4">
-      {sections.map((s) => (
-        <Card key={s.title}>
-          <h3 className="font-semibold text-main-text mb-2">{s.title}</h3>
-          <DocCode data={s.code} limit={4000} />
-        </Card>
+    <div className="space-y-10">
+      <DocHeader kicker={kicker} title={title} />
+      {sections.map((sec) => (
+        <DocSection key={sec.title} title={sec.title}>
+          <DocCode data={sec.code} />
+        </DocSection>
       ))}
     </div>
   );
 }
 
 export default function Docs() {
+  const { m } = useI18n();
+  const d = m.docsPage;
   const [params, setParams] = useSearchParams();
   const requested = params.get('tab');
   const tab = TABS.some((t) => t.id === requested) ? requested : 'overview';
@@ -1359,41 +1360,67 @@ export default function Docs() {
       return next;
     }, { replace: true });
   };
+  // A new tab starts at its top.
+  useEffect(() => {
+    if (typeof window !== 'undefined') window.scrollTo({ top: 0 });
+  }, [tab]);
 
+  const label = (t) => t.label || d.tabs[t.id];
   let content;
   if (tab === 'overview') content = <Overview setTab={setTab} />;
   else if (tab === 'base') content = <BaseDoc />;
   else if (tab === 'faststore') content = <FaststoreDoc />;
   else if (tab === 'queue') content = <QueueDoc />;
-  else if (tab === 'javascript') content = <SdkDoc sections={JS_SECTIONS} />;
-  else if (tab === 'python') content = <SdkDoc sections={PYTHON_SECTIONS} />;
-  else if (tab === 'go') content = <SdkDoc sections={GO_SECTIONS} />;
-  else content = <SdkDoc sections={CLI_SECTIONS} />;
+  else if (tab === 'javascript') content = <SdkDoc title="JavaScript SDK" kicker={`${d.sdkKicker} · @synapseone/sdk`} sections={JS_SECTIONS} />;
+  else if (tab === 'python') content = <SdkDoc title="Python SDK" kicker={`${d.sdkKicker} · synapseone-sdk`} sections={PYTHON_SECTIONS} />;
+  else if (tab === 'go') content = <SdkDoc title="Go SDK" kicker={`${d.sdkKicker} · synapseone-sdk-go`} sections={GO_SECTIONS} />;
+  else content = <SdkDoc title="SynapseOne CLI" kicker={`${d.cliKicker} · synapseone`} sections={CLI_SECTIONS} />;
+
+  const nav = ['start', 'data', 'clients'].map((g) => ({
+    title: d.groups[g],
+    items: TABS.filter((t) => t.group === g).map((t) => ({
+      id: t.id,
+      label: label(t),
+      active: t.id === tab,
+      onClick: () => setTab(t.id),
+    })),
+  }));
+  nav.push({ title: d.groups.more, items: [{ id: 'api', label: m.nav.apiDocs, to: '/api-docs' }] });
+
+  const index = TABS.findIndex((t) => t.id === tab);
+  const prev = TABS[index - 1];
+  const next = TABS[index + 1];
 
   return (
-    <>
-      <PageTitle
-        title="Docs"
-        sub="Platform, data services, SDKs and CLI — organized for the running Docker stack"
-        right={
-          <Link
-            to="/api-docs"
-            className="px-4 py-2 rounded-2xl text-sm font-medium bg-white text-main-blue shadow-sm hover:bg-background"
-          >
-            API explorer →
-          </Link>
-        }
-      />
-      <div className="flex gap-2 mb-4 flex-wrap" role="tablist" aria-label="Documentation sections">
-        {TABS.map((t) => (
-          <TabButton key={t.id} tab={t.id} active={tab === t.id} onClick={setTab}>
-            {t.label}
-          </TabButton>
-        ))}
-      </div>
-      <div role="tabpanel" aria-label={TABS.find((t) => t.id === tab)?.label}>
+    <DocsShell navLabel={d.navLabel} nav={nav} toc tocKey={`${tab}:${m.meta.title}`}>
+      <div role="region" aria-label={label(TABS[index])}>
         {content}
       </div>
-    </>
+      <nav className="mt-14 grid gap-3 border-t border-s1-line pt-6 sm:grid-cols-2" aria-label={`${d.prev} / ${d.next}`}>
+        {prev ? (
+          <button type="button" onClick={() => setTab(prev.id)} className={PAGER}>
+            <span className="text-xs text-s1-muted">{d.prev}</span>
+            <span className="mt-1 flex items-center gap-2 font-medium text-s1-fg group-hover:text-s1-accent">
+              <ArrowLeft className="h-4 w-4" />
+              {label(prev)}
+            </span>
+          </button>
+        ) : (
+          <span className="hidden sm:block" />
+        )}
+        {next && (
+          <button type="button" onClick={() => setTab(next.id)} className={`${PAGER} sm:items-end sm:text-right`}>
+            <span className="text-xs text-s1-muted">{d.next}</span>
+            <span className="mt-1 flex items-center gap-2 font-medium text-s1-fg group-hover:text-s1-accent">
+              {label(next)}
+              <ArrowRight className="h-4 w-4" />
+            </span>
+          </button>
+        )}
+      </nav>
+    </DocsShell>
   );
 }
+
+const PAGER =
+  'group flex flex-col items-start rounded-xl border border-s1-line bg-s1-surface px-4 py-3 text-left transition hover:border-s1-accent';

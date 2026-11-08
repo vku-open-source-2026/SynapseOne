@@ -182,7 +182,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
     try {
       localStorage.setItem(draftKey, JSON.stringify({ name, nodes, connections, savedAt: Date.now() }));
     } catch {
-      /* storage full/blocked — editing still works, just no draft */
+      /* storage full/blocked, editing still works, just no draft */
     }
   }, [name, nodes, connections, draftKey]);
   const clearDraft = () => {
@@ -209,7 +209,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
     [norm],
   );
   const visualDirty = snapshot !== JSON.stringify({ name, nodes, connections });
-  // JSON-tab edits live only in jsonText until staged — compare against what
+  // JSON-tab edits live only in jsonText until staged, compare against what
   // the tab was last synced from so Save enables and close() warns.
   const jsonSynced = JSON.stringify({ nodes, connections }, null, 2);
   const dirty = visualDirty || (tab === 'json' && jsonText !== jsonSynced);
@@ -218,13 +218,13 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
   const selEdge = sel && typeof sel === 'object' ? (sel.edge || sel) : null;
   const [paramsRev, setParamsRev] = useState(0);
 
-  // Live structural validation — blocks Save with a tooltip (synced with
+  // Live structural validation, blocks Save with a tooltip (synced with
   // workflow-service validateDefinition: duplicate / self-loop / dangling / cycle).
   const graphErr = useMemo(() => validateGraph(nodes, connections, { requireTrigger: true }), [nodes, connections]);
   const saveBlocked = graphErr || paramsErr ? (graphErr || paramsErr) : null;
 
   const syncJsonTab = (ns, conns) => {
-    // Don't clobber dirty JSON typing — only resync a clean tab.
+    // Don't clobber dirty JSON typing, only resync a clean tab.
     if (tab === 'json' && jsonText !== JSON.stringify({ nodes, connections }, null, 2)) return;
     setJsonText(JSON.stringify({ nodes: ns, connections: conns }, null, 2));
   };
@@ -263,7 +263,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
       setParamsErr(null);
       setShowAdvJson(false);
     } else {
-      // Leaving a node clears its params error — it must never block a save
+      // Leaving a node clears its params error, it must never block a save
       // from an unrelated selection with a stale message.
       setParamsErr(null);
     }
@@ -516,7 +516,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
       }
     }
     if (wouldCycle(nodes, connections, fromName, targetName, { targetPort })) {
-      setErr(new Error(`Connecting '${fromName}' → '${targetName}' would close a cycle — refused.`));
+      setErr(new Error(`Connecting '${fromName}' → '${targetName}' would close a cycle, refused.`));
       return;
     }
     checkpoint();
@@ -752,7 +752,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
       } catch {
         throw new Error('Definition is not valid JSON');
       }
-      // An empty/missing nodes array would wipe the workflow — reject here
+      // An empty/missing nodes array would wipe the workflow, reject here
       // (validateGraph tolerates [] for canvas-built states).
       if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.nodes)) {
         throw new Error('Definition needs a nodes array');
@@ -1016,7 +1016,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
         <Err e={err} />
         {graphErr && (
           <div className="mx-4 mt-2 px-3 py-2 rounded-2xl bg-red-500/10 text-red-600 text-xs">
-            Save blocked: {graphErr} — fix the graph (connect isolated nodes, remove self-loops/cycles/duplicates) to continue.
+            Save blocked: {graphErr}, fix the graph (connect isolated nodes, remove self-loops/cycles/duplicates) to continue.
           </div>
         )}
         {warnings.length > 0 && (
@@ -1087,7 +1087,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
           </div>
           ) : (
           <div className="w-44 shrink-0 border-r border-slate-100 p-2 overflow-y-auto">
-            <p className="text-[11px] text-normal-text px-1">Edit the JSON directly, then Save — or switch back to Visual to stage it onto the canvas.</p>
+            <p className="text-[11px] text-normal-text px-1">Edit the JSON directly, then Save, or switch back to Visual to stage it onto the canvas.</p>
           </div>
           )}
           {tab === 'visual' ? (
@@ -1236,7 +1236,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
                   data-node={n.name}
                   onPointerDown={(e) => onNodePointerDown(e, n)}
                   onPointerUp={(e) => onNodePointerUp(e, n)}
-                  title={disabled ? `${n.name} (disabled — skipped at run time)` : n.name}
+                  title={disabled ? `${n.name} (disabled, skipped at run time)` : n.name}
                   className={`absolute rounded-2xl border-2 bg-white shadow-sm ${border} ${disabled ? 'opacity-50 border-dashed' : ''} hover:shadow-md transition-shadow`}
                   style={{ left: n.position[0] * view.k + view.x, top: n.position[1] * view.k + view.y, width: dims.w * view.k, height: dims.h * view.k, fontSize: 12 * view.k }}
                 >
@@ -1257,7 +1257,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
                               <span className="px-1.5 py-0.2 rounded-full text-[9px] font-semibold bg-purple-100 text-purple-700 truncate" style={{ fontSize: 9 * view.k }}>
                                 {(modelSourceNode?.parameters?.core || n.parameters?.core || 'synapse-inference') === 'synapse-inference' ? 'Synapse Engine' : 'External API'}
                               </span>
-                              <span className="text-normal-text truncate font-mono text-[9px]" style={{ fontSize: 9 * view.k }} title={modelSource ? `Model source: ${modelSource.from}` : 'No Model socket wired — uses this agent\'s inline model config'}>
+                              <span className="text-normal-text truncate font-mono text-[9px]" style={{ fontSize: 9 * view.k }} title={modelSource ? `Model source: ${modelSource.from}` : 'No Model socket wired, uses this agent\'s inline model config'}>
                                 {modelSourceNode?.parameters?.model || n.parameters?.model || 'lfm-2.5-2.6b'}
                               </span>
                             </div>
@@ -1299,7 +1299,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
                             </span>
                           ))}
                           {totalTools > 6 && <span className="px-1 py-0.2 rounded-md bg-purple-200/60 text-purple-900 font-semibold" style={{ fontSize: 9 * view.k }}>+{totalTools - 6}</span>}
-                          {totalTools === 0 && <span className="text-slate-400 italic" style={{ fontSize: 9 * view.k }}>No tools — wire one below</span>}
+                          {totalTools === 0 && <span className="text-slate-400 italic" style={{ fontSize: 9 * view.k }}>No tools, wire one below</span>}
                         </div>
                       </div>
 
@@ -1310,7 +1310,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
                           onClick={(e) => onPortClick(e, n, 'tools')}
                           onPointerDown={(e) => e.stopPropagation()}
                           className="flex items-center gap-1 font-medium text-purple-700 truncate cursor-pointer hover:underline"
-                          title="Tools socket — drop any canvas node here (or click after picking an output) to expose it as a callable tool"
+                          title="Tools socket, drop any canvas node here (or click after picking an output) to expose it as a callable tool"
                         >
                           <span className="w-1.5 h-1.5 rounded-full bg-purple-500 inline-block" /> Tools socket
                         </span>
@@ -1320,7 +1320,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
                           onClick={(e) => onPortClick(e, n, 'model')}
                           onPointerDown={(e) => e.stopPropagation()}
                           className="flex items-center gap-1 font-medium text-indigo-700 truncate cursor-pointer hover:underline"
-                          title={modelSource ? `Model from ${modelSource.from}` : 'Model socket — drop a Model Core node here to override the inline model'}
+                          title={modelSource ? `Model from ${modelSource.from}` : 'Model socket, drop a Model Core node here to override the inline model'}
                         >
                           <span className={`w-1.5 h-1.5 rounded-full inline-block ${modelSource ? 'bg-indigo-500' : 'bg-slate-300'}`} /> {modelSource ? modelSource.from : 'Model socket'}
                         </span>
@@ -1392,7 +1392,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
                         <div className="font-semibold text-main-text truncate leading-tight" style={{ fontSize: 12 * view.k }}>
                           {disabled ? '⏸ ' : ''}{n.name}{st === 'success' ? ' ✓' : st === 'error' ? ' ✗' : ''}
                         </div>
-                        <div className={`text-normal-text truncate leading-tight mt-0.5 ${known ? '' : 'underline decoration-wavy decoration-amber-500'}`} style={{ fontSize: 9.5 * view.k }} title={known ? String(n.type) : `${n.type} — unknown type: the engine passes it through as skipped`}>
+                        <div className={`text-normal-text truncate leading-tight mt-0.5 ${known ? '' : 'underline decoration-wavy decoration-amber-500'}`} style={{ fontSize: 9.5 * view.k }} title={known ? String(n.type) : `${n.type}, unknown type: the engine passes it through as skipped`}>
                           {subtitle}{known ? '' : ' ⚠'}
                         </div>
                         {isIf && (
@@ -1411,7 +1411,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
                         onPointerDown={(e) => e.stopPropagation()}
                         data-wire-target={n.name}
                         data-wire-kind="in"
-                        title="Flow input — receive data from the previous node"
+                        title="Flow input, receive data from the previous node"
                         aria-label={`Flow input of ${n.name}`}
                         className="absolute rounded-full bg-white border-2 border-slate-300 hover:border-main-blue hover:scale-110 transition-transform shadow-sm z-10"
                         style={{ left: off, top: '50%', marginTop: off, width: ps, height: ps }}
@@ -1419,7 +1419,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
                       <button
                         onClick={(e) => onPortClick(e, n, 'out')}
                         onPointerDown={(e) => beginWire(e, n, 'out', undefined)}
-                        title="Flow output — click, then click a target input"
+                        title="Flow output, click, then click a target input"
                         aria-label={`Flow output of ${n.name}`}
                         className={`absolute rounded-full border-2 hover:scale-110 transition-transform shadow-sm z-10 ${pendingFrom === n.name && pendingBranch === null ? 'bg-main-blue border-main-blue ring-2 ring-main-blue/30' : 'bg-white border-slate-300 hover:border-main-blue'}`}
                         style={{ right: off, top: '50%', marginTop: off, width: ps, height: ps }}
@@ -1429,7 +1429,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
                         onPointerDown={(e) => e.stopPropagation()}
                         data-wire-target={n.name}
                         data-wire-kind="tools"
-                        title="Tools socket — wire any canvas node here to expose it as a callable agent tool"
+                        title="Tools socket, wire any canvas node here to expose it as a callable agent tool"
                         aria-label={`Tools socket of ${n.name}`}
                         className="absolute rounded-full bg-purple-500 border-2 border-white hover:border-purple-300 hover:scale-125 transition-transform shadow-md ring-2 ring-purple-400/50 z-10"
                         style={{ left: 46 * view.k + off, bottom: off, width: ps + 2, height: ps + 2 }}
@@ -1439,7 +1439,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
                         onPointerDown={(e) => e.stopPropagation()}
                         data-wire-target={n.name}
                         data-wire-kind="model"
-                        title="Model socket — wire a Model Core node here to override the inline model"
+                        title="Model socket, wire a Model Core node here to override the inline model"
                         aria-label={`Model socket of ${n.name}`}
                         className="absolute rounded-full bg-indigo-500 border-2 border-white hover:border-indigo-300 hover:scale-125 transition-transform shadow-md ring-2 ring-indigo-400/50 z-10"
                         style={{ right: 46 * view.k + off, bottom: off, width: ps + 2, height: ps + 2 }}
@@ -1452,7 +1452,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
                         onPointerDown={(e) => e.stopPropagation()}
                         data-wire-target={n.name}
                         data-wire-kind="in"
-                        title="Flow input — click after picking an output to connect"
+                        title="Flow input, click after picking an output to connect"
                         aria-label={`Flow input of ${n.name}`}
                         className="absolute rounded-full bg-white border-2 border-slate-300 hover:border-main-blue hover:scale-110 transition-transform z-10"
                         style={{ left: off, top: '50%', marginTop: off, width: ps, height: ps }}
@@ -1462,7 +1462,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
                           key={`${r.name}:${idx}`}
                           onClick={(e) => onPortClick(e, n, 'out', idx)}
                           onPointerDown={(e) => beginWire(e, n, 'out', idx)}
-                          title={`Route ${idx}: ${r.name} — click, then click a target input`}
+                          title={`Route ${idx}: ${r.name}, click, then click a target input`}
                           aria-label={`Route ${idx} ${r.name} output of ${n.name}`}
                           className={`absolute rounded-full border-2 hover:scale-125 transition-transform shadow-sm z-10 ${pendingFrom === n.name && pendingBranch === idx ? 'bg-indigo-600 border-indigo-600 ring-2 ring-indigo-300' : 'bg-white border-indigo-400 hover:border-indigo-600'}`}
                           style={{ right: off, top: 46 * view.k + idx * 26 * view.k + 13 * view.k - ps / 2, width: ps, height: ps }}
@@ -1472,7 +1472,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
                           key={idx}
                           onClick={(e) => onPortClick(e, n, 'out', idx)}
                           onPointerDown={(e) => beginWire(e, n, 'out', idx)}
-                          title={`${idx === 0 ? 'True' : 'False'} output — click, then click a target input`}
+                          title={`${idx === 0 ? 'True' : 'False'} output, click, then click a target input`}
                           aria-label={`${idx === 0 ? 'True' : 'False'} output of ${n.name}`}
                           className={`absolute rounded-full border-2 hover:scale-125 transition-transform shadow-sm z-10 ${pendingFrom === n.name && pendingBranch === idx ? 'ring-2 ring-main-blue/30' : ''} ${idx === 0 ? 'bg-white border-emerald-500' : 'bg-white border-red-500'}`}
                           style={{ right: off, top: dims.h * (idx === 0 ? 0.32 : 0.68) * view.k - ps / 2, width: ps, height: ps }}
@@ -1481,7 +1481,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
                         <button
                           onClick={(e) => onPortClick(e, n, 'out')}
                           onPointerDown={(e) => beginWire(e, n, 'out', undefined)}
-                          title="Flow output — click, then click a target input (or drag)"
+                          title="Flow output, click, then click a target input (or drag)"
                           aria-label={`Flow output of ${n.name}`}
                           className={`absolute rounded-full border-2 hover:scale-110 transition-transform shadow-sm z-10 ${pendingFrom === n.name && pendingBranch === null ? 'bg-main-blue border-main-blue ring-2 ring-main-blue/30' : 'bg-white border-slate-300 hover:border-main-blue'}`}
                           style={{ right: off, top: '50%', marginTop: off, width: ps, height: ps }}
@@ -1501,7 +1501,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
                 <div className="absolute inset-0 flex items-center justify-center pointer-events-none px-6">
                   <div className="max-w-sm text-center rounded-3xl bg-white/90 shadow-md px-5 py-4">
                     <p className="text-sm font-semibold text-main-text">Empty canvas</p>
-                    <p className="text-xs text-normal-text mt-1">Drag a node here from the palette — start with a trigger (Webhook, Schedule or Manual), then wire it to an action, AI Agent, or Decision Engine. Every node ships with a runnable example.</p>
+                    <p className="text-xs text-normal-text mt-1">Drag a node here from the palette, start with a trigger (Webhook, Schedule or Manual), then wire it to an action, AI Agent, or Decision Engine. Every node ships with a runnable example.</p>
                   </div>
                 </div>
               )}
@@ -1523,7 +1523,7 @@ export default function WorkflowEditor({ workflowId, initial, headers, onClose, 
                       : isDecisionType(src?.type) && typeof pendingBranch === 'number'
                       ? ` (route ${pendingBranch}: ${decisionRoutes(src.parameters || {})[pendingBranch]?.name || ''})`
                       : '';
-                    return <span>Connecting “{pendingFrom}”{branchText} — click a target input/socket, or drag onto it. Esc cancels.</span>;
+                    return <span>Connecting “{pendingFrom}”{branchText}, click a target input/socket, or drag onto it. Esc cancels.</span>;
                   })()}
                   <button onClick={(e) => { e.stopPropagation(); clearPending(); }} className="px-2 py-0.5 rounded-xl bg-white/20 font-semibold hover:bg-white/30">Cancel</button>
                 </div>
@@ -1911,7 +1911,7 @@ function NodeForm({
     case 'n8n-nodes-base.cron':
       return <CronForm params={p} onPatch={onPatch} />;
     default:
-      return <p className="text-[11px] text-normal-text">No extra fields for this node — use Advanced JSON below if needed.</p>;
+      return <p className="text-[11px] text-normal-text">No extra fields for this node, use Advanced JSON below if needed.</p>;
   }
 }
 
@@ -1932,7 +1932,7 @@ function CodeForm({ params, onPatch }) {
 }
 
 /** Account-scoped credential picker (P0-4): nodes store only the
- *  credentialId — secrets never touch node params or the browser history. */
+ *  credentialId, secrets never touch node params or the browser history. */
 function CredentialPicker({ headers, value, onChange, allowKinds }) {
   const [accountId, setAccountId] = useState(() => {
     try { return localStorage.getItem('synapseone.credAccount') || ''; } catch { return ''; }
@@ -2006,7 +2006,7 @@ function CredentialPicker({ headers, value, onChange, allowKinds }) {
           className={`${rowInputCls()} font-mono`}
           title="Nodes store only this id"
         >
-          <option value="">— none (no auth) —</option>
+          <option value="">None (no auth)</option>
           {(items || []).map((c) => (
             <option key={c.id} value={c.id}>{c.name} [{c.kind}]</option>
           ))}
@@ -2016,7 +2016,7 @@ function CredentialPicker({ headers, value, onChange, allowKinds }) {
       {err && <p className="text-[11px] text-red-500 mt-1 break-words">{err.message || String(err)}</p>}
       {value && <p className="text-[11px] text-normal-text mt-1 font-mono break-all">id: {value}</p>}
       {items && value && !items.some((c) => c.id === value) && (
-        <p className="text-[11px] text-amber-600 mt-1">Referenced id is not in this account — runs will fail until fixed.</p>
+        <p className="text-[11px] text-amber-600 mt-1">Referenced id is not in this account, runs will fail until fixed.</p>
       )}
       {showNew && (
         <div className="mt-1 rounded-xl border border-slate-200 p-2 space-y-1">
@@ -2107,7 +2107,7 @@ function HttpForm({ params, onPatch, headers }) {
         </select>
       </div>
       <div className="rounded-xl border border-slate-100 p-2">
-        <p className="text-[11px] font-medium text-normal-text mb-1">AUTH (credential id only — never paste secrets here)</p>
+        <p className="text-[11px] font-medium text-normal-text mb-1">AUTH (credential id only, never paste secrets here)</p>
         <CredentialPicker headers={headers} value={auth.credentialId} onChange={(id) => setAuth('credentialId', id)} />
         {auth.credentialId && (
           <label className="block text-[11px] text-normal-text mt-1">Custom header name (api-key kind only)
@@ -2120,14 +2120,14 @@ function HttpForm({ params, onPatch, headers }) {
         {rows.map(([k, v]) => (
           <div key={k} className="flex gap-1 mb-1">
             <input value={k} disabled className={`${rowInputCls()} font-mono`} title="Header name (delete + re-add to rename)" />
-            <input value={String(v)} onChange={(e) => setHeader(k, e.target.value)} placeholder="avoid secrets — use Auth above" className={rowInputCls()} />
+            <input value={String(v)} onChange={(e) => setHeader(k, e.target.value)} placeholder="avoid secrets, use Auth above" className={rowInputCls()} />
             <button onClick={() => delHeader(k)} title="Remove header" className="px-2 text-red-500">×</button>
           </div>
         ))}
         <HeaderAdder onAdd={setHeader} />
       </div>
       <div>
-        <label className="block text-xs text-normal-text mb-1">Body (POST/PUT/PATCH — JSON or template)</label>
+        <label className="block text-xs text-normal-text mb-1">Body (POST/PUT/PATCH, JSON or template)</label>
         <textarea value={body} onChange={(e) => onPatch({ body: e.target.value })} rows={3} spellCheck={false} placeholder='{"key": "={{ $json.value }}"}' className="w-full px-2 py-1.5 rounded-xl border border-slate-200 text-xs font-mono outline-none" />
       </div>
       <RetryTimeout params={params} onPatch={onPatch} kinds="http" />
@@ -2165,7 +2165,7 @@ function SetForm({ params, onPatch }) {
   const [nv, setNv] = useState('');
   return (
     <div>
-      <label className="block text-xs text-normal-text mb-1">Fields (merged over input — supports ={'{{'} $json.x {'}}'})</label>
+      <label className="block text-xs text-normal-text mb-1">Fields (merged over input, supports ={'{{'} $json.x {'}}'})</label>
       {rows.map(([k, v]) => (
         <div key={k} className="flex gap-1 mb-1">
           <input value={k} disabled className={`${rowInputCls()} font-mono`} title="Field name (delete + re-add to rename)" />
@@ -2272,7 +2272,7 @@ function AiAgentForm({ params, onPatch, nodeName, nodes, connections, onRemoveAu
     <div className="space-y-3">
       <div className="p-2.5 rounded-xl bg-purple-50 border border-purple-200 text-[11px] text-purple-900 leading-snug">
         <p className="font-bold mb-1">🤖 Autonomous AI Agent</p>
-        <p className="text-purple-800 text-[10px]">Native tool calling is enabled. Wire any canvas node — SynapseBase, Faststore, IAM, HTTP, Code, Decision — into the <b>Tools</b> socket and the model can call it. A <b>Model Core</b> wired into the Model socket overrides the inline model below.</p>
+        <p className="text-purple-800 text-[10px]">Native tool calling is enabled. Wire any canvas node, SynapseBase, Faststore, IAM, HTTP, Code, Decision, into the <b>Tools</b> socket and the model can call it. A <b>Model Core</b> wired into the Model socket overrides the inline model below.</p>
       </div>
 
       <div>
@@ -2295,7 +2295,7 @@ function AiAgentForm({ params, onPatch, nodeName, nodes, connections, onRemoveAu
       </div>
 
       <div>
-        <label className="block text-xs text-normal-text mb-1">Model {modelNode && <span className="text-indigo-600">— overridden by “{modelNode.name}”</span>}</label>
+        <label className="block text-xs text-normal-text mb-1">Model {modelNode && <span className="text-indigo-600">(overridden by “{modelNode.name}”)</span>}</label>
         <input value={model} onChange={(e) => onPatch({ model: e.target.value })} placeholder={core === 'synapse-inference' ? 'liquid/lfm-2.5-2.6b:free' : 'gpt-4o-mini'} className={`${rowInputCls()} font-mono`} />
         {modelNode && <p className="text-[10px] text-indigo-600 mt-0.5 font-mono">socket: {modelNode.parameters?.core || 'synapse-inference'} · {modelNode.parameters?.model || 'default'}</p>}
       </div>
@@ -2522,7 +2522,7 @@ function DecisionForm({ params, onPatch, nodeName, connections, onRoutesChange, 
       <div>
         <label className="block text-xs text-normal-text mb-1">Fallback route</label>
         <select value={fb} onChange={(e) => onPatch({ fallbackBranch: Number(e.target.value) })} className={rowInputCls()}>
-          {routes.map((r, i) => <option key={`${r.name}:${i}`} value={i}>{i} — {r.name}</option>)}
+          {routes.map((r, i) => <option key={`${r.name}:${i}`} value={i}>{i} · {r.name}</option>)}
         </select>
         <p className="text-[10px] text-normal-text mt-0.5">Used when the model is uncertain or returns an unknown route.</p>
       </div>
@@ -2705,7 +2705,7 @@ function IntegrationForm({ type, params, onPatch }) {
   return (
     <div className="space-y-3">
       <div className="p-2 rounded-xl bg-sky-50 border border-sky-100 text-[11px] text-sky-900 leading-tight">
-        <b>{spec.label}</b> — {spec.hint} Runs as the current user through the gateway; no secrets needed.
+        <b>{spec.label}</b>, {spec.hint} Runs as the current user through the gateway; no secrets needed.
       </div>
       <div>
         <label className="block text-xs text-normal-text mb-1">Operation</label>
@@ -2835,7 +2835,7 @@ function IfForm({ params, onPatch }) {
     <div className="space-y-2">
       {!simple ? (
         <div>
-          <label className="block text-xs text-normal-text mb-1">Condition (JS — true → output 0, false → output 1)</label>
+          <label className="block text-xs text-normal-text mb-1">Condition (JS, true → output 0, false → output 1)</label>
           <input value={params.condition || ''} onChange={(e) => onPatch({ condition: e.target.value })} placeholder="$input.value > 10" className={`${rowInputCls()} font-mono`} />
           <button onClick={() => onPatch({ value1: '={{ $json.value }}', operation: 'larger', value2: '10' })} className="mt-1 text-[11px] text-main-blue hover:underline">Switch to value / operation / value</button>
         </div>
@@ -2987,7 +2987,7 @@ function CronForm({ params, onPatch }) {
       </div>
       <div className="rounded-xl bg-background p-2 text-[11px] text-normal-text">
         {info.text}
-        {info.nextRun && <span> — next run ≈ {new Date(info.nextRun).toLocaleString()}</span>}
+        {info.nextRun && <span>, next run ≈ {new Date(info.nextRun).toLocaleString()}</span>}
       </div>
     </div>
   );

@@ -84,12 +84,12 @@ export const GROUPS = [
     name: 'Usage & Telemetry',
     endpoints: [
       { method: 'GET', path: '/v1/usage/summary', auth: 'either', desc: 'Org-scoped request/feature aggregates (?from, ?to, ?feature, ?statusClass=2xx..5xx, ?method, ?q, ?accountId)' },
-      { method: 'GET', path: '/v1/usage/events', auth: 'either', desc: 'Raw request log, newest first (?from, ?to, ?limit 1..200, ?offset + same filters) — drill-down for the dashboard' },
+      { method: 'GET', path: '/v1/usage/events', auth: 'either', desc: 'Raw request log, newest first (?from, ?to, ?limit 1..200, ?offset + same filters); drill-down for the dashboard' },
       { method: 'POST', path: '/v1/usage/ingest', auth: 'internal', desc: 'Gateway telemetry batch ingest (service-to-service: X-SynapseOne-Internal)' },
     ],
   },
   {
-    name: 'Credentials (PROPOSED — backend in progress)',
+    name: 'Credentials (proposed, backend in progress)',
     endpoints: [
       { method: 'POST', path: '/v1/accounts/:accountId/credentials', auth: 'either', desc: 'Store an account credential (secret write-only, encrypted at rest)', body: { name: 'stripe-live', type: 'bearer', secret: '<secret>' } },
       { method: 'GET', path: '/v1/accounts/:accountId/credentials', auth: 'either', desc: 'List credential metadata (never secrets)' },
@@ -130,7 +130,7 @@ export const GROUPS = [
       { method: 'DELETE', path: '/v1/lds/datasources/:id', auth: 'either', desc: 'Delete a datasource (registry + records cascade)' },
       { method: 'GET', path: '/v1/lds/datasources/:id/attributes', auth: 'either', desc: 'Attribute registry (schema)' },
       { method: 'PUT', path: '/v1/lds/datasources/:id/attributes', auth: 'either', desc: 'Replace the registry; reserved names rejected (default deny)', body: { attributes: [{ name: 'name', ngsiLdType: 'Property', visibility: 'public' }] } },
-      { method: 'POST', path: '/v1/lds/datasources/:id/records', auth: 'either', desc: 'Ingest record(s) — reserved fields quarantined, id → _core.sourceRecordId', body: { id: '55001', name: 'Công ty ABC' } },
+      { method: 'POST', path: '/v1/lds/datasources/:id/records', auth: 'either', desc: 'Ingest record(s); reserved fields quarantined, id → _core.sourceRecordId', body: { id: '55001', name: 'Công ty ABC' } },
       { method: 'GET', path: '/v1/lds/datasources/:id/entities', auth: 'either', desc: 'NGSI-LD export (?limit 1..500&offset&visibility=public|restricted; Link rel=license)' },
       { method: 'GET', path: '/v1/lds/datasources/:id/entities/:entityId', auth: 'either', desc: 'One NGSI-LD entity (projection allowlist)' },
       { method: 'GET', path: '/v1/lds/datasources/:id/stats', auth: 'either', desc: 'Record count + visibility buckets' },

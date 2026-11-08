@@ -25,7 +25,7 @@ function writeStored(key, value) {
   try {
     localStorage.setItem(key, value);
   } catch {
-    /* private mode etc. — selection just won't persist */
+    /* private mode etc., selection just won't persist */
   }
 }
 
@@ -92,7 +92,7 @@ export function ScopeProvider({ children }) {
     };
   }, [orgId, headers]);
 
-  // Stored selection may point at a deleted org/account — fall back to first.
+  // Stored selection may point at a deleted org/account, fall back to first.
   useEffect(() => {
     if (orgs.length && !orgs.find((o) => o.id === orgId)) setOrgId(orgs[0].id);
   }, [orgs]);
@@ -118,7 +118,7 @@ export function ScopeBar({ scope, showAccount = true }) {
   return (
     <div className="flex flex-wrap gap-2 mb-4">
       <select value={scope.orgId} onChange={(e) => scope.setOrgId(e.target.value)} className={sel}>
-        <option value="">— Organization —</option>
+        <option value="">Organization</option>
         {scope.orgs.map((o) => (
           <option key={o.id} value={o.id}>
             {o.slug}
@@ -127,7 +127,7 @@ export function ScopeBar({ scope, showAccount = true }) {
       </select>
       {showAccount && (
         <select value={scope.accountId} onChange={(e) => scope.setAccountId(e.target.value)} className={sel}>
-          <option value="">— Account —</option>
+          <option value="">Account</option>
           {scope.accounts.map((a) => (
             <option key={a.id} value={a.id}>
               {a.slug}

@@ -10,7 +10,7 @@ import { highlightJS, checkJSSyntax, hasTopReturn, looksLikeStatements } from '.
 // Dependency-free code editor: a transparent <textarea> stacked over a
 // highlighted <pre> (same font/padding), with line numbers, Tab-to-indent,
 // live syntax check, missing-return hint, example insert and fullscreen.
-// No new dependencies — highlighting comes from lib/code-highlight.js.
+// No new dependencies, highlighting comes from lib/code-highlight.js.
 const FONT_CLS = 'font-mono text-xs leading-5';
 
 export default function CodeEditor({
@@ -128,12 +128,12 @@ export default function CodeEditor({
       ) : (
         editor
       )}
-      {!syntax.ok && <p className="text-[11px] text-red-500 mt-1 break-words">Syntax error: {syntax.error} — fix before Test-run.</p>}
+      {!syntax.ok && <p className="text-[11px] text-red-500 mt-1 break-words">Syntax error: {syntax.error}, fix before Test-run.</p>}
       {syntax.ok && showReturnHint && (
-        <p className="text-[11px] text-amber-600 mt-1">No <code className="font-mono">return</code> found — the output will be the input echoed back (plus any <code className="font-mono">console</code> logs).</p>
+        <p className="text-[11px] text-amber-600 mt-1">No <code className="font-mono">return</code> found, the output will be the input echoed back (plus any <code className="font-mono">console</code> logs).</p>
       )}
       {minRows > 0 && !String(value || '').trim() && (
-        <p className="text-[11px] text-normal-text mt-1">Empty — the node passes its input through untouched.</p>
+        <p className="text-[11px] text-normal-text mt-1">Empty, the node passes its input through untouched.</p>
       )}
       {docs}
     </div>
@@ -148,7 +148,7 @@ export function CodeDocs() {
       <div className="mt-1 space-y-0.5">
         <p><code className="font-mono">$input</code> / <code className="font-mono">$json</code> / <code className="font-mono">input</code>: current item · <code className="font-mono">$now</code>: ISO timestamp.</p>
         <p><code className="font-mono">return {'{ … }'}</code> sets the output. A bare expression like <code className="font-mono">({'{'}a: 1{'}'})</code> is auto-returned; <code className="font-mono">await</code> works.</p>
-        <p><code className="font-mono">console.log</code> is captured (see <code className="font-mono">_logs</code> in output — or <code className="font-mono">_consoleLogs</code> if your data already has <code className="font-mono">_logs</code>).</p>
+        <p><code className="font-mono">console.log</code> is captured (see <code className="font-mono">_logs</code> in output, or <code className="font-mono">_consoleLogs</code> if your data already has <code className="font-mono">_logs</code>).</p>
         <p>No <code className="font-mono">process / require / fetch</code>, 5s timeout, ≤50KB code, ≤500KB output.</p>
       </div>
     </details>

@@ -237,7 +237,7 @@ export default function SynapseOCS() {
 
         <div className="space-y-5">
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-            <Card><p className="text-xs text-normal-text mb-1">Selected bucket</p><p className="font-semibold text-main-text truncate">{selected || '—'}</p></Card>
+            <Card><p className="text-xs text-normal-text mb-1">Selected bucket</p><p className="font-semibold text-main-text truncate">{selected || '–'}</p></Card>
             <Card><p className="text-xs text-normal-text mb-1">Objects</p><StatValue value={current?.objects ?? objects.length} /></Card>
             <Card><p className="text-xs text-normal-text mb-1">Used</p><StatValue value={formatBytes(current?.bytes)} /></Card>
             <Card><p className="text-xs text-normal-text mb-1">Quota</p><StatValue value={current?.quotaBytes ? formatBytes(current.quotaBytes) : 'Tenant'} /></Card>
@@ -280,9 +280,9 @@ export default function SynapseOCS() {
                       </div>
                     </td>
                     <td className="py-3 pr-4 text-normal-text whitespace-nowrap">{formatBytes(object.size)}</td>
-                    <td className="py-3 pr-4 text-normal-text whitespace-nowrap">{object.contentType || '—'}</td>
-                    <td className="py-3 pr-4 text-xs text-normal-text font-mono truncate max-w-[140px]">{object.etag || '—'}</td>
-                    <td className="py-3 pr-4 text-xs text-normal-text whitespace-nowrap">{object.updatedAt ? new Date(object.updatedAt).toLocaleString() : '—'}</td>
+                    <td className="py-3 pr-4 text-normal-text whitespace-nowrap">{object.contentType || '–'}</td>
+                    <td className="py-3 pr-4 text-xs text-normal-text font-mono truncate max-w-[140px]">{object.etag || '–'}</td>
+                    <td className="py-3 pr-4 text-xs text-normal-text whitespace-nowrap">{object.updatedAt ? new Date(object.updatedAt).toLocaleString() : '–'}</td>
                     <td className="py-3">
                       <div className="flex items-center gap-1">
                         <button type="button" className="p-2 rounded-xl hover:bg-slate-100 text-main-blue" onClick={() => downloadObject(object)} aria-label={`Download ${object.key}`}>
