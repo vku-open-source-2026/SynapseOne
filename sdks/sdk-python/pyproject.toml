@@ -31,7 +31,7 @@ Issues = "https://github.com/vku-open-source-2026/SynapseOne/issues"
 
 [project.optional-dependencies]
 # Pin ruff so future default-rule changes cannot break CI unexpectedly.
-dev = ["pytest", "ruff==0.17.0"]
+dev = ["pytest", "ruff==0.17.4"]
 
 [tool.ruff]
 target-version = "py39"
