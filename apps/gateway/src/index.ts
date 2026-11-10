@@ -641,7 +641,13 @@ export function createApp(): express.Express {
   // Sau khi xác thực, gateway XÓA header x-synapseone-* do client gửi (chống spoof) và
   // GHI header từ principal đã verify để upstream tin dùng mà không cần re-verify JWT.
   // Auth endpoints (/v1/auth/*) đi thẳng nhưng vẫn giới hạn brute-force.
-  app.use('/v1/auth/' as any, edgeLimit(120) as any);
+  // /v1/auth/verify is a server-to-server hot path used by Tier-2 for every
+  // request; it is not a password attempt and must not be throttled by the
+  // brute-force bucket.
+  app.use('/v1/auth/' as any, ((req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (req.originalUrl.split('?')[0] === '/v1/auth/verify') return next();
+    return edgeLimit(120)(req, res, next);
+  }) as any);
   app.use(((req: express.Request, res: express.Response, next: express.NextFunction) => {
     const urlPath = req.path; // pathname, không query
     if (urlPath === '/' || urlPath === '/health' || urlPath === '/metrics' || urlPath === '/ready') return next();
