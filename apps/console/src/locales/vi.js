@@ -176,7 +176,7 @@ export const vi = {
     teamLead: 'Những người xây dựng và duy trì SynapseOne (VKU.VIC)',
     partnersTitle: 'Đơn vị đồng hành',
     partnersLead: 'Nhận được sự ủng hộ từ các tổ chức tin tưởng vào mã nguồn mở',
-    partners: { vku: 'Đại học VKU', vic: 'CLB IT VKU' },
+    partners: { vku: 'Đại học VKU', vic: 'CLB IT VKU', olp: 'Đội tuyển OLP-ICPC VKU' },
   },
 
   login: {

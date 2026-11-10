@@ -176,7 +176,7 @@ export const en = {
     teamLead: 'The people who build and maintain SynapseOne (VKU.VIC)',
     partnersTitle: 'Supported by',
     partnersLead: 'Backed by organizations that believe in open source',
-    partners: { vku: 'VKU University', vic: 'VKU IT Club' },
+    partners: { vku: 'VKU University', vic: 'VKU IT Club', olp: 'VKU OLP-ICPC Team' },
   },
 
   login: {

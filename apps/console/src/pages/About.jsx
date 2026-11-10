@@ -48,6 +48,7 @@ const TEAM = [
 const PARTNERS = [
   { key: 'vku', href: 'https://vku.udn.vn', logo: '/vku-logo.svg' },
   { key: 'vic', href: 'https://www.facebook.com/vic.club.vku?locale=vi_VN', logo: '/vic-logo.svg' },
+  { key: 'olp', href: 'https://online.vku.udn.vn/organization/32-vku-olp-icpc-team', logo: '/olp-icpc-logo.svg' },
 ];
 
 const H2 = 'text-2xl font-semibold tracking-tight text-balance';
