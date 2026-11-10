@@ -138,6 +138,11 @@ The release publishes these public images (same names as the Compose services):
 | `synapseone-ocs`, `synapseone-inference` | object storage, LLM/embeddings/decision |
 | `synapseone-postgres`, `synapseone-edge` | Postgres 16 + pgvector/PostGIS, TLS edge |
 
+> If `docker pull` returns `unauthorized`, the GHCR packages have not been
+> switched to public yet. An organization admin must add a `GHCR_PAT` secret
+> (package admin) and run the `packages-public` workflow once; releases also try
+> to flip visibility automatically when that secret exists.
+
 ### 2. Build from source
 
 ```bash

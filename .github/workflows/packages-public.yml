@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 VKU.VIC
+name: packages-public
+
+# GHCR packages are private by default. The release jobs try to flip them with
+# GITHUB_TOKEN, but GitHub only allows that through an organization admin token.
+# Add an org secret named GHCR_PAT (classic: admin:org + write:packages, or
+# fine-grained: Packages write + org admin), then run this workflow once.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  make-public:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Make every Synapse GHCR package public
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::Add an organization secret GHCR_PAT with package admin rights, then re-run this workflow."
+            exit 1
+          fi
+          OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          packages=(
+            synapseone-gateway synapseone-iam synapseone-workflow synapseone-ai
+            synapseone-lds synapseone-base synapseone-faststore synapseone-queue
+            synapseone-stream synapseone-inference synapseone-ocs synapseone-notifications
+            synapseone-console synapseone-postgres synapseone-edge
+            synapsedx/capabilities synapsedx/gateway synapsedx/console
+            synapsecity-city-service synapsecity-gateway synapsecity-console
+            synapsecitysos-sos-service synapsecitysos-gateway synapsecitysos-console
+          )
+          for pkg in "${packages[@]}"; do
+            encoded="${pkg//\//%2F}"
+            if gh api --method PATCH "/orgs/${OWNER}/packages/container/${encoded}" -f visibility=public >/dev/null 2>&1; then
+              echo "public: ${pkg}"
+            else
+              echo "::warning::Could not set ${pkg} public (missing package or insufficient token scope)."
+            fi
+          done
