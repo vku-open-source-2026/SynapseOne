@@ -16,7 +16,7 @@ standard OIDC. Everything else is SynapseOne code, pure Apache-2.0.
 
 - 🌐 **Live demo:** [synapseone.space](https://synapseone.space) · Console: [cloud.synapseone.space](https://cloud.synapseone.space) · API: `https://api.synapseone.space/health`
 - 📦 **Install:** `npm i @synapseone/sdk` · `pip install synapseone-sdk` · `npx @synapseone/cli` · Go SDK via the monorepo (see below)
-- 🚀 **Self-host:** `docker compose up -d --build` (details below)
+- 🚀 **Self-host:** public GHCR images (`docker compose pull`) or build from source (`docker compose up -d --build`) — see [Self-host](#self-host)
 
 ## Why SynapseOne
 
@@ -106,13 +106,57 @@ matrix in `docs/sdk-js.md` for the few intentional differences.
 
 ## Self-host
 
+Two supported paths produce the same stack. Every first-party image is published
+to the public GitHub Container Registry as
+`ghcr.io/vku-open-source-2026/synapseone-<service>:<tag>` (Apache-2.0, no
+registry login needed). Pin a release tag for reproducible deployments, or use
+`latest`.
+
+### 1. Run the published images (recommended)
+
+Requirements: Docker Engine 24+, Docker Compose v2.24+, ~4 GB RAM.
+
 ```bash
-cp .env.example .env   # then replace every *_change_me_* secret
-docker compose up -d --build
-curl localhost:8080/health && curl localhost:4001/health && curl localhost:4002/health
-curl localhost:4005/health && curl localhost:4006/health && curl localhost:4007/health
+git clone https://github.com/vku-open-source-2026/SynapseOne.git
+cd SynapseOne
+cp .env.example .env      # replace every *_change_me_* secret
+export SYNAPSEONE_VERSION=v0.9.0   # or latest
+docker compose pull
+docker compose up -d --no-build
+curl localhost:8080/health && curl localhost:8080/ready
 open http://localhost:3000   # sign in: demo@acme.local / org acme
 ```
+
+The release publishes these public images (same names as the Compose services):
+
+| Images | Purpose |
+|---|---|
+| `synapseone-gateway`, `synapseone-console` | public API edge and admin UI |
+| `synapseone-iam`, `synapseone-workflow`, `synapseone-ai` | identity, workflows, docs assistant |
+| `synapseone-lds`, `synapseone-base`, `synapseone-faststore` | linked data, documents, cache |
+| `synapseone-queue`, `synapseone-stream`, `synapseone-notifications` | messaging, event log, outbox |
+| `synapseone-ocs`, `synapseone-inference` | object storage, LLM/embeddings/decision |
+| `synapseone-postgres`, `synapseone-edge` | Postgres 16 + pgvector/PostGIS, TLS edge |
+
+### 2. Build from source
+
+```bash
+git clone https://github.com/vku-open-source-2026/SynapseOne.git
+cd SynapseOne
+cp .env.example .env      # replace every *_change_me_* secret
+
+# Node 20+ monorepo build (services, SDKs, CLI, Console)
+npm ci
+npm run build
+
+# Build every image locally and start the stack
+docker compose build
+docker compose up -d --no-build
+```
+
+`docker compose up -d --build` combines the last two steps. The previous
+`synapseone/*` image names are replaced by the GHCR names above; a local build
+tags them with the same names so `up` never needs a registry round-trip.
 
 Production (TLS, edge rate limiting, hardened secrets): `docker-compose.prod.yml` +
 `infra/prod/` (nginx + Let's Encrypt via Certbot). Full checklist: `docs/production.md`.
@@ -127,6 +171,10 @@ Production (TLS, edge rate limiting, hardened secrets): `docker-compose.prod.yml
 | Base | `http://localhost:4005` | Internal — SynapseBase documents + mapping (behind gateway in prod) |
 | Faststore | `http://localhost:4006` | Internal — cache/KV/data structures (behind gateway in prod) |
 | Queue | `http://localhost:4007` | Internal — SynapseQueue messaging (behind gateway in prod) |
+| Stream | `http://localhost:4009` | Internal — SynapseStream event log (behind gateway in prod) |
+| OCS | `http://localhost:4010` | Internal — buckets, objects and presigned URLs |
+| Notifications | `http://localhost:4011` | Internal — durable notification outbox |
+| Inference | `http://localhost:4008` | Internal — LLM proxy, embeddings, decision |
 
 ## Architecture
 

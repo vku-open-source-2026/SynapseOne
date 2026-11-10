@@ -6,7 +6,7 @@ services:
   postgres:
     build:
       context: ./infra/postgres
-    image: synapseone/postgres:16-pgvector-postgis
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-postgres:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-synapseone}
@@ -140,7 +140,7 @@ services:
   iam:
     build:
       context: ./apps/iam-service
-    image: synapseone/iam:0.7.0
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-iam:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       PORT: 4001
@@ -185,7 +185,7 @@ services:
   workflow:
     build:
       context: ./apps/workflow-service
-    image: synapseone/workflow:0.7.0
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-workflow:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       PORT: 4002
@@ -222,7 +222,7 @@ services:
   ai:
     build:
       context: ./apps/ai-service
-    image: synapseone/ai:0.7.0
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-ai:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       PORT: 4003
@@ -250,7 +250,7 @@ services:
   lds:
     build:
       context: ./apps/lds-service
-    image: synapseone/lds:0.7.0
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-lds:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       PORT: 4004
@@ -277,7 +277,7 @@ services:
   base:
     build:
       context: ./apps/base-service
-    image: synapseone/base:0.7.0
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-base:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       PORT: 4005
@@ -307,7 +307,7 @@ services:
   faststore:
     build:
       context: ./apps/faststore-service
-    image: synapseone/faststore:0.7.0
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-faststore:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       PORT: 4006
@@ -333,7 +333,7 @@ services:
   queue:
     build:
       context: ./apps/queue-service
-    image: synapseone/queue:0.7.0
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-queue:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       PORT: 4007
@@ -360,7 +360,7 @@ services:
   stream:
     build:
       context: ./apps/stream-service
-    image: synapseone/stream:0.7.0
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-stream:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       PORT: 4009
@@ -387,7 +387,7 @@ services:
   inference:
     build:
       context: ./apps/inference-service
-    image: synapseone/inference:0.7.0
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-inference:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       PORT: 4008
@@ -414,7 +414,7 @@ services:
   ocs:
     build:
       context: ./apps/ocs-service
-    image: synapseone/ocs:0.7.1
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-ocs:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       NODE_ENV: production
@@ -481,7 +481,7 @@ services:
   s3-backup:
     build:
       context: ./apps/ocs-service
-    image: synapseone/ocs:0.7.1
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-ocs:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     entrypoint: ["node", "/app/s3-backup.mjs"]
     command: ["loop"]
@@ -506,7 +506,7 @@ services:
   notifications:
     build:
       context: ./apps/notifications-service
-    image: synapseone/notifications:0.7.0
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-notifications:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       PORT: 4011
@@ -542,7 +542,7 @@ services:
   gateway:
     build:
       context: ./apps/gateway
-    image: synapseone/gateway:0.7.1
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-gateway:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       PORT: 8080
@@ -604,7 +604,7 @@ services:
   console:
     build:
       context: ./apps/console
-    image: synapseone/console:0.7.0
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-console:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       # URL gateway ma TRINH DUYET goi toi (khong phai ten service docker).

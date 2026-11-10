@@ -143,7 +143,7 @@ services:
   nginx:
     build:
       context: ./infra/prod
-    image: synapseone/edge:0.7.1
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-edge:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       DOMAIN: ${DOMAIN:-synapseone.space}

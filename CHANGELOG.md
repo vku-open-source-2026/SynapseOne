@@ -5,6 +5,17 @@ Format based on Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-10
+
+### Added
+- Public GHCR images for every first-party service
+  (`ghcr.io/vku-open-source-2026/synapseone-*`) plus a self-host guide for both
+  `docker compose pull` and building from source. Release tags publish
+  `vX.Y.Z`, `latest` and `sha-<commit>` image tags.
+- Docs now cover every platform service (IAM, Workflow, AI/Inference, LDS,
+  Base, Faststore, Queue, Stream, OCS and Notifications) with quick starts,
+  endpoint tables and the complete overview service map.
+
 ### Security
 - IAM no longer returns `password_hash` (or any `scrypt$…` material) on
   `/v1/auth/login`, `/v1/auth/refresh`, `/v1/auth/me`, `/v1/orgs/:id/users`
