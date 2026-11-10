@@ -5,6 +5,18 @@ Format based on Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Security
+- IAM no longer returns `password_hash` (or any `scrypt$…` material) on
+  `/v1/auth/login`, `/v1/auth/refresh`, `/v1/auth/me`, `/v1/orgs/:id/users`
+  and the OIDC callback. User rows are stripped through `publicUser()` before
+  serialization, and the in-memory `listUsers` path is covered too.
+- Password-reset/verification tokens are now **opt-in**
+  (`IAM_EXPOSE_LIFECYCLE_TOKENS=true`); they were previously on by default in
+  any non-production process. The prod compose overlay pins the flag to `false`
+  and `IS_PROD` also honours `SYNAPSEONE_ENV`/`SYNAPSEDX_ENV`/`APP_ENV`/
+  `ENVIRONMENT`, so a deployment that forgets `NODE_ENV=production` still fails
+  closed instead of echoing reset tokens to unauthenticated callers.
+
 ### Changed: Console public pages and shell
 - Vietnamese/English switch and light/dark/system theme on the public pages, sign-in
   and the console top bar. The choice is saved per browser and applied before first

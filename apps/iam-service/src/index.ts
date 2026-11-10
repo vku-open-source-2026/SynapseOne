@@ -22,7 +22,7 @@ import {
   getRoleById, getPolicyById, getAccountById, accountsForUser, getOrgById,
   policiesForRole, rolesForUser, ensureTables,
   setUserPassword, markEmailVerified, storeOneTimeToken, consumeOneTimeToken,
-  setUserActive, updateUserProfile,
+  setUserActive, updateUserProfile, publicUser,
   setOrgAdmin, orgHasAdmin, assignRoleToServiceAccount, unassignRoleFromServiceAccount, rolesForServiceAccount,
   type User,
 } from './db';
@@ -63,7 +63,18 @@ const VERSION = (() => {
   }
 })();
 
-const IS_PROD = process.env.NODE_ENV === 'production';
+/**
+ * Production detection. `NODE_ENV=production` is the documented switch, but a
+ * deployment that forgets it (the prod compose overlay/Helm values are the only
+ * places that set it) would silently fall back to dev behaviour — including
+ * echoing password-reset/verification tokens in API responses. Accept the
+ * common environment aliases so a live stack fails closed even then.
+ */
+const IS_PROD = (() => {
+  if (process.env.NODE_ENV === 'production') return true;
+  const env = (process.env.SYNAPSEONE_ENV ?? process.env.SYNAPSEDX_ENV ?? process.env.APP_ENV ?? process.env.ENVIRONMENT ?? '').trim().toLowerCase();
+  return env === 'production' || env === 'prod';
+})();
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function isUuid(s: string): boolean { return UUID_RE.test(s || ''); }
 /** Linear-time email sanity check (avoids CodeQL's polynomial-regex alert). */
@@ -284,10 +295,12 @@ export function registrationAllowsNewOrgs(): boolean {
 }
 
 /** Dev-only convenience: return reset/verification tokens in the response
- *  (there is no mailer wired by default). Never enabled in production. */
+ *  (there is no mailer wired by default). Opt-in: a deployment must set
+ *  `IAM_EXPOSE_LIFECYCLE_TOKENS=true` explicitly, so an unset/typo'd env can
+ *  never hand a reset token to an unauthenticated caller. Forced off in prod. */
 export function exposesLifecycleTokens(): boolean {
   if (IS_PROD) return false;
-  return (process.env.IAM_EXPOSE_LIFECYCLE_TOKENS ?? 'true') === 'true';
+  return process.env.IAM_EXPOSE_LIFECYCLE_TOKENS === 'true';
 }
 
 /** Issue an access+refresh pair for a user (login/register/refresh). */
@@ -295,7 +308,7 @@ async function issueSession(user: { id: string; email: string; org_id: string })
   const { token, expiresIn } = signAccess({ sub: user.id, email: user.email, org: user.org_id });
   const rt = newRefreshToken();
   await storeRefresh(user.id, rt.hash, refreshExpiry());
-  return { accessToken: token, expiresIn, refreshToken: rt.value, user };
+  return { accessToken: token, expiresIn, refreshToken: rt.value, user: publicUser(user as User) };
 }
 
 function sendLocked(res: express.Response, seconds: number) {
@@ -766,8 +779,17 @@ async function auditMutation(req: express.Request, action: string, resource: str
   }
 
   // Brute-force guard for credential endpoints (in-memory; edge WAF still required in prod).
-  const authLimiter = rateLimit(60, 60_000);
-  app.use('/v1/auth/', authLimiter as any);
+  const authLimiter = rateLimit(
+    Math.max(1, Number(process.env.IAM_AUTH_RATE_LIMIT_PER_MIN) || 60),
+    60_000,
+  );
+  // `/v1/auth/verify` is a machine-to-machine token check that Tier-2 calls on
+  // every write. Keep the brute-force ceiling for credential endpoints while
+  // letting verification use the internal-service traffic path.
+  app.use('/v1/auth/', ((req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (req.path === '/verify') return next();
+    return authLimiter(req, res, next);
+  }) as any);
   // SCIM is machine-to-machine but still needs a brute-force / abuse ceiling.
   const scimLimiter = rateLimit(120, 60_000);
   app.use('/scim/', scimLimiter as any);
@@ -858,7 +880,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
           const rt = newRefreshToken();
           await storeRefresh(user.id, rt.hash, refreshExpiry());
           noStore(res);
-          return res.json({ accessToken: token, expiresIn, refreshToken: rt.value, user });
+          return res.json({ accessToken: token, expiresIn, refreshToken: rt.value, user: publicUser(user) });
         } catch (e: any) {
           if (e instanceof OidcError) {
             return res.status(e.status).json({ error: e.code, message: e.message });
@@ -893,7 +915,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       const rt = newRefreshToken();
       await storeRefresh(user.id, rt.hash, refreshExpiry());
       noStore(res);
-      res.json({ accessToken: token, expiresIn, refreshToken: rt.value, user });
+      res.json({ accessToken: token, expiresIn, refreshToken: rt.value, user: publicUser(user) });
     } catch (e: any) {
       res.status(500).json({ error: 'oidc_callback_failed', message: e.message });
     }
@@ -1774,7 +1796,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       const decoded: any = verifyAccess(h.slice(7));
       const user = await getUserById(decoded.sub);
       if (!user) return res.status(404).json({ error: 'user_not_found' });
-      res.json({ user, kind: decoded.kind || 'user' });
+      res.json({ user: publicUser(user), kind: decoded.kind || 'user' });
     } catch (e: any) {
       return res.status(401).json({ error: 'invalid_token', message: e.message });
     }
@@ -1875,7 +1897,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
     }
     const created = await upsertUser(req.params.orgId, email, displayName ? sanitizeName(displayName) : undefined);
     await auditMutation(req, 'iam:user:create', `user:${created.id}`, { org: req.params.orgId, email });
-    res.status(201).json(created);
+    res.status(201).json(publicUser(created));
   });
 
   app.get('/v1/orgs/:orgId/users', async (req, res) => {
@@ -2502,7 +2524,8 @@ async function auditMutation(req: express.Request, action: string, resource: str
       const admins = (await listUsers(user.org_id)).filter((u) => u.is_org_admin);
       if (admins.length <= 1) return res.status(409).json({ error: 'last_admin', message: 'an organization needs at least one administrator' });
     }
-    res.json(await setOrgAdmin(user.id, flag));
+    const updated = await setOrgAdmin(user.id, flag);
+    res.json(updated ? publicUser(updated) : { ok: true });
   });
 
   // Lost authenticator: an org administrator removes the user's second

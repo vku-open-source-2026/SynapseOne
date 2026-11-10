@@ -58,7 +58,7 @@ reads which key (audited from source):
 | `OIDC_ISSUER` / `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` / `OIDC_REDIRECT_URI` | see `.env.example` | federated OIDC (Authentik/Keycloak). For SPA login, point `OIDC_REDIRECT_URI` at the Console's `/oidc/callback` page (e.g. `https://cloud.example.com/oidc/callback`) |
 | `IAM_REGISTRATION_ENABLED` | `true` | first-party registration (`POST /v1/auth/register`); set `false` for OIDC-only deployments |
 | `IAM_REGISTRATION_ALLOW_NEW_ORGS` | `true` | self-service creation of a brand-new org on register; joining an existing org always requires an invitation |
-| `IAM_EXPOSE_LIFECYCLE_TOKENS` | `true` (dev) | return reset/verification tokens in API responses when no mailer is wired; forced off in production |
+| `IAM_EXPOSE_LIFECYCLE_TOKENS` | `false` | **opt-in** dev convenience: return reset/verification tokens in API responses when no mailer is wired. Forced off in production (`NODE_ENV=production`, or `SYNAPSEONE_ENV`/`SYNAPSEDX_ENV`/`APP_ENV`/`ENVIRONMENT` = `production`/`prod`) |
 | `IAM_RESET_TOKEN_TTL_SECONDS` / `IAM_VERIFY_TOKEN_TTL_SECONDS` | `3600` / `86400` | single-use token TTLs (clamped) |
 | `OIDC_ALLOWED_ORGS` | — (any slug) | comma-separated org **slugs** allowed through OIDC → `403 org_not_allowed` otherwise. A new slug is self-service (org is created on first login); joining an **existing** org always requires an existing membership (`403 org_membership_required`) |
 

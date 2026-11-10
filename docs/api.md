@@ -45,7 +45,8 @@ tenant. Platform calls without a tenant fail with `400 tenant_required`.
   (`403 org_membership_required` otherwise). Password policy: 12–128 chars.
 - `POST /v1/auth/password/change {currentPassword, newPassword}` → `{ok, revokedSessions}`
 - `POST /v1/auth/password/forgot {email, orgSlug?}` → `202 {ok}` (no account enumeration;
-  dev responses may include `resetToken` when no mailer is configured)
+  responses include `resetToken` only when the deployment opts in with
+  `IAM_EXPOSE_LIFECYCLE_TOKENS=true` outside production)
 - `POST /v1/auth/password/reset {token, newPassword}` → `{ok, revokedSessions}`
 - `POST /v1/auth/email/verify {token}` → `{ok, emailVerified}`
 - `POST /v1/auth/email/verify/request` (Bearer) → `{ok, emailVerificationToken?}`

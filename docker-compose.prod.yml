@@ -24,6 +24,8 @@ services:
       HSTS_ENABLED: "true"
       IAM_ALLOW_DEV_LOGIN: "false"
       IAM_ALLOW_OIDC_DEMO_CALLBACK: "false"
+      # Never echo reset/verification tokens on the public API.
+      IAM_EXPOSE_LIFECYCLE_TOKENS: "false"
     # Unpublish internal API in prod (gateway-only access via docker network).
     # Requires Compose v2.24+ (!reset). Fallback is .env bind 127.0.0.1.
     ports: !reset []

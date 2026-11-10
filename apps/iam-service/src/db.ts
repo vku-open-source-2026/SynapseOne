@@ -126,6 +126,11 @@ function userRow(r: { id: string; orgId: string; email: string; displayName: str
     is_org_admin: !!r.isOrgAdmin,
   };
 }
+/** Strip credential material before a user row is serialized to a client. */
+export function publicUser(user: User): Omit<User, 'password_hash'> {
+  const { password_hash: _ignored, ...rest } = user;
+  return rest;
+}
 function roleRow(r: { id: string; accountId: string; slug: string; description: string | null }): Role {
   return { id: r.id, account_id: r.accountId, slug: r.slug, description: r.description ?? '' };
 }
@@ -429,9 +434,9 @@ export async function listUsers(orgId: string): Promise<User[]> {
       active: schema.users.active,
       isOrgAdmin: schema.users.isOrgAdmin,
     }).from(schema.users).where(eq(schema.users.orgId, orgId)).orderBy(asc(schema.users.email));
-    return rows.map(userRow);
+    return rows.map(userRow).map(publicUser);
   }
-  return [...mem.users.values()].filter((u) => u.org_id === orgId);
+  return [...mem.users.values()].filter((u) => u.org_id === orgId).map(publicUser);
 }
 
 export async function getUserById(id: string): Promise<User | null> {

@@ -13,6 +13,9 @@ import jwt from 'jsonwebtoken';
 import { createApp } from './index';
 import { getJwtSecret, verifyAccess } from './tokens';
 
+// Lifecycle tokens are opt-in; these tests assert the dev/mailer-less flow.
+process.env.IAM_EXPOSE_LIFECYCLE_TOKENS = 'true';
+
 let base = '';
 let server: Server;
 
@@ -69,6 +72,26 @@ describe('first-party credential lifecycle', () => {
     assert.equal(verify.data.emailVerified, true);
     const reused = await call('POST', '/v1/auth/email/verify', { token: reg.emailVerificationToken });
     assert.equal(reused.status, 400);
+  });
+
+  it('never returns password material on auth or user endpoints', async () => {
+    const reg = await register('cred-hash', 'hash@cred.local');
+    const login = await call('POST', '/v1/auth/login', { email: 'hash@cred.local', password: PASSWORD, orgSlug: 'cred-hash' });
+    const me = await call('GET', '/v1/auth/me', undefined, login.data.accessToken);
+    const orgs = await call('GET', '/v1/orgs', undefined, login.data.accessToken);
+    const users = await call('GET', `/v1/orgs/${orgs.data[0].id}/users`, undefined, login.data.accessToken);
+    const invite = await call('POST', `/v1/orgs/${orgs.data[0].id}/users`, { email: 'second@cred.local' }, login.data.accessToken);
+
+    for (const [label, payload] of [
+      ['register', reg],
+      ['login', login.data],
+      ['me', me.data],
+      ['users', users.data],
+      ['invite', invite.data],
+    ] as const) {
+      assert.ok(!JSON.stringify(payload).includes('password_hash'), `${label} leaked password_hash`);
+      assert.ok(!JSON.stringify(payload).includes('scrypt$'), `${label} leaked a password hash`);
+    }
   });
 
   it('requires an invitation to join an existing organization', async () => {
