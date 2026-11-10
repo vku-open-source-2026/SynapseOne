@@ -37,40 +37,51 @@ jobs:
   publish-images:
     runs-on: ubuntu-latest
     needs: release
-    permissions:
-      contents: read
-      packages: write
+    permissions: { packages: write, id-token: write, contents: read }
     steps:
       - uses: actions/checkout@v4
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-      - name: Build every first-party image
+      - uses: docker/setup-buildx-action@v3
+      - uses: sigstore/cosign-installer@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build, attest and push every first-party image
         env:
           OWNER: ${{ github.repository_owner }}
-        run: |
-          set -euo pipefail
-          OWNER="$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')"
-          export SYNAPSEONE_IMAGE_OWNER="$OWNER"
-          export SYNAPSEONE_VERSION=latest
-          docker compose build postgres iam workflow ai lds base faststore queue stream inference ocs notifications gateway console
-          docker build -t "ghcr.io/${OWNER}/synapseone-edge:latest" -f infra/prod/Dockerfile infra/prod
-      - name: Tag and push images
-        env:
           TAG: ${{ github.ref_name }}
-          OWNER: ${{ github.repository_owner }}
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           OWNER="$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')"
-          for svc in postgres iam workflow ai lds base faststore queue stream inference ocs notifications gateway console edge; do
-            local="ghcr.io/${OWNER}/synapseone-${svc}:latest"
-            remote="ghcr.io/${OWNER}/synapseone-${svc}"
-            docker tag "${local}" "${remote}:${TAG}"
-            docker tag "${local}" "${remote}:latest"
-            docker tag "${local}" "${remote}:sha-${SHA}"
-            docker push "${remote}:${TAG}"
-            docker push "${remote}:latest"
-            docker push "${remote}:sha-${SHA}"
+          SEMVER="${TAG#v}"
+          for pair in \
+            "gateway:apps/gateway" "iam:apps/iam-service" "workflow:apps/workflow-service" \
+            "ai:apps/ai-service" "lds:apps/lds-service" "base:apps/base-service" \
+            "faststore:apps/faststore-service" "queue:apps/queue-service" "stream:apps/stream-service" \
+            "inference:apps/inference-service" "ocs:apps/ocs-service" \
+            "notifications:apps/notifications-service" "console:apps/console" \
+            "postgres:infra/postgres" "edge:infra/prod"; do
+            name="${pair%%:*}"
+            context="${pair##*:}"
+            docker buildx build --push --provenance=true --sbom=true \
+              -t "ghcr.io/${OWNER}/synapseone-${name}:${TAG}" \
+              -t "ghcr.io/${OWNER}/synapseone-${name}:${SEMVER}" \
+              -t "ghcr.io/${OWNER}/synapseone-${name}:sha-${SHA}" \
+              -t "ghcr.io/${OWNER}/synapseone-${name}:latest" \
+              "${context}"
+          done
+      - name: Sign images with cosign (keyless)
+        env:
+          OWNER: ${{ github.repository_owner }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          OWNER="$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')"
+          for name in gateway iam workflow ai lds base faststore queue stream inference ocs notifications console postgres edge; do
+            cosign sign --yes "ghcr.io/${OWNER}/synapseone-${name}:${TAG}"
+            cosign sign --yes "ghcr.io/${OWNER}/synapseone-${name}:latest"
           done
       - name: Make GHCR packages public
         continue-on-error: true
@@ -80,11 +91,12 @@ jobs:
         run: |
           set -uo pipefail
           OWNER="$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')"
-          for svc in postgres iam workflow ai lds base faststore queue stream inference ocs notifications gateway console edge; do
-            if ! gh api --method PATCH "/orgs/${OWNER}/packages/container/synapseone-${svc}" -f visibility=public >/dev/null 2>&1; then
-              echo "::warning::Could not set synapseone-${svc} public; set it in GitHub package settings."
+          for name in gateway iam workflow ai lds base faststore queue stream inference ocs notifications console postgres edge; do
+            if ! gh api --method PATCH "/orgs/${OWNER}/packages/container/synapseone-${name}" -f visibility=public >/dev/null 2>&1; then
+              echo "::warning::Could not set synapseone-${name} public; set it in GitHub package settings."
             fi
           done
+
 
   publish-sdk-js:
     runs-on: ubuntu-latest
@@ -148,38 +160,3 @@ jobs:
           packages-dir: sdks/sdk-python/dist/
           verbose: true
           skip-existing: true # re-runs stay green when the version already exists
-
-  publish-images:
-    runs-on: ubuntu-latest
-    needs: release
-    permissions: { packages: write, id-token: write, contents: read }
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: sigstore/cosign-installer@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build, attest and push images
-        run: |
-          set -euo pipefail
-          OWNER="${{ github.repository_owner }}"
-          TAG="${GITHUB_REF_NAME#v}"
-          for pair in "gateway:apps/gateway" "iam:apps/iam-service" "workflow:apps/workflow-service" "console:apps/console"; do
-            name="${pair%%:*}"
-            context="${pair##*:}"
-            docker buildx build --push --provenance=true --sbom=true \
-              -t "ghcr.io/$OWNER/synapseone-$name:$TAG" \
-              -t "ghcr.io/$OWNER/synapseone-$name:latest" \
-              "$context"
-          done
-      - name: Sign images with cosign (keyless)
-        run: |
-          set -euo pipefail
-          OWNER="${{ github.repository_owner }}"
-          TAG="${GITHUB_REF_NAME#v}"
-          for name in gateway iam workflow console; do
-            cosign sign --yes "ghcr.io/$OWNER/synapseone-$name:$TAG"
-          done

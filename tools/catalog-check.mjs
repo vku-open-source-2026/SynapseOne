@@ -32,7 +32,15 @@ const fail = (msg) => {
 const endpoints = jsEntries('apps/console/src/lib/endpoints.js');
 const agentCatalog = jsEntries('apps/ai-service/src/catalog.ts');
 
+// The AI service deliberately does not expose itself (or the inference
+// backend it calls) to the agent: doing so would recurse and burn LLM budget.
+// The Console/API reference still documents them, and the docs check below
+// applies to every catalogue entry.
+const SELF_ENDPOINT = /^\/(?:v1\/ai|v1\/inference)(?:\/|$)/;
+const selfEndpoint = (entry) => SELF_ENDPOINT.test(entry.slice(entry.indexOf(' ') + 1));
+
 for (const e of endpoints) {
+  if (selfEndpoint(e)) continue;
   if (!agentCatalog.has(e)) fail(`in endpoints.js but missing from ai catalog.ts: ${e}`);
 }
 for (const e of agentCatalog) {

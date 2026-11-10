@@ -721,6 +721,25 @@ from telemetry.
 - Retention: sweep every hour, `USAGE_RETENTION_DAYS` (default 30, `0` keeps
   events forever).
 
+## AI assistant and inference (`ai-service:4003`, `inference-service:4008`)
+
+The assistant is guidance-only: it suggests an endpoint and drafts a request,
+but never executes it. Inference is an OpenAI-compatible LLM proxy plus local
+embeddings and Decision-2.0 routing used by the workflow AI nodes.
+
+| Method | Route | Description |
+| --- | --- | --- |
+| POST | `/v1/ai/agent` | Docs assistant: `{question (1..2000), history?}` → endpoint suggestion, path values, body and explanation. Requires `AI_API_KEY`; `503 ai_not_configured` otherwise. |
+| GET | `/v1/inference/health` | LLM/embedding/decision subsystem health. |
+| POST | `/v1/inference/chat/completions` | OpenAI-compatible chat completion; SSE when `stream:true`; supports `tools`, `tool_choice` and `response_format`. |
+| POST | `/v1/inference/embeddings` | Self-hosted embeddings: `{input: string|string[], model?}` → OpenAI-shaped vectors. |
+| POST | `/v1/inference/decision` | Structured evaluation: `{state, questions:{id:{type:"choice"|"noul"|"score", instructions, criteria?}}}`. |
+| POST | `/v1/inference/decision/route` | Semantic router: `{input, choices:{id:description}, instruction?}` → `{best_choice, confidence, probabilities}`. |
+
+The chat proxy is also mounted at `/v1/chat/completions`; the other inference
+handlers accept the `/v1/embeddings` and `/v1/decision*` aliases. The public
+gateway only exposes `/v1/ai` and `/v1/inference` (the aliases stay internal).
+
 ## Health / Metrics
 
 - `GET /health` (each service + gateway)
