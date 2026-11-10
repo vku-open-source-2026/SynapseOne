@@ -174,7 +174,8 @@ API-key traffic of one org share the `org:<id>` namespace and usage attribution 
 
 See `docs/object-storage.md`. Key settings: `STORAGE_BACKEND` (`fs|s3`, required in
 production), `STORAGE_S3_ENDPOINT/BUCKET/REGION/ACCESS_KEY/SECRET_KEY/PATH_STYLE`,
-`STORAGE_FS_ROOT`, `STORAGE_MAX_OBJECT_BYTES` (25 MiB), `STORAGE_TENANT_QUOTA_BYTES`
+`STORAGE_FS_ROOT`, `STORAGE_MAX_OBJECT_BYTES` (25 MiB by default; production
+sets 128 MiB for signed release uploads), `STORAGE_TENANT_QUOTA_BYTES`
 (5 GiB), `STORAGE_ALLOWED_CONTENT_TYPES`.
 
 ## Backups (`pg-backup`, `s3-backup` in docker-compose.yml)
