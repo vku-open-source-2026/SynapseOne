@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 VKU.VIC
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
 import type { Server } from 'http';
 import { createApp } from './index';
 import { warehouseStore } from './duck';
@@ -211,4 +212,82 @@ test('tenants cannot see each other datasets', async () => {
     sql: 'SELECT * FROM city_incidents',
   }, headers('tenant-b'));
   assert.equal(crossQuery.status, 400);
+});
+
+test('stream ETL consumes SynapseStream, inserts rows and acks', async () => {
+  let reads = 0;
+  const fake = createServer((req, res) => {
+    let raw = '';
+    req.on('data', (chunk) => { raw += chunk; });
+    req.on('end', () => {
+      res.setHeader('content-type', 'application/json');
+      if (req.method === 'PUT') {
+        res.statusCode = 201;
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (req.url?.includes('/read')) {
+        reads += 1;
+        const events = reads === 1
+          ? [{ id: '1-0', payload: { ts: '2026-11-11T10:00:00Z', device_id: 'sensor-01', value: 24.5 } }]
+          : [];
+        res.end(JSON.stringify({ events, count: events.length }));
+        return;
+      }
+      if (req.url?.includes('/ack')) {
+        res.end(JSON.stringify({ acked: 1 }));
+        return;
+      }
+      res.statusCode = 404;
+      res.end('{}');
+    });
+  });
+  await new Promise<void>((resolve) => fake.listen(0, '127.0.0.1', () => resolve()));
+  const address = fake.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+  process.env.STREAM_SERVICE_URL = `http://127.0.0.1:${port}`;
+  try {
+    await call('POST', '/v1/warehouse/datasets', {
+      id: 'sensor_readings',
+      name: 'Sensor readings',
+      mode: 'stream',
+      streamTopic: 'iot-sensors',
+      columns: [
+        { name: 'ts', type: 'timestamp' },
+        { name: 'device_id', type: 'string' },
+        { name: 'value', type: 'number' },
+      ],
+    });
+    const job = await call('POST', '/v1/warehouse/jobs', {
+      name: 'Sensor ingest',
+      mode: 'stream',
+      targetDatasetId: 'sensor_readings',
+      streamTopic: 'iot-sensors',
+      batchSize: 10,
+      intervalMs: 100,
+    });
+    assert.equal(job.status, 201);
+
+    let dataset: any = null;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const current = await call('GET', '/v1/warehouse/datasets/sensor_readings');
+      dataset = current.json;
+      if (Number(dataset?.rowCount) >= 1) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(dataset.rowCount, 1);
+
+    const query = await call('POST', '/v1/warehouse/query', {
+      sql: 'SELECT device_id, value FROM sensor_readings',
+    });
+    assert.equal(query.status, 200);
+    assert.equal(query.json.rows[0].device_id, 'sensor-01');
+    assert.equal(query.json.rows[0].value, 24.5);
+
+    await call('POST', `/v1/warehouse/jobs/${job.json.id}/pause`);
+    await call('DELETE', `/v1/warehouse/jobs/${job.json.id}`);
+  } finally {
+    delete process.env.STREAM_SERVICE_URL;
+    await new Promise<void>((resolve) => fake.close(() => resolve()));
+  }
 });
