@@ -2231,6 +2231,30 @@ const SYNAPSEONE_API = {
     },
     hint: 'SynapseQueue: reliable message queue with delayed delivery and receipts',
   },
+  stream: {
+    ops: ['list-topics', 'ensure-group', 'consume', 'ack', 'publish'],
+    fields: {
+      'list-topics': [],
+      'ensure-group': ['topic', 'group'],
+      consume: ['topic', 'group'],
+      ack: ['topic', 'group'],
+      publish: ['topic'],
+    },
+    hint: 'SynapseStream: consumer groups, micro-batch consume + ack',
+  },
+  warehouse: {
+    ops: ['list-datasets', 'create-dataset', 'ingest', 'query', 'run-batch', 'ensure-stream', 'list-jobs'],
+    fields: {
+      'list-datasets': [],
+      'create-dataset': ['name'],
+      ingest: ['datasetId'],
+      query: ['sql'],
+      'run-batch': ['targetDatasetId', 'sql'],
+      'ensure-stream': ['targetDatasetId', 'streamTopic'],
+      'list-jobs': [],
+    },
+    hint: 'Synapse Warehouse: OLAP SQL, batch ETL and stream ingestion jobs',
+  },
   inference: {
     ops: ['chat', 'embeddings', 'decision', 'route'],
     fields: {
