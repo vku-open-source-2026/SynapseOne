@@ -1088,6 +1088,8 @@ export const SYNAPSEONE_API_RESOURCES: Record<string, string[]> = {
   base: ['list-collections', 'create-document', 'get-document', 'query-documents', 'delete-document', 'vector-search'],
   faststore: ['get', 'set', 'incr', 'delete', 'hash-get', 'hash-set'],
   queue: ['list', 'publish', 'consume', 'ack'],
+  stream: ['list-topics', 'publish', 'ensure-group', 'consume', 'ack'],
+  warehouse: ['list-datasets', 'create-dataset', 'ingest', 'query', 'run-batch', 'ensure-stream', 'list-jobs'],
   inference: ['chat', 'embeddings', 'decision', 'route'],
 };
 
@@ -1119,6 +1121,15 @@ const SYNAPSEONE_API_REQUIRED: Record<string, string[]> = {
   'queue.publish': ['queue', 'payload'],
   'queue.consume': ['queue'],
   'queue.ack': ['queue', 'receipt'],
+  'stream.ensure-group': ['topic', 'group'],
+  'stream.consume': ['topic', 'group'],
+  'stream.ack': ['topic', 'group', 'ids'],
+  'stream.publish': ['topic', 'payload'],
+  'warehouse.create-dataset': ['name', 'columns'],
+  'warehouse.ingest': ['datasetId', 'rows'],
+  'warehouse.query': ['sql'],
+  'warehouse.run-batch': ['targetDatasetId', 'sql'],
+  'warehouse.ensure-stream': ['targetDatasetId', 'streamTopic'],
   'inference.chat': ['messages'],
   'inference.embeddings': ['input'],
   'inference.decision': ['state', 'questions'],
@@ -1268,6 +1279,18 @@ async function execSynapseOne(node: EngineNode, input: any, ctx?: { principal?: 
       }
       continue;
     }
+    if (resource === 'warehouse' && operation === 'ingest' && f === 'rows') {
+      if (!Array.isArray((args as any).rows)) {
+        throw new Error("synapseone.api: warehouse.ingest needs an array 'rows'");
+      }
+      continue;
+    }
+    if (resource === 'stream' && operation === 'ack' && f === 'ids') {
+      if (!Array.isArray((args as any).ids)) {
+        throw new Error("synapseone.api: stream.ack needs an array 'ids'");
+      }
+      continue;
+    }
     const v = (args as any)[f];
     if (v === undefined || v === null || String(v).trim() === '') {
       throw new Error(`synapseone.api: '${resource}.${operation}' needs '${f}' (put it in input or use ={{ $json.${f} }})`);
@@ -1292,6 +1315,10 @@ async function execSynapseOne(node: EngineNode, input: any, ctx?: { principal?: 
   const out = await ctx.synapseoneCall(resource, operation, args, ctx.principal);
   if (safeJsonSize(out) > MAX_OUTPUT_BYTES) throw new Error('synapseone.api: response exceeds 500KB');
   if (resource === 'base' && operation === 'vector-search' && out && typeof out === 'object' && !Array.isArray(out) && input && typeof input === 'object' && !Array.isArray(input)) {
+    return { ...clone(input), ...clone(out) };
+  }
+  if (resource === 'warehouse' && operation === 'ingest' && out && typeof out === 'object' && !Array.isArray(out) && input && typeof input === 'object' && !Array.isArray(input)) {
+    // Keep the consumed stream batch available for a follow-up stream.ack.
     return { ...clone(input), ...clone(out) };
   }
   return clone(out);

@@ -21,6 +21,7 @@
     "dev:faststore": "npm run dev --workspace=apps/faststore-service",
     "dev:queue": "npm run dev --workspace=apps/queue-service",
     "dev:stream": "npm run dev --workspace=apps/stream-service",
+    "dev:warehouse": "npm run dev --workspace=apps/warehouse-service",
     "dev:inference": "cd apps/inference-service && (.venv/bin/uvicorn src.main:app --port 4008 --reload || uvicorn src.main:app --port 4008 --reload)",
     "test:inference": "node tools/run-inference-tests.cjs",
     "test:sdk-go": "docker run --rm -v $(pwd)/sdks/sdk-go:/sdk -w /sdk golang:1.22-alpine go test -v ./...",

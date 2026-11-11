@@ -5,6 +5,27 @@ Format based on Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added
+- **Synapse Warehouse** (`apps/warehouse-service`, `/v1/warehouse`): tenant-scoped
+  DuckDB OLAP datasets, read-only SQL with file/DDL blocking, batch SQL
+  transforms, SynapseStream-driven stream ETL jobs, ETL templates and a
+  TypeScript SDK namespace (`client.warehouse`).
+- SynapseFlow ETL templates: `etl-batch-warehouse`,
+  `etl-stream-warehouse` and `etl-stream-microbatch` (consume -> ingest -> ack
+  with at-least-once semantics).
+
+### Changed
+- Inference service now runs embeddings on ONNX Runtime int8 by default
+  (AVX-512 VNNI / AVX2 / ARM64 graphs), with PyTorch and deterministic mock
+  fallbacks. CPU PyTorch is installed by default for the 0.8B Decision-2.0
+  model (`INSTALL_TORCH=0` drops it); added CPU thread pinning, model-load
+  backoff, build-time graph prefetch, and a real OpenRouter fallback model.
+- Enabled the real Decision-2.0 model end to end: fixed the loader (the bundled
+  runtime rejects `torch_dtype`), pass `device`/`threads`, unwrap
+  `system_one`'s `{"answers": ...}`, and normalise native `choice`/`noul`/`score`
+  fields to the existing `best_choice`/`answer` API contract. The 0.8B model is
+  FP32 on CPU (~3.6 GB RSS); use `DECISION_ENABLED=false` on small nodes.
+
 ## [0.9.0] - 2026-11-10
 
 ### Added

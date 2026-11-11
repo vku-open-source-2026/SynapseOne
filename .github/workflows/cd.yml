@@ -82,11 +82,12 @@ jobs:
         run: |
           OWNER="${{ github.repository_owner }}"
           SHA="${{ steps.ver.outputs.sha }}"
-          for SVC in gateway iam workflow console; do
+          for SVC in gateway iam workflow warehouse console; do
             case "$SVC" in
               gateway) CTX=apps/gateway ;;
               iam) CTX=apps/iam-service ;;
               workflow) CTX=apps/workflow-service ;;
+              warehouse) CTX=apps/warehouse-service ;;
               console) CTX=apps/console ;;
             esac
             docker build -t "ghcr.io/$OWNER/synapseone-$SVC:main" -t "ghcr.io/$OWNER/synapseone-$SVC:main-$SHA" "$CTX"

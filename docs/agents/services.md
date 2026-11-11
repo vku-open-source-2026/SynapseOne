@@ -372,6 +372,33 @@ stays server-side. Output is validated against the catalog and fails closed
 
 ---
 
+## Warehouse — `apps/warehouse-service` (:4012, TypeScript)
+
+**Purpose:** Tier-1 OLAP store behind the gateway's `/v1/warehouse` route.
+Tenant-scoped DuckDB databases hold datasets, SQL query results and ETL jobs.
+Batch jobs transform one dataset into another; stream jobs consume a
+SynapseStream topic and append event payloads to a dataset.
+
+**Files:** `src/index.ts` (Express + stream workers), `src/duck.ts` (tenant
+store and metadata), `src/sql.ts` (identifier/SQL safety), `src/types.ts`;
+tests in `src/index.test.ts`.
+
+**API:** `GET /health`; datasets (`GET/POST /v1/warehouse/datasets`,
+`GET/DELETE /v1/warehouse/datasets/:id`, `POST .../rows`), read-only SQL
+(`POST /v1/warehouse/query`), ETL templates (`GET /v1/warehouse/templates`)
+and jobs (`GET/POST /v1/warehouse/jobs`, `POST .../:id/run|pause|resume`,
+`DELETE .../:id`).
+
+**Invariants:** one DuckDB file per tenant (`WAREHOUSE_DATA_DIR`); every SQL
+statement is a single read-only `SELECT`/`WITH` with file/DDL functions denied;
+dataset ids are lower-case slugs and physical table names; stream jobs are
+single-writer (`replicas: 1`).
+
+**Env:** `PORT`, `WAREHOUSE_DATA_DIR`, `WAREHOUSE_THREADS`,
+`STREAM_SERVICE_URL`, `SYNAPSEONE_INTERNAL_SECRET`, `CORS_ORIGIN`.
+
+---
+
 ## Inference — `apps/inference-service` (:4008, Python)
 
 **Purpose:** multi-model runtime behind the gateway's `/v1/inference` route.
@@ -386,8 +413,10 @@ stays server-side. Output is validated against the catalog and fails closed
 at `/docs`.
 
 **Models/defaults:** OpenRouter-compatible LLM (default
-`liquid/lfm-2.5-2.6b:free`), sentence-transformers `all-MiniLM-L6-v2`
-(384-dim), Decision-2.0-Eos-0.8B. Device auto-detected.
+`liquid/lfm-2.5-2.6b:free`) with a fallback model, sentence-transformers
+`all-MiniLM-L6-v2` (384-dim, ONNX int8 on CPU, torch/mock fallbacks), and
+Decision-2.0-Eos-0.8B (FP32 CPU, ~3 GB RAM; `DECISION_ENABLED=false` disables).
+Device auto-detected.
 
 **Rules:** `/v1/*` requires `x-synapseone-internal` when configured; production
 requires the secret. Not tenant-aware — callers must not send tenant data.
@@ -396,7 +425,11 @@ No auth beyond the internal secret.
 **Env:** `PORT`, `OPENROUTER_BASE_URL`, `OPENROUTER_API_KEY`,
 `OPENROUTER_MODEL`, `OPENROUTER_FALLBACK_MODEL`, `OPENROUTER_TIMEOUT_MS`,
 `OPENROUTER_RETRIES`, `EMBEDDING_MODEL_NAME`, `EMBEDDING_DIM`,
-`DECISION_MODEL_NAME`, `INFERENCE_DEVICE`, `INFERENCE_MOCK_MODELS`,
+`EMBEDDING_BACKEND`, `EMBEDDING_ONNX_PATH`, `EMBEDDING_ONNX_FILE`,
+`EMBEDDING_BATCH_SIZE`, `EMBEDDING_MAX_LENGTH`, `DECISION_MODEL_NAME`,
+`DECISION_ENABLED`, `DECISION_THREADS`, `DECISION_WARMUP`, `INFERENCE_DEVICE`,
+`INFERENCE_CPU_THREADS`, `INFERENCE_MODEL_DOWNLOAD`, `INFERENCE_WARMUP`,
+`MODEL_LOAD_RETRY_SECONDS`, `INFERENCE_MOCK_MODELS`,
 `SYNAPSEONE_INTERNAL_SECRET`.
 
 ---

@@ -60,6 +60,7 @@ jobs:
             "gateway:apps/gateway" "iam:apps/iam-service" "workflow:apps/workflow-service" \
             "ai:apps/ai-service" "lds:apps/lds-service" "base:apps/base-service" \
             "faststore:apps/faststore-service" "queue:apps/queue-service" "stream:apps/stream-service" \
+            "warehouse:apps/warehouse-service" \
             "inference:apps/inference-service" "ocs:apps/ocs-service" \
             "notifications:apps/notifications-service" "console:apps/console" \
             "postgres:infra/postgres" "edge:infra/prod"; do

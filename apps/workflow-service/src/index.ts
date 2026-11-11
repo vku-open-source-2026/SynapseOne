@@ -266,6 +266,154 @@ export const synapseoneCall: SynapseOneCall = async (resource, operation, args, 
     }
   }
 
+  // Synapse Warehouse (OLAP + ETL)
+  if (resource === 'warehouse') {
+    const WAREHOUSE_BASE = (process.env.WAREHOUSE_SERVICE_URL || 'http://warehouse:4012').replace(/\/$/, '');
+    const INTERNAL = process.env.SYNAPSEONE_INTERNAL_SECRET || '';
+    const ctl = new AbortController();
+    const to = setTimeout(() => ctl.abort(), 30000);
+    try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (INTERNAL) headers['x-synapseone-internal'] = INTERNAL;
+      if (principal?.sub) {
+        headers['X-SynapseOne-Kind'] = String(principal.kind || 'user');
+        headers['X-SynapseOne-User'] = String(principal.sub);
+        if (principal.org) headers['X-SynapseOne-Org'] = String(principal.org);
+        if (principal.account) headers['X-SynapseOne-Account'] = String(principal.account);
+      }
+      let method = 'GET';
+      let path = '';
+      let body: any;
+      if (operation === 'list-datasets') {
+        path = '/v1/warehouse/datasets';
+      } else if (operation === 'list-jobs') {
+        path = '/v1/warehouse/jobs';
+      } else if (operation === 'create-dataset') {
+        method = 'POST';
+        path = '/v1/warehouse/datasets';
+        body = {
+          id: a.id,
+          name: a.name,
+          description: a.description,
+          columns: a.columns,
+          mode: a.mode,
+          streamTopic: a.streamTopic,
+        };
+      } else if (operation === 'ingest') {
+        method = 'POST';
+        path = `/v1/warehouse/datasets/${encodeURIComponent(cleanId(a.datasetId, 'datasetId', 64))}/rows`;
+        if (!Array.isArray(a.rows) || !a.rows.length) {
+          // An empty micro-batch is a normal result; keep the flow moving so
+          // the following stream.ack can complete with zero ids.
+          return { ok: true, inserted: 0 };
+        }
+        body = { rows: a.rows };
+      } else if (operation === 'query') {
+        method = 'POST';
+        path = '/v1/warehouse/query';
+        body = { sql: a.sql, limit: a.limit };
+      } else if (operation === 'run-batch') {
+        method = 'POST';
+        path = '/v1/warehouse/etl/batch';
+        body = {
+          targetDatasetId: a.targetDatasetId,
+          sql: a.sql,
+          writeMode: a.writeMode,
+          name: a.name,
+        };
+      } else if (operation === 'ensure-stream') {
+        method = 'POST';
+        path = '/v1/warehouse/etl/stream';
+        body = {
+          targetDatasetId: a.targetDatasetId,
+          streamTopic: a.streamTopic,
+          streamGroup: a.streamGroup,
+          name: a.name,
+          batchSize: a.batchSize,
+          intervalMs: a.intervalMs,
+        };
+      } else {
+        throw new Error(`synapseone.api: unsupported call 'warehouse.${operation}'`);
+      }
+      const r = await fetch(`${WAREHOUSE_BASE}${path}`, {
+        method, headers, signal: ctl.signal,
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      const text = await r.text();
+      let parsed: any = text;
+      try { parsed = text ? JSON.parse(text) : null; } catch { /* keep text */ }
+      if (!r.ok) {
+        const detail = parsed && typeof parsed === 'object' ? (parsed.error || parsed.message || '') : '';
+        throw new Error(`synapseone.api: warehouse.${operation} -> ${r.status}${detail ? ` (${String(detail).slice(0, 160)})` : ''}`);
+      }
+      return parsed;
+    } catch (e: any) {
+      if (e?.name === 'AbortError') throw new Error('synapseone.api: Synapse Warehouse timed out after 30000ms');
+      throw e instanceof Error ? e : new Error(String(e));
+    } finally {
+      clearTimeout(to);
+    }
+  }
+
+  // SynapseStream (micro-batch ETL templates)
+  if (resource === 'stream') {
+    const STREAM_BASE = (process.env.STREAM_SERVICE_URL || 'http://stream:4009').replace(/\/$/, '');
+    const INTERNAL = process.env.SYNAPSEONE_INTERNAL_SECRET || '';
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (INTERNAL) headers['x-synapseone-internal'] = INTERNAL;
+    if (principal?.sub) {
+      headers['X-SynapseOne-Kind'] = String(principal.kind || 'user');
+      headers['X-SynapseOne-User'] = String(principal.sub);
+      if (principal.org) headers['X-SynapseOne-Org'] = String(principal.org);
+      if (principal.account) headers['X-SynapseOne-Account'] = String(principal.account);
+    } else {
+      headers['X-SynapseOne-Tenant'] = 'platform';
+    }
+    const callStream = async (method: string, path: string, body?: any, allowConflict = false): Promise<any> => {
+      const r = await fetch(`${STREAM_BASE}${path}`, {
+        method, headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      const text = await r.text();
+      let parsed: any = text;
+      try { parsed = text ? JSON.parse(text) : null; } catch { /* keep text */ }
+      if (!r.ok && !(allowConflict && r.status === 409)) {
+        const detail = parsed && typeof parsed === 'object' ? (parsed.error || parsed.message || '') : '';
+        throw new Error(`synapseone.api: stream.${operation} -> ${r.status}${detail ? ` (${String(detail).slice(0, 160)})` : ''}`);
+      }
+      return parsed;
+    };
+    if (operation === 'list-topics') return callStream('GET', '/v1/stream/topics');
+    const topic = cleanId(a.topic, 'topic', 64);
+    if (operation === 'publish') {      return callStream('POST', `/v1/stream/topics/${encodeURIComponent(topic)}/events`, {
+        payload: a.payload, key: a.key, headers: a.headers,
+      });
+    }
+    const group = cleanId(a.group, 'group', 128);
+    if (operation === 'ensure-group') {
+      await callStream('PUT', `/v1/stream/topics/${encodeURIComponent(topic)}`, {}, true);
+      const created = await callStream('PUT', `/v1/stream/topics/${encodeURIComponent(topic)}/groups/${encodeURIComponent(group)}`, {
+        startId: a.startId !== undefined ? a.startId : '0',
+      }, true);
+      return created || { topic, group, startId: a.startId || '0' };
+    }
+    if (operation === 'consume') {
+      return callStream('POST', `/v1/stream/topics/${encodeURIComponent(topic)}/groups/${encodeURIComponent(group)}/read`, {
+        consumer: a.consumer || 'synapseflow',
+        count: Math.min(Math.max(Number(a.count) || 50, 1), 100),
+        blockMs: a.blockMs,
+      });
+    }
+    if (operation === 'ack') {
+      if (!Array.isArray(a.ids)) {
+        throw new Error("synapseone.api: stream.ack needs an array 'ids'");
+      }
+      if (!a.ids.length) return { acked: 0 };
+      return callStream('POST', `/v1/stream/topics/${encodeURIComponent(topic)}/groups/${encodeURIComponent(group)}/ack`, { ids: a.ids });
+    }
+    throw new Error(`synapseone.api: unsupported call 'stream.${operation}'`);
+  }
+
   // Base service
   if (resource === 'base') {
     const BASE_BASE = (process.env.BASE_SERVICE_URL || 'http://base:4005').replace(/\/$/, '');
@@ -2298,6 +2446,9 @@ export function listTemplates() {
     { name: 'ai-triage-ops', description: 'AI triage showcase: webhook -> Decision (4 routes) -> 3 AI Agents with canvas Tools/Model sockets + Base/Faststore/IAM/HTTP tools -> aggregate -> escalation queue' },
     { name: 'customer-360-orchestrator', description: 'Customer 360 showcase: webhook -> Decision (4 routes) -> AI SRE agent + canvas Tools/Model sockets -> Base/Faststore/IAM/LDS/Queue/Flow integrations -> fan-out/fan-in -> risk gate' },
     { name: 'vector-rag-orchestrator', description: 'Enterprise RAG triage: webhook -> Base vector search -> Decision (multi-route) -> AI Agent with vector tools -> Faststore cache -> Queue escalation' },
+    { name: 'etl-batch-warehouse', description: 'Manual/cron ETL: run a warehouse SQL transform into a target dataset (daily rollup template)' },
+    { name: 'etl-stream-warehouse', description: 'Manual: ensure a SynapseStream topic consumer job that appends events to a warehouse dataset' },
+    { name: 'etl-stream-microbatch', description: 'Manual: consume a SynapseStream micro-batch -> warehouse ingest -> ack (at-least-once)' },
   ];
 }
 
@@ -2899,6 +3050,114 @@ export function buildTemplate(name: string, workflowName?: string): any | null {
         AgentFormat: { main: [[edge('CacheResult'), edge('FinalSummary')]] },
         EscalateQueue: { main: [[edge('EscalateFormat')]] },
         EscalateFormat: { main: [[edge('CacheResult'), edge('FinalSummary')]] },
+      },
+    };
+  }
+  if (name === 'etl-batch-warehouse') {
+    return {
+      name: wname,
+      nodes: [
+        { id: wid(), name: 'Manual', type: 'n8n-nodes-base.manualTrigger', typeVersion: 1, position: [200, 300], parameters: {} },
+        {
+          id: wid(), name: 'WarehouseETL', type: 'synapseone.api', typeVersion: 1, position: [460, 300],
+          parameters: {
+            resource: 'warehouse',
+            operation: 'run-batch',
+            input: {
+              targetDatasetId: 'city_daily',
+              writeMode: 'replace',
+              name: 'Daily incident rollup',
+              sql: "SELECT date_trunc('day', ts) AS day, category, count(*) AS events FROM city_incidents GROUP BY 1, 2 ORDER BY 1 DESC",
+            },
+          },
+        },
+        { id: wid(), name: 'Summary', type: 'n8n-nodes-base.noOp', typeVersion: 1, position: [720, 300], parameters: {} },
+      ],
+      connections: {
+        Manual: { main: [[{ node: 'WarehouseETL', type: 'main', index: 0 }]] },
+        WarehouseETL: { main: [[{ node: 'Summary', type: 'main', index: 0 }]] },
+      },
+    };
+  }
+  if (name === 'etl-stream-warehouse') {
+    return {
+      name: wname,
+      nodes: [
+        { id: wid(), name: 'Manual', type: 'n8n-nodes-base.manualTrigger', typeVersion: 1, position: [200, 300], parameters: {} },
+        {
+          id: wid(), name: 'EnsureStreamJob', type: 'synapseone.api', typeVersion: 1, position: [460, 300],
+          parameters: {
+            resource: 'warehouse',
+            operation: 'ensure-stream',
+            input: {
+              name: 'sensor-stream-ingest',
+              targetDatasetId: 'sensor_readings',
+              streamTopic: 'iot-sensors',
+              batchSize: 100,
+              intervalMs: 1000,
+            },
+          },
+        },
+        { id: wid(), name: 'Summary', type: 'n8n-nodes-base.noOp', typeVersion: 1, position: [720, 300], parameters: {} },
+      ],
+      connections: {
+        Manual: { main: [[{ node: 'EnsureStreamJob', type: 'main', index: 0 }]] },
+        EnsureStreamJob: { main: [[{ node: 'Summary', type: 'main', index: 0 }]] },
+      },
+    };
+  }
+  if (name === 'etl-stream-microbatch') {
+    return {
+      name: wname,
+      nodes: [
+        { id: wid(), name: 'Manual', type: 'n8n-nodes-base.manualTrigger', typeVersion: 1, position: [200, 300], parameters: {} },
+        {
+          id: wid(), name: 'EnsureGroup', type: 'synapseone.api', typeVersion: 1, position: [380, 300],
+          parameters: {
+            resource: 'stream',
+            operation: 'ensure-group',
+            input: { topic: 'iot-sensors', group: 'warehouse-microbatch', startId: '0' },
+          },
+        },
+        {
+          id: wid(), name: 'Consume', type: 'synapseone.api', typeVersion: 1, position: [560, 300],
+          parameters: {
+            resource: 'stream',
+            operation: 'consume',
+            input: { topic: 'iot-sensors', group: 'warehouse-microbatch', count: 50, consumer: 'synapseflow-etl' },
+          },
+        },
+        {
+          id: wid(), name: 'Ingest', type: 'synapseone.api', typeVersion: 1, position: [740, 300],
+          parameters: {
+            resource: 'warehouse',
+            operation: 'ingest',
+            input: {
+              datasetId: 'sensor_readings',
+              rows: '={{ $json.events.map((event) => event.payload) }}',
+            },
+          },
+        },
+        {
+          id: wid(), name: 'Ack', type: 'synapseone.api', typeVersion: 1, position: [920, 300],
+          parameters: {
+            resource: 'stream',
+            operation: 'ack',
+            input: {
+              topic: 'iot-sensors',
+              group: 'warehouse-microbatch',
+              ids: '={{ $json.events.map((event) => event.id) }}',
+            },
+          },
+        },
+        { id: wid(), name: 'Summary', type: 'n8n-nodes-base.noOp', typeVersion: 1, position: [1100, 300], parameters: {} },
+      ],
+      connections: {
+        Manual: { main: [[{ node: 'EnsureGroup', type: 'main', index: 0 }]] },
+        EnsureGroup: { main: [[{ node: 'Consume', type: 'main', index: 0 }]] },
+        Consume: { main: [[{ node: 'Ingest', type: 'main', index: 0 }]] },
+        Ingest: { main: [[{ node: 'Ack', type: 'main', index: 0 }]] },
+        Ack: { main: [[{ node: 'Summary', type: 'main', index: 0 }]] },
       },
     };
   }

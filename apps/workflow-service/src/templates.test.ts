@@ -29,6 +29,15 @@ describe('workflow templates', () => {
       assert.ok(def.connections, t.name);
     }
   });
+  it('ships warehouse ETL templates (batch + stream)', () => {
+    const batch: any = buildTemplate('etl-batch-warehouse');
+    assert.ok(batch.nodes.some((node: any) => node.type === 'synapseone.api' && node.parameters.operation === 'run-batch'));
+    const micro: any = buildTemplate('etl-stream-microbatch');
+    assert.ok(micro.nodes.some((node: any) => node.parameters.operation === 'consume'));
+    assert.ok(micro.nodes.some((node: any) => node.parameters.operation === 'ack'));
+    const stream: any = buildTemplate('etl-stream-warehouse');
+    assert.ok(stream.nodes.some((node: any) => node.parameters.operation === 'ensure-stream'));
+  });
   it('unknown template returns null', () => {
     assert.equal(buildTemplate('nope'), null);
   });

@@ -135,6 +135,14 @@ routes:
     service: inference
     actions:
       - { method: POST, path: /v1/inference/*, action: inference:Invoke }
+
+  - path: /v1/warehouse
+    target: ${WAREHOUSE_SERVICE_URL:http://warehouse:4012}
+    auth: either
+    service: warehouse
+    actions:
+      - { method: POST, path: /v1/warehouse/query, action: warehouse:Read }
+      - { method: GET, path: /v1/warehouse/*, action: warehouse:Read }
     timeoutMs: 120000
 
   # SynapseLDS — linked data service (NGSI-LD datasources + licensed exports).

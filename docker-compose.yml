@@ -384,9 +384,42 @@ services:
         condition: service_healthy
     networks: [synapseone-net]
 
+  warehouse:
+    build:
+      context: ./apps/warehouse-service
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-warehouse:${SYNAPSEONE_VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      PORT: 4012
+      NODE_ENV: production
+      WAREHOUSE_DATA_DIR: /data/warehouse
+      WAREHOUSE_THREADS: ${WAREHOUSE_THREADS:-2}
+      STREAM_SERVICE_URL: ${STREAM_SERVICE_URL:-http://stream:4009}
+      SYNAPSEONE_INTERNAL_SECRET: ${SYNAPSEONE_INTERNAL_SECRET:-${SYNAPSEDX_INTERNAL_SECRET:-}}
+      CORS_ORIGIN: ${CORS_ORIGIN:-}
+    volumes:
+      - warehousedata:/data/warehouse
+    ports:
+      - "${WAREHOUSE_SERVICE_HOST_PORT:-127.0.0.1:4012}:4012"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:4012/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      stream:
+        condition: service_healthy
+    networks: [synapseone-net]
+
   inference:
     build:
       context: ./apps/inference-service
+      args:
+        INSTALL_MODELS: ${INFERENCE_INSTALL_MODELS:-1}
+        INSTALL_TORCH: ${INFERENCE_INSTALL_TORCH:-1}
+        PREFETCH_EMBEDDING: ${INFERENCE_PREFETCH_EMBEDDING:-1}
+        PREFETCH_DECISION: ${INFERENCE_PREFETCH_DECISION:-0}
     image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-inference:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
@@ -398,8 +431,20 @@ services:
       OPENROUTER_FALLBACK_MODEL: ${OPENROUTER_FALLBACK_MODEL:-${AI_LLM_FALLBACK_MODEL:-inception/mercury-2.5}}
       OPENROUTER_TIMEOUT_MS: ${OPENROUTER_TIMEOUT_MS:-30000}
       EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-sentence-transformers/all-MiniLM-L6-v2}
+      EMBEDDING_BACKEND: ${EMBEDDING_BACKEND:-auto}
+      EMBEDDING_ONNX_PATH: ${EMBEDDING_ONNX_PATH:-}
+      EMBEDDING_ONNX_FILE: ${EMBEDDING_ONNX_FILE:-}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-32}
+      EMBEDDING_MAX_LENGTH: ${EMBEDDING_MAX_LENGTH:-256}
       DECISION_MODEL_NAME: ${DECISION_MODEL_NAME:-vllm-sr/Decision-2.0-Eos-0.8B}
+      DECISION_ENABLED: ${DECISION_ENABLED:-true}
+      DECISION_THREADS: ${DECISION_THREADS:-0}
+      DECISION_WARMUP: ${DECISION_WARMUP:-true}
       INFERENCE_DEVICE: ${INFERENCE_DEVICE:-auto}
+      INFERENCE_CPU_THREADS: ${INFERENCE_CPU_THREADS:-0}
+      INFERENCE_MODEL_DOWNLOAD: ${INFERENCE_MODEL_DOWNLOAD:-true}
+      INFERENCE_WARMUP: ${INFERENCE_WARMUP:-true}
+      MODEL_LOAD_RETRY_SECONDS: ${MODEL_LOAD_RETRY_SECONDS:-300}
       SYNAPSEONE_INTERNAL_SECRET: ${SYNAPSEONE_INTERNAL_SECRET:-${SYNAPSEDX_INTERNAL_SECRET:-}}
     ports:
       - "${INFERENCE_HOST_PORT:-127.0.0.1:4008}:4008"
@@ -555,6 +600,7 @@ services:
       FASTSTORE_SERVICE_URL: ${FASTSTORE_SERVICE_URL:-http://faststore:4006}
       QUEUE_SERVICE_URL: ${QUEUE_SERVICE_URL:-http://queue:4007}
       STREAM_SERVICE_URL: ${STREAM_SERVICE_URL:-http://stream:4009}
+      WAREHOUSE_SERVICE_URL: ${WAREHOUSE_SERVICE_URL:-http://warehouse:4012}
       STORAGE_SERVICE_URL: ${STORAGE_SERVICE_URL:-http://ocs:4010}
       OCS_SERVICE_URL: ${OCS_SERVICE_URL:-http://ocs:4010}
       NOTIFICATIONS_SERVICE_URL: ${NOTIFICATIONS_SERVICE_URL:-http://notifications:4011}
@@ -592,6 +638,8 @@ services:
       queue:
         condition: service_healthy
       stream:
+        condition: service_healthy
+      warehouse:
         condition: service_healthy
       ocs:
         condition: service_healthy
@@ -666,6 +714,7 @@ volumes:
   pgdata:
   redisdata:
   storagedata:
+  warehousedata:
   pgbackups:
   s3backups:
   prometheusdata:

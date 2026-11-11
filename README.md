@@ -30,6 +30,7 @@ standard OIDC. Everything else is SynapseOne code, pure Apache-2.0.
 | **Synapse Faststore** | Redis-backed cache/KV and data structures: TTL strings, counters, hashes, lists, sets, sorted sets, scans, batches and distributed locks (`/v1/faststore`) |
 | **SynapseQueue** | At-least-once messaging: delayed/deduplicated publishing, visibility-timeout leases, ack/nack/heartbeat, retries, dead letters and replay (`/v1/queue`) |
 | **SynapseStream** | Tenant-scoped event log over Redis Streams/Kafka with consumer groups, acks and retention (`/v1/stream`) |
+| **Synapse Warehouse** | Tenant-scoped OLAP: DuckDB datasets, read-only SQL, batch SQL transforms and SynapseStream-driven stream ETL, plus workflow templates (`/v1/warehouse`) |
 | **SynapseOCS** | Tenant-scoped buckets/objects with direct + multipart upload, presigned URLs, checksums, size/type limits and quotas (`/v1/ocs`, legacy `/v1/storage`) |
 | **SynapseNotifications** | Durable outbox + `{{var}}` templates, per-recipient preferences/unsubscribe, email/SMS/push relays, webhooks, retries and dead letters (`/v1/notifications`) |
 | **Workflows** | Built-in workflow engine (Apache-2.0): DAG runner, versioned templates, activate/deactivate/execute (real webhook & cron triggers), sandboxed code execution, execution history, visual graph editor |
@@ -177,6 +178,7 @@ Production (TLS, edge rate limiting, hardened secrets): `docker-compose.prod.yml
 | Faststore | `http://localhost:4006` | Internal — cache/KV/data structures (behind gateway in prod) |
 | Queue | `http://localhost:4007` | Internal — SynapseQueue messaging (behind gateway in prod) |
 | Stream | `http://localhost:4009` | Internal — SynapseStream event log (behind gateway in prod) |
+| Warehouse | `http://localhost:4012` | Internal — Synapse Warehouse OLAP + ETL (behind gateway in prod) |
 | OCS | `http://localhost:4010` | Internal — buckets, objects and presigned URLs |
 | Notifications | `http://localhost:4011` | Internal — durable notification outbox |
 | Inference | `http://localhost:4008` | Internal — LLM proxy, embeddings, decision |
@@ -213,6 +215,7 @@ apps/base-service          SynapseBase — documents, mapping, queries, change f
 apps/faststore-service     Synapse Faststore — cache/KV, data structures, locks
 apps/queue-service         SynapseQueue — publish/consume, leases, retries, DLQ
 apps/stream-service        SynapseStream — topics, consumer groups, acks
+apps/warehouse-service     Synapse Warehouse — OLAP datasets, SQL, batch/stream ETL
 apps/ocs-service       SynapseOCS — objects, multipart, presign, quotas
 apps/notifications-service SynapseNotifications — outbox, templates, preferences
 sdks/sdk-js                @synapseone/sdk (TypeScript, zero runtime deps)

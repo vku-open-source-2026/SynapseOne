@@ -15,6 +15,7 @@
  *   client.base       SynapseBase collections/documents/queries/mapping
  *   client.faststore  Synapse Faststore cache/KV, collections, locks
  *   client.queue      SynapseQueue publish/consume/ack, dead letters
+ *   client.warehouse  Synapse Warehouse datasets, read-only SQL, batch/stream ETL
  *   client.inference  LLM proxy, embeddings, decision + semantic routing
  *
  * The old flat methods still work but emit a DeprecationWarning pointing at the
@@ -30,6 +31,7 @@ import { BaseService } from './base';
 import { FaststoreService } from './faststore';
 import { QueueService } from './queue';
 import { StreamService } from './stream';
+import { WarehouseService } from './warehouse';
 import { InferenceService } from './inference';
 import { AiService } from './ai';
 import { HealthService } from './health';
@@ -47,6 +49,7 @@ export * from './base';
 export * from './faststore';
 export * from './queue';
 export * from './stream';
+export * from './warehouse';
 export * from './inference';
 export * from './health';
 export * from './storage';
@@ -80,6 +83,7 @@ export class SynapseOneClient {
   readonly faststore: FaststoreService;
   readonly queue: QueueService;
   readonly stream: StreamService;
+  readonly warehouse: WarehouseService;
   readonly inference: InferenceService;
   readonly storage: StorageService;
   /** Tenant-scoped search over Base documents (#46). */
@@ -100,6 +104,7 @@ export class SynapseOneClient {
     this.faststore = new FaststoreService(this.http);
     this.queue = new QueueService(this.http);
     this.stream = new StreamService(this.http);
+    this.warehouse = new WarehouseService(this.http);
     this.inference = new InferenceService(this.http);
     this.storage = new StorageService(this.http);
     this.search = new SearchService(this.http);

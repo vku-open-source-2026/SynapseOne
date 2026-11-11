@@ -52,6 +52,7 @@ Skip: `node_modules/`, `apps/*/dist/`, `.pytest_cache/`, `.ruff_cache/`,
 | `apps/faststore-service` | Synapse Faststore cache/KV/data structures/locks | 4006 | Redis / memory |
 | `apps/queue-service` | SynapseQueue messaging, leases, retries, DLQ | 4007 | Redis / memory |
 | `apps/stream-service` | SynapseStream tenant-scoped event log | 4009 | Redis Streams / memory |
+| `apps/warehouse-service` | Synapse Warehouse OLAP datasets, SQL queries, batch/stream ETL | 4012 | DuckDB files / memory |
 | `apps/ocs-service` | SynapseOCS objects, multipart, presign, quotas | 4010 | S3 / filesystem |
 | `apps/notifications-service` | SynapseNotifications outbox, templates, preferences, delivery | 4011 | Postgres / memory + queue |
 | `apps/inference-service` | Python FastAPI LLM proxy + embeddings + decision | 4008 | local models / OpenRouter |
