@@ -28,11 +28,12 @@ def test_health():
     res = client.get("/health")
     assert res.status_code == 200
     data = res.json()
-    assert data["status"] == "ok"
+    assert data["status"] in ("ok", "degraded")
     assert data["service"] == "inference"
     assert "models" in data
     assert data["models"]["decision"] == "vllm-sr/Decision-2.0-Eos-0.8B"
     assert "sentence-transformers" in data["models"]["embedding"]
+    assert data["components"]["embedding"]["backend"] in ("mock", "onnx", "torch")
     assert "time" in data
 
 
@@ -244,7 +245,106 @@ def test_inference_health_reports_components():
     assert res.status_code == 200
     body = res.json()
     assert body["components"]["embedding"]["dimension"] == 384
+    assert body["components"]["embedding"]["backend"] in ("mock", "onnx", "torch")
     assert "loaded" in body["components"]["decision"]
+
+
+def test_decision_uses_native_answers_mapping():
+    """The Decision 2.0 runtime returns {"answers": ...} with native keys."""
+    from src.decision import DecisionEngine, DecisionQuestion
+
+    class FakeDecisionModel:
+        def system_one(self, *, state, questions):
+            return {
+                "model": "fake",
+                "answers": {
+                    "route": {
+                        "type": "choice",
+                        "choice": "returns",
+                        "probabilities": {"returns": 0.99, "billing": 0.01},
+                        "confidence": 0.9,
+                    },
+                    "receipt": {"type": "noul", "noul": 0.9989},
+                    "urgency": {
+                        "type": "score",
+                        "score": 1.65,
+                        "probabilities": {"0": 0.1, "1": 0.2, "2": 0.7},
+                        "legend": {"0": "Routine", "1": "Soon", "2": "Today"},
+                        "confidence": 0.35,
+                    },
+                },
+                "usage": {},
+            }
+
+    engine = DecisionEngine()
+    engine._model = FakeDecisionModel()
+    engine._is_loaded = True
+    engine._torch = None
+
+    response = engine.evaluate(
+        state="damaged order",
+        questions={
+            "route": DecisionQuestion(
+                type="choice",
+                instructions="Which team?",
+                criteria={"returns": "refunds", "billing": "invoices"},
+            ),
+            "receipt": DecisionQuestion(
+                type="noul", instructions="Does the customer have a receipt?"
+            ),
+            "urgency": DecisionQuestion(
+                type="score",
+                instructions="How urgent?",
+                criteria=["Routine", "Soon", "Today"],
+            ),
+        },
+    )
+    assert response.results["route"]["best_choice"] == "returns"
+    assert response.results["route"]["choice"] == "returns"
+    assert response.results["receipt"]["answer"] == "yes"
+    assert response.results["receipt"]["probabilities"]["no"] < 0.01
+    assert response.results["urgency"]["score"] == 1.65
+    assert response.results["urgency"]["legend"]["2"] == "Today"
+    assert "answers" not in response.results
+
+
+def test_llm_model_candidates_use_fallback():
+    from src.config import Settings
+    from src.llm import ChatCompletionRequest, ChatMessage, _model_candidates
+
+    cfg = Settings()
+    cfg.OPENROUTER_MODEL = "primary/model"
+    cfg.OPENROUTER_FALLBACK_MODEL = "fallback/model"
+
+    default_req = ChatCompletionRequest(
+        messages=[ChatMessage(role="user", content="hi")]
+    )
+    assert _model_candidates(default_req, cfg) == ["primary/model", "fallback/model"]
+
+    explicit_req = ChatCompletionRequest(
+        model="explicit/model", messages=[ChatMessage(role="user", content="hi")]
+    )
+    assert _model_candidates(explicit_req, cfg) == [
+        "explicit/model",
+        "fallback/model",
+    ]
+
+    cfg.OPENROUTER_FALLBACK_MODEL = ""
+    assert _model_candidates(default_req, cfg) == ["primary/model"]
+
+
+def test_onnx_candidates_prefer_int8(monkeypatch):
+    pytest.importorskip("numpy")
+    from src import onnx_embedding
+
+    monkeypatch.setattr(onnx_embedding.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(onnx_embedding, "cpu_flags", lambda: {"avx2", "avx512_vnni"})
+    candidates = onnx_embedding.candidate_onnx_files()
+    assert candidates[0] == "onnx/model_qint8_avx512_vnni.onnx"
+    assert candidates[-1] == "onnx/model.onnx"
+
+    monkeypatch.setattr(onnx_embedding, "cpu_flags", lambda: set())
+    assert onnx_embedding.candidate_onnx_files() == ["onnx/model.onnx"]
 
 
 @pytest.mark.asyncio

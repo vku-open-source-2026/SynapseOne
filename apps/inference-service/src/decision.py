@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 VKU.VIC
+import logging
 import math
+import os
+import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
 
 from .config import Settings, settings
+from .model_lock import MODEL_IMPORT_LOCK
+
+logger = logging.getLogger(__name__)
 
 
 class DecisionQuestion(BaseModel):
@@ -14,9 +20,12 @@ class DecisionQuestion(BaseModel):
         description="Question type: 'choice', 'noul' (yes/no), or 'score'"
     )
     instructions: str = Field(description="Instructions or criteria for the question")
-    criteria: Optional[Dict[str, str]] = Field(
+    criteria: Optional[Union[Dict[str, str], List[str]]] = Field(
         default=None,
-        description="Mapping of choice key -> choice description (required for type='choice')",
+        description=(
+            "Choice questions: mapping of choice key -> description. "
+            "Score questions: ordered list of scale labels."
+        ),
     )
 
 
@@ -55,14 +64,30 @@ class RouteResponse(BaseModel):
 
 
 class DecisionEngine:
-    """Self-hosted Decision model runner for vllm-sr/Decision-2.0-Eos-0.8B (0.8B parameters)."""
+    """Self-hosted Decision model runner for vllm-sr/Decision-2.0-Eos-0.8B (0.8B parameters).
+
+    The model bundles its own inference runtime (``trust_remote_code``). It is
+    FP32 on CPU (~3 GB RAM) and accepts ``device`` / ``threads`` runtime
+    options. Loading and inference are serialised: one batch already saturates
+    the CPU and concurrent 0.8B forwards only add memory pressure.
+    """
 
     def __init__(self, cfg: Optional[Settings] = None):
         self.cfg = cfg or settings
         self.model_name = self.cfg.DECISION_MODEL_NAME
         self._model = None
+        self._torch = None
         self._is_loaded = False
         self._load_error: Optional[str] = None
+        self._lock = threading.Lock()
+        self._load_lock = threading.Lock()
+        self._retry_after = 0.0
+
+    def _threads(self) -> int:
+        configured = self.cfg.DECISION_THREADS or self.cfg.INFERENCE_CPU_THREADS
+        if configured > 0:
+            return configured
+        return max(1, min(4, os.cpu_count() or 1))
 
     def _determine_device(self) -> str:
         dev = self.cfg.INFERENCE_DEVICE.lower()
@@ -76,34 +101,72 @@ class DecisionEngine:
             return "cpu"
 
     def load_model(self) -> bool:
-        """Attempt to load the Decision-2.0-Eos-0.8B model via HuggingFace transformers."""
+        """Load the Decision 2.0 model through its bundled runtime.
+
+        ``torch_dtype`` must not be passed: Decision 2.0 fixes numerics to FP32
+        on CPU (BF16 autocast on GPU) and raises for anything else. ``device``
+        and ``threads`` are passed through to the bundled runtime.
+        """
         if self._is_loaded:
             return True
         if self.cfg.INFERENCE_MOCK_MODELS:
             return False
-
-        try:
-            import torch
-            from transformers import AutoModel
-
-            device = self._determine_device()
-            dtype = torch.bfloat16 if device == "cuda" else torch.float32
-
-            self._model = AutoModel.from_pretrained(
-                self.model_name,
-                trust_remote_code=True,
-                torch_dtype=dtype,
-            )
-            if device != "cpu" and hasattr(self._model, "to"):
-                self._model = self._model.to(device)
-
-            self._is_loaded = True
-            self._load_error = None
-            return True
-        except Exception as e:
-            self._load_error = str(e)
-            self._is_loaded = False
+        if not self.cfg.DECISION_ENABLED:
+            self._load_error = "disabled by DECISION_ENABLED"
             return False
+
+        with self._load_lock:
+            if self._is_loaded:
+                return True
+            if time.monotonic() < self._retry_after:
+                return False
+
+            try:
+                with MODEL_IMPORT_LOCK:
+                    import torch
+                    from transformers import AutoModel
+
+                device = self._determine_device()
+                threads = self._threads()
+                options: Dict[str, Any] = {
+                    "trust_remote_code": True,
+                    "device": device,
+                    "local_files_only": not self.cfg.INFERENCE_MODEL_DOWNLOAD,
+                }
+                if threads > 0:
+                    options["threads"] = threads
+
+                try:
+                    model = AutoModel.from_pretrained(self.model_name, **options)
+                except TypeError:
+                    # Generic HF models do not accept Decision-2 runtime options.
+                    model = AutoModel.from_pretrained(
+                        self.model_name, trust_remote_code=True
+                    )
+
+                if hasattr(model, "eval"):
+                    model.eval()
+
+                self._torch = torch
+                self._model = model
+                self._is_loaded = True
+                self._load_error = None
+                logger.info(
+                    "decision model loaded: %s device=%s threads=%s",
+                    self.model_name,
+                    device,
+                    threads,
+                )
+                return True
+            except Exception as exc:  # noqa: BLE001 - keep the lexical fallback
+                self._is_loaded = False
+                self._model = None
+                self._load_error = str(exc)
+                self._retry_after = time.monotonic() + self.cfg.MODEL_LOAD_RETRY_SECONDS
+                logger.warning(
+                    "decision model unavailable, using deterministic fallback: %s", exc
+                )
+                return False
 
     def _fallback_system_one(
         self, state: str, questions: Dict[str, DecisionQuestion]
@@ -117,7 +180,7 @@ class DecisionEngine:
 
         for q_id, q_spec in questions.items():
             q_type = q_spec.type.lower()
-            if q_type == "choice" and q_spec.criteria:
+            if q_type == "choice" and isinstance(q_spec.criteria, dict):
                 raw_scores: Dict[str, float] = {}
                 for choice_key, choice_desc in q_spec.criteria.items():
                     desc_tokens = set(re.findall(r"\w+", choice_desc.lower()))
@@ -195,6 +258,37 @@ class DecisionEngine:
 
         return results
 
+    @staticmethod
+    def _normalize_answers(results: Dict[str, Any]) -> Dict[str, Any]:
+        """Keep the public API stable across the native and fallback shapes.
+
+        Decision 2.0 returns ``choice`` (not ``best_choice``) and ``noul`` as
+        P(true) (not ``answer``). Add the compatibility aliases used by the
+        gateway, workflow nodes and Tier-2 capabilities.
+        """
+        normalized: Dict[str, Any] = {}
+        for question_id, answer in results.items():
+            if not isinstance(answer, dict):
+                normalized[question_id] = answer
+                continue
+
+            item = dict(answer)
+            kind = item.get("type")
+            if kind == "choice" and item.get("best_choice") is None:
+                item["best_choice"] = item.get("choice")
+            elif kind == "noul":
+                probability = item.get("noul")
+                if isinstance(probability, (int, float)):
+                    probability = max(0.0, min(1.0, float(probability)))
+                    item.setdefault("answer", "yes" if probability >= 0.5 else "no")
+                    item.setdefault(
+                        "probabilities",
+                        {"yes": probability, "no": round(1.0 - probability, 6)},
+                    )
+            normalized[question_id] = item
+
+        return normalized
+
     def evaluate(
         self, state: str, questions: Dict[str, DecisionQuestion]
     ) -> DecisionResponse:
@@ -210,13 +304,32 @@ class DecisionEngine:
                 q_dict = {
                     k: v.model_dump(exclude_none=True) for k, v in questions.items()
                 }
-                raw_out = self._model.system_one(state=state, questions=q_dict)
+                with self._lock:
+                    if self._torch is not None:
+                        with self._torch.inference_mode():
+                            raw_out = self._model.system_one(
+                                state=state, questions=q_dict
+                            )
+                    else:
+                        raw_out = self._model.system_one(state=state, questions=q_dict)
+
+                # Decision 2.0 returns {"model", "answers", "usage"}; the API
+                # contract exposes the per-question answers directly.
+                if isinstance(raw_out, dict) and isinstance(
+                    raw_out.get("answers"), dict
+                ):
+                    results = raw_out["answers"]
+                elif isinstance(raw_out, dict):
+                    results = raw_out
+                else:
+                    results = {"output": raw_out}
+
+                results = self._normalize_answers(results)
+
                 duration = round((time.time() - t0) * 1000.0, 2)
                 return DecisionResponse(
                     model=self.model_name,
-                    results=raw_out
-                    if isinstance(raw_out, dict)
-                    else {"output": raw_out},
+                    results=results,
                     duration_ms=duration,
                 )
             except Exception as e:
@@ -272,8 +385,11 @@ class DecisionEngine:
         return {
             "model": self.model_name,
             "architecture": "Qwen3.5-0.8B-hybrid-backbone",
+            "backend": "decision2-transformers" if self._is_loaded else "fallback",
+            "enabled": self.cfg.DECISION_ENABLED,
             "loaded": self._is_loaded,
             "device": self._determine_device(),
+            "threads": self._threads(),
             "mock_mode": self.cfg.INFERENCE_MOCK_MODELS or not self._is_loaded,
             "error": self._load_error,
         }

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 VKU.VIC
 import secrets
+import threading
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request, Response, status
@@ -21,12 +23,45 @@ from .usage import Timer, report_usage
 
 VERSION = "0.7.0"
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Warm the embedding backend without delaying the socket bind.
+
+    The ONNX graph is small enough to load in about a second, but a cold HF
+    download can take longer. Doing it on a daemon thread keeps /health and the
+    LLM proxy responsive while the model becomes ready.
+    """
+    if (
+        settings.INFERENCE_WARMUP
+        and not settings.INFERENCE_MOCK_MODELS
+        and settings.EMBEDDING_BACKEND != "mock"
+    ):
+        threading.Thread(
+            target=embedding_engine.load_model,
+            name="embedding-warmup",
+            daemon=True,
+        ).start()
+    if (
+        settings.DECISION_WARMUP
+        and settings.DECISION_ENABLED
+        and not settings.INFERENCE_MOCK_MODELS
+    ):
+        threading.Thread(
+            target=decision_engine.load_model,
+            name="decision-warmup",
+            daemon=True,
+        ).start()
+    yield
+
+
 app = FastAPI(
     title="Synapse Inference Engine",
     description="Multi-model inference microservice (OpenRouter LLM + Local Embedding + Decision-2.0-Eos-0.8B)",
     version=VERSION,
     docs_url="/docs",
     redoc_url=None,
+    lifespan=lifespan,
 )
 
 # CORS configuration: explicit allowlist in production (never wildcard), the
@@ -99,12 +134,26 @@ async def security_and_telemetry_middleware(request: Request, call_next):
 async def health():
     """Health check endpoint reporting readiness of inference subsystems."""
     now_iso = datetime.now(timezone.utc).isoformat()
+    embedding_status = embedding_engine.status
+    decision_status = decision_engine.status
+    # Explicit mock mode is a dev/test choice; an unexpected failure to load a
+    # real model is reported as degraded instead of a misleading "ok".
+    decision_failed = (
+        settings.DECISION_ENABLED
+        and not decision_status.get("loaded")
+        and bool(decision_status.get("error"))
+    )
+    degraded = (
+        bool(embedding_status.get("mock_mode")) and not settings.INFERENCE_MOCK_MODELS
+    ) or decision_failed
     return {
-        "status": "ok",
+        "status": "degraded" if degraded else "ok",
+        "degraded": degraded,
         "service": "inference",
         "version": VERSION,
         "models": {
             "llm": settings.OPENROUTER_MODEL,
+            "llm_fallback": settings.OPENROUTER_FALLBACK_MODEL,
             "embedding": settings.EMBEDDING_MODEL_NAME,
             "decision": settings.DECISION_MODEL_NAME,
         },
@@ -113,9 +162,10 @@ async def health():
                 "provider": "openrouter",
                 "configured": bool(settings.OPENROUTER_API_KEY),
                 "base_url": settings.OPENROUTER_BASE_URL,
+                "fallback_model": settings.OPENROUTER_FALLBACK_MODEL,
             },
-            "embedding": embedding_engine.status,
-            "decision": decision_engine.status,
+            "embedding": embedding_status,
+            "decision": decision_status,
         },
         "time": now_iso,
     }

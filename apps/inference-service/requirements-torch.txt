@@ -1,0 +1,8 @@
+# Optional PyTorch stack for the 0.8B Decision-2.0 model (FP32 on CPU, ~3 GB
+# RAM) and for the EMBEDDING_BACKEND=torch fallback. CPU wheel index keeps the
+# image free of CUDA libraries.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.2.0
+safetensors>=0.4.0
+# Embedding torch fallback only (ONNX is the default and does not need this):
+# sentence-transformers>=3.0.0
