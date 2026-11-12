@@ -110,6 +110,9 @@ function networkHint(e: any, base: string): { code: string; message: string } {
 export function createRunnerApi(opts: RunnerApiOptions) {
   const base = String(opts.baseUrl || '').replace(/\/$/, '');
   if (!base) throw new Error('SYNAPSEONE_URL is required');
+  let parsedBase: URL;
+  try { parsedBase = new URL(base); } catch { throw new Error(`SYNAPSEONE_URL must be an absolute http(s) URL, got '${base}'`); }
+  if (!['http:', 'https:'].includes(parsedBase.protocol)) throw new Error(`SYNAPSEONE_URL must use http or https, got '${parsedBase.protocol}'`);
   if (!opts.apiKey) throw new Error('SYNAPSEONE_API_KEY is required');
   const timeoutMs = Math.min(Math.max(Number(opts.timeoutMs) || 30000, 1000), 300000);
   const maxAttempts = envInt('SYNAPSEONE_HTTP_RETRIES', 3, 1, 6);
