@@ -262,11 +262,11 @@ separate deployment instruction, the same code was verified against a faithful
 - Created a tenant on the clone and verified tenant isolation.
 - Ran 16 API checks + 8 Playwright checks; all passed.
 
-The clone credentials are local-only at
-`.local/platform-superadmin-product-credentials.txt` (mode 600). The production
-database and production containers were not modified. To apply this to the
-product database, follow the deployment steps in `docs/platform-superadmin.md`
-with a backup and a maintenance window.
+The clone database, its dump and its temporary credentials were deleted after
+verification; no clone secrets are retained. The production database and
+production containers were not modified. To apply this to the product database,
+follow the deployment steps in `docs/platform-superadmin.md` with a backup and a
+maintenance window.
 
 ## Stopping the isolated stack
 
