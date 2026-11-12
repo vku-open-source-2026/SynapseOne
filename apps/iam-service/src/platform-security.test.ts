@@ -115,6 +115,47 @@ describe('iam sensitive mutation hardening', () => {
     assert.equal(denied.json.error, 'platform_org_create_required');
   });
 
+  it('reserves the platform organization slug from self-service registration', async () => {
+    const r = await call('POST', '/v1/auth/register', {
+      email: 'squatter@test.local',
+      password: 'SquatterTest!2345',
+      orgSlug: 'synapseone-platform',
+    }, '');
+    assert.equal(r.status, 403);
+    assert.equal(r.json.error, 'reserved_org_slug');
+  });
+
+  it('tenant invitations require a one-time activation code', async () => {
+    const created = await call('POST', `/v1/orgs/${orgId}/users`, {
+      email: 'invitee@test.local',
+      displayName: 'Invitee',
+    }, adminToken);
+    assert.equal(created.status, 201, JSON.stringify(created.json));
+    assert.equal(typeof created.json.inviteToken, 'string');
+
+    const direct = await call('POST', '/v1/auth/register', {
+      email: 'invitee@test.local',
+      password: 'InviteeTest!2345',
+      orgSlug: 'secorg',
+    }, '');
+    assert.equal(direct.status, 403);
+    assert.equal(direct.json.error, 'invite_required');
+
+    const accepted = await call('POST', '/v1/auth/invite/accept', {
+      token: created.json.inviteToken,
+      password: 'InviteeTest!2345',
+    }, '');
+    assert.equal(accepted.status, 201, JSON.stringify(accepted.json));
+    assert.equal(typeof accepted.json.accessToken, 'string');
+
+    const replay = await call('POST', '/v1/auth/invite/accept', {
+      token: created.json.inviteToken,
+      password: 'InviteeTest!2345',
+    }, '');
+    assert.equal(replay.status, 400);
+    assert.equal(replay.json.error, 'invalid_invite_token');
+  });
+
   it('audit reads are org-admin only', async () => {
     const denied = await fetch(`${base}/v1/audit`, { headers: h(memberToken) });
     assert.equal(denied.status, 403);

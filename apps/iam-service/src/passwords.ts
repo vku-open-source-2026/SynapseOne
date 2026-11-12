@@ -61,10 +61,16 @@ export async function verifyPassword(password: string, stored: string | null | u
   return got.length === want.length && timingSafeEqual(got, want);
 }
 
-/** Opaque, single-use token (reset / verification) + its at-rest hash. */
-export function newOneTimeToken(prefix: 'reset' | 'verify'): { value: string; hash: string } {
+/** Opaque, single-use token (reset / verification / invite) + its at-rest hash. */
+export function newOneTimeToken(prefix: 'reset' | 'verify' | 'invite'): { value: string; hash: string } {
   const value = `synapseone_${prefix}_` + randomBytes(32).toString('base64url');
   return { value, hash: hashSecret(value) };
+}
+
+export function inviteTokenExpiry(): Date {
+  const raw = Number(process.env.IAM_INVITE_TOKEN_TTL_SECONDS ?? 7 * 86_400);
+  const secs = Number.isFinite(raw) ? Math.min(Math.max(Math.floor(raw), 300), 30 * 86_400) : 7 * 86_400;
+  return new Date(Date.now() + secs * 1000);
 }
 
 export function resetTokenExpiry(): Date {

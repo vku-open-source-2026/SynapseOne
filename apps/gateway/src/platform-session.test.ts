@@ -76,6 +76,21 @@ describe('platform session exchange boundary', () => {
     assert.equal(sessionHits, beforeHits + 1);
   });
 
+  it('rejects a platform step-up JWT as a tenant access token', async () => {
+    const stepUp = jwt.sign({
+      sub: 'tenant-user-1',
+      kind: 'platform-step-up',
+      typ: 'platform_step_up',
+      aud: 'synapseone-platform-step-up',
+    }, SECRET, { issuer: 'synapseone-iam', algorithm: 'HS256', expiresIn: 120 });
+    const r = await fetch(`${base}/v1/orgs`, {
+      headers: { Authorization: `Bearer ${stepUp}` },
+    });
+    const body: any = await r.json();
+    assert.equal(r.status, 401);
+    assert.equal(body.error, 'invalid_token');
+  });
+
   it('still rejects a tenant JWT on platform-admin APIs at the gateway', async () => {
     const r = await fetch(`${base}/v1/platform/me`, {
       headers: { Authorization: `Bearer ${token}` },

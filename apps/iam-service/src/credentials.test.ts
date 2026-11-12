@@ -107,10 +107,17 @@ describe('first-party credential lifecycle', () => {
     const orgId = orgs.data[0].id;
     const invited = await call('POST', `/v1/orgs/${orgId}/users`, { email: 'invited@cred.local' }, admin.accessToken);
     assert.equal(invited.status, 201, JSON.stringify(invited.data));
-    const reg = await call('POST', '/v1/auth/register', {
+    assert.equal(typeof invited.data.inviteToken, 'string');
+    const noCode = await call('POST', '/v1/auth/register', {
       email: 'invited@cred.local', password: PASSWORD, orgSlug: 'cred-join',
     });
-    assert.equal(reg.status, 201);
+    assert.equal(noCode.status, 403);
+    assert.equal(noCode.data.error, 'invite_required');
+    const reg = await call('POST', '/v1/auth/invite/accept', {
+      token: invited.data.inviteToken, password: PASSWORD,
+    });
+    assert.equal(reg.status, 201, JSON.stringify(reg.data));
+    assert.equal(typeof reg.data.accessToken, 'string');
   });
 
   it('changes and resets passwords, revoking old sessions', async () => {

@@ -59,6 +59,11 @@ export interface AccessClaims {
   kind?: string;
   /** Platform administrator role (only kind=platform-admin). */
   role?: 'owner' | 'operator' | 'auditor';
+  /** JWT id and one-time step-up binding. */
+  jti?: string;
+  sid?: string;
+  typ?: string;
+  action?: string;
   /** Delegated token: the service identity that acted for the user. */
   act?: { sub: string; kind?: string };
   /** Delegation marker + audience (Tier-2 service). */
@@ -127,13 +132,14 @@ export function signPlatformAccess(input: {
   userId: string;
   role: 'owner' | 'operator' | 'auditor';
   ttlSeconds?: number;
-}): { token: string; expiresIn: number } {
+}): { token: string; expiresIn: number; jti: string } {
   const expiresIn = Math.min(Math.max(Math.floor(input.ttlSeconds ?? 900), 60), 3600);
   const scopes = input.role === 'owner'
     ? ['platform:read', 'platform:write', 'platform:admin']
     : input.role === 'operator'
       ? ['platform:read', 'platform:write']
       : ['platform:read'];
+  const jti = randomUUID();
   const token = jwt.sign({
     sub: input.userId,
     kind: 'platform-admin',
@@ -142,8 +148,9 @@ export function signPlatformAccess(input: {
     aud: PLATFORM_AUDIENCE,
     iss: 'synapseone-iam',
     auth_time: Math.floor(Date.now() / 1000),
+    jti,
   }, JWT_SECRET, { expiresIn });
-  return { token, expiresIn };
+  return { token, expiresIn, jti };
 }
 
 export function verifyPlatformAccess(token: string): AccessClaims {
@@ -154,29 +161,50 @@ export function verifyPlatformAccess(token: string): AccessClaims {
   return claims;
 }
 
-/** Short-lived proof of a fresh TOTP challenge for one destructive action. */
-export function signPlatformStepUp(input: { userId: string; role: 'owner' | 'operator' | 'auditor' }): { token: string; expiresIn: number } {
-  const expiresIn = Math.min(Math.max(Number(process.env.PLATFORM_STEP_UP_TTL_SECONDS || 300), 60), 900);
+/** Short-lived proof of a fresh TOTP challenge for one action in one platform
+ *  session. The jti is consumed server-side exactly once. */
+export function signPlatformStepUp(input: {
+  userId: string;
+  role: 'owner' | 'operator' | 'auditor';
+  sessionJti: string;
+  action: string;
+}): { token: string; expiresIn: number; jti: string } {
+  const raw = Number(process.env.PLATFORM_STEP_UP_TTL_SECONDS || 300);
+  const expiresIn = Math.min(Math.max(Number.isFinite(raw) ? Math.floor(raw) : 300, 60), 900);
+  const jti = randomUUID();
   const token = jwt.sign({
     sub: input.userId,
+    kind: 'platform-step-up',
     typ: 'platform_step_up',
     role: input.role,
+    action: input.action,
+    sid: input.sessionJti,
+    jti,
     aud: PLATFORM_STEP_UP_AUDIENCE,
     iss: 'synapseone-iam',
   }, JWT_SECRET, { expiresIn });
-  return { token, expiresIn };
+  return { token, expiresIn, jti };
 }
 
-export function verifyPlatformStepUp(token: string, userId: string): boolean {
+export function verifyPlatformStepUp(
+  token: string,
+  userId: string,
+  action: string,
+  sessionJti: string,
+): AccessClaims | null {
   try {
     const claims: any = jwt.verify(token, JWT_SECRET, {
       issuer: ['synapseone-iam', 'synapsedx-iam'],
       audience: PLATFORM_STEP_UP_AUDIENCE,
       algorithms: ['HS256'],
     });
-    return claims?.typ === 'platform_step_up' && claims?.sub === userId;
+    if (claims?.typ !== 'platform_step_up' || claims?.kind !== 'platform-step-up') return null;
+    if (claims?.sub !== userId || claims?.sid !== sessionJti) return null;
+    if (String(claims?.action || '') !== String(action)) return null;
+    if (typeof claims?.jti !== 'string' || !claims.jti) return null;
+    return claims as AccessClaims;
   } catch {
-    return false;
+    return null;
   }
 }
 

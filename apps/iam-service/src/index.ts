@@ -25,6 +25,7 @@ import {
   setUserActive, updateUserProfile, publicUser,
   setOrgAdmin, orgHasAdmin, assignRoleToServiceAccount, unassignRoleFromServiceAccount, rolesForServiceAccount,
   getPlatformAdmin, listPlatformAdmins, grantPlatformAdmin, revokePlatformAdmin, countActivePlatformOwners,
+  registerPlatformStepUp, consumePlatformStepUp,
   listPlatformOrganizations, getPlatformOrganization, listPlatformUsers, getPlatformOverviewCounts, platformAuditStats,
   type PlatformAdmin, type User,
 } from './db';
@@ -52,7 +53,7 @@ import { ingestUsageEvents, listUsageEvents, purgeUsage, usageSummary, type Usag
 import { assertOidcConfig, isPublicHttpsUrl, signState, exchangeCode, authorizationEndpoint, oidcSettings, OidcError } from './oidc';
 import {
   hashPassword, verifyPassword, passwordPolicyError, newOneTimeToken,
-  resetTokenExpiry, verifyTokenExpiry, PASSWORD_MAX,
+  resetTokenExpiry, verifyTokenExpiry, inviteTokenExpiry, PASSWORD_MAX,
 } from './passwords';
 
 dotenv.config();
@@ -286,6 +287,17 @@ function platformFeatureEnabled(): boolean {
 }
 
 const PLATFORM_ROLE_RANK: Record<string, number> = { auditor: 1, operator: 2, owner: 3 };
+const PLATFORM_STEP_UP_ACTIONS = new Set([
+  'org:create',
+  'org:account:create',
+  'user:org-admin',
+  'user:reset-mfa',
+  'user:invite',
+  'user:revoke-sessions',
+  'user:disable',
+  'admin:grant',
+  'admin:revoke',
+]);
 
 async function currentPlatformAdmin(
   req: express.Request,
@@ -305,36 +317,66 @@ async function currentPlatformAdmin(
   try {
     claims = verifyPlatformAccess(h.slice(7));
   } catch {
+    await auditPlatformDenied(req, '', null, 'platform:access', 'invalid_platform_token');
     res.status(403).json({ error: 'platform_admin_required', message: 'a platform administrator token is required' });
     return null;
   }
   const admin = await getPlatformAdmin(String(claims.sub || ''));
   if (!admin || admin.revoked_at) {
+    await auditPlatformDenied(req, String(claims.sub || ''), null, 'platform:access', 'admin_revoked_or_missing');
     res.status(403).json({ error: 'platform_admin_inactive', message: 'platform administrator access has been revoked' });
     return null;
   }
   const user = await getUserById(String(claims.sub));
   if (!user || user.active === false) {
+    await auditPlatformDenied(req, String(claims.sub || ''), user?.org_id || null, 'platform:access', 'account_inactive');
     res.status(403).json({ error: 'platform_admin_inactive', message: 'platform administrator account is inactive' });
+    return null;
+  }
+  const org = await getOrgById(user.org_id);
+  if (!org || (org.kind || 'tenant') !== 'platform') {
+    await auditPlatformDenied(req, user.id, user.org_id, 'platform:access', 'platform_org_required');
+    res.status(403).json({ error: 'platform_admin_org_required', message: 'platform administrators must belong to the platform organization' });
     return null;
   }
   const requireMfa = (process.env.PLATFORM_ADMIN_REQUIRE_MFA ?? 'true') === 'true';
   if (requireMfa && !(await mfaEnabled(user.id))) {
+    await auditPlatformDenied(req, user.id, user.org_id, 'platform:access', 'mfa_not_enabled');
     res.status(403).json({ error: 'platform_mfa_required', message: 'enable TOTP MFA before using the platform console' });
     return null;
   }
   if ((PLATFORM_ROLE_RANK[admin.role] || 0) < (PLATFORM_ROLE_RANK[minRole] || 0)) {
+    await auditPlatformDenied(req, user.id, user.org_id, 'platform:access', 'role_required');
     res.status(403).json({ error: 'platform_role_required', message: `platform ${minRole} role required` });
     return null;
   }
   return { claims, admin, user };
 }
 
-function requirePlatformStepUp(req: express.Request, res: express.Response, userId: string): boolean {
+async function requirePlatformStepUp(
+  req: express.Request,
+  res: express.Response,
+  ctx: { claims: any; user: User },
+  action: string,
+): Promise<boolean> {
   if ((process.env.PLATFORM_ADMIN_REQUIRE_STEP_UP ?? 'true') !== 'true') return true;
   const token = firstHeader(req.headers['x-platform-step-up'] as any);
-  if (!token || !verifyPlatformStepUp(token, userId)) {
-    res.status(403).json({ error: 'platform_step_up_required', message: 'fresh TOTP step-up verification is required' });
+  const sessionJti = String(ctx.claims?.jti || '');
+  const claims = token ? verifyPlatformStepUp(token, ctx.user.id, action, sessionJti) : null;
+  if (!claims) {
+    await auditPlatformDenied(req, ctx.user.id, ctx.user.org_id, action, 'step_up_required');
+    res.status(403).json({ error: 'platform_step_up_required', message: 'fresh TOTP step-up verification is required for this action' });
+    return false;
+  }
+  const consumed = await consumePlatformStepUp({
+    jti: String(claims.jti),
+    userId: ctx.user.id,
+    sessionJti,
+    action,
+  });
+  if (!consumed) {
+    await auditPlatformDenied(req, ctx.user.id, ctx.user.org_id, action, 'step_up_replayed_or_expired');
+    res.status(403).json({ error: 'platform_step_up_required', message: 'this step-up proof was already used, expired, or belongs to another session' });
     return false;
   }
   return true;
@@ -386,6 +428,14 @@ async function auditPlatformDenied(
   }).catch(() => undefined);
 }
 
+/** Issue a one-time activation code for a passwordless invited account. */
+async function issueInvite(user: User): Promise<string | null> {
+  if (user.password_hash) return null;
+  const token = newOneTimeToken('invite');
+  await storeOneTimeToken(user.id, token.hash, 'invite', inviteTokenExpiry());
+  return token.value;
+}
+
 function parsePlatformRange(req: express.Request, res: express.Response, defaultHours = 24): { from: Date; to: Date } | null {
   const to = req.query.to ? new Date(String(req.query.to)) : new Date();
   const from = req.query.from ? new Date(String(req.query.from)) : new Date(to.getTime() - defaultHours * 3600_000);
@@ -417,13 +467,16 @@ async function resolveOidcIdentity(
   email: string,
   displayName?: string,
   externalSub?: string,
-): Promise<{ user: import('./db').User } | { error: 'org_not_allowed' | 'org_membership_required'; message: string }> {
+): Promise<{ user: import('./db').User } | { error: 'org_not_allowed' | 'org_membership_required' | 'reserved_org_slug'; message: string }> {
   const allowed = oidcAllowedOrgs();
   if (allowed.length && !allowed.includes(slug)) {
     return { error: 'org_not_allowed', message: `organization '${slug}' is not in OIDC_ALLOWED_ORGS` };
   }
   let org = await getOrgBySlug(slug);
   if (!org) {
+    if (slug.toLowerCase() === (process.env.PLATFORM_ORG_SLUG || 'synapseone-platform').toLowerCase()) {
+      return { error: 'reserved_org_slug', message: 'This organization slug is reserved for platform administration.' };
+    }
     try {
       org = await createOrganization(slug, slug);
     } catch (e: any) {
@@ -736,6 +789,24 @@ export function createApp(): express.Express {
     }
     if (!process.env.DATABASE_URL) {
       throw new Error('[iam] DATABASE_URL must be set in production (in-memory fallback would split-brain).');
+    }
+    if (platformFeatureEnabled()) {
+      if ((process.env.PLATFORM_ADMIN_REQUIRE_MFA ?? 'true') !== 'true') {
+        throw new Error('[iam] PLATFORM_ADMIN_REQUIRE_MFA must be true when the platform console is enabled in production.');
+      }
+      if ((process.env.PLATFORM_ADMIN_REQUIRE_STEP_UP ?? 'true') !== 'true') {
+        throw new Error('[iam] PLATFORM_ADMIN_REQUIRE_STEP_UP must be true when the platform console is enabled in production.');
+      }
+      const slug = process.env.PLATFORM_ORG_SLUG || 'synapseone-platform';
+      if (!/^[a-z0-9-]{1,64}$/.test(slug)) {
+        throw new Error('[iam] PLATFORM_ORG_SLUG must match ^[a-z0-9-]{1,64}$.');
+      }
+      for (const [name, value] of [
+        ['PLATFORM_BOOTSTRAP_SECRET', process.env.PLATFORM_BOOTSTRAP_SECRET],
+        ['PLATFORM_RECOVERY_SECRET', process.env.PLATFORM_RECOVERY_SECRET],
+      ] as const) {
+        if (value && value.length < 32) throw new Error(`[iam] ${name} must be at least 32 characters.`);
+      }
     }
     // OIDC must be browser-reachable: public HTTPS issuer + redirect (issue #21).
     assertOidcConfig();
@@ -1491,7 +1562,11 @@ async function auditMutation(req: express.Request, action: string, resource: str
         message: 'Passwordless dev login is disabled. Use email+password or the OIDC flow.',
       });
     }
-    const org = (await getOrgBySlug(slug)) || (await createOrganization(slug, slug));
+    const existingOrg = await getOrgBySlug(slug);
+    if (!existingOrg && slug.toLowerCase() === (process.env.PLATFORM_ORG_SLUG || 'synapseone-platform').toLowerCase()) {
+      return res.status(403).json({ error: 'reserved_org_slug', message: 'This organization slug is reserved for platform administration.' });
+    }
+    const org = existingOrg || (await createOrganization(slug, slug));
     const user = await bootstrapOrgAdmin(await upsertUser(org.id, email, email));
     if (user.active === false) {
       return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated by an administrator.' });
@@ -1648,6 +1723,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
 
     let org = await getOrgBySlug(slug);
     if (!org) {
+      if (slug.toLowerCase() === (process.env.PLATFORM_ORG_SLUG || 'synapseone-platform').toLowerCase()) {
+        return res.status(403).json({ error: 'reserved_org_slug', message: 'This organization slug is reserved for platform administration.' });
+      }
       if (!registrationAllowsNewOrgs()) {
         return res.status(403).json({ error: 'unknown_org', message: 'Organization does not exist and self-service org creation is disabled' });
       }
@@ -1658,16 +1736,22 @@ async function auditMutation(req: express.Request, action: string, resource: str
         if (!org) throw e;
       }
     } else {
-      // Joining an EXISTING org requires an invitation (an existing user row):
-      // org membership grants org-wide access, so this must never be
-      // self-service by guessing a slug (same rule as the OIDC callback).
+      // Joining an EXISTING org requires a one-time invite code. Membership
+      // grants org-wide access, so an email+slug guess must never be enough.
       const existing = await findUserByOrgEmail(org.id, email);
       if (!existing) {
         return res.status(403).json({
           error: 'org_membership_required',
-          message: 'Your email is not invited to this organization. Ask an admin to invite you, or choose a new organization slug.',
+          message: 'Your email is not invited to this organization. Ask an admin to invite you.',
         });
       }
+      if (existing.password_hash) {
+        return res.status(409).json({ error: 'account_exists', message: 'An account with this email already has a password. Sign in or reset it.' });
+      }
+      return res.status(403).json({
+        error: 'invite_required',
+        message: 'Use the one-time activation code from your administrator.',
+      });
     }
     const existing = await findUserByOrgEmail(org.id, email);
     if (existing?.password_hash) {
@@ -1688,6 +1772,42 @@ async function auditMutation(req: express.Request, action: string, resource: str
       user: { ...(session.user as any), email_verified: false },
       ...(exposesLifecycleTokens() ? { emailVerificationToken: verify.value } : {}),
     });
+  });
+
+  /** Activate an invited account with a one-time invite code. The code is
+   *  generated by a platform admin (or org admin) and returned exactly once. */
+  app.post('/v1/auth/invite/accept', async (req, res) => {
+    const schema = z.object({
+      token: z.string().trim().min(10).max(512),
+      password: z.string().min(1).max(PASSWORD_MAX),
+      displayName: z.string().trim().max(200).nullish(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    let userId: string | null = null;
+    for (const hash of hashCandidates(parsed.data.token)) {
+      userId = await consumeOneTimeToken(hash, 'invite');
+      if (userId) break;
+    }
+    if (!userId) {
+      return res.status(400).json({ error: 'invalid_invite_token', message: 'This activation code is invalid, expired or already used.' });
+    }
+    const user = await getUserById(userId);
+    if (!user) return res.status(404).json({ error: 'user_not_found' });
+    if (user.active === false) return res.status(403).json({ error: 'account_deactivated' });
+    if (user.password_hash) return res.status(409).json({ error: 'account_exists', message: 'This account already has a password.' });
+    const policyErr = passwordPolicyError(parsed.data.password, user.email);
+    if (policyErr) return res.status(400).json({ error: 'weak_password', message: policyErr });
+    await setUserPassword(user.id, await hashPassword(parsed.data.password));
+    if (parsed.data.displayName) await updateUserProfile(user.id, { displayName: sanitizeName(parsed.data.displayName) });
+    const fresh = (await getUserById(user.id)) || user;
+    const session = await issueSession(fresh);
+    await logAudit({
+      actor_type: 'user', actor_id: user.id, action: 'iam:user:invite-accept', resource: `user:${user.id}`,
+      decision: true, context: { org: user.org_id },
+    }).catch(() => undefined);
+    noStore(res);
+    return res.status(201).json(session);
   });
 
   app.post('/v1/auth/password/change', async (req, res) => {
@@ -2017,6 +2137,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
       await auditMutation(req, 'iam:org:create', `org:${created.id}`, { slug: created.slug });
       res.status(201).json(created);
     } catch (e: any) {
+      if (e?.code === 'reserved_org_slug' || e?.status === 403) {
+        return res.status(403).json({ error: 'reserved_org_slug', message: 'This organization slug is reserved for platform administration.' });
+      }
       if (e?.code === '23505' || e?.status === 409) {
         return res.status(409).json({ error: 'conflict', message: 'organization slug exists' });
       }
@@ -2076,8 +2199,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
     }
     if (!(await requireSensitiveMutation(req, res, TRUST_STAMPED, req.params.orgId, 'iam:user:create'))) return;
     const created = await upsertUser(req.params.orgId, email, displayName ? sanitizeName(displayName) : undefined);
-    await auditMutation(req, 'iam:user:create', `user:${created.id}`, { org: req.params.orgId, email });
-    res.status(201).json(publicUser(created));
+    const inviteToken = await issueInvite(created);
+    await auditMutation(req, 'iam:user:create', `user:${created.id}`, { org: req.params.orgId, email, inviteIssued: !!inviteToken });
+    res.status(201).json({ ...publicUser(created), inviteToken });
   });
 
   app.get('/v1/orgs/:orgId/users', async (req, res) => {
@@ -2750,8 +2874,8 @@ async function auditMutation(req: express.Request, action: string, resource: str
       return res.status(403).json({ error: 'org_admin_required', message: 'only an organization administrator can change administrators' });
     }
     if (!flag && user.is_org_admin) {
-      const admins = (await listUsers(user.org_id)).filter((u) => u.is_org_admin);
-      if (admins.length <= 1) return res.status(409).json({ error: 'last_admin', message: 'an organization needs at least one administrator' });
+      const admins = (await listUsers(user.org_id)).filter((u) => u.is_org_admin && u.active !== false);
+      if (admins.length <= 1) return res.status(409).json({ error: 'last_admin', message: 'an organization needs at least one active administrator' });
     }
     const reason = typeof (req.body || {}).reason === 'string' ? String((req.body || {}).reason).slice(0, 500) : '';
     const updated = await setOrgAdmin(user.id, flag);
@@ -3007,6 +3131,11 @@ async function auditMutation(req: express.Request, action: string, resource: str
       await auditPlatformDenied(req, user.id, user.org_id, 'platform:session:exchange', 'not_platform_admin');
       return res.status(403).json({ error: 'platform_admin_required' });
     }
+    const org = await getOrgById(user.org_id);
+    if (!org || (org.kind || 'tenant') !== 'platform') {
+      await auditPlatformDenied(req, user.id, user.org_id, 'platform:session:exchange', 'platform_org_required');
+      return res.status(403).json({ error: 'platform_admin_org_required' });
+    }
     const requireMfa = (process.env.PLATFORM_ADMIN_REQUIRE_MFA ?? 'true') === 'true';
     if (requireMfa && !(await mfaEnabled(user.id))) {
       await auditPlatformDenied(req, user.id, user.org_id, 'platform:session:exchange', 'mfa_not_enabled');
@@ -3015,6 +3144,8 @@ async function auditMutation(req: express.Request, action: string, resource: str
     // Proof of a fresh second factor for THIS session: do not treat
     // user_mfa.enabled as evidence that the current login completed MFA.
     if (requireMfa) {
+      const locked = await lockRemaining(user.id);
+      if (locked > 0) return res.status(429).json({ error: 'account_locked', message: 'too many failed verification attempts', retryAfter: locked });
       const parsed = z.object({
         code: z.string().trim().max(16).nullish(),
         recoveryCode: z.string().trim().max(32).nullish(),
@@ -3025,8 +3156,13 @@ async function auditMutation(req: express.Request, action: string, resource: str
       }
       const check = await checkSecondFactor(user.id, parsed.data);
       if (!check.ok) {
+        const lockedFor = await recordLoginFailure(user.id);
         await auditPlatformDenied(req, user.id, user.org_id, 'platform:session:exchange', 'invalid_mfa_code');
-        return res.status(401).json({ error: 'invalid_mfa_code', message: 'The verification code is incorrect' });
+        return res.status(401).json({
+          error: 'invalid_mfa_code',
+          message: 'The verification code is incorrect',
+          ...(lockedFor ? { lockedForSeconds: lockedFor } : {}),
+        });
       }
     }
     const session = signPlatformAccess({ userId: user.id, role: admin.role });
@@ -3038,6 +3174,8 @@ async function auditMutation(req: express.Request, action: string, resource: str
       role: admin.role,
       user: publicUser(user),
       mfa: { enabled: requireMfa ? true : await mfaEnabled(user.id) },
+      mfaRequired: requireMfa,
+      stepUpRequired: (process.env.PLATFORM_ADMIN_REQUIRE_STEP_UP ?? 'true') === 'true',
     });
   });
 
@@ -3047,16 +3185,44 @@ async function auditMutation(req: express.Request, action: string, resource: str
     const parsed = z.object({
       code: z.string().trim().max(16).nullish(),
       recoveryCode: z.string().trim().max(32).nullish(),
+      action: z.string().trim().max(64),
     }).safeParse(req.body);
     if (!parsed.success || (!parsed.data.code && !parsed.data.recoveryCode)) {
       return res.status(400).json({ error: 'invalid_body', message: 'code or recoveryCode required' });
     }
+    if (!PLATFORM_STEP_UP_ACTIONS.has(parsed.data.action)) {
+      return res.status(400).json({ error: 'invalid_step_up_action', message: 'unknown step-up action' });
+    }
+    const sessionJti = String(ctx.claims?.jti || '');
+    if (!sessionJti) return res.status(403).json({ error: 'platform_session_required', message: 'obtain a fresh platform session' });
+    const locked = await lockRemaining(ctx.user.id);
+    if (locked > 0) return res.status(429).json({ error: 'account_locked', message: 'too many failed verification attempts', retryAfter: locked });
     const result = await checkSecondFactor(ctx.user.id, { code: parsed.data.code, recoveryCode: parsed.data.recoveryCode });
-    if (!result.ok) return res.status(401).json({ error: 'invalid_mfa_code', message: 'The verification code is incorrect' });
-    const step = signPlatformStepUp({ userId: ctx.user.id, role: ctx.admin.role });
-    await auditPlatformAction(req, ctx.user.id, 'platform:step-up', ctx.user.org_id);
+    if (!result.ok) {
+      const lockedFor = await recordLoginFailure(ctx.user.id);
+      await auditPlatformDenied(req, ctx.user.id, ctx.user.org_id, parsed.data.action, 'invalid_step_up_code');
+      return res.status(401).json({
+        error: 'invalid_mfa_code',
+        message: 'The verification code is incorrect',
+        ...(lockedFor ? { lockedForSeconds: lockedFor } : {}),
+      });
+    }
+    const step = signPlatformStepUp({
+      userId: ctx.user.id,
+      role: ctx.admin.role,
+      sessionJti,
+      action: parsed.data.action,
+    });
+    await registerPlatformStepUp({
+      jti: step.jti,
+      userId: ctx.user.id,
+      sessionJti,
+      action: parsed.data.action,
+      expiresAt: new Date(Date.now() + step.expiresIn * 1000),
+    });
+    await auditPlatformAction(req, ctx.user.id, 'platform:step-up', ctx.user.org_id, { action: parsed.data.action });
     noStore(res);
-    return res.json({ stepUpToken: step.token, expiresIn: step.expiresIn });
+    return res.json({ stepUpToken: step.token, expiresIn: step.expiresIn, action: parsed.data.action });
   });
 
   app.get('/v1/platform/me', async (req, res) => {
@@ -3067,6 +3233,8 @@ async function auditMutation(req: express.Request, action: string, resource: str
       user: publicUser(ctx.user),
       role: ctx.admin.role,
       mfa: { enabled: await mfaEnabled(ctx.user.id) },
+      mfaRequired: (process.env.PLATFORM_ADMIN_REQUIRE_MFA ?? 'true') === 'true',
+      stepUpRequired: (process.env.PLATFORM_ADMIN_REQUIRE_STEP_UP ?? 'true') === 'true',
       platformOrgId: ctx.user.org_id,
     });
   });
@@ -3115,13 +3283,18 @@ async function auditMutation(req: express.Request, action: string, resource: str
     }).safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
     const b = parsed.data;
+    if (b.slug.toLowerCase() === (process.env.PLATFORM_ORG_SLUG || 'synapseone-platform').toLowerCase()) {
+      return res.status(403).json({ error: 'reserved_org_slug', message: 'this slug is reserved for the platform organization' });
+    }
     if (await getOrgBySlug(b.slug)) return res.status(409).json({ error: 'conflict', message: 'organization slug exists' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'org:create'))) return;
     const { organization: created, admin } = await createOrganizationWithAdmin(
       sanitizeName(b.slug, 64),
       sanitizeName(b.displayName),
       b.adminEmail,
       b.adminDisplayName ? sanitizeName(b.adminDisplayName) : undefined,
     );
+    const inviteToken = await issueInvite(admin);
     await auditPlatformAction(req, ctx.user.id, 'platform:org:create', created.id, {
       slug: created.slug,
       adminUserId: admin.id,
@@ -3129,7 +3302,35 @@ async function auditMutation(req: express.Request, action: string, resource: str
       ...(b.reason ? { reason: b.reason } : {}),
     });
     noStore(res);
-    res.status(201).json({ organization: created, admin: publicUser(admin) });
+    res.status(201).json({ organization: created, admin: publicUser(admin), inviteToken });
+  });
+
+  app.post('/v1/platform/orgs/:orgId/accounts', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id' });
+    const parsed = z.object({
+      slug: z.string().trim().regex(/^[a-z0-9-]{1,64}$/),
+      displayName: z.string().trim().min(2).max(200),
+      reason: z.string().trim().max(500).nullish(),
+    }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    const org = await getOrgById(req.params.orgId);
+    if (!org || (org.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'org_not_found' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'org:account:create'))) return;
+    try {
+      const account = await createAccount(org.id, parsed.data.slug, sanitizeName(parsed.data.displayName));
+      await auditPlatformAction(req, ctx.user.id, 'platform:org:account:create', org.id, {
+        accountId: account.id,
+        slug: account.slug,
+        ...(parsed.data.reason ? { reason: parsed.data.reason } : {}),
+      });
+      noStore(res);
+      res.status(201).json(account);
+    } catch (e: any) {
+      if (e?.code === '23505' || e?.status === 409) return res.status(409).json({ error: 'conflict', message: 'account slug exists' });
+      return res.status(400).json({ error: 'invalid_body', message: e.message });
+    }
   });
 
   app.get('/v1/platform/orgs/:orgId', async (req, res) => {
@@ -3172,15 +3373,34 @@ async function auditMutation(req: express.Request, action: string, resource: str
       getMfa(user.id),
       listRefreshSessions(user.id),
     ]);
+    const lockedForSeconds = await lockRemaining(user.id);
     noStore(res);
     res.json({
-      user: publicUser(user),
+      user: { ...publicUser(user), passwordSet: !!user.password_hash },
       organization: org,
       roles,
-      policies: policies.map((p, i) => ({ index: i, Statement: Array.isArray((p as any).Statement) ? (p as any).Statement.length : 0 })),
+      policies: policies.map((document, index) => ({ index, document })),
       mfa: { enabled: !!mfa?.enabled, recoveryCodesRemaining: mfa?.enabled ? mfa.recovery_hashes.length : 0 },
+      lockedForSeconds,
       sessions: sessions.map((s) => ({ id: s.id, created_at: s.created_at, expires_at: s.expires_at, revoked_at: s.revoked_at })),
     });
+  });
+
+  app.post('/v1/platform/users/:userId/invite', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.userId)) return res.status(400).json({ error: 'invalid_id' });
+    const target = await getUserById(req.params.userId);
+    if (!target) return res.status(404).json({ error: 'user_not_found' });
+    const targetOrg = await getOrgById(target.org_id);
+    if (!targetOrg || (targetOrg.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'user_not_found' });
+    if (target.active === false) return res.status(409).json({ error: 'account_deactivated' });
+    if (target.password_hash) return res.status(409).json({ error: 'password_already_set' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'user:invite'))) return;
+    const inviteToken = await issueInvite(target);
+    await auditPlatformAction(req, ctx.user.id, 'platform:user:invite', target.org_id, { targetUserId: target.id });
+    noStore(res);
+    res.json({ ok: true, inviteToken });
   });
 
   app.put('/v1/platform/users/:userId/org-admin', async (req, res) => {
@@ -3193,10 +3413,10 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!target) return res.status(404).json({ error: 'user_not_found' });
     const targetOrg = await getOrgById(target.org_id);
     if (!targetOrg || (targetOrg.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'user_not_found' });
-    if (!requirePlatformStepUp(req, res, ctx.user.id)) return;
+    if (!(await requirePlatformStepUp(req, res, ctx, 'user:org-admin'))) return;
     if (!flag && target.is_org_admin) {
-      const admins = (await listUsers(target.org_id)).filter((u) => u.is_org_admin);
-      if (admins.length <= 1) return res.status(409).json({ error: 'last_admin', message: 'an organization needs at least one administrator' });
+      const admins = (await listUsers(target.org_id)).filter((u) => u.is_org_admin && u.active !== false);
+      if (admins.length <= 1) return res.status(409).json({ error: 'last_admin', message: 'an organization needs at least one active administrator' });
     }
     const reason = typeof (req.body || {}).reason === 'string' ? String((req.body || {}).reason).slice(0, 500) : '';
     const updated = await setOrgAdmin(target.id, flag);
@@ -3214,11 +3434,13 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!target) return res.status(404).json({ error: 'user_not_found' });
     const targetOrg = await getOrgById(target.org_id);
     if (!targetOrg || (targetOrg.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'user_not_found' });
-    if (!requirePlatformStepUp(req, res, ctx.user.id)) return;
+    if (!(await requirePlatformStepUp(req, res, ctx, 'user:reset-mfa'))) return;
     const removed = await removeMfa(target.id);
     await clearLoginFailures(target.id);
-    await auditPlatformAction(req, ctx.user.id, 'platform:user:reset-mfa', target.org_id, { targetUserId: target.id, removed });
-    res.json({ ok: true, removed });
+    const revoked = await revokeAllRefresh(target.id);
+    const revokedKeys = await revokeApiKeysForUser(target.id);
+    await auditPlatformAction(req, ctx.user.id, 'platform:user:reset-mfa', target.org_id, { targetUserId: target.id, removed, revoked, revokedKeys });
+    res.json({ ok: true, removed, revoked, revokedKeys });
   });
 
   app.post('/v1/platform/users/:userId/unlock', async (req, res) => {
@@ -3242,10 +3464,11 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!target) return res.status(404).json({ error: 'user_not_found' });
     const targetOrg = await getOrgById(target.org_id);
     if (!targetOrg || (targetOrg.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'user_not_found' });
-    if (!requirePlatformStepUp(req, res, ctx.user.id)) return;
+    if (!(await requirePlatformStepUp(req, res, ctx, 'user:revoke-sessions'))) return;
     const revoked = await revokeAllRefresh(target.id);
-    await auditPlatformAction(req, ctx.user.id, 'platform:user:revoke-sessions', target.org_id, { targetUserId: target.id, revoked });
-    res.json({ ok: true, revoked });
+    const revokedKeys = await revokeApiKeysForUser(target.id);
+    await auditPlatformAction(req, ctx.user.id, 'platform:user:revoke-sessions', target.org_id, { targetUserId: target.id, revoked, revokedKeys });
+    res.json({ ok: true, revoked, revokedKeys });
   });
 
   app.post('/v1/platform/users/:userId/disable', async (req, res) => {
@@ -3256,11 +3479,12 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!target) return res.status(404).json({ error: 'user_not_found' });
     const targetOrg = await getOrgById(target.org_id);
     if (!targetOrg || (targetOrg.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'user_not_found' });
-    if (!requirePlatformStepUp(req, res, ctx.user.id)) return;
+    if (!(await requirePlatformStepUp(req, res, ctx, 'user:disable'))) return;
     await setUserActive(target.id, false);
     const revoked = await revokeAllRefresh(target.id);
-    await auditPlatformAction(req, ctx.user.id, 'platform:user:disable', target.org_id, { targetUserId: target.id, revoked });
-    res.json({ ok: true });
+    const revokedKeys = await revokeApiKeysForUser(target.id);
+    await auditPlatformAction(req, ctx.user.id, 'platform:user:disable', target.org_id, { targetUserId: target.id, revoked, revokedKeys });
+    res.json({ ok: true, revoked, revokedKeys });
   });
 
   app.post('/v1/platform/users/:userId/enable', async (req, res) => {
@@ -3342,9 +3566,12 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!ctx) return;
     const role = String((req.body || {}).role || 'auditor');
     if (!['owner', 'operator', 'auditor'].includes(role)) return res.status(400).json({ error: 'invalid_role' });
-    if (!requirePlatformStepUp(req, res, ctx.user.id)) return;
+    if (!(await requirePlatformStepUp(req, res, ctx, 'admin:grant'))) return;
     const email = typeof (req.body || {}).email === 'string' ? String((req.body || {}).email).trim().toLowerCase() : '';
     const userId = typeof (req.body || {}).userId === 'string' ? String((req.body || {}).userId) : '';
+    if (email && !z.string().email().max(320).safeParse(email).success) {
+      return res.status(400).json({ error: 'invalid_email' });
+    }
     const platformOrg = await getOrgBySlug(process.env.PLATFORM_ORG_SLUG || 'synapseone-platform');
     if (!platformOrg || (platformOrg.kind || 'tenant') !== 'platform') {
       return res.status(409).json({ error: 'platform_org_missing', message: 'initialize the platform organization first' });
@@ -3363,6 +3590,15 @@ async function auditMutation(req: express.Request, action: string, resource: str
     } else {
       return res.status(400).json({ error: 'email_or_userId_required' });
     }
+    if (target.active === false) {
+      return res.status(409).json({ error: 'platform_user_inactive', message: 'the target platform account is inactive' });
+    }
+    const previous = await getPlatformAdmin(target.id);
+    if (previous && !previous.revoked_at && previous.role === 'owner' && role !== 'owner'
+        && (await countActivePlatformOwners()) <= 1) {
+      await auditPlatformDenied(req, ctx.user.id, target.org_id, 'admin:grant', 'last_owner_demotion');
+      return res.status(409).json({ error: 'last_owner', message: 'at least one platform owner must remain' });
+    }
     const reason = typeof (req.body || {}).reason === 'string' ? String((req.body || {}).reason).slice(0, 500) : '';
     const admin = await grantPlatformAdmin({
       userId: target.id,
@@ -3370,37 +3606,50 @@ async function auditMutation(req: express.Request, action: string, resource: str
       grantedBy: ctx.user.id,
       reason,
     });
+    const inviteToken = await issueInvite(target);
     await auditPlatformAction(req, ctx.user.id, 'platform:admin:grant', target.org_id, {
-      targetUserId: target.id, role, ...(reason ? { reason } : {}),
+      targetUserId: target.id,
+      oldRole: previous?.role || null,
+      role,
+      inviteIssued: !!inviteToken,
+      ...(reason ? { reason } : {}),
     });
-    res.status(201).json({ ...admin, email: target.email, display_name: target.display_name || '' });
+    res.status(201).json({ ...admin, email: target.email, display_name: target.display_name || '', inviteToken });
   });
 
   app.delete('/v1/platform/admins/:userId', async (req, res) => {
     const ctx = await currentPlatformAdmin(req, res, 'owner');
     if (!ctx) return;
     if (!isUuid(req.params.userId)) return res.status(400).json({ error: 'invalid_id' });
-    if (req.params.userId === ctx.user.id && (await countActivePlatformOwners()) <= 1) {
-      return res.status(409).json({ error: 'last_owner', message: 'at least one platform owner must remain' });
-    }
-    if (!requirePlatformStepUp(req, res, ctx.user.id)) return;
     const target = await getUserById(req.params.userId);
     if (!target) return res.status(404).json({ error: 'user_not_found' });
     const targetAdmin = await getPlatformAdmin(target.id);
     if (!targetAdmin || targetAdmin.revoked_at) return res.status(404).json({ error: 'platform_admin_not_found' });
-    if (targetAdmin.role === 'owner' && (await countActivePlatformOwners()) <= 1) {
+    if (targetAdmin.role === 'owner' && target.active !== false && (await countActivePlatformOwners()) <= 1) {
+      await auditPlatformDenied(req, ctx.user.id, target.org_id, 'admin:revoke', 'last_owner');
+      return res.status(409).json({ error: 'last_owner', message: 'at least one platform owner must remain' });
+    }
+    if (!(await requirePlatformStepUp(req, res, ctx, 'admin:revoke'))) return;
+    if (targetAdmin.role === 'owner' && target.active !== false && (await countActivePlatformOwners()) <= 1) {
+      await auditPlatformDenied(req, ctx.user.id, target.org_id, 'admin:revoke', 'last_owner');
       return res.status(409).json({ error: 'last_owner', message: 'at least one platform owner must remain' });
     }
     const ok = await revokePlatformAdmin(target.id);
+    if (!ok) {
+      await auditPlatformDenied(req, ctx.user.id, target.org_id, 'admin:revoke', 'revoke_failed');
+      return res.status(404).json({ error: 'platform_admin_not_found' });
+    }
     const revoked = await revokeAllRefresh(target.id);
+    const revokedKeys = await revokeApiKeysForUser(target.id);
     const reason = typeof (req.body || {}).reason === 'string' ? String((req.body || {}).reason).slice(0, 500) : '';
     await auditPlatformAction(req, ctx.user.id, 'platform:admin:revoke', target.org_id, {
       targetUserId: target.id,
       revoked,
+      revokedKeys,
+      previousRole: targetAdmin.role,
       ...(reason ? { reason } : {}),
     });
-    if (!ok) return res.status(404).json({ error: 'platform_admin_not_found' });
-    res.json({ ok: true, revoked });
+    res.json({ ok: true, revoked, revokedKeys });
   });
 
   // One-time bootstrap, called directly over the internal network. No gateway
@@ -3421,15 +3670,20 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
     const slug = process.env.PLATFORM_ORG_SLUG || 'synapseone-platform';
     let org = await getOrgBySlug(slug);
+    if (org && (org.kind || 'tenant') !== 'platform') {
+      return res.status(409).json({ error: 'platform_org_conflict', message: 'the reserved slug already belongs to a tenant organization' });
+    }
     if (!org) org = await createOrganization(slug, 'SynapseOne Platform', 'platform');
     const user = await upsertUser(org.id, parsed.data.email, parsed.data.displayName ? sanitizeName(parsed.data.displayName) : undefined);
+    if (user.active === false) await setUserActive(user.id, true);
     const admin = await grantPlatformAdmin({ userId: user.id, role: 'owner', grantedBy: user.id, reason: 'initial bootstrap' });
+    const inviteToken = await issueInvite((await getUserById(user.id)) || user);
     await logAudit({
       actor_type: 'platform-bootstrap', actor_id: 'bootstrap', action: 'platform:bootstrap', resource: 'platform',
       decision: true, org_id: org.id, context: { platformAdmin: true, targetUserId: user.id, email: user.email },
     }).catch(() => undefined);
     noStore(res);
-    res.status(201).json({ organization: org, user: publicUser(user), admin });
+    res.status(201).json({ organization: org, user: publicUser(user), admin, inviteToken });
   });
 
   // Break-glass recovery for a platform administrator who lost their second

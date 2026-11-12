@@ -83,6 +83,7 @@ const mem = {
   passwordResets: new Map<string, any>(), // hash -> { user_id, purpose, expires_at, used_at }
   serviceAccountRoles: new Map<string, Set<string>>(), // serviceAccountId -> roleIds
   platformAdmins: new Map<string, PlatformAdmin>(), // userId -> admin record
+  platformStepUps: new Map<string, { user_id: string; session_jti: string; action: string; expires_at: string; used_at: string | null }>(),
   usage: [] as any[], // request/feature usage events (schedule from gateway)
 };
 
@@ -181,6 +182,13 @@ export function secretsEqual(a: string, b: string): boolean {
 // ---------- high-level CRUD that works on both pg + memory ----------
 
 export async function createOrganization(slug: string, display_name: string, kind = 'tenant'): Promise<Organization> {
+  const reserved = (process.env.PLATFORM_ORG_SLUG || 'synapseone-platform').trim().toLowerCase();
+  if (kind !== 'platform' && slug.toLowerCase() === reserved) {
+    throw Object.assign(new Error('reserved platform organization slug'), {
+      status: 403,
+      code: 'reserved_org_slug',
+    });
+  }
   if (db) {
     await ensureTables();
     const rows = await db.insert(schema.organizations)
@@ -967,7 +975,7 @@ export async function markEmailVerified(userId: string): Promise<boolean> {
 export async function storeOneTimeToken(
   userId: string,
   tokenHash: string,
-  purpose: 'reset' | 'verify',
+  purpose: 'reset' | 'verify' | 'invite',
   expiresAt: Date,
 ): Promise<void> {
   if (db) {
@@ -992,7 +1000,7 @@ export async function storeOneTimeToken(
 /** Atomically consume a single-use token. Returns the owning user id. */
 export async function consumeOneTimeToken(
   tokenHash: string,
-  purpose: 'reset' | 'verify',
+  purpose: 'reset' | 'verify' | 'invite',
 ): Promise<string | null> {
   if (db) {
     await ensureTables();
@@ -1187,14 +1195,78 @@ export async function revokePlatformAdmin(userId: string): Promise<boolean> {
   return true;
 }
 
+/** Count owners that can actually sign in (active user rows). An owner row for
+ *  an unclaimed/inactive account must not satisfy last-owner protection. */
 export async function countActivePlatformOwners(): Promise<number> {
   if (db) {
     await ensureTables();
-    const rows = await db.select({ n: sql<number>`count(*)::int` }).from(schema.platformAdmins)
-      .where(and(eq(schema.platformAdmins.role, 'owner'), isNull(schema.platformAdmins.revokedAt)));
+    const rows = await db.select({ n: sql<number>`count(*)::int` })
+      .from(schema.platformAdmins)
+      .innerJoin(schema.users, eq(schema.users.id, schema.platformAdmins.userId))
+      .where(and(
+        eq(schema.platformAdmins.role, 'owner'),
+        isNull(schema.platformAdmins.revokedAt),
+        eq(schema.users.active, true),
+      ));
     return Number(rows[0]?.n) || 0;
   }
-  return [...mem.platformAdmins.values()].filter((r) => r.role === 'owner' && !r.revoked_at).length;
+  return [...mem.platformAdmins.values()].filter((r) => {
+    if (r.role !== 'owner' || r.revoked_at) return false;
+    return mem.users.get(r.user_id)?.active !== false;
+  }).length;
+}
+
+export async function registerPlatformStepUp(input: {
+  jti: string; userId: string; sessionJti: string; action: string; expiresAt: Date;
+}): Promise<void> {
+  if (db) {
+    await ensureTables();
+    await db.insert(schema.platformStepUps).values({
+      jti: input.jti,
+      userId: input.userId,
+      sessionJti: input.sessionJti,
+      action: input.action,
+      expiresAt: input.expiresAt,
+    });
+    // Best-effort cleanup; never blocks issuance of a fresh proof.
+    await db.delete(schema.platformStepUps).where(lt(schema.platformStepUps.expiresAt, new Date())).catch(() => undefined);
+    return;
+  }
+  mem.platformStepUps.set(input.jti, {
+    user_id: input.userId,
+    session_jti: input.sessionJti,
+    action: input.action,
+    expires_at: input.expiresAt.toISOString(),
+    used_at: null,
+  });
+}
+
+/** Atomically consume a step-up proof. False means missing, wrong session,
+ *  wrong action, expired, or already used. */
+export async function consumePlatformStepUp(input: {
+  jti: string; userId: string; sessionJti: string; action: string;
+}): Promise<boolean> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(schema.platformStepUps)
+      .set({ usedAt: new Date() })
+      .where(and(
+        eq(schema.platformStepUps.jti, input.jti),
+        eq(schema.platformStepUps.userId, input.userId),
+        eq(schema.platformStepUps.sessionJti, input.sessionJti),
+        eq(schema.platformStepUps.action, input.action),
+        isNull(schema.platformStepUps.usedAt),
+        sql`${schema.platformStepUps.expiresAt} > now()`,
+      ))
+      .returning({ jti: schema.platformStepUps.jti });
+    return rows.length > 0;
+  }
+  const rec = mem.platformStepUps.get(input.jti);
+  if (!rec || rec.used_at) return false;
+  if (rec.user_id !== input.userId || rec.session_jti !== input.sessionJti || rec.action !== input.action) return false;
+  if (new Date(rec.expires_at).getTime() <= Date.now()) return false;
+  rec.used_at = new Date().toISOString();
+  return true;
 }
 
 export interface PlatformOrgCounts {

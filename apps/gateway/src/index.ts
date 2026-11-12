@@ -185,6 +185,10 @@ function authMiddleware(mode: RouteRule['auth']) {
       if (bearer) {
         try {
           const decoded: any = jwt.verify(bearer, JWT_SECRET, { issuer: JWT_ISSUERS, algorithms: ['HS256'] });
+          if (decoded.kind === 'platform-step-up') {
+            (req as any).synapseoneError = 'invalid_token';
+            return res.status(401).json({ error: 'invalid_token', message: 'step-up token is not an access token' });
+          }
           (req as any).principal = {
             type: 'jwt',
             kind: decoded.kind || 'user',
@@ -231,6 +235,10 @@ function authMiddleware(mode: RouteRule['auth']) {
         const token = h.slice(7);
         try {
           const decoded: any = jwt.verify(token, JWT_SECRET, { issuer: JWT_ISSUERS, algorithms: ['HS256'] });
+          if (decoded.kind === 'platform-step-up') {
+            (req as any).synapseoneError = 'invalid_token';
+            return res.status(401).json({ error: 'invalid_token', message: 'step-up token is not an access token' });
+          }
           (req as any).principal = {
             type: 'jwt',
             kind: decoded.kind || 'user',

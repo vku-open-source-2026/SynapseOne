@@ -345,3 +345,22 @@ export const platformAdmins = pgTable(
   },
   (t) => [index('idx_platform_admins_role').on(t.role), index('idx_platform_admins_revoked').on(t.revokedAt)],
 );
+
+/** One-time step-up proofs. A step-up JWT is bound to the issuing platform
+ *  session (sid), one action, and a jti consumed exactly once. */
+export const platformStepUps = pgTable(
+  'platform_step_ups',
+  {
+    jti: uuid('jti').primaryKey(),
+    userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+    sessionJti: uuid('session_jti').notNull(),
+    action: text('action').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    usedAt: timestamp('used_at', { withTimezone: true }),
+  },
+  (t) => [
+    index('idx_platform_step_ups_user').on(t.userId, t.expiresAt.desc()),
+    index('idx_platform_step_ups_expiry').on(t.expiresAt),
+  ],
+);

@@ -10,7 +10,8 @@ import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import { createApp } from './index';
 import { base32Decode, totp } from './mfa';
-import { queryAudit } from './db';
+import { queryAudit, grantPlatformAdmin, revokePlatformAdmin } from './db';
+import { signPlatformAccess } from './tokens';
 
 const BOOTSTRAP = 'bootstrap-test-secret';
 const saved: Record<string, string | undefined> = {};
@@ -22,7 +23,7 @@ describe('platform super admin', () => {
   let normalToken = '';
   let platformUserId = '';
   let platformSecret = '';
-  let platformRecoveryCode = '';
+  let platformRecoveryCodes: string[] = [];
   let stepUpToken = '';
   let tenantOrgId = '';
   let tenantUserId = '';
@@ -74,7 +75,23 @@ describe('platform super admin', () => {
             assert.equal(boot.status, 201, bootText);
             const bootJson: any = JSON.parse(bootText);
             platformUserId = bootJson.user.id;
-            const login = await call('POST', '/v1/auth/login', { email: 'platform-owner@test.local', orgSlug: 'synapseone-platform' });
+            assert.equal(typeof bootJson.inviteToken, 'string');
+            const accept = await call('POST', '/v1/auth/invite/accept', {
+              token: bootJson.inviteToken,
+              password: 'PlatformOwnerTest!2345',
+              displayName: 'Platform Owner',
+            });
+            assert.equal(accept.status, 201, JSON.stringify(accept.json));
+            const replayInvite = await call('POST', '/v1/auth/invite/accept', {
+              token: bootJson.inviteToken,
+              password: 'PlatformOwnerTest!2345',
+            });
+            assert.equal(replayInvite.status, 400);
+            const login = await call('POST', '/v1/auth/login', {
+              email: 'platform-owner@test.local',
+              password: 'PlatformOwnerTest!2345',
+              orgSlug: 'synapseone-platform',
+            });
             assert.equal(login.status, 200);
             normalToken = login.json.accessToken;
             const setup = await call('POST', '/v1/auth/mfa/totp/setup', {}, normalToken);
@@ -82,8 +99,9 @@ describe('platform super admin', () => {
             platformSecret = setup.json.secret;
             const enable = await call('POST', '/v1/auth/mfa/totp/enable', { code: totp(base32Decode(setup.json.secret)) }, normalToken);
             assert.equal(enable.status, 200);
-            platformRecoveryCode = enable.json.recoveryCodes[0];
-            const session = await call('POST', '/v1/platform/session', { recoveryCode: platformRecoveryCode }, normalToken);
+            platformRecoveryCodes = enable.json.recoveryCodes;
+            assert.equal(platformRecoveryCodes.length, 10);
+            const session = await call('POST', '/v1/platform/session', { recoveryCode: platformRecoveryCodes[0] }, normalToken);
             assert.equal(session.status, 200, JSON.stringify(session.json));
             platformToken = session.json.accessToken;
             resolve();
@@ -126,18 +144,24 @@ describe('platform super admin', () => {
     assert.equal(typeof overview.json.usage.requests, 'number');
   });
 
-  it('creates a tenant organization with a first admin', async () => {
+  it('creates a tenant organization with a first admin and a one-time invite', async () => {
     const slug = `tenant-${Date.now()}`;
+    const step = await call('POST', '/v1/platform/step-up', {
+      recoveryCode: platformRecoveryCodes[4],
+      action: 'org:create',
+    }, platformToken);
+    assert.equal(step.status, 200, JSON.stringify(step.json));
     const created = await call('POST', '/v1/platform/orgs', {
       slug,
       displayName: 'Tenant Co',
       adminEmail: `admin-${slug}@test.local`,
       adminDisplayName: 'Tenant Admin',
-    }, platformToken);
+    }, platformToken, { 'x-platform-step-up': step.json.stepUpToken });
     assert.equal(created.status, 201, JSON.stringify(created.json));
     tenantOrgId = created.json.organization.id;
     tenantUserId = created.json.admin.id;
     assert.equal(created.json.admin.is_org_admin, true);
+    assert.equal(typeof created.json.inviteToken, 'string');
 
     const orgs = await call('GET', `/v1/platform/orgs?q=${encodeURIComponent(slug)}`, undefined, platformToken);
     assert.equal(orgs.status, 200);
@@ -147,6 +171,33 @@ describe('platform super admin', () => {
     const detail = await call('GET', `/v1/platform/orgs/${tenantOrgId}`, undefined, platformToken);
     assert.equal(detail.status, 200);
     assert.equal(detail.json.organization.slug, slug);
+  });
+
+  it('creates a tenant account with step-up', async () => {
+    const step = await call('POST', '/v1/platform/step-up', {
+      recoveryCode: platformRecoveryCodes[5],
+      action: 'org:account:create',
+    }, platformToken);
+    assert.equal(step.status, 200, JSON.stringify(step.json));
+    const account = await call('POST', `/v1/platform/orgs/${tenantOrgId}/accounts`, {
+      slug: 'production',
+      displayName: 'Production',
+      reason: 'test',
+    }, platformToken, { 'x-platform-step-up': step.json.stepUpToken });
+    assert.equal(account.status, 201, JSON.stringify(account.json));
+    assert.equal(account.json.slug, 'production');
+    const detail = await call('GET', `/v1/platform/orgs/${tenantOrgId}`, undefined, platformToken);
+    assert.equal(detail.json.counts.accounts, 1);
+  });
+
+  it('rejects a platform row whose user belongs to a tenant organization', async () => {
+    if (!tenantUserId) return; // tenant user is created by the next test
+    const badAdmin = await grantPlatformAdmin({ userId: tenantUserId, role: 'operator', reason: 'test' });
+    const token = signPlatformAccess({ userId: tenantUserId, role: badAdmin.role });
+    const r = await call('GET', '/v1/platform/me', undefined, token.token);
+    assert.equal(r.status, 403);
+    assert.equal(r.json.error, 'platform_admin_org_required');
+    await revokePlatformAdmin(tenantUserId);
   });
 
   it('searches users and requires step-up for sensitive actions', async () => {
@@ -159,11 +210,15 @@ describe('platform super admin', () => {
     assert.equal(noStep.status, 403);
     assert.equal(noStep.json.error, 'platform_step_up_required');
 
-    const invalid = await call('POST', '/v1/platform/step-up', { code: '000000' }, platformToken);
+    const invalid = await call('POST', '/v1/platform/step-up', { code: '000000', action: 'user:reset-mfa' }, platformToken);
     assert.equal(invalid.status, 401);
+    const badAction = await call('POST', '/v1/platform/step-up', { recoveryCode: platformRecoveryCodes[5], action: 'not:allowed' }, platformToken);
+    assert.equal(badAction.status, 400);
 
-    const nextCode = totp(base32Decode(platformSecret), Date.now() + 30_000);
-    const step = await call('POST', '/v1/platform/step-up', { code: nextCode }, platformToken);
+    const step = await call('POST', '/v1/platform/step-up', {
+      recoveryCode: platformRecoveryCodes[1],
+      action: 'user:reset-mfa',
+    }, platformToken);
     assert.equal(step.status, 200, JSON.stringify(step.json));
     stepUpToken = step.json.stepUpToken;
     assert.ok(stepUpToken);
@@ -172,14 +227,46 @@ describe('platform super admin', () => {
       'x-platform-step-up': stepUpToken,
     });
     assert.equal(reset.status, 200, JSON.stringify(reset.json));
+
+    const replay = await call('POST', `/v1/platform/users/${tenantUserId}/reset-mfa`, {}, platformToken, {
+      'x-platform-step-up': stepUpToken,
+    });
+    assert.equal(replay.status, 403);
+    assert.equal(replay.json.error, 'platform_step_up_required');
+
+    // A proof minted for one action cannot authorize another action.
+    const mismatched = await call('POST', '/v1/platform/step-up', {
+      recoveryCode: platformRecoveryCodes[2],
+      action: 'user:reset-mfa',
+    }, platformToken);
+    assert.equal(mismatched.status, 200, JSON.stringify(mismatched.json));
+    const disableWithMismatch = await call('POST', `/v1/platform/users/${tenantUserId}/disable`, {}, platformToken, {
+      'x-platform-step-up': mismatched.json.stepUpToken,
+    });
+    assert.equal(disableWithMismatch.status, 403);
+    assert.equal(disableWithMismatch.json.error, 'platform_step_up_required');
   });
 
-  it('lists platform administrators and protects the last owner', async () => {
+  it('lists platform administrators and protects the last owner from demotion or revocation', async () => {
     const admins = await call('GET', '/v1/platform/admins', undefined, platformToken);
     assert.equal(admins.status, 200);
     assert.ok(admins.json.items.some((a: any) => a.user_id === platformUserId && a.role === 'owner'));
+
     const revoke = await call('DELETE', `/v1/platform/admins/${platformUserId}`, undefined, platformToken);
     assert.equal(revoke.status, 409);
     assert.equal(revoke.json.error, 'last_owner');
+
+    const step = await call('POST', '/v1/platform/step-up', {
+      recoveryCode: platformRecoveryCodes[3],
+      action: 'admin:grant',
+    }, platformToken);
+    assert.equal(step.status, 200, JSON.stringify(step.json));
+    const demote = await call('POST', '/v1/platform/admins', {
+      email: 'platform-owner@test.local',
+      role: 'auditor',
+      reason: 'test demotion guard',
+    }, platformToken, { 'x-platform-step-up': step.json.stepUpToken });
+    assert.equal(demote.status, 409, JSON.stringify(demote.json));
+    assert.equal(demote.json.error, 'last_owner');
   });
 });
