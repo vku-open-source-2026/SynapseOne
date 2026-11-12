@@ -174,9 +174,12 @@ export const workflowRunners = pgTable(
   {
     id: text('id').primaryKey(),
     name: text('name').notNull(),
+    /** workflow | inference | hybrid runner capability. */
+    kind: text('kind').notNull().default('workflow'),
     /** custom | hybrid (platform workers are built into workflow-service). */
     mode: text('mode').notNull().default('custom'),
     queue: text('queue').notNull(),
+    inferenceQueue: text('inference_queue'),
     orgId: text('org_id'),
     accountId: text('account_id'),
     apiKeyId: text('api_key_id'),
@@ -221,5 +224,33 @@ export const workflowRunnerInstances = pgTable(
   (t) => [
     index('idx_synapseone_runner_instances_runner').on(t.runnerId),
     index('idx_synapseone_runner_instances_seen').on(t.lastSeenAt.desc()),
+  ],
+);
+
+/** Queued inference work consumed by inference/hybrid runners. */
+export const inferenceJobs = pgTable(
+  'synapseone_inference_jobs',
+  {
+    id: text('id').primaryKey(),
+    type: text('type').notNull().default('chat'),
+    status: text('status').notNull().default('queued'),
+    request: jsonb('request').$type<any>().notNull().default(sql`'{}'::jsonb`),
+    result: jsonb('result').$type<any>(),
+    error: text('error'),
+    orgId: text('org_id'),
+    accountId: text('account_id'),
+    runnerId: text('runner_id'),
+    instanceId: text('instance_id'),
+    queueName: text('queue_name'),
+    attempt: integer('attempt').notNull().default(0),
+    leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    finishedAt: timestamp('finished_at', { withTimezone: true }),
+  },
+  (t) => [
+    index('idx_synapseone_inference_jobs_status').on(t.status, t.createdAt.desc()),
+    index('idx_synapseone_inference_jobs_tenant').on(t.orgId, t.accountId),
+    index('idx_synapseone_inference_jobs_runner').on(t.runnerId, t.createdAt.desc()),
   ],
 );

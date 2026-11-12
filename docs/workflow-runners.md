@@ -2,17 +2,28 @@
 
 SynapseFlow executes DAGs on **workers that consume a SynapseQueue queue**.
 You can use SynapseOne's built-in worker, deploy your own runner from the
-published image, or run both against the same queue (hybrid).
+published image, or run both against the same queue (hybrid). A connector can
+run one or both lanes:
+
+| Runner type | Lanes | Use it for |
+| --- | --- | --- |
+| `workflow` | workflow queue | SynapseFlow DAG execution (default) |
+| `inference` | inference queue | Running chat/embeddings/decision jobs against a local OpenAI-compatible backend |
+| `hybrid` | both | One process for workflow + inference work |
 
 ```text
-trigger (manual/webhook/cron/human task)
-        │  create queued execution (Postgres)
-        ▼
-SynapseQueue  ──►  platform worker (workflow-service)
-        │      └─►  self-hosted runner (your infra)
-        ▼
-claim → execute DAG → complete → ack
+trigger (manual/webhook/cron/human task)        inference job API
+        │                                             │
+        ▼                                             ▼
+workflow queue ──► platform worker / workflow runner   inference queue ──► inference/hybrid runner
+        │                                             │
+        └──────── claim → execute → complete → ack ───┘
 ```
+
+The runner only needs **outbound HTTPS to the SynapseOne gateway**. The scoped
+API key is used for queue/job calls and for every other SynapseOne service
+(Base, LDS, Faststore, Inference, Warehouse, IAM, …) — no database, internal
+secret or service-network access is needed.
 
 The queue message contains only the execution id. Workflow input and the DAG
 definition stay in Postgres and are returned by the authenticated claim.
@@ -94,7 +105,40 @@ gateway.
 | `WORKFLOW_RUNNER_LEASE_SECONDS` | no | `300` | Claim/visibility lease |
 | `WORKFLOW_RUNNER_HEARTBEAT_SECONDS` | no | `15` | Connector heartbeat + lease refresh |
 | `WORKFLOW_RUNNER_INSTANCE_ID` | no | host-pid-random | Stable connector id for this process |
+| `WORKFLOW_RUNNER_INFERENCE_CONCURRENCY` | no | workflow concurrency | Parallel inference jobs |
 | `WORKFLOW_RUNNER_ONCE` | no | — | Drain one poll then exit (smoke test) |
+| `INFERENCE_RUNNER_URL` | inference/hybrid | — | Local OpenAI-compatible base URL (`http://vllm:8000/v1`) |
+| `INFERENCE_RUNNER_API_KEY` | no | — | Bearer token for the local backend |
+| `INFERENCE_RUNNER_MODEL` | no | request model | Force a local model name |
+| `INFERENCE_RUNNER_CHAT_PATH` | no | `/chat/completions` | Local chat path |
+| `INFERENCE_RUNNER_EMBEDDINGS_PATH` | no | `/embeddings` | Local embeddings path |
+| `INFERENCE_RUNNER_DECISION_PATH` / `ROUTE_PATH` | no | `/decision`, `/decision/route` | Local decision paths |
+| `INFERENCE_RUNNER_TIMEOUT_MS` | no | 120000 | Local backend timeout |
+
+### Inference lane
+
+`POST /v1/inference-jobs {type, payload, queue?, wait?}` creates a queued inference
+job. Types: `chat`, `embeddings`, `decision`, `route`, `generic` (`generic` uses
+`payload.path` and `payload.body`). The inference/hybrid runner claims the job,
+POSTs to the local backend, stores the result, and acks the queue. Consumers can
+poll `GET /v1/inference-jobs/:id` or call with `wait: true`.
+
+### Network hardening
+
+The runner's HTTP client (undici) is built for hostile networks:
+
+- retries connection errors, `408/425/429/500/502/503/504` with exponential
+  backoff + jitter, honors `Retry-After`, and is safe with claim/ack retries
+  (claim is idempotent per runner);
+- honors `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`;
+- supports a private CA with `SYNAPSEONE_CA_CERT=/path/ca.pem` (or the standard
+  `NODE_EXTRA_CA_CERTS`); `SYNAPSEONE_TLS_INSECURE=true` is dev-only;
+- fails fast at startup if `/v1/auth/verify` rejects the key or required scopes
+  are missing;
+- detects HTML responses (wrong URL / login proxy) and prints an actionable
+  error instead of a JSON parse error;
+- `SYNAPSEONE_HTTP_RETRIES` (default 3) and
+  `SYNAPSEONE_HTTP_RETRY_BASE_MS` (default 300) tune retries.
 
 Run with Docker, Compose, Kubernetes or a systemd unit. The runner sends a
 heartbeat immediately on boot, so **Workflow Runners** switches to

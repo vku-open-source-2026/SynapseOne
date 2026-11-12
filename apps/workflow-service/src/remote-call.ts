@@ -13,16 +13,30 @@
  * runner job protocol (never by reading the database).
  */
 import './env-compat';
+import fs from 'fs';
+import { Agent, ProxyAgent, fetch as undiciFetch } from 'undici';
 import type { CredentialResolver, SynapseOneCall } from './engine';
 
 export class RunnerHttpError extends Error {
   status: number;
   body: any;
   constructor(status: number, path: string, body: any) {
-    super(`SynapseOne ${status} ${path}: ${typeof body === 'string' ? body : JSON.stringify(body)}`);
+    const detail = typeof body === 'string' ? body : JSON.stringify(body);
+    super(`SynapseOne ${status} ${path}: ${detail}`);
     this.name = 'RunnerHttpError';
     this.status = status;
     this.body = body;
+  }
+}
+
+export class RunnerNetworkError extends Error {
+  code: string;
+  path: string;
+  constructor(message: string, code: string, path: string) {
+    super(message);
+    this.name = 'RunnerNetworkError';
+    this.code = code;
+    this.path = path;
   }
 }
 
@@ -33,41 +47,149 @@ export interface RunnerApiOptions {
   timeoutMs?: number;
 }
 
+function envInt(name: string, def: number, min: number, max: number): number {
+  const n = Number(process.env[name] || def);
+  return Math.min(Math.max(Number.isFinite(n) ? n : def, min), max);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function proxyFor(base: string): string {
+  const proxy = String(process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || '').trim();
+  if (!proxy) return '';
+  let host = '';
+  try { host = new URL(base).hostname.toLowerCase(); } catch { /* ignore */ }
+  const noProxy = String(process.env.NO_PROXY || process.env.no_proxy || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  for (const entry of noProxy) {
+    if (!entry) continue;
+    if (entry === '*') return '';
+    const clean = entry.replace(/^\./, '');
+    if (host === clean || host.endsWith(`.${clean}`)) return '';
+  }
+  return proxy;
+}
+
+function tlsOptions(): { ca?: Buffer; rejectUnauthorized: boolean } {
+  const rejectUnauthorized = String(process.env.SYNAPSEONE_TLS_INSECURE || '').toLowerCase() !== 'true';
+  const caPath = String(process.env.SYNAPSEONE_CA_CERT || '').trim();
+  if (caPath) {
+    try {
+      return { ca: fs.readFileSync(caPath), rejectUnauthorized };
+    } catch (e: any) {
+      throw new Error(`SYNAPSEONE_CA_CERT '${caPath}' cannot be read: ${e?.message || e}`);
+    }
+  }
+  return { rejectUnauthorized };
+}
+
+function networkHint(e: any, base: string): { code: string; message: string } {
+  const code = String(e?.cause?.code || e?.code || e?.name || 'NETWORK_ERROR');
+  const host = (() => { try { return new URL(base).host; } catch { return base; } })();
+  const proxy = proxyFor(base);
+  const suffix = proxy ? ` (HTTPS_PROXY=${proxy})` : '';
+  if (/ENOTFOUND|EAI_AGAIN/.test(code)) {
+    return { code, message: `DNS lookup failed for ${host}. Check SYNAPSEONE_URL and the runner's DNS/resolver${suffix}.` };
+  }
+  if (/ECONNREFUSED/.test(code)) {
+    return { code, message: `Connection refused by ${host}. Check the gateway URL/port, TLS terminator and firewall${suffix}.` };
+  }
+  if (/CERT_|SELF_SIGNED|UNABLE_TO_VERIFY|ERR_TLS/.test(code)) {
+    return { code, message: `TLS verification failed for ${host}. Install the CA in the runner container (SYNAPSEONE_CA_CERT=/path/ca.pem or NODE_EXTRA_CA_CERTS)${suffix}.` };
+  }
+  if (/TIMEOUT|UND_ERR_CONNECT_TIMEOUT|UND_ERR_HEADERS_TIMEOUT/.test(code)) {
+    return { code, message: `Timed out connecting to ${host}. Check egress firewall/security groups, proxy settings and the gateway timeout${suffix}.` };
+  }
+  if (/PROXY/.test(code)) {
+    return { code, message: `Proxy error for ${host}: ${e?.message || e}. Check HTTPS_PROXY/NO_PROXY credentials and connectivity${suffix}.` };
+  }
+  return { code, message: `Cannot reach ${host}: ${e?.cause?.message || e?.message || e}${suffix}` };
+}
+
 export function createRunnerApi(opts: RunnerApiOptions) {
   const base = String(opts.baseUrl || '').replace(/\/$/, '');
   if (!base) throw new Error('SYNAPSEONE_URL is required');
   if (!opts.apiKey) throw new Error('SYNAPSEONE_API_KEY is required');
   const timeoutMs = Math.min(Math.max(Number(opts.timeoutMs) || 30000, 1000), 300000);
+  const maxAttempts = envInt('SYNAPSEONE_HTTP_RETRIES', 3, 1, 6);
+  const retryBaseMs = envInt('SYNAPSEONE_HTTP_RETRY_BASE_MS', 300, 50, 5000);
+  const proxy = proxyFor(base);
+  const tls = tlsOptions();
+  const dispatcher = proxy
+    ? new ProxyAgent({ uri: proxy, requestTls: tls })
+    : new Agent({ connect: tls });
 
   async function request(method: string, path: string, body?: any, extraHeaders: Record<string, string> = {}): Promise<any> {
-    const ctl = new AbortController();
-    const to = setTimeout(() => ctl.abort(), timeoutMs);
-    try {
-      const r = await fetch(`${base}${path}`, {
-        method,
-        headers: {
-          'Content-Type': 'application/json',
-          'X-API-Key': opts.apiKey,
-          'X-Workflow-Runner-Id': opts.runnerId,
-          ...extraHeaders,
-        },
-        signal: ctl.signal,
-        body: body === undefined ? undefined : JSON.stringify(body),
-      });
-      const text = await r.text();
-      let parsed: any = text;
-      try { parsed = text ? JSON.parse(text) : null; } catch { /* keep text */ }
-      if (!r.ok) throw new RunnerHttpError(r.status, path, parsed);
-      return parsed;
-    } catch (e: any) {
-      if (e?.name === 'AbortError') throw new Error(`SynapseOne ${method} ${path} timed out after ${timeoutMs}ms`);
-      throw e instanceof Error ? e : new Error(String(e));
-    } finally {
-      clearTimeout(to);
+    let lastError: any = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const ctl = new AbortController();
+      const to = setTimeout(() => ctl.abort(), timeoutMs);
+      try {
+        const r = await undiciFetch(`${base}${path}`, {
+          method,
+          headers: {
+            'Content-Type': 'application/json',
+            'X-API-Key': opts.apiKey,
+            'X-Workflow-Runner-Id': opts.runnerId,
+            'User-Agent': 'synapseone-workflow-runner/0.7',
+            ...extraHeaders,
+          },
+          signal: ctl.signal,
+          dispatcher,
+          body: body === undefined ? undefined : JSON.stringify(body),
+        });
+        const text = await r.text();
+        let parsed: any = text;
+        const contentType = String(r.headers.get('content-type') || '');
+        if (/text\/html/i.test(contentType)) {
+          throw new RunnerNetworkError(
+            `Received HTML from ${base}${path} instead of JSON. SYNAPSEONE_URL must point at the SynapseOne gateway root (for example https://api.synapseone.space), not a UI/proxy login page.`,
+            'HTML_RESPONSE',
+            path,
+          );
+        }
+        try { parsed = text ? JSON.parse(text) : null; } catch { /* keep text */ }
+        if (!r.ok) {
+          // Transient upstream/edge failures are safe to retry for this API:
+          // workflow claims are idempotent, queue ack/nack are receipt-based.
+          if ([408, 425, 429, 500, 502, 503, 504].includes(r.status) && attempt < maxAttempts) {
+            const retryAfter = Number(r.headers.get('retry-after'));
+            const wait = Number.isFinite(retryAfter) && retryAfter > 0
+              ? Math.min(retryAfter * 1000, 30000)
+              : Math.min(retryBaseMs * 2 ** (attempt - 1), 10000) + Math.floor(Math.random() * 250);
+            await sleep(wait);
+            continue;
+          }
+          throw new RunnerHttpError(r.status, path, parsed);
+        }
+        return parsed;
+      } catch (e: any) {
+        if (e instanceof RunnerHttpError || e instanceof RunnerNetworkError) {
+          if (e instanceof RunnerHttpError && attempt < maxAttempts && [408, 425, 429, 500, 502, 503, 504].includes(e.status)) {
+            await sleep(Math.min(retryBaseMs * 2 ** (attempt - 1), 10000) + Math.floor(Math.random() * 250));
+            continue;
+          }
+          throw e;
+        }
+        if (e?.name === 'AbortError') {
+          lastError = new RunnerNetworkError(`SynapseOne ${method} ${path} timed out after ${timeoutMs}ms`, 'ETIMEDOUT', path);
+        } else {
+          const hint = networkHint(e, base);
+          lastError = new RunnerNetworkError(`SynapseOne ${method} ${path}: ${hint.message}`, hint.code, path);
+        }
+        if (attempt < maxAttempts) {
+          await sleep(Math.min(retryBaseMs * 2 ** (attempt - 1), 10000) + Math.floor(Math.random() * 250));
+          continue;
+        }
+      } finally {
+        clearTimeout(to);
+      }
     }
+    throw lastError || new RunnerNetworkError(`SynapseOne ${method} ${path} failed`, 'NETWORK_ERROR', path);
   }
 
-  return { base, request };
+  return { base, request, dispatcher, proxy };
 }
 
 function cleanId(v: unknown, field: string, max = 256): string {

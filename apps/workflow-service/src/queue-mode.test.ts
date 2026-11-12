@@ -178,6 +178,13 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
       if (String(req.headers['x-api-key'] || '') !== 'sk-runner-e2e') {
         return res.status(401).json({ error: 'invalid_api_key' });
       }
+      if (req.path === '/v1/auth/verify') {
+        return res.json({
+          valid: true,
+          type: 'apikey',
+          scopes: ['workflow:*', 'queue:*', '*:read', 'base:query', 'base:vector-search', 'inference:*'],
+        });
+      }
       const target = req.path.startsWith('/v1/queue/') ? mockList.base : list.base;
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
@@ -471,6 +478,45 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
     assert.equal(done.nodeRuns.filter((n: any) => n.node === 'Apply').length, 1);
   });
 
+  it('queues and completes an inference job for a hybrid runner', async () => {
+    const created = await fetch(`${base}/v1/workflow-runners`, {
+      method: 'POST', headers: USER,
+      body: JSON.stringify({ name: 'hybrid-inference', kind: 'hybrid', mode: 'custom', inferenceQueue: 'synapseone-inference' }),
+    });
+    const runner: any = (await created.json()).runner;
+    assert.equal(runner.kind, 'hybrid');
+    assert.deepEqual(runner.capabilities, ['workflow', 'inference']);
+
+    const submitted = await fetch(`${base}/v1/inference-jobs`, {
+      method: 'POST', headers: USER,
+      body: JSON.stringify({ type: 'chat', payload: { messages: [{ role: 'user', content: 'ping' }] } }),
+    });
+    const queued: any = await submitted.json();
+    assert.equal(submitted.status, 202);
+    assert.equal(queued.queue, 'synapseone-inference');
+    assert.ok(queued.jobId);
+
+    const claim = await fetch(`${base}/v1/runner/inference/jobs/${queued.jobId}/claim`, {
+      method: 'POST', headers: RUNNER_AUTH,
+      body: JSON.stringify({ runnerId: runner.id, instanceId: 'connector-inf', leaseSeconds: 60 }),
+    });
+    assert.equal(claim.status, 200);
+    const job: any = await claim.json();
+    assert.equal(job.type, 'chat');
+    assert.equal(job.request.messages[0].content, 'ping');
+
+    const complete = await fetch(`${base}/v1/runner/inference/jobs/${queued.jobId}/complete`, {
+      method: 'POST', headers: RUNNER_AUTH,
+      body: JSON.stringify({ runnerId: runner.id, status: 'success', result: { choices: [{ message: { content: 'pong' } }] } }),
+    });
+    assert.equal(complete.status, 200);
+
+    const done: any = await (await fetch(`${base}/v1/inference-jobs/${queued.jobId}?includeData=true`, { headers: USER })).json();
+    assert.equal(done.status, 'success');
+    assert.equal(done.result.choices[0].message.content, 'pong');
+    assert.equal(done.runnerId, runner.id);
+  });
+
   it('drains a custom queue with the published runner entrypoint', async () => {
     // Earlier tests completed a custom job through the HTTP protocol without a
     // queue consumer; clear those stale messages so ONCE picks our job.
@@ -512,7 +558,7 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
     });
     assert.equal(exec.output.doubled, 14);
     assert.equal(exec.runner, 'custom');
-    assert.ok(logs.includes(`run execution=${queued.executionId}`), logs);
+    assert.ok(logs.includes(`run workflow execution=${queued.executionId}`), logs);
     // The runner acked the message, so the mock queue is empty.
     const remaining = mock.queues.get('synapseone-wf-custom')?.size || 0;
     assert.equal(remaining, 0, `queue still has ${remaining} message(s)`);

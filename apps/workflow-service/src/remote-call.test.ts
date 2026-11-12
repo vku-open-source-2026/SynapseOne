@@ -5,7 +5,8 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { createRemoteCredentialResolver, createRemoteSynapseOneCall } from './remote-call';
+import { createServer } from 'node:http';
+import { createRemoteCredentialResolver, createRemoteSynapseOneCall, createRunnerApi, RunnerNetworkError } from './remote-call';
 
 function fakeApi(handler?: (method: string, path: string, body?: any, headers?: any) => any) {
   const calls: Array<{ method: string; path: string; body?: any; headers?: any }> = [];
@@ -65,5 +66,55 @@ describe('self-hosted runner public API mapping', () => {
     assert.deepEqual(await resolver('cred-1'), { kind: 'bearer', secret: 'shhh' });
     assert.equal(calls[0].path, '/v1/runner/jobs/exec-1/credentials');
     assert.deepEqual(calls[0].body, { runnerId: 'runner-1', credentialId: 'cred-1' });
+  });
+
+  it('retries transient gateway failures and preserves the API key header', async () => {
+    let hits = 0;
+    const server = createServer((req, res) => {
+      hits += 1;
+      assert.equal(req.headers['x-api-key'], 'sk-test');
+      if (hits < 3) {
+        res.statusCode = 503;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ error: 'unavailable' }));
+        return;
+      }
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ ok: true, hits }));
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const port = (server.address() as any).port;
+    const oldRetries = process.env.SYNAPSEONE_HTTP_RETRIES;
+    const oldBase = process.env.SYNAPSEONE_HTTP_RETRY_BASE_MS;
+    process.env.SYNAPSEONE_HTTP_RETRIES = '3';
+    process.env.SYNAPSEONE_HTTP_RETRY_BASE_MS = '20';
+    try {
+      const api = createRunnerApi({ baseUrl: `http://127.0.0.1:${port}`, apiKey: 'sk-test', runnerId: 'r1', timeoutMs: 2000 });
+      const res: any = await api.request('GET', '/v1/anything');
+      assert.equal(res.ok, true);
+      assert.equal(hits, 3);
+    } finally {
+      if (oldRetries === undefined) delete process.env.SYNAPSEONE_HTTP_RETRIES; else process.env.SYNAPSEONE_HTTP_RETRIES = oldRetries;
+      if (oldBase === undefined) delete process.env.SYNAPSEONE_HTTP_RETRY_BASE_MS; else process.env.SYNAPSEONE_HTTP_RETRY_BASE_MS = oldBase;
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  it('reports HTML responses as a URL/proxy problem', async () => {
+    const server = createServer((_req, res) => {
+      res.setHeader('Content-Type', 'text/html');
+      res.end('<html>login</html>');
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const port = (server.address() as any).port;
+    try {
+      const api = createRunnerApi({ baseUrl: `http://127.0.0.1:${port}`, apiKey: 'sk-test', runnerId: 'r1', timeoutMs: 2000 });
+      await assert.rejects(
+        () => api.request('GET', '/v1/anything'),
+        (e: any) => e instanceof RunnerNetworkError && e.code === 'HTML_RESPONSE' && /gateway root/.test(e.message),
+      );
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
   });
 });

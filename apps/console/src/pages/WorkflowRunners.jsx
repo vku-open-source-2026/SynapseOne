@@ -64,9 +64,12 @@ export default function WorkflowRunners() {
 
   const [open, setOpen] = useState(false);
   const [step, setStep] = useState(1);
+  const [kind, setKind] = useState('workflow');
   const [name, setName] = useState('');
   const [mode, setMode] = useState('custom');
   const [queue, setQueue] = useState('');
+  const [inferenceQueue, setInferenceQueue] = useState('');
+  const [inferenceUrl, setInferenceUrl] = useState('http://localhost:8000/v1');
   const [scopes, setScopes] = useState(DEFAULT_SCOPES);
   const [concurrency, setConcurrency] = useState(1);
   const [busy, setBusy] = useState(false);
@@ -75,8 +78,10 @@ export default function WorkflowRunners() {
 
   const [editOpen, setEditOpen] = useState(false);
   const [editName, setEditName] = useState('');
+  const [editKind, setEditKind] = useState('workflow');
   const [editMode, setEditMode] = useState('custom');
   const [editQueue, setEditQueue] = useState('');
+  const [editInferenceQueue, setEditInferenceQueue] = useState('');
   const [editBusy, setEditBusy] = useState(false);
 
   const selectedRef = useRef(null);
@@ -87,6 +92,7 @@ export default function WorkflowRunners() {
     if (!o) return;
     setOptions(o);
     if (!queue) setQueue(mode === 'hybrid' ? o.queues?.shared : o.queues?.custom);
+    if (!inferenceQueue) setInferenceQueue(o.queues?.inference || '');
   };
 
   const load = async (quiet = false) => {
@@ -168,8 +174,11 @@ export default function WorkflowRunners() {
     setCheck(null);
     setCopied(false);
     setName('');
+    setKind('workflow');
     setMode('custom');
     setQueue(options?.queues?.custom || '');
+    setInferenceQueue(options?.queues?.inference || '');
+    setInferenceUrl('http://localhost:8000/v1');
     setScopes(DEFAULT_SCOPES);
     setConcurrency(1);
   };
@@ -179,7 +188,9 @@ export default function WorkflowRunners() {
     if (!scope.accountId) return setErr(new Error('Pick an account in the scope bar first — runner API keys belong to an account'));
     const scopeList = scopes.split(',').map((s) => s.trim()).filter(Boolean);
     if (!scopeList.length) return setErr(new Error('At least one API key scope is required'));
-    if (!queue.trim()) return setErr(new Error('Queue is required'));
+    if (kind !== 'inference' && !queue.trim()) return setErr(new Error('Workflow queue is required'));
+    if (kind !== 'workflow' && !inferenceQueue.trim()) return setErr(new Error('Inference queue is required'));
+    if (kind !== 'workflow' && !inferenceUrl.trim()) return setErr(new Error('Inference backend URL is required'));
     setBusy(true);
     setErr(null);
     let keyId = null;
@@ -189,17 +200,25 @@ export default function WorkflowRunners() {
       keyId = key.id;
       const reg = await api.createWorkflowRunner({
         name: name.trim(),
+        kind,
         mode,
         queue: queue.trim(),
+        ...(kind !== 'workflow' ? { inferenceQueue: inferenceQueue.trim() } : {}),
         apiKeyId: key.id,
         keyPrefix: key.prefix,
         scopes: scopeList,
-        metadata: { concurrency },
+        metadata: {
+          concurrency,
+          ...(kind !== 'workflow' ? { inferenceBackend: inferenceUrl.trim() } : {}),
+        },
       }, headers);
       runnerId = reg.runner.id;
       const cmd = await api.workflowRunnerCommand(reg.runner.id, key.apiKey, headers);
+      const command = kind === 'workflow'
+        ? cmd.command
+        : cmd.command.replace('<YOUR_OPENAI_COMPATIBLE_BASE_URL>', inferenceUrl.trim() || 'http://localhost:8000/v1');
       if (reg.options) applyOptions(reg.options);
-      setCreated({ ...reg, command: cmd.command, apiKey: key.apiKey });
+      setCreated({ ...reg, command, apiKey: key.apiKey });
       setStep(2);
       setCheck({ connected: false, status: 'waiting', instanceCount: 0 });
       load(true);
@@ -259,8 +278,10 @@ export default function WorkflowRunners() {
   const openEdit = () => {
     if (!detail) return;
     setEditName(detail.name);
+    setEditKind(detail.kind || 'workflow');
     setEditMode(detail.mode);
     setEditQueue(detail.queue);
+    setEditInferenceQueue(detail.inferenceQueue || options?.queues?.inference || '');
     setEditOpen(true);
   };
 
@@ -269,7 +290,13 @@ export default function WorkflowRunners() {
     setEditBusy(true);
     setErr(null);
     try {
-      const res = await api.updateWorkflowRunner(detail.id, { name: editName.trim(), mode: editMode, queue: editQueue.trim() }, headers);
+      const res = await api.updateWorkflowRunner(detail.id, {
+        name: editName.trim(),
+        kind: editKind,
+        mode: editMode,
+        queue: editQueue.trim(),
+        ...(editKind !== 'workflow' ? { inferenceQueue: editInferenceQueue.trim() } : {}),
+      }, headers);
       setDetail(res.runner);
       setEditOpen(false);
       load(true);
@@ -332,7 +359,7 @@ export default function WorkflowRunners() {
         {loading && !runners ? (
           <div className="py-6 flex justify-center"><Spinner /></div>
         ) : rows.length ? (
-          <Table head={['Runner', 'Mode', 'Queue', 'Connectors', 'Status', 'Version', 'Last seen', '']}>
+          <Table head={['Runner', 'Type', 'Queues', 'Connectors', 'Status', 'Version', 'Last seen', '']}>
             {rows.map((r) => (
               <tr
                 key={r.id}
@@ -343,8 +370,13 @@ export default function WorkflowRunners() {
                   <div className="font-medium text-main-text text-sm">{r.name}</div>
                   <div className="font-mono text-[11px] text-normal-text">{r.id.slice(0, 8)}…</div>
                 </td>
-                <td className="py-2 pr-4 text-xs">{r.mode}</td>
-                <td className="py-2 pr-4 font-mono text-xs">{r.queue}</td>
+                <td className="py-2 pr-4 text-xs">
+                  <Badge tone={r.kind === 'hybrid' ? 'amber' : r.kind === 'inference' ? 'blue' : 'gray'}>{r.kind || 'workflow'}</Badge>
+                </td>
+                <td className="py-2 pr-4 font-mono text-[11px]">
+                  <div>{r.kind === 'inference' ? (r.inferenceQueue || r.queue) : r.queue}</div>
+                  {r.kind === 'hybrid' && r.inferenceQueue && <div className="text-normal-text">{r.inferenceQueue}</div>}
+                </td>
                 <td className="py-2 pr-4 text-xs">
                   <span className="font-medium">{r.connectedInstances || 0}</span>
                   <span className="text-normal-text"> / {r.instanceCount || 0} online</span>
@@ -386,7 +418,13 @@ export default function WorkflowRunners() {
                     {detail.connected && <span className="text-[11px] text-emerald-600">heartbeat OK</span>}
                   </div>
                   <p className="text-xs text-normal-text mt-0.5">
-                    <span className="font-mono">{detail.id}</span> · {detail.mode} · queue <span className="font-mono">{detail.queue}</span> · key {detail.keyPrefix ? `${detail.keyPrefix}…` : '–'}
+                    <span className="font-mono">{detail.id}</span> · <b>{detail.kind || 'workflow'}</b> · capabilities {(detail.capabilities || []).join('+') || 'workflow'} · key {detail.keyPrefix ? `${detail.keyPrefix}…` : '–'}
+                  </p>
+                  <p className="text-[11px] text-normal-text mt-0.5 font-mono">
+                    {detail.kind !== 'inference' ? `workflow: ${detail.queue}` : ''}
+                    {detail.kind === 'hybrid' ? ' · ' : ''}
+                    {detail.kind !== 'workflow' ? `inference: ${detail.inferenceQueue || options?.queues?.inference || '-'}` : ''}
+                    {detail.kind === 'workflow' ? `mode: ${detail.mode}` : ''}
                   </p>
                   {Array.isArray(detail.metadata?.scopes) && (
                     <p className="text-[11px] text-normal-text mt-1">
@@ -469,23 +507,52 @@ export default function WorkflowRunners() {
             <Field label="Runner name">
               <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="edge-runner-eu" />
             </Field>
-            <Field label="Mode">
+            <Field label="Runner type">
               <select
-                value={mode}
-                onChange={(e) => {
-                  const next = e.target.value;
-                  setMode(next);
-                  setQueue(next === 'hybrid' ? (options?.queues?.shared || '') : (options?.queues?.custom || ''));
-                }}
+                value={kind}
+                onChange={(e) => setKind(e.target.value)}
                 className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm bg-white outline-none"
               >
-                <option value="custom">custom — only workflows configured for this queue</option>
-                <option value="hybrid">hybrid — competes with the platform worker on the shared queue</option>
+                <option value="workflow">workflow — execute SynapseFlow DAGs</option>
+                <option value="inference">inference — run AI jobs against a local model backend</option>
+                <option value="hybrid">hybrid — workflow + inference lanes in one connector</option>
               </select>
             </Field>
-            <Field label="Queue">
-              <Input value={queue} onChange={(e) => setQueue(e.target.value)} placeholder="synapseone-wf-custom" />
-            </Field>
+            {kind !== 'inference' && (
+              <>
+                <Field label="Workflow queue mode">
+                  <select
+                    value={mode}
+                    onChange={(e) => {
+                      const next = e.target.value;
+                      setMode(next);
+                      setQueue(next === 'hybrid' ? (options?.queues?.shared || '') : (options?.queues?.custom || ''));
+                    }}
+                    className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm bg-white outline-none"
+                  >
+                    <option value="custom">custom — only workflows configured for this queue</option>
+                    <option value="hybrid">hybrid — competes with the platform worker on the shared queue</option>
+                  </select>
+                </Field>
+                <Field label="Workflow queue">
+                  <Input value={queue} onChange={(e) => setQueue(e.target.value)} placeholder="synapseone-wf-custom" />
+                </Field>
+              </>
+            )}
+            {kind !== 'workflow' && (
+              <>
+                <Field label="Inference queue">
+                  <Input value={inferenceQueue} onChange={(e) => setInferenceQueue(e.target.value)} placeholder="synapseone-inference" />
+                </Field>
+                <Field label="Local inference backend (OpenAI-compatible base URL)">
+                  <Input value={inferenceUrl} onChange={(e) => setInferenceUrl(e.target.value)} placeholder="http://vllm:8000/v1" />
+                </Field>
+                <p className="text-[11px] text-normal-text mb-2">
+                  The backend must expose <span className="font-mono">/chat/completions</span> and <span className="font-mono">/embeddings</span>
+                  {' '}(or set <span className="font-mono">INFERENCE_RUNNER_*_PATH</span>). The URL is embedded in the command, not stored as a secret.
+                </p>
+              </>
+            )}
             <div className="grid grid-cols-2 gap-3">
               <Field label="Connector concurrency">
                 <Input type="number" min="1" max={options?.maxConcurrency || 32} value={concurrency} onChange={(e) => setConcurrency(Math.max(1, Math.min(Number(e.target.value) || 1, options?.maxConcurrency || 32)))} />
@@ -555,14 +622,28 @@ export default function WorkflowRunners() {
 
       <Modal title="Edit runner" open={editOpen} onClose={() => setEditOpen(false)}>
         <Field label="Name"><Input value={editName} onChange={(e) => setEditName(e.target.value)} /></Field>
-        <Field label="Mode">
-          <select value={editMode} onChange={(e) => setEditMode(e.target.value)} className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm bg-white outline-none">
-            <option value="custom">custom</option>
+        <Field label="Runner type">
+          <select value={editKind} onChange={(e) => setEditKind(e.target.value)} className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm bg-white outline-none">
+            <option value="workflow">workflow</option>
+            <option value="inference">inference</option>
             <option value="hybrid">hybrid</option>
           </select>
         </Field>
-        <Field label="Queue"><Input value={editQueue} onChange={(e) => setEditQueue(e.target.value)} /></Field>
-        <p className="text-[11px] text-normal-text mb-3">Queue/mode changes are blocked while a connector is online.</p>
+        {editKind !== 'inference' && (
+          <>
+            <Field label="Workflow queue mode">
+              <select value={editMode} onChange={(e) => setEditMode(e.target.value)} className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm bg-white outline-none">
+                <option value="custom">custom</option>
+                <option value="hybrid">hybrid</option>
+              </select>
+            </Field>
+            <Field label="Workflow queue"><Input value={editQueue} onChange={(e) => setEditQueue(e.target.value)} /></Field>
+          </>
+        )}
+        {editKind !== 'workflow' && (
+          <Field label="Inference queue"><Input value={editInferenceQueue} onChange={(e) => setEditInferenceQueue(e.target.value)} /></Field>
+        )}
+        <p className="text-[11px] text-normal-text mb-3">Type/queue changes are blocked while a connector is online.</p>
         <Btn onClick={saveEdit} disabled={editBusy} loading={editBusy}>Save changes</Btn>
       </Modal>
     </>

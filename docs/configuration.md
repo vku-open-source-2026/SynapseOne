@@ -80,6 +80,7 @@ reads which key (audited from source):
 | `WORKFLOW_QUEUE_PLATFORM` | `synapseone-wf-platform` | queue for `platform` workflows |
 | `WORKFLOW_QUEUE_CUSTOM` | `synapseone-wf-custom` | queue for `custom` workflows |
 | `WORKFLOW_QUEUE_SHARED` | `synapseone-wf-shared` | queue for `hybrid` workflows |
+| `WORKFLOW_QUEUE_INFERENCE` | `synapseone-inference` | queue for inference/hybrid runner jobs |
 | `SYNAPSEONE_PUBLIC_URL` | `https://api.synapseone.space` | gateway URL embedded in runner commands |
 | `WORKFLOW_RUNNER_IMAGE` | `ghcr.io/.../synapseone-workflow-runner:latest` | runner image embedded in commands |
 | `WORKFLOW_RUNNER_HEARTBEAT_SECONDS` | 15 | connector heartbeat interval (5–300) |

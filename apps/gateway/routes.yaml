@@ -140,6 +140,14 @@ routes:
     # agent room instead of cutting it off at the 30s global default.
     timeoutMs: 120000
 
+  # Queued inference jobs for self-hosted inference/hybrid runners.
+  - path: /v1/inference-jobs
+    target: ${WORKFLOW_SERVICE_URL:http://workflow:4002}
+    auth: either
+    service: inference
+    actions:
+      - { method: POST, path: /v1/inference-jobs, action: inference:Invoke }
+
   # Synapse Inference Engine — LLM proxy (OpenRouter), local embeddings, Decision-2.0-Eos-0.8B
   - path: /v1/inference
     target: ${INFERENCE_SERVICE_URL:http://inference:4008}

@@ -43,6 +43,13 @@
       "when": 1798000000000,
       "tag": "0005_slimy_crusher_hogan",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1799000000000,
+      "tag": "0006_optimal_firestar",
+      "breakpoints": true
     }
   ]
 }

@@ -380,11 +380,13 @@ Per-workflow mode (`settings.execution.mode`, also accepted as
 
 Runner management (JWT or a runner-scoped API key):
 
-- `POST /v1/workflow-runners {name, mode?, queue?, apiKeyId?, keyPrefix?, scopes?, apiKey?}`
-  → `{runner, queue, scopes, command, options}`. Default key scopes:
+- `POST /v1/workflow-runners {name, kind?, mode?, queue?, inferenceQueue?, apiKeyId?, keyPrefix?, scopes?, apiKey?}`
+  → `{runner, kind, queue, inferenceQueue, scopes, command, options}`.
+  `kind` is `workflow|inference|hybrid`; default key scopes:
   `workflow:*,queue:*,*:read,base:query,base:vector-search,inference:*`.
   `command` is a copy-paste `docker run` with the API key **when the caller
   passes `apiKey`**; the key is echoed only in this response and never stored.
+  Inference/hybrid commands include `INFERENCE_RUNNER_URL` placeholder.
 - `GET /v1/workflow-runners/options` → public URL, image, queues, heartbeat /
   stale windows, max concurrency and built-in platform-worker config.
 - `GET /v1/workflow-runners` → `{data: [{...runner, instances, connected,
@@ -417,6 +419,26 @@ Runner job protocol (API key + `X-Workflow-Runner-Id`):
 - `POST /v1/runner/jobs/:id/credentials {runnerId, credentialId}`
   → `{kind, secret}` for exactly this claimed execution. Custom runners hold
   plaintext credentials only in memory for that run.
+
+### Inference jobs (inference / hybrid runners)
+
+- `POST /v1/inference-jobs {type, payload, queue?, wait?, timeoutMs?}` →
+  `202 {ok, jobId, status: queued, queue, type}`. Types:
+  `chat|embeddings|decision|route|generic`. `wait: true` blocks and returns
+  `{ok, jobId, status, result}`. Gateway action `inference:Invoke`.
+- `GET /v1/inference-jobs[?status=&limit=]` and
+  `GET /v1/inference-jobs/:id[?includeData=true]` (tenant-scoped).
+- Runner protocol:
+  - `POST /v1/runner/inference/jobs/:id/claim {runnerId, instanceId?, leaseSeconds}`
+    → `{jobId, type, request, attempt, leaseExpiresAt}`; idempotent for the
+    same runner after a lost response.
+  - `POST .../heartbeat` and `POST .../release`.
+  - `POST .../complete {runnerId, instanceId?, status: success|error, result?, error?}`.
+
+Runner types: `workflow` (workflow lane only), `inference` (inference lane
+only), `hybrid` (both). The inference lane calls a local OpenAI-compatible
+backend configured by `INFERENCE_RUNNER_URL`; the SynapseOne API key is only
+used for the queue/claim/report path (and any workflow nodes, for hybrid).
 
 The published image is `ghcr.io/<owner>/synapseone-workflow-runner:<tag>`
 (also built as `:main` on CD). See [`workflow-runners.md`](workflow-runners.md)

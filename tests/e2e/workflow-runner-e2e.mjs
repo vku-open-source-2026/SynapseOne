@@ -15,6 +15,7 @@
  */
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,6 +35,7 @@ let keyId = '';
 let child = null;
 let childLogs = '';
 const workflowIds = [];
+let fakeBackend = null;
 
 async function api(pathname, options = {}) {
   const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
@@ -74,6 +76,31 @@ async function waitConnection(timeoutMs = 20000) {
   }, timeoutMs, 'runner connector heartbeat');
 }
 
+async function startFakeInferenceBackend() {
+  const server = createServer((req, res) => {
+    let raw = '';
+    req.on('data', (chunk) => { raw += String(chunk); });
+    req.on('end', () => {
+      res.setHeader('Content-Type', 'application/json');
+      if (req.url?.endsWith('/embeddings')) {
+        res.end(JSON.stringify({ data: [{ embedding: [0.1, 0.2, 0.3], index: 0 }], model: 'fake-embed' }));
+        return;
+      }
+      let body = {};
+      try { body = raw ? JSON.parse(raw) : {}; } catch { /* ignore */ }
+      res.end(JSON.stringify({
+        id: 'chatcmpl-e2e',
+        object: 'chat.completion',
+        model: body.model || 'fake-model',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'pong-from-local-backend' }, finish_reason: 'stop' }],
+      }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  return { server, url: `http://127.0.0.1:${port}` };
+}
+
 function stopChild(signal = 'SIGTERM') {
   if (!child || child.killed) return Promise.resolve();
   return new Promise((resolve) => {
@@ -111,8 +138,10 @@ async function main() {
   assert.equal(options.platformWorker.enabled, true, 'platform worker disabled');
   assert.ok(options.queues.custom, 'missing custom queue');
   assert.ok(options.queues.shared, 'missing shared queue');
+  assert.ok(options.queues.inference, 'missing inference queue');
+  assert.ok(Array.isArray(options.kinds) && options.kinds.includes('hybrid'), 'runner kinds missing hybrid');
 
-  // 3. Create the runner key + registration.
+  // 3. Create the runner key + hybrid registration (workflow + inference lanes).
   const scopes = ['workflow:*', 'queue:*', '*:read', 'base:query', 'base:vector-search', 'inference:*'];
   const key = await api(`/v1/accounts/${encodeURIComponent(accountId)}/keys`, {
     method: 'POST',
@@ -121,25 +150,32 @@ async function main() {
   keyId = key.id;
   assert.ok(key.apiKey, 'IAM did not return apiKey');
 
+  fakeBackend = await startFakeInferenceBackend();
   const reg = await api('/v1/workflow-runners', {
     method: 'POST',
     body: JSON.stringify({
       name: `e2e-runner-${RUNNER_ID_SUFFIX}`,
+      kind: 'hybrid',
       mode: 'custom',
       queue: options.queues.custom,
+      inferenceQueue: options.queues.inference,
       apiKeyId: key.id,
       keyPrefix: key.prefix,
       scopes,
       apiKey: key.apiKey,
-      metadata: { e2e: true, concurrency: 2 },
+      metadata: { e2e: true, concurrency: 2, inferenceBackend: fakeBackend.url },
     }),
   });
   runnerId = reg.runner.id;
   assert.ok(runnerId, 'runner id missing');
+  assert.equal(reg.runner.kind, 'hybrid');
+  assert.deepEqual(reg.runner.capabilities, ['workflow', 'inference']);
   assert.match(reg.command, /SYNAPSEONE_API_KEY=/, 'install command does not include the API key');
   assert.match(reg.command, /WORKFLOW_RUNNER_ID=/, 'install command does not include the runner id');
+  assert.match(reg.command, /WORKFLOW_RUNNER_KIND=hybrid/, 'install command does not include the runner kind');
+  assert.match(reg.command, /WORKFLOW_RUNNER_INFERENCE_QUEUE=/, 'install command does not include the inference queue');
   assert.equal(reg.runner.status, 'waiting');
-  console.log(`runner registered: ${runnerId}`);
+  console.log(`runner registered: ${runnerId} (hybrid)`);
 
   const waiting = await api(`/v1/workflow-runners/${encodeURIComponent(runnerId)}/connection`);
   assert.equal(waiting.connected, false);
@@ -157,6 +193,9 @@ async function main() {
       WORKFLOW_RUNNER_POLL_MS: '200',
       WORKFLOW_RUNNER_LEASE_SECONDS: '60',
       WORKFLOW_RUNNER_HEARTBEAT_SECONDS: '5',
+      WORKFLOW_RUNNER_INFERENCE_CONCURRENCY: '2',
+      INFERENCE_RUNNER_URL: fakeBackend.url,
+      INFERENCE_RUNNER_MODEL: 'fake-model',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -174,6 +213,8 @@ async function main() {
   assert.equal(instance.concurrency, 2, 'connector concurrency mismatch');
   assert.equal(instance.status, 'connected');
   assert.ok(instance.version, 'connector version missing');
+  assert.deepEqual(connected.runner.capabilities, ['workflow', 'inference']);
+  assert.equal(connected.runner.kind, 'hybrid');
   console.log(`connector connected: ${instance.id} host=${instance.hostname} v=${instance.version}`);
 
   const listed = await api('/v1/workflow-runners');
@@ -215,7 +256,28 @@ async function main() {
   assert.equal(customExec.output.lane, 'custom');
   console.log(`custom run OK: execution=${customExec.id} worker=${customExec.workerId}`);
 
-  // 6. Platform-mode workflow must be consumed by the built-in worker.
+  // 6. Inference job must be executed by the local backend through the hybrid runner.
+  const inference = await api('/v1/inference-jobs', {
+    method: 'POST',
+    body: JSON.stringify({
+      type: 'chat',
+      payload: { model: 'request-model', messages: [{ role: 'user', content: 'ping' }] },
+      queue: options.queues.inference,
+    }),
+  });
+  assert.ok(inference.jobId, 'inference job id missing');
+  assert.equal(inference.status, 'queued');
+  const inferenceDone = await waitFor(async () => {
+    const j = await api(`/v1/inference-jobs/${encodeURIComponent(inference.jobId)}?includeData=true`);
+    return j && !['queued', 'running'].includes(j.status) ? j : null;
+  }, 60000, 'inference job result');
+  assert.equal(inferenceDone.status, 'success', `inference job failed: ${inferenceDone.error || ''}`);
+  assert.equal(inferenceDone.runnerId, runnerId, 'inference job was not run by the hybrid runner');
+  assert.equal(inferenceDone.result.choices[0].message.content, 'pong-from-local-backend');
+  assert.equal(inferenceDone.result.model, 'fake-model');
+  console.log(`inference job OK: id=${inference.jobId} runner=${inferenceDone.runnerId}`);
+
+  // 7. Platform-mode workflow must be consumed by the built-in worker.
   const platformWf = await api('/v1/workflows', {
     method: 'POST',
     body: JSON.stringify({
@@ -270,6 +332,7 @@ async function main() {
 
 async function cleanup() {
   await stopChild('SIGKILL');
+  if (fakeBackend?.server) await new Promise((resolve) => fakeBackend.server.close(resolve));
   for (const id of workflowIds) {
     try { await api(`/v1/workflows/${encodeURIComponent(id)}`, { method: 'DELETE' }); } catch { /* best effort */ }
   }

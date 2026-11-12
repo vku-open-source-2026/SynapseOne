@@ -15,7 +15,7 @@ import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, or, sql } from 'dri
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { isWebhookType, isCronType, normalizeNodeType } from './engine';
-import { credentials, executions, humanTasks, secrets, secretVersions, workflowRunnerInstances, workflowRunners, workflows } from './schema';
+import { credentials, executions, humanTasks, inferenceJobs, secrets, secretVersions, workflowRunnerInstances, workflowRunners, workflows } from './schema';
 
 /** Caller principal stamped by the gateway (P0-2). Anonymous when called
  *  directly with only the internal secret (dev/tests). */
@@ -81,11 +81,15 @@ export interface StoredExecution {
 
 export type RunnerMode = 'custom' | 'hybrid';
 
+export type RunnerKind = 'workflow' | 'inference' | 'hybrid';
+
 export interface StoredWorkflowRunner {
   id: string;
   name: string;
+  kind: RunnerKind;
   mode: RunnerMode;
   queue: string;
+  inference_queue?: string | null;
   org_id?: string | null;
   account_id?: string | null;
   api_key_id?: string | null;
@@ -115,13 +119,32 @@ export interface StoredRunnerInstance {
   updated_at: string;
 }
 
+export interface StoredInferenceJob {
+  id: string;
+  type: string;
+  status: 'queued' | 'running' | 'success' | 'error' | 'cancelled';
+  request: any;
+  result: any;
+  error?: string | null;
+  org_id?: string | null;
+  account_id?: string | null;
+  runner_id?: string | null;
+  instance_id?: string | null;
+  queue_name?: string | null;
+  attempt: number;
+  lease_expires_at?: string | null;
+  created_at: string;
+  updated_at: string;
+  finished_at?: string | null;
+}
+
 const DATABASE_URL = process.env.DATABASE_URL || '';
 let pool: Pool | null = null;
 if (DATABASE_URL) {
   pool = new Pool({ connectionString: DATABASE_URL });
   pool.on('error', (e) => console.error('[workflow][db] pool error', (e as any)?.message || e));
 }
-const db = pool ? drizzle(pool, { schema: { credentials, executions, workflowRunnerInstances, workflowRunners, workflows } }) : null;
+const db = pool ? drizzle(pool, { schema: { credentials, executions, inferenceJobs, workflowRunnerInstances, workflowRunners, workflows } }) : null;
 
 export function useDb(): boolean {
   return !!db;
@@ -132,6 +155,7 @@ const memWorkflows = new Map<string, StoredWorkflow>();
 const memExecutions = new Map<string, StoredExecution>();
 const memRunners = new Map<string, StoredWorkflowRunner>();
 const memRunnerInstances = new Map<string, StoredRunnerInstance>();
+const memInferenceJobs = new Map<string, StoredInferenceJob>();
 // newest-first ordering helper
 const memExecOrder: string[] = [];
 
@@ -158,7 +182,7 @@ export async function ensureTables(): Promise<void> {
     try {
       // Hold the advisory lock on the same dedicated session that runs the
       // migration (pool connections are not guaranteed to be reused).
-      const migrationDb = drizzle(client, { schema: { credentials, executions, workflowRunnerInstances, workflowRunners, workflows } });
+      const migrationDb = drizzle(client, { schema: { credentials, executions, inferenceJobs, workflowRunnerInstances, workflowRunners, workflows } });
       await migrationDb.execute(sql`select pg_advisory_lock(hashtext('synapseone_workflow_migrations'))`);
       try {
         await migrate(migrationDb, {
@@ -843,6 +867,7 @@ export function __clearCredentials(): void {
   memSecretVersions.clear();
   memRunners.clear();
   memRunnerInstances.clear();
+  memInferenceJobs.clear();
 }
 
 export function __clearMem(): void {
@@ -855,6 +880,7 @@ export function __clearMem(): void {
   memSecretVersions.clear();
   memRunners.clear();
   memRunnerInstances.clear();
+  memInferenceJobs.clear();
 }
 
 
@@ -1548,8 +1574,10 @@ export async function deleteRunnerInstancesForRunner(runnerId: string): Promise<
 
 export async function updateRunnerRec(id: string, patch: {
   name?: string;
+  kind?: RunnerKind;
   mode?: RunnerMode;
   queue?: string;
+  inference_queue?: string | null;
   metadata?: Record<string, any>;
 }): Promise<StoredWorkflowRunner | null> {
   const now = new Date();
@@ -1557,8 +1585,10 @@ export async function updateRunnerRec(id: string, patch: {
     await ensureTables();
     const rows = await db.update(workflowRunners).set({
       ...(patch.name !== undefined ? { name: patch.name } : {}),
+      ...(patch.kind !== undefined ? { kind: patch.kind } : {}),
       ...(patch.mode !== undefined ? { mode: patch.mode } : {}),
       ...(patch.queue !== undefined ? { queue: patch.queue } : {}),
+      ...(patch.inference_queue !== undefined ? { inferenceQueue: patch.inference_queue } : {}),
       ...(patch.metadata !== undefined ? { metadata: patch.metadata } : {}),
       updatedAt: now,
     }).where(eq(workflowRunners.id, id)).returning();
@@ -1569,8 +1599,10 @@ export async function updateRunnerRec(id: string, patch: {
   const next: StoredWorkflowRunner = {
     ...cur,
     ...(patch.name !== undefined ? { name: patch.name } : {}),
+    ...(patch.kind !== undefined ? { kind: patch.kind } : {}),
     ...(patch.mode !== undefined ? { mode: patch.mode } : {}),
     ...(patch.queue !== undefined ? { queue: patch.queue } : {}),
+    ...(patch.inference_queue !== undefined ? { inference_queue: patch.inference_queue } : {}),
     ...(patch.metadata !== undefined ? { metadata: patch.metadata } : {}),
     updated_at: now.toISOString(),
   };
@@ -1584,8 +1616,10 @@ function rowToRunner(r: typeof workflowRunners.$inferSelect): StoredWorkflowRunn
   return {
     id: String(r.id),
     name: String(r.name || ''),
+    kind: r.kind === 'inference' || r.kind === 'hybrid' ? r.kind : 'workflow',
     mode,
     queue: String(r.queue || ''),
+    inference_queue: r.inferenceQueue != null ? String(r.inferenceQueue) : null,
     org_id: r.orgId != null ? String(r.orgId) : null,
     account_id: r.accountId != null ? String(r.accountId) : null,
     api_key_id: r.apiKeyId != null ? String(r.apiKeyId) : null,
@@ -1604,8 +1638,10 @@ function rowToRunner(r: typeof workflowRunners.$inferSelect): StoredWorkflowRunn
 export async function createRunnerRec(data: {
   id?: string;
   name: string;
+  kind?: RunnerKind;
   mode: RunnerMode;
   queue: string;
+  inference_queue?: string | null;
   org_id?: string | null;
   account_id?: string | null;
   api_key_id?: string | null;
@@ -1616,8 +1652,10 @@ export async function createRunnerRec(data: {
   const rec: StoredWorkflowRunner = {
     id: data.id || randomUUID(),
     name: data.name,
+    kind: data.kind === 'inference' || data.kind === 'hybrid' ? data.kind : 'workflow',
     mode: data.mode === 'hybrid' ? 'hybrid' : 'custom',
     queue: data.queue,
+    inference_queue: cleanTenant(data.inference_queue),
     org_id: cleanTenant(data.org_id),
     account_id: cleanTenant(data.account_id),
     api_key_id: cleanTenant(data.api_key_id),
@@ -1636,8 +1674,10 @@ export async function createRunnerRec(data: {
     const rows = await db.insert(workflowRunners).values({
       id: rec.id,
       name: rec.name,
+      kind: rec.kind,
       mode: rec.mode,
       queue: rec.queue,
+      inferenceQueue: rec.inference_queue,
       orgId: rec.org_id,
       accountId: rec.account_id,
       apiKeyId: rec.api_key_id,
@@ -1722,4 +1762,249 @@ export async function deleteRunnerRec(id: string): Promise<boolean> {
     return rows.length > 0;
   }
   return memRunners.delete(id);
+}
+
+// ---------- inference jobs (inference/hybrid runners) ----------
+
+function rowToInferenceJob(r: typeof inferenceJobs.$inferSelect): StoredInferenceJob {
+  return {
+    id: String(r.id),
+    type: String(r.type || 'chat'),
+    status: r.status === 'running' ? 'running'
+      : r.status === 'success' ? 'success'
+        : r.status === 'error' ? 'error'
+          : r.status === 'cancelled' ? 'cancelled' : 'queued',
+    request: r.request ?? {},
+    result: r.result ?? null,
+    error: r.error ?? null,
+    org_id: r.orgId != null ? String(r.orgId) : null,
+    account_id: r.accountId != null ? String(r.accountId) : null,
+    runner_id: r.runnerId != null ? String(r.runnerId) : null,
+    instance_id: r.instanceId != null ? String(r.instanceId) : null,
+    queue_name: r.queueName != null ? String(r.queueName) : null,
+    attempt: Number.isFinite(Number(r.attempt)) ? Number(r.attempt) : 0,
+    lease_expires_at: r.leaseExpiresAt ? iso(r.leaseExpiresAt) : null,
+    created_at: iso(r.createdAt),
+    updated_at: iso(r.updatedAt),
+    finished_at: r.finishedAt ? iso(r.finishedAt) : null,
+  };
+}
+
+export async function createInferenceJobRec(data: {
+  id?: string;
+  type: string;
+  request: any;
+  org_id?: string | null;
+  account_id?: string | null;
+  queue_name: string;
+}): Promise<StoredInferenceJob> {
+  const now = nowIso();
+  const rec: StoredInferenceJob = {
+    id: data.id || randomUUID(),
+    type: String(data.type || 'chat').slice(0, 32),
+    status: 'queued',
+    request: data.request ?? {},
+    result: null,
+    error: null,
+    org_id: cleanTenant(data.org_id),
+    account_id: cleanTenant(data.account_id),
+    runner_id: null,
+    instance_id: null,
+    queue_name: data.queue_name,
+    attempt: 0,
+    lease_expires_at: null,
+    created_at: now,
+    updated_at: now,
+    finished_at: null,
+  };
+  if (db) {
+    await ensureTables();
+    const rows = await db.insert(inferenceJobs).values({
+      id: rec.id,
+      type: rec.type,
+      status: rec.status,
+      request: rec.request,
+      orgId: rec.org_id,
+      accountId: rec.account_id,
+      queueName: rec.queue_name,
+      createdAt: new Date(now),
+      updatedAt: new Date(now),
+    }).returning();
+    return rowToInferenceJob(rows[0]);
+  }
+  memInferenceJobs.set(rec.id, rec);
+  return rec;
+}
+
+export async function getInferenceJobRec(id: string): Promise<StoredInferenceJob | null> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.select().from(inferenceJobs).where(eq(inferenceJobs.id, id)).limit(1);
+    return rows[0] ? rowToInferenceJob(rows[0]) : null;
+  }
+  return memInferenceJobs.get(id) || null;
+}
+
+export async function listInferenceJobRecs(opts: { orgId?: string; accountId?: string; status?: string; limit?: number } = {}): Promise<StoredInferenceJob[]> {
+  const limit = Math.min(Math.max(opts.limit ?? 20, 1), 100);
+  if (db) {
+    await ensureTables();
+    const conds: any[] = [];
+    if (opts.orgId) conds.push(eq(inferenceJobs.orgId, opts.orgId));
+    if (opts.accountId) conds.push(eq(inferenceJobs.accountId, opts.accountId));
+    if (opts.status) conds.push(eq(inferenceJobs.status, opts.status));
+    const rows = await db.select().from(inferenceJobs)
+      .where(conds.length ? and(...conds) : undefined)
+      .orderBy(desc(inferenceJobs.createdAt))
+      .limit(limit);
+    return rows.map(rowToInferenceJob);
+  }
+  return [...memInferenceJobs.values()]
+    .filter((j) => (!opts.orgId || j.org_id === opts.orgId)
+      && (!opts.accountId || j.account_id === opts.accountId)
+      && (!opts.status || j.status === opts.status))
+    .sort((a, b) => b.created_at.localeCompare(a.created_at))
+    .slice(0, limit);
+}
+
+export async function claimInferenceJobRec(id: string, opts: { runnerId: string; instanceId?: string | null; leaseSeconds: number }): Promise<StoredInferenceJob | null> {
+  const leaseSeconds = Math.min(Math.max(Number(opts.leaseSeconds) || 120, 15), 3600);
+  const now = new Date();
+  const lease = new Date(now.getTime() + leaseSeconds * 1000);
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(inferenceJobs).set({
+      status: 'running',
+      runnerId: opts.runnerId,
+      instanceId: opts.instanceId || null,
+      leaseExpiresAt: lease,
+      attempt: sql`${inferenceJobs.attempt} + 1`,
+      error: null,
+      updatedAt: now,
+    }).where(and(
+      eq(inferenceJobs.id, id),
+      or(
+        eq(inferenceJobs.status, 'queued'),
+        and(eq(inferenceJobs.status, 'running'), or(isNull(inferenceJobs.leaseExpiresAt), lt(inferenceJobs.leaseExpiresAt, now))),
+      ),
+    )).returning();
+    return rows[0] ? rowToInferenceJob(rows[0]) : null;
+  }
+  const cur = memInferenceJobs.get(id);
+  if (!cur) return null;
+  const expired = cur.status === 'running'
+    && (!cur.lease_expires_at || new Date(cur.lease_expires_at).getTime() < now.getTime());
+  if (cur.status !== 'queued' && !expired) return null;
+  const next: StoredInferenceJob = {
+    ...cur,
+    status: 'running',
+    runner_id: opts.runnerId,
+    instance_id: opts.instanceId || null,
+    lease_expires_at: lease.toISOString(),
+    attempt: (cur.attempt || 0) + 1,
+    error: null,
+    updated_at: now.toISOString(),
+  };
+  memInferenceJobs.set(id, next);
+  return next;
+}
+
+export async function heartbeatInferenceJobRec(id: string, opts: { runnerId: string; leaseSeconds: number }): Promise<StoredInferenceJob | null> {
+  const leaseSeconds = Math.min(Math.max(Number(opts.leaseSeconds) || 120, 15), 3600);
+  const lease = new Date(Date.now() + leaseSeconds * 1000);
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(inferenceJobs).set({
+      leaseExpiresAt: lease,
+      updatedAt: new Date(),
+    }).where(and(eq(inferenceJobs.id, id), eq(inferenceJobs.status, 'running'), eq(inferenceJobs.runnerId, opts.runnerId))).returning();
+    return rows[0] ? rowToInferenceJob(rows[0]) : null;
+  }
+  const cur = memInferenceJobs.get(id);
+  if (!cur || cur.status !== 'running' || cur.runner_id !== opts.runnerId) return null;
+  const next: StoredInferenceJob = { ...cur, lease_expires_at: lease.toISOString(), updated_at: new Date().toISOString() };
+  memInferenceJobs.set(id, next);
+  return next;
+}
+
+export async function finishInferenceJobRec(id: string, patch: {
+  status: 'success' | 'error';
+  result?: any;
+  error?: string | null;
+  runnerId: string;
+}): Promise<StoredInferenceJob | null> {
+  const now = new Date();
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(inferenceJobs).set({
+      status: patch.status,
+      result: patch.result ?? null,
+      error: patch.error ?? null,
+      leaseExpiresAt: null,
+      updatedAt: now,
+      finishedAt: now,
+    }).where(and(
+      eq(inferenceJobs.id, id),
+      eq(inferenceJobs.status, 'running'),
+      eq(inferenceJobs.runnerId, patch.runnerId),
+    )).returning();
+    return rows[0] ? rowToInferenceJob(rows[0]) : null;
+  }
+  const cur = memInferenceJobs.get(id);
+  if (!cur || cur.status !== 'running' || cur.runner_id !== patch.runnerId) return null;
+  const next: StoredInferenceJob = {
+    ...cur,
+    status: patch.status,
+    result: patch.result ?? null,
+    error: patch.error ?? null,
+    lease_expires_at: null,
+    updated_at: now.toISOString(),
+    finished_at: now.toISOString(),
+  };
+  memInferenceJobs.set(id, next);
+  return next;
+}
+
+export async function releaseInferenceJobRec(id: string, opts: { runnerId: string; error?: string }): Promise<StoredInferenceJob | null> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(inferenceJobs).set({
+      status: 'queued',
+      runnerId: null,
+      instanceId: null,
+      leaseExpiresAt: null,
+      error: opts.error ? String(opts.error).slice(0, 1000) : null,
+      updatedAt: new Date(),
+    }).where(and(eq(inferenceJobs.id, id), eq(inferenceJobs.status, 'running'), eq(inferenceJobs.runnerId, opts.runnerId))).returning();
+    return rows[0] ? rowToInferenceJob(rows[0]) : null;
+  }
+  const cur = memInferenceJobs.get(id);
+  if (!cur || cur.status !== 'running' || cur.runner_id !== opts.runnerId) return null;
+  const next: StoredInferenceJob = {
+    ...cur,
+    status: 'queued',
+    runner_id: null,
+    instance_id: null,
+    lease_expires_at: null,
+    error: opts.error ? String(opts.error).slice(0, 1000) : null,
+    updated_at: new Date().toISOString(),
+  };
+  memInferenceJobs.set(id, next);
+  return next;
+}
+
+export async function setInferenceJobError(id: string, error: string): Promise<StoredInferenceJob | null> {
+  const now = new Date();
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(inferenceJobs).set({
+      status: 'error', error: String(error).slice(0, 2000), updatedAt: now, finishedAt: now,
+    }).where(and(eq(inferenceJobs.id, id), eq(inferenceJobs.status, 'queued'))).returning();
+    return rows[0] ? rowToInferenceJob(rows[0]) : null;
+  }
+  const cur = memInferenceJobs.get(id);
+  if (!cur || cur.status !== 'queued') return null;
+  const next: StoredInferenceJob = { ...cur, status: 'error', error: String(error).slice(0, 2000), updated_at: now.toISOString(), finished_at: now.toISOString() };
+  memInferenceJobs.set(id, next);
+  return next;
 }

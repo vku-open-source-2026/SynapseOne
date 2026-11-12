@@ -29,14 +29,16 @@ import {
   queueExecutionResume,
   createRunnerRec, getRunnerRec, listRunnerRecs, heartbeatRunnerRec, deleteRunnerRec,
   upsertRunnerInstance, listRunnerInstances, listRunnerInstancesForRunners, deleteRunnerInstance, updateRunnerRec,
+  createInferenceJobRec, getInferenceJobRec, listInferenceJobRecs, claimInferenceJobRec,
+  heartbeatInferenceJobRec, finishInferenceJobRec, releaseInferenceJobRec, setInferenceJobError,
   createSecretRec, listSecretRecs, findSecretRec, readSecretValue, rotateSecretRec,
   listSecretVersionRecs, revokeSecretRec, deleteSecretRec, toPublicSecret, toPublicSecretVersion,
 } from './store';
-import type { Principal, StoredExecution, StoredWorkflowRunner, StoredRunnerInstance } from './store';
+import type { Principal, StoredExecution, StoredWorkflowRunner, StoredRunnerInstance, StoredInferenceJob } from './store';
 import {
   queueTransportEnabled, queueBackendConfigured, runnerModeForSettings, queueNameForSettings,
-  ensureWorkflowQueue, publishWorkflowRun, isQueueName, queueVisibilitySeconds, queueMaxAttempts,
-  pingWorkflowQueue,
+  ensureWorkflowQueue, publishWorkflowRun, publishInferenceJob, isQueueName, queueVisibilitySeconds, queueMaxAttempts,
+  pingWorkflowQueue, DEFAULT_INFERENCE_QUEUE,
   DEFAULT_CUSTOM_QUEUE, DEFAULT_SHARED_QUEUE,
 } from './queue';
 import type { WorkflowRunnerMode } from './queue';
@@ -1433,17 +1435,25 @@ export function runnerCommand(runner: StoredWorkflowRunner, apiKey?: string | nu
   const raw = apiKey && apiKey.trim() && !/[\r\n\u0000]/.test(apiKey) ? apiKey.trim().slice(0, 512) : '';
   const key = raw || '<YOUR_SYNAPSEONE_API_KEY>';
   const container = `synapseone-runner-${runner.id.slice(0, 8)}`;
-  return [
+  const lines = [
     `docker run -d --name ${shQuote(container)} --restart unless-stopped \\`,
     `  -e SYNAPSEONE_URL=${shQuote(runnerPublicUrl())} \\`,
     `  -e SYNAPSEONE_API_KEY=${shQuote(key)} \\`,
     `  -e WORKFLOW_RUNNER_ID=${shQuote(runner.id)} \\`,
-    `  -e WORKFLOW_RUNNER_QUEUE=${shQuote(runner.queue)} \\`,
-    `  -e WORKFLOW_RUNNER_MODE=${shQuote(runner.mode)} \\`,
-    `  -e WORKFLOW_RUNNER_CONCURRENCY=1 \\`,
-    `  -e WORKFLOW_RUNNER_HEARTBEAT_SECONDS=${runnerHeartbeatSeconds()} \\`,
-    `  ${runnerImage()}`,
-  ].join('\n');
+    `  -e WORKFLOW_RUNNER_KIND=${shQuote(runner.kind)} \\`,
+  ];
+  if (runner.kind !== 'inference') {
+    lines.push(`  -e WORKFLOW_RUNNER_QUEUE=${shQuote(runner.queue)} \\`);
+    lines.push(`  -e WORKFLOW_RUNNER_MODE=${shQuote(runner.mode)} \\`);
+  }
+  if (runner.kind !== 'workflow') {
+    lines.push(`  -e WORKFLOW_RUNNER_INFERENCE_QUEUE=${shQuote(runner.inference_queue || DEFAULT_INFERENCE_QUEUE)} \\`);
+    lines.push('  -e INFERENCE_RUNNER_URL=<YOUR_OPENAI_COMPATIBLE_BASE_URL> \\');
+  }
+  lines.push('  -e WORKFLOW_RUNNER_CONCURRENCY=1 \\');
+  lines.push(`  -e WORKFLOW_RUNNER_HEARTBEAT_SECONDS=${runnerHeartbeatSeconds()} \\`);
+  lines.push(`  ${runnerImage()}`);
+  return lines.join('\n');
 }
 
 function runnerHeartbeatSeconds(): number {
@@ -1470,7 +1480,9 @@ function runnerOptions(): any {
       custom: DEFAULT_CUSTOM_QUEUE,
       shared: DEFAULT_SHARED_QUEUE,
       platform: process.env.WORKFLOW_QUEUE_PLATFORM || 'synapseone-wf-platform',
+      inference: DEFAULT_INFERENCE_QUEUE,
     },
+    kinds: ['workflow', 'inference', 'hybrid'],
     heartbeatIntervalSeconds: runnerHeartbeatSeconds(),
     staleAfterSeconds: runnerStaleAfterSeconds(),
     maxConcurrency: runnerMaxConcurrency(),
@@ -1521,8 +1533,13 @@ function toApiRunner(r: StoredWorkflowRunner, instances: StoredRunnerInstance[] 
   return {
     id: r.id,
     name: r.name,
+    kind: r.kind,
     mode: r.mode,
     queue: r.queue,
+    inferenceQueue: r.inference_queue || null,
+    capabilities: r.kind === 'hybrid'
+      ? ['workflow', 'inference']
+      : r.kind === 'inference' ? ['inference'] : ['workflow'],
     status: status.status,
     connected: status.connected,
     connectedInstances: status.connectedInstances,
@@ -1539,8 +1556,33 @@ function toApiRunner(r: StoredWorkflowRunner, instances: StoredRunnerInstance[] 
   };
 }
 
-function canAccessRunner(r: StoredWorkflowRunner, p: Principal | null | undefined): boolean {
+function canAccessInferenceJob(j: StoredInferenceJob, p: Principal | null | undefined): boolean {
   if (!p) return true;
+  if (p.account && j.account_id === p.account) return true;
+  if (p.org && j.org_id === p.org) return true;
+  return false;
+}
+
+function toApiInferenceJob(j: StoredInferenceJob, includeRequest = false): any {
+  return {
+    id: j.id,
+    type: j.type,
+    status: j.status,
+    ...(includeRequest ? { request: j.request } : {}),
+    result: j.result,
+    error: j.error ?? undefined,
+    runnerId: j.runner_id ?? undefined,
+    instanceId: j.instance_id ?? undefined,
+    queue: j.queue_name ?? undefined,
+    attempt: j.attempt,
+    leaseExpiresAt: j.lease_expires_at ?? undefined,
+    createdAt: j.created_at,
+    updatedAt: j.updated_at,
+    finishedAt: j.finished_at ?? undefined,
+  };
+}
+
+function canAccessRunner(r: StoredWorkflowRunner, p: Principal | null | undefined): boolean {  if (!p) return true;
   if (p.account && r.account_id === p.account) return true;
   if (p.org && r.org_id === p.org) return true;
   return false;
@@ -2321,10 +2363,18 @@ function tenantBinding(
     if (!RUNNER_NAME_RE.test(name)) {
       return res.status(400).json({ error: 'invalid_name', message: 'name must be 1..100 printable chars' });
     }
+    const kind: 'workflow' | 'inference' | 'hybrid' = b.kind === 'inference' || b.kind === 'hybrid' ? b.kind : 'workflow';
     const mode: 'custom' | 'hybrid' = b.mode === 'hybrid' ? 'hybrid' : 'custom';
-    const queue = String(b.queue || (mode === 'hybrid' ? DEFAULT_SHARED_QUEUE : DEFAULT_CUSTOM_QUEUE)).trim();
+    const defaultWorkflowQueue = mode === 'hybrid' ? DEFAULT_SHARED_QUEUE : DEFAULT_CUSTOM_QUEUE;
+    const queue = String(b.queue || (kind === 'inference' ? DEFAULT_INFERENCE_QUEUE : defaultWorkflowQueue)).trim();
     if (!isQueueName(queue)) {
       return res.status(400).json({ error: 'invalid_queue', message: 'queue must match [A-Za-z][A-Za-z0-9_-]{0,63}' });
+    }
+    const inferenceQueue = kind === 'workflow'
+      ? null
+      : String(b.inferenceQueue || DEFAULT_INFERENCE_QUEUE).trim();
+    if (inferenceQueue !== null && !isQueueName(inferenceQueue)) {
+      return res.status(400).json({ error: 'invalid_queue', message: 'inferenceQueue must match [A-Za-z][A-Za-z0-9_-]{0,63}' });
     }
     const apiKeyId = b.apiKeyId ? String(b.apiKeyId).slice(0, 128) : null;
     const keyPrefix = b.keyPrefix ? String(b.keyPrefix).slice(0, 32) : null;
@@ -2333,8 +2383,10 @@ function tenantBinding(
       : RUNNER_KEY_SCOPES;
     const runner = await createRunnerRec({
       name,
+      kind,
       mode,
       queue,
+      inference_queue: inferenceQueue,
       org_id: principal.org || null,
       account_id: principal.account || null,
       api_key_id: apiKeyId,
@@ -2348,7 +2400,9 @@ function tenantBinding(
     if (typeof b.apiKey === 'string' && b.apiKey) res.setHeader('Cache-Control', 'no-store');
     res.status(201).json({
       runner: toApiRunner(runner),
+      kind: runner.kind,
       queue: runner.queue,
+      inferenceQueue: runner.inference_queue || null,
       scopes,
       command: runnerCommand(runner, typeof b.apiKey === 'string' ? b.apiKey : null),
       options: runnerOptions(),
@@ -2400,11 +2454,15 @@ function tenantBinding(
     const runner = await loadRunnerForRequest(req, res);
     if (!runner) return;
     const b = (req.body || {}) as any;
-    const patch: { name?: string; mode?: 'custom' | 'hybrid'; queue?: string; metadata?: Record<string, any> } = {};
+    const patch: { name?: string; kind?: 'workflow' | 'inference' | 'hybrid'; mode?: 'custom' | 'hybrid'; queue?: string; inference_queue?: string | null; metadata?: Record<string, any> } = {};
     if (b.name !== undefined) {
       const name = String(b.name).trim();
       if (!RUNNER_NAME_RE.test(name)) return res.status(400).json({ error: 'invalid_name', message: 'name must be 1..100 printable chars' });
       patch.name = name;
+    }
+    if (b.kind !== undefined) {
+      if (b.kind !== 'workflow' && b.kind !== 'inference' && b.kind !== 'hybrid') return res.status(400).json({ error: 'invalid_kind', message: 'kind must be workflow|inference|hybrid' });
+      patch.kind = b.kind;
     }
     if (b.mode !== undefined) {
       if (b.mode !== 'custom' && b.mode !== 'hybrid') return res.status(400).json({ error: 'invalid_mode', message: 'mode must be custom|hybrid' });
@@ -2415,11 +2473,24 @@ function tenantBinding(
       if (!isQueueName(queue)) return res.status(400).json({ error: 'invalid_queue', message: 'queue must match [A-Za-z][A-Za-z0-9_-]{0,63}' });
       patch.queue = queue;
     }
+    if (b.inferenceQueue !== undefined) {
+      if (b.inferenceQueue === null || b.inferenceQueue === '') patch.inference_queue = null;
+      else {
+        const iq = String(b.inferenceQueue).trim();
+        if (!isQueueName(iq)) return res.status(400).json({ error: 'invalid_queue', message: 'inferenceQueue must match [A-Za-z][A-Za-z0-9_-]{0,63}' });
+        patch.inference_queue = iq;
+      }
+    }
     if (b.metadata !== undefined) {
       if (!b.metadata || typeof b.metadata !== 'object' || Array.isArray(b.metadata)) return res.status(400).json({ error: 'invalid_metadata' });
       patch.metadata = { ...(runner.metadata || {}), ...b.metadata };
     }
-    const changingQueue = (patch.queue && patch.queue !== runner.queue) || (patch.mode && patch.mode !== runner.mode);
+    const nextKind = patch.kind || runner.kind;
+    if (nextKind !== 'workflow' && !patch.inference_queue && !runner.inference_queue) patch.inference_queue = DEFAULT_INFERENCE_QUEUE;
+    const changingQueue = (patch.queue && patch.queue !== runner.queue)
+      || (patch.mode && patch.mode !== runner.mode)
+      || (patch.kind && patch.kind !== runner.kind)
+      || (patch.inference_queue !== undefined && patch.inference_queue !== runner.inference_queue);
     if (changingQueue) {
       const instances = await listRunnerInstances(runner.id);
       if (runnerStatus(runner, instances).connected) {
@@ -2438,8 +2509,14 @@ function tenantBinding(
     res.json({
       runnerId: runner.id,
       name: runner.name,
+      kind: runner.kind,
       mode: runner.mode,
       queue: runner.queue,
+      inferenceQueue: runner.inference_queue || null,
+      queues: {
+        workflow: runner.kind === 'inference' ? null : runner.queue,
+        inference: runner.kind === 'workflow' ? null : (runner.inference_queue || DEFAULT_INFERENCE_QUEUE),
+      },
       apiBaseUrl: runnerPublicUrl(),
       heartbeatIntervalSeconds: runnerHeartbeatSeconds(),
       staleAfterSeconds: runnerStaleAfterSeconds(),
@@ -2546,6 +2623,188 @@ function tenantBinding(
     res.json({ ok: true, id: runner.id, deleted: await deleteRunnerRec(runner.id) });
   });
 
+  // ---- inference jobs (inference / hybrid runners) ----
+  const INFERENCE_JOB_TYPES = new Set(['chat', 'embeddings', 'decision', 'route', 'generic']);
+
+  async function waitInferenceJob(id: string, timeoutMs = 120000): Promise<StoredInferenceJob | null> {
+    const deadline = Date.now() + Math.min(Math.max(Number(timeoutMs) || 120000, 1000), 300000);
+    let job = await getInferenceJobRec(id);
+    while (job && (job.status === 'queued' || job.status === 'running') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 250));
+      job = await getInferenceJobRec(id);
+    }
+    return job;
+  }
+
+  app.post('/v1/inference-jobs', async (req, res) => {
+    const principal = principalFromHeaders(req);
+    if (!principal) return res.status(401).json({ error: 'unauthenticated', message: 'a verified principal is required' });
+    const b = (req.body || {}) as any;
+    const type = String(b.type || 'chat');
+    if (!INFERENCE_JOB_TYPES.has(type)) {
+      return res.status(400).json({ error: 'invalid_type', message: `type must be ${[...INFERENCE_JOB_TYPES].join('|')}` });
+    }
+    const request = b.payload !== undefined ? b.payload : b.input !== undefined ? b.input : b.request;
+    if (!request || typeof request !== 'object' || Array.isArray(request)) {
+      return res.status(400).json({ error: 'invalid_payload', message: 'payload must be a JSON object' });
+    }
+    let bodySize = 0;
+    try { bodySize = Buffer.byteLength(JSON.stringify(request), 'utf8'); } catch { return res.status(400).json({ error: 'invalid_payload' }); }
+    if (bodySize > 200 * 1024) return res.status(413).json({ error: 'payload_too_large', message: 'payload ≤200KB' });
+    const queue = String(b.queue || DEFAULT_INFERENCE_QUEUE).trim();
+    if (!isQueueName(queue)) return res.status(400).json({ error: 'invalid_queue' });
+    const job = await createInferenceJobRec({
+      type,
+      request,
+      org_id: principal.org || null,
+      account_id: principal.account || null,
+      queue_name: queue,
+    });
+    try {
+      await ensureWorkflowQueue(queue, principal, {
+        maxAttempts: queueMaxAttempts(),
+        visibilityTimeoutSeconds: Math.min(Math.max(Number(b.visibilityTimeoutSeconds) || 300, 30), 3600),
+      });
+      await publishInferenceJob(queue, job.id, principal);
+    } catch (e: any) {
+      await setInferenceJobError(job.id, `queue dispatch failed: ${String(e?.message || e).slice(0, 500)}`).catch(() => null);
+      return res.status(503).json({ error: 'queue_unavailable', message: String(e?.message || e) });
+    }
+    const wait = b.wait === true || b.wait === '1' || b.wait === 'true' || req.query.wait === '1' || req.query.wait === 'true';
+    if (wait) {
+      const final = await waitInferenceJob(job.id, Number(b.timeoutMs || req.query.timeoutMs) || 120000);
+      if (!final) return res.status(202).json({ ok: true, jobId: job.id, status: 'queued', queue });
+      return res.status(final.status === 'success' ? 200 : 500).json({
+        ok: final.status === 'success',
+        jobId: final.id,
+        status: final.status,
+        result: final.result,
+        ...(final.error ? { error: final.error } : {}),
+      });
+    }
+    res.status(202).json({ ok: true, jobId: job.id, status: 'queued', queue, type });
+  });
+
+  app.get('/v1/inference-jobs', async (req, res) => {
+    const principal = principalFromHeaders(req);
+    const scope = humanTaskScope(principal);
+    if (scope === null) return res.status(403).json({ error: 'tenant_required' });
+    const q = req.query as any;
+    const jobs = await listInferenceJobRecs({
+      ...scope,
+      status: q.status ? String(q.status) : undefined,
+      limit: Number(q.limit) || 20,
+    });
+    res.json({ data: jobs.map((j) => toApiInferenceJob(j)) });
+  });
+
+  app.get('/v1/inference-jobs/:id', async (req, res) => {
+    const id = String(req.params.id || '');
+    if (!id || id.length > 128 || /[\r\n]/.test(id)) return res.status(400).json({ error: 'invalid_id' });
+    const job = await getInferenceJobRec(id);
+    if (!job || !canAccessInferenceJob(job, principalFromHeaders(req))) return res.status(404).json({ error: 'not_found' });
+    res.json(toApiInferenceJob(job, (req.query as any).includeData === 'true'));
+  });
+
+  async function inferenceJobForRunner(req: any, res: any, opts: { requireRunning?: boolean } = {}): Promise<{ runner: StoredWorkflowRunner; job: StoredInferenceJob } | null> {
+    const runner = await loadRunnerForRequest(req, res, undefined, false);
+    if (!runner) return null;
+    if (runner.kind !== 'inference' && runner.kind !== 'hybrid') {
+      res.status(403).json({ error: 'runner_kind', message: `runner kind '${runner.kind}' cannot claim inference jobs` });
+      return null;
+    }
+    const id = String(req.params.id || '');
+    if (!id || id.length > 128 || /[\r\n]/.test(id)) {
+      res.status(400).json({ error: 'invalid_id' });
+      return null;
+    }
+    const job = await getInferenceJobRec(id);
+    if (!job || !canAccessInferenceJob(job, principalFromHeaders(req))) {
+      res.status(404).json({ error: 'not_found', message: 'inference job not found' });
+      return null;
+    }
+    const expectedQueue = runner.inference_queue || DEFAULT_INFERENCE_QUEUE;
+    if (job.queue_name !== expectedQueue) {
+      res.status(403).json({ error: 'runner_mismatch', message: `job belongs to queue '${job.queue_name || '-'}'` });
+      return null;
+    }
+    if (opts.requireRunning) {
+      if (job.status !== 'running' || job.runner_id !== runner.id) {
+        res.status(409).json({ error: 'not_claimed', message: 'inference job is not claimed by this runner' });
+        return null;
+      }
+    }
+    return { runner, job };
+  }
+
+  app.post('/v1/runner/inference/jobs/:id/claim', async (req, res) => {
+    const ctx = await inferenceJobForRunner(req, res);
+    if (!ctx) return;
+    const b = (req.body || {}) as any;
+    const instanceId = b.instanceId ? String(b.instanceId).slice(0, 128) : null;
+    const leaseSeconds = Math.min(Math.max(Number(b.leaseSeconds) || 300, 15), 3600);
+    const claimed = await claimInferenceJobRec(ctx.job.id, { runnerId: ctx.runner.id, instanceId, leaseSeconds });
+    if (!claimed) {
+      const current = await getInferenceJobRec(ctx.job.id);
+      if (!current || current.status !== 'running' || current.runner_id !== ctx.runner.id) {
+        return res.status(409).json({ error: 'not_claimable', message: 'inference job is already claimed or finished' });
+      }
+      await heartbeatRunnerRec(ctx.runner.id, { status: 'connected' }).catch(() => null);
+      return res.json({
+        jobId: current.id, type: current.type, request: current.request,
+        attempt: current.attempt, leaseExpiresAt: current.lease_expires_at,
+      });
+    }
+    await heartbeatRunnerRec(ctx.runner.id, { status: 'connected' }).catch(() => null);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      jobId: claimed.id,
+      type: claimed.type,
+      request: claimed.request,
+      attempt: claimed.attempt,
+      leaseExpiresAt: claimed.lease_expires_at,
+    });
+  });
+
+  app.post('/v1/runner/inference/jobs/:id/heartbeat', async (req, res) => {
+    const ctx = await inferenceJobForRunner(req, res, { requireRunning: true });
+    if (!ctx) return;
+    const leaseSeconds = Math.min(Math.max(Number((req.body || {}).leaseSeconds) || 300, 15), 3600);
+    const updated = await heartbeatInferenceJobRec(ctx.job.id, { runnerId: ctx.runner.id, leaseSeconds });
+    if (!updated) return res.status(409).json({ error: 'not_running' });
+    await heartbeatRunnerRec(ctx.runner.id, { status: 'connected' }).catch(() => null);
+    res.json({ ok: true, leaseExpiresAt: updated.lease_expires_at });
+  });
+
+  app.post('/v1/runner/inference/jobs/:id/complete', async (req, res) => {
+    const ctx = await inferenceJobForRunner(req, res, { requireRunning: true });
+    if (!ctx) return;
+    const b = (req.body || {}) as any;
+    const status = b.status === 'success' ? 'success' : b.status === 'error' ? 'error' : null;
+    if (!status) return res.status(400).json({ error: 'invalid_status', message: 'status must be success|error' });
+    const finished = await finishInferenceJobRec(ctx.job.id, {
+      status,
+      result: b.result ?? null,
+      error: b.error ? String(b.error).slice(0, 2000) : null,
+      runnerId: ctx.runner.id,
+    });
+    if (!finished) return res.status(409).json({ error: 'already_finished' });
+    recordRun(ctx.runner.kind === 'hybrid' ? 'runner-hybrid-inference' : 'runner-inference', finished.status);
+    await heartbeatRunnerRec(ctx.runner.id, { status: 'connected' }).catch(() => null);
+    res.json({ ok: true, jobId: finished.id, status: finished.status });
+  });
+
+  app.post('/v1/runner/inference/jobs/:id/release', async (req, res) => {
+    const ctx = await inferenceJobForRunner(req, res);
+    if (!ctx) return;
+    const released = await releaseInferenceJobRec(ctx.job.id, {
+      runnerId: ctx.runner.id,
+      error: (req.body || {}).error ? String((req.body || {}).error).slice(0, 1000) : undefined,
+    });
+    if (!released) return res.status(409).json({ error: 'not_releasable' });
+    res.json({ ok: true, jobId: released.id, status: released.status });
+  });
+
   // ---- runner job protocol (API-key authenticated) ----
   async function runnerJob(req: any, res: any, opts: { requireRunning?: boolean } = {}): Promise<{ runner: StoredWorkflowRunner; execution: StoredExecution } | null> {
     const runner = await loadRunnerForRequest(req, res, undefined, false);
@@ -2578,7 +2837,13 @@ function tenantBinding(
     const ctx = await runnerJob(req, res);
     if (!ctx) return;
     const leaseSeconds = Math.min(Math.max(Number((req.body || {}).leaseSeconds) || queueVisibilitySeconds(), 15), 3600);
-    const claimed = await claimExecutionRec(ctx.execution.id, { workerId: ctx.runner.id, leaseSeconds });
+    let claimed = await claimExecutionRec(ctx.execution.id, { workerId: ctx.runner.id, leaseSeconds });
+    if (!claimed) {
+      // Idempotent re-claim: a retried HTTP request after a lost response must
+      // get the same job back instead of orphaning an already-running run.
+      const current = await getExecutionRec(ctx.execution.id);
+      if (current && current.status === 'running' && current.worker_id === ctx.runner.id) claimed = current;
+    }
     if (!claimed) return res.status(409).json({ error: 'not_claimable', message: 'execution is already claimed or finished' });
     const wf = await getWorkflowRec(claimed.workflow_id);
     if (!wf) {

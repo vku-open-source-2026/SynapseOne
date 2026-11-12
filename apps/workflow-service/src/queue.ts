@@ -44,6 +44,7 @@ function internalSecret(): string {
 export const DEFAULT_PLATFORM_QUEUE = process.env.WORKFLOW_QUEUE_PLATFORM || 'synapseone-wf-platform';
 export const DEFAULT_CUSTOM_QUEUE = process.env.WORKFLOW_QUEUE_CUSTOM || 'synapseone-wf-custom';
 export const DEFAULT_SHARED_QUEUE = process.env.WORKFLOW_QUEUE_SHARED || 'synapseone-wf-shared';
+export const DEFAULT_INFERENCE_QUEUE = process.env.WORKFLOW_QUEUE_INFERENCE || 'synapseone-inference';
 
 /** `queue` when a SynapseQueue URL is configured, `inline` for dev/tests.
  *  WORKFLOW_EXECUTION_MODE=queue|inline forces one or the other. */
@@ -183,6 +184,21 @@ export async function publishWorkflowRun(queue: string, executionId: string, p: 
   const body: Record<string, any> = {
     payload: { v: 1, kind: 'workflow.run', executionId },
     ...(opts.dedupeKey ? { dedupeKey: opts.dedupeKey } : {}),
+    ...(opts.delaySeconds ? { delaySeconds: Math.min(Math.max(Number(opts.delaySeconds), 0), 604800) } : {}),
+    ...(opts.maxAttempts ? { maxAttempts: Math.min(Math.max(Number(opts.maxAttempts), 1), 100) } : {}),
+  };
+  const res = await queueFetch('POST', `/v1/queue/queues/${encodeURIComponent(queue)}/messages`, p, body);
+  return { id: String(res?.id || ''), duplicate: !!res?.duplicate };
+}
+
+/** Publish a queued inference job. Payload stays small; request lives in the
+ *  inference job row and is returned only to an authenticated claim. */
+export async function publishInferenceJob(queue: string, jobId: string, p: Principal | null | undefined, opts: {
+  delaySeconds?: number;
+  maxAttempts?: number;
+} = {}): Promise<{ id: string; duplicate: boolean }> {
+  const body: Record<string, any> = {
+    payload: { v: 1, kind: 'inference.run', jobId },
     ...(opts.delaySeconds ? { delaySeconds: Math.min(Math.max(Number(opts.delaySeconds), 0), 604800) } : {}),
     ...(opts.maxAttempts ? { maxAttempts: Math.min(Math.max(Number(opts.maxAttempts), 1), 100) } : {}),
   };

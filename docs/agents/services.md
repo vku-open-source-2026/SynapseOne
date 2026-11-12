@@ -130,6 +130,9 @@ Migrations seed demo org `acme` and account `prod`; the memory fallback seeds
   `GET /v1/workflow-runners/options`, `GET .../config|connection`,
   `POST .../heartbeat|command`, `DELETE .../instances/:instanceId`,
   `POST /v1/runner/jobs/:id/claim|heartbeat|complete|release|credentials`.
+- `POST/GET /v1/inference-jobs`, `GET /v1/inference-jobs/:id`,
+  `POST /v1/runner/inference/jobs/:id/claim|heartbeat|complete|release`
+  (inference/hybrid runner lane).
 - `GET /v1/templates`, `GET /v1/templates/:name`.
 - `GET/POST /v1/credentials`, `DELETE /v1/credentials/:id` (secrets never
   returned).
@@ -172,10 +175,12 @@ never embedded in queue messages. See `docs/workflow-runners.md`.
 **Data:** `synapseone_workflows` (nodes/connections/settings/active/tenant/
 run_as/revision), `synapseone_executions` (input/output/node runs/principal/
 trigger + queue/runner/worker/attempt/lease/resume), `synapseone_workflow_runners`
-(queue/mode/tenant/API-key metadata), `synapseone_workflow_runner_instances`
-(per-connector hostname/version/concurrency/last heartbeat), `synapseone_credentials`
-(AES-256-GCM envelope, `SYNAPSEONE_CREDENTIAL_KEY` 32-byte hex required in
-prod; dev uses an ephemeral key).
+(kind workflow/inference/hybrid, queues, tenant/API-key metadata),
+`synapseone_workflow_runner_instances` (per-connector hostname/version/
+concurrency/last heartbeat), `synapseone_inference_jobs` (queued inference
+chat/embeddings/decision work for inference/hybrid runners),
+`synapseone_credentials` (AES-256-GCM envelope, `SYNAPSEONE_CREDENTIAL_KEY`
+32-byte hex required in prod; dev uses an ephemeral key).
 
 **Rules:**
 - Workflows are tenant-scoped: visibility = account match OR org match; create/

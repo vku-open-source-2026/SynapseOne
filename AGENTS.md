@@ -155,10 +155,16 @@ E2E helpers: `bash tests/e2e/api-check.sh`, `node tests/e2e/services-check.js`,
   exactly-one-runner guard. A registration may have many connector instances
   (`synapseone_workflow_runner_instances`, Cloudflare-style); status is
   `waiting|connected|degraded|offline` and is computed from connector
-  heartbeats (`WORKFLOW_RUNNER_STALE_SECONDS`, default 60). Tests stay inline
-  because they do not set `QUEUE_SERVICE_URL`/`NODE_ENV=production`; the
-  `tests/e2e/workflow-runner-e2e.mjs` gate asserts `transport=queue` and fails
-  on any inline fallback.
+  heartbeats (`WORKFLOW_RUNNER_STALE_SECONDS`, default 60). Runner `kind` is
+  `workflow|inference|hybrid`; inference/hybrid lanes consume
+  `synapseone-inference` (`/v1/inference-jobs`) and call a local OpenAI-
+  compatible backend. The runner HTTP client retries transient failures,
+  supports HTTP(S)_PROXY/NO_PROXY and `SYNAPSEONE_CA_CERT`, verifies the API key
+  and required scopes at startup, and reports actionable DNS/TLS/proxy errors.
+  Tests stay inline because they do not set
+  `QUEUE_SERVICE_URL`/`NODE_ENV=production`; the
+  `tests/e2e/workflow-runner-e2e.mjs` gate asserts `transport=queue`, runs
+  workflow + inference jobs on a hybrid connector, and fails on inline fallback.
 - **Workflow node types are n8n-compatible** (`n8n-nodes-base.*`) plus
   `synapseone.*` nodes and `synapseone.api` operations across IAM, Workflow,
   LDS, Base, Faststore, Queue and Inference. Preserve aliases when touching
