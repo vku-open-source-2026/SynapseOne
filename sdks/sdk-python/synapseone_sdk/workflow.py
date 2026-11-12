@@ -178,7 +178,9 @@ class WorkflowService:
             "GET", f"/v1/workflow-runners/{quote(runner_id, safe='')}/connection"
         )
 
-    def get_workflow_runner_command(self, runner_id: str, api_key: str | None = None) -> Any:
+    def get_workflow_runner_command(
+        self, runner_id: str, api_key: str | None = None
+    ) -> Any:
         body = {"apiKey": api_key} if api_key else {}
         return self._req(
             "POST",
@@ -187,9 +189,7 @@ class WorkflowService:
         )
 
     def delete_workflow_runner(self, runner_id: str) -> Any:
-        return self._req(
-            "DELETE", f"/v1/workflow-runners/{quote(runner_id, safe='')}"
-        )
+        return self._req("DELETE", f"/v1/workflow-runners/{quote(runner_id, safe='')}")
 
     # ---- executions ----
     def list_executions(self, query: str | dict | None = "") -> Any:
