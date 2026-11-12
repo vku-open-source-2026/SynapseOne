@@ -147,8 +147,33 @@ class WorkflowService:
     def list_workflow_runners(self) -> Any:
         return self._req("GET", "/v1/workflow-runners")
 
+    def get_workflow_runner_options(self) -> Any:
+        return self._req("GET", "/v1/workflow-runners/options")
+
     def get_workflow_runner(self, runner_id: str) -> Any:
         return self._req("GET", f"/v1/workflow-runners/{quote(runner_id, safe='')}")
+
+    def update_workflow_runner(
+        self,
+        runner_id: str,
+        *,
+        name: str | None = None,
+        mode: str | None = None,
+        queue: str | None = None,
+        metadata: dict | None = None,
+    ) -> Any:
+        body: dict = {}
+        if name is not None:
+            body["name"] = name
+        if mode is not None:
+            body["mode"] = mode
+        if queue is not None:
+            body["queue"] = queue
+        if metadata is not None:
+            body["metadata"] = metadata
+        return self._req(
+            "PATCH", f"/v1/workflow-runners/{quote(runner_id, safe='')}", body
+        )
 
     def create_workflow_runner(
         self,
@@ -190,6 +215,13 @@ class WorkflowService:
 
     def delete_workflow_runner(self, runner_id: str) -> Any:
         return self._req("DELETE", f"/v1/workflow-runners/{quote(runner_id, safe='')}")
+
+    def delete_workflow_runner_instance(self, runner_id: str, instance_id: str) -> Any:
+        return self._req(
+            "DELETE",
+            f"/v1/workflow-runners/{quote(runner_id, safe='')}/instances/"
+            f"{quote(instance_id, safe='')}",
+        )
 
     # ---- executions ----
     def list_executions(self, query: str | dict | None = "") -> Any:

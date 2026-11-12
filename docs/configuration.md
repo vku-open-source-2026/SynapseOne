@@ -82,6 +82,9 @@ reads which key (audited from source):
 | `WORKFLOW_QUEUE_SHARED` | `synapseone-wf-shared` | queue for `hybrid` workflows |
 | `SYNAPSEONE_PUBLIC_URL` | `https://api.synapseone.space` | gateway URL embedded in runner commands |
 | `WORKFLOW_RUNNER_IMAGE` | `ghcr.io/.../synapseone-workflow-runner:latest` | runner image embedded in commands |
+| `WORKFLOW_RUNNER_HEARTBEAT_SECONDS` | 15 | connector heartbeat interval (5–300) |
+| `WORKFLOW_RUNNER_STALE_SECONDS` | 60 | a connector is offline after this many seconds without heartbeat (30–3600) |
+| `WORKFLOW_RUNNER_MAX_CONCURRENCY` | 32 | max per-connector concurrency (1–64) |
 | `INFERENCE_TIMEOUT_MS` | 120000 | per-call budget for workflow → inference LLM requests (clamped 1000–300000) |
 | `IAM_SERVICE_URL` | `http://iam:4001` | internal base URL for `synapseone.api` IAM nodes (users/roles/policies/audit/keys) |
 | `SYNAPSEONE_IAM_API_KEY` | — | service API key sent as `X-API-Key` on `synapseone.api` IAM calls; IAM requires a real caller credential even with the internal secret. Create it on the workflow service account (`POST /v1/accounts/:accountId/keys`, scope `*`). Unset → IAM nodes fail with a clear configuration error |

@@ -126,8 +126,9 @@ Migrations seed demo org `acme` and account `prod`; the memory fallback seeds
   `POST /v1/workflows/test-run` (`execute` returns 202 queued in queue mode;
   `?wait=1` blocks).
 - `GET /v1/executions`, `GET /v1/executions/:id`.
-- `GET/POST /v1/workflow-runners`, `GET/DELETE /v1/workflow-runners/:id`,
-  `GET .../config|connection`, `POST .../heartbeat|command`,
+- `GET/POST /v1/workflow-runners`, `GET/PATCH/DELETE /v1/workflow-runners/:id`,
+  `GET /v1/workflow-runners/options`, `GET .../config|connection`,
+  `POST .../heartbeat|command`, `DELETE .../instances/:instanceId`,
   `POST /v1/runner/jobs/:id/claim|heartbeat|complete|release|credentials`.
 - `GET /v1/templates`, `GET /v1/templates/:name`.
 - `GET/POST /v1/credentials`, `DELETE /v1/credentials/:id` (secrets never
@@ -171,7 +172,8 @@ never embedded in queue messages. See `docs/workflow-runners.md`.
 **Data:** `synapseone_workflows` (nodes/connections/settings/active/tenant/
 run_as/revision), `synapseone_executions` (input/output/node runs/principal/
 trigger + queue/runner/worker/attempt/lease/resume), `synapseone_workflow_runners`
-(queue/mode/tenant/API-key metadata/last heartbeat), `synapseone_credentials`
+(queue/mode/tenant/API-key metadata), `synapseone_workflow_runner_instances`
+(per-connector hostname/version/concurrency/last heartbeat), `synapseone_credentials`
 (AES-256-GCM envelope, `SYNAPSEONE_CREDENTIAL_KEY` 32-byte hex required in
 prod; dev uses an ephemeral key).
 

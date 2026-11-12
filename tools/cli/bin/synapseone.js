@@ -719,7 +719,22 @@ async function cmdRunners(o) {
   const [sub, ...rest] = o._;
   if (!sub || sub === 'list') {
     const r = await GET('/v1/workflow-runners', o);
-    return out(Array.isArray(r) ? r : r.data || r, o, ['id', 'name', 'mode', 'queue', 'status']);
+    const rows = (Array.isArray(r) ? r : r.data || r).map((x) => ({
+      ...x,
+      connectors: `${x.connectedInstances || 0}/${x.instanceCount || 0}`,
+    }));
+    return out(rows, o, ['id', 'name', 'mode', 'queue', 'connectors', 'status']);
+  }
+  if (sub === 'options') return out(await GET('/v1/workflow-runners/options', o), o);
+  if (sub === 'instances') {
+    need(rest[0], 'runner-id');
+    const r = await GET(`/v1/workflow-runners/${encodeURIComponent(rest[0])}`, o);
+    return out(r.runner?.instances || [], o, ['id', 'hostname', 'version', 'concurrency', 'status', 'lastSeenAt']);
+  }
+  if (sub === 'rm-instance') {
+    need(rest[0], 'runner-id');
+    need(rest[1], 'instance-id');
+    return out(await DEL(`/v1/workflow-runners/${encodeURIComponent(rest[0])}/instances/${encodeURIComponent(rest[1])}`, o), o);
   }
   if (sub === 'create') {
     need(o.name, '--name');
@@ -1134,7 +1149,7 @@ const COMMANDS = {
   credentials: { fn: cmdCredentials, use: 'credentials create <account> --name N --type bearer|basic|apiKey|oauth2 (--secret S | --secret-file F) [--expires-at ISO] | credentials [list] <account> | credentials get|delete <id> | credentials rotate <id> (--secret S | --secret-file F)', doc: 'Account credentials, secrets write-only (PROPOSED: backend in progress)' },
   call: { fn: cmdCall, use: 'call <METHOD> <path> [--data \'{...}\'|body.json] [--file body.json]', doc: 'Generic gateway call (escape hatch for new endpoints)' },
   workflows: { fn: cmdWorkflows, use: 'workflows [list] | workflows create --template T [--name N] | workflows create --file def.json [--name N] | workflows get|activate|deactivate <id> | workflows exec|execute <id> [--data \'{...}\'|input.json] [--file payload.json] [--wait] [--timeout MS] | workflows update [--name N] [--file def.json] <id> | workflows delete <id> | workflows test-run --file def.json [--input input.json|\'{...}\'] [--workflow-id ID]', doc: 'Workflows (local engine)' },
-  runners: { fn: cmdRunners, use: 'runners [list] | runners create --name N --account ID [--mode custom|hybrid] [--queue Q] [--scopes S] | runners get|connection|command|delete <id>', doc: 'Self-hosted workflow runners (queue workers)' },
+  runners: { fn: cmdRunners, use: 'runners [list] | runners options | runners create --name N --account ID [--mode custom|hybrid] [--queue Q] [--scopes S] | runners get|connection|instances|command|delete <id> | runners rm-instance <id> <instance-id>', doc: 'Self-hosted workflow runners (queue connectors)' },
   executions: { fn: cmdExecutions, use: 'executions [list] [--limit N] [--offset N] [--workflow-id ID] [--status success|error|running] [--triggered-by manual|webhook|cron|test] [--include-data] | executions <id> [--include-data]', doc: 'Workflow executions ({data:[]} envelope)' },
   webhook: { fn: cmdWebhook, use: 'webhook <path> [--data \'{...}\'|payload.json] [--file payload.json] [--method POST] [--base http://localhost:4002]', doc: 'Fire a public inbound webhook (no auth; --base = workflow origin)' },
   templates: { fn: cmdTemplates, use: 'templates [list|<name>]', doc: 'Built-in templates' },

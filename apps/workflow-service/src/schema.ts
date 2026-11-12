@@ -196,3 +196,30 @@ export const workflowRunners = pgTable(
     index('idx_synapseone_runners_seen').on(t.lastSeenAt.desc()),
   ],
 );
+
+/**
+ * One running connector process for a runner registration. A runner may have
+ * several replicas (Cloudflare-connector style); each sends heartbeats with
+ * its own instance id, hostname, version and concurrency.
+ */
+export const workflowRunnerInstances = pgTable(
+  'synapseone_workflow_runner_instances',
+  {
+    id: text('id').primaryKey(),
+    runnerId: text('runner_id').notNull(),
+    hostname: text('hostname').notNull().default(''),
+    version: text('version'),
+    queue: text('queue').notNull().default(''),
+    concurrency: integer('concurrency').notNull().default(1),
+    status: text('status').notNull().default('connected'),
+    lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow(),
+    startedAt: timestamp('started_at', { withTimezone: true }),
+    metadata: jsonb('metadata').$type<Record<string, any>>().notNull().default(sql`'{}'::jsonb`),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index('idx_synapseone_runner_instances_runner').on(t.runnerId),
+    index('idx_synapseone_runner_instances_seen').on(t.lastSeenAt.desc()),
+  ],
+);

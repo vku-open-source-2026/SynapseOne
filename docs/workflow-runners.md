@@ -19,6 +19,12 @@ definition stay in Postgres and are returned by the authenticated claim.
 Delivery is at-least-once; `claim` is the exactly-one-runner guard, so a
 duplicate delivery is acknowledged without running twice.
 
+A runner registration is like a Cloudflare tunnel: you create it once, copy an
+install command containing its scoped API key, and every running replica
+registers as a **connector instance** with its own id, hostname, version,
+concurrency and heartbeat. The Console lists connectors and their live status;
+a registration with no live connector shows `waiting`/`offline`.
+
 ## Choose a mode
 
 Set it per workflow with `settings.execution.mode` (Console: workflow detail →
@@ -66,6 +72,7 @@ docker run -d --name synapseone-runner-1a2b3c4d --restart unless-stopped \
   -e WORKFLOW_RUNNER_QUEUE=synapseone-wf-custom \
   -e WORKFLOW_RUNNER_MODE=custom \
   -e WORKFLOW_RUNNER_CONCURRENCY=1 \
+  -e WORKFLOW_RUNNER_HEARTBEAT_SECONDS=15 \
   ghcr.io/vku-open-source-2026/synapseone-workflow-runner:latest
 ```
 
@@ -85,20 +92,43 @@ gateway.
 | `WORKFLOW_RUNNER_CONCURRENCY` | no | `1` | Parallel jobs (1..32) |
 | `WORKFLOW_RUNNER_POLL_MS` | no | `1000` | Queue poll interval |
 | `WORKFLOW_RUNNER_LEASE_SECONDS` | no | `300` | Claim/visibility lease |
-| `WORKFLOW_RUNNER_HEARTBEAT_SECONDS` | no | `15` | Liveness + lease heartbeat |
+| `WORKFLOW_RUNNER_HEARTBEAT_SECONDS` | no | `15` | Connector heartbeat + lease refresh |
+| `WORKFLOW_RUNNER_INSTANCE_ID` | no | host-pid-random | Stable connector id for this process |
 | `WORKFLOW_RUNNER_ONCE` | no | — | Drain one poll then exit (smoke test) |
 
 Run with Docker, Compose, Kubernetes or a systemd unit. The runner sends a
 heartbeat immediately on boot, so **Workflow Runners** switches to
 `connected` within ~2.5s. `GET /v1/workflow-runners/:id/connection` is the
-programmatic check (`connected: true`, `ageSeconds < 60`).
+programmatic check.
 
-### Connection check
+### Connection states and connectors
 
-The Console polls the connection endpoint every 2.5 seconds after the command
-is generated. A runner that never starts stays `waiting`; one that stops
-heartbeating becomes `stale` after 60 seconds. `lastError` is populated when a
-runner reports a fatal loop error.
+The Console auto-refreshes the runner list every 5s and the selected runner
+every 4s:
+
+| Status | Meaning |
+| --- | --- |
+| `waiting` | Registration exists, no connector has ever heartbeated |
+| `connected` | At least one connector is fresh; all connectors fresh |
+| `degraded` | Some connectors fresh, some offline |
+| `offline` | Connectors exist but none has heartbeated within `WORKFLOW_RUNNER_STALE_SECONDS` (default 60) |
+
+Each connector shows `id`, `hostname`, `version`, `concurrency`, `lastSeenAt`
+and `status`; stale connector rows can be removed from the Console or with
+`DELETE /v1/workflow-runners/:id/instances/:instanceId`. A graceful
+`SIGTERM` sends an `offline` heartbeat immediately instead of waiting for the
+stale timeout. The API surface is:
+
+- `GET /v1/workflow-runners/options` — public URL, image, queues, heartbeat/stale
+  windows, max concurrency and built-in platform-worker config.
+- `GET /v1/workflow-runners` — registrations with `instances`, `connected`,
+  `connectedInstances`, `instanceCount` and aggregate `status`.
+- `GET /v1/workflow-runners/:id` / `:id/connection` — registration + live
+  connector details (`checkedAt`, `staleAfterSeconds`, …).
+- `PATCH /v1/workflow-runners/:id` — rename/retarget; queue/mode changes are
+  refused with `409 runner_connected` while a connector is online.
+- `DELETE /v1/workflow-runners/:id/instances/:instanceId` — remove a stale
+  connector row.
 
 ## 3. Execute
 
@@ -146,6 +176,22 @@ effects). Unexpected transport/DB errors release the execution and nack with a
 - Turning queue mode off: `WORKFLOW_EXECUTION_MODE=inline` (dev/tests only).
   Production compose sets `queue` by default.
 
+## Verification
+
+`tests/e2e/workflow-runner-e2e.mjs` runs against a real gateway + IAM +
+workflow-service + SynapseQueue stack and **fails if the platform falls back to
+inline execution**. It asserts `transport=queue`, `worker=platform`, creates a
+custom runner key/registration, starts the runner process, waits for a
+connected connector instance, runs a custom-mode workflow on that runner, runs
+a platform-mode workflow on the built-in worker, and verifies a graceful
+`offline` heartbeat.
+
+```bash
+SYNAPSEONE_BASE_URL=http://localhost:8080 \
+WORKFLOW_HEALTH_URL=http://localhost:4002/health \
+node tests/e2e/workflow-runner-e2e.mjs
+```
+
 ## Building/releasing the image
 
 ```bash
@@ -156,6 +202,9 @@ docker build -f apps/workflow-runner/Dockerfile -t synapseone-workflow-runner .
 `.github/workflows/release.yml` publishes and signs
 `ghcr.io/<owner>/synapseone-workflow-runner:<tag>` (also `latest`, `sha-*`);
 `cd.yml` publishes `:main` and `:main-<sha>` from the main branch.
+`publish-runner.yml` is the standalone runner channel: run it manually or push
+a `runner-v*` tag (for example `git tag runner-v0.9.1 && git push origin
+runner-v0.9.1`) to refresh `:latest` without a full platform release.
 
 GHCR packages start **private**, and GitHub does not expose a REST/GraphQL API
 to change package visibility. An organization owner must make the package

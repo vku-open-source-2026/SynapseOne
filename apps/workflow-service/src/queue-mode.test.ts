@@ -287,6 +287,12 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
   });
 
   it('creates a custom runner with a copy-paste command containing the API key', async () => {
+    const optsRes = await fetch(`${base}/v1/workflow-runners/options`, { headers: USER });
+    assert.equal(optsRes.status, 200);
+    const opts: any = await optsRes.json();
+    assert.equal(opts.queues.custom, 'synapseone-wf-custom');
+    assert.equal(opts.platformWorker.enabled, true);
+
     const res = await fetch(`${base}/v1/workflow-runners`, {
       method: 'POST', headers: USER,
       body: JSON.stringify({ name: 'edge-runner', mode: 'custom', apiKey: 'sk-runner-secret-123' }),
@@ -297,19 +303,56 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
     assert.match(body.command, /docker run/);
     assert.match(body.command, /SYNAPSEONE_API_KEY=sk-runner-secret-123/);
     assert.match(body.command, /WORKFLOW_RUNNER_ID=/);
+    assert.match(body.command, /WORKFLOW_RUNNER_HEARTBEAT_SECONDS=/);
     assert.equal(body.runner.connected, false);
+    assert.equal(body.options.queues.shared, 'synapseone-wf-shared');
 
     const waiting = await fetch(`${base}/v1/workflow-runners/${body.runner.id}/connection`, { headers: USER });
-    assert.equal((await waiting.json()).connected, false);
+    const waitingBody: any = await waiting.json();
+    assert.equal(waitingBody.connected, false);
+    assert.equal(waitingBody.status, 'waiting');
+    assert.equal(waitingBody.instanceCount, 0);
 
     const hb = await fetch(`${base}/v1/workflow-runners/${body.runner.id}/heartbeat`, {
-      method: 'POST', headers: RUNNER_AUTH, body: JSON.stringify({ version: 'test' }),
+      method: 'POST', headers: RUNNER_AUTH,
+      body: JSON.stringify({
+        instanceId: 'connector-a', hostname: 'edge-1', version: 'test',
+        concurrency: 3, queue: 'synapseone-wf-custom', startedAt: new Date().toISOString(),
+      }),
     });
     assert.equal(hb.status, 200);
+    const hbBody: any = await hb.json();
+    assert.equal(hbBody.instance.id, 'connector-a');
+    assert.equal(hbBody.instance.hostname, 'edge-1');
+    assert.equal(hbBody.instance.concurrency, 3);
+
     const connected = await fetch(`${base}/v1/workflow-runners/${body.runner.id}/connection`, { headers: USER });
     const c: any = await connected.json();
     assert.equal(c.connected, true);
     assert.equal(c.status, 'connected');
+    assert.equal(c.instanceCount, 1);
+    assert.equal(c.connectedInstances, 1);
+    assert.equal(c.instances[0].hostname, 'edge-1');
+
+    const list = await (await fetch(`${base}/v1/workflow-runners`, { headers: USER })).json();
+    const listed: any = (list.data || []).find((r: any) => r.id === body.runner.id);
+    assert.equal(listed.connectedInstances, 1);
+    assert.equal(listed.instances[0].id, 'connector-a');
+
+    const offline = await fetch(`${base}/v1/workflow-runners/${body.runner.id}/heartbeat`, {
+      method: 'POST', headers: RUNNER_AUTH,
+      body: JSON.stringify({ instanceId: 'connector-a', status: 'offline', version: 'test' }),
+    });
+    assert.equal(offline.status, 200);
+    const offlineConn = await (await fetch(`${base}/v1/workflow-runners/${body.runner.id}/connection`, { headers: USER })).json();
+    assert.equal(offlineConn.connected, false);
+    assert.equal(offlineConn.status, 'offline');
+
+    const removed = await fetch(`${base}/v1/workflow-runners/${body.runner.id}/instances/connector-a`, { method: 'DELETE', headers: USER });
+    assert.equal(removed.status, 200);
+    const emptyConn = await (await fetch(`${base}/v1/workflow-runners/${body.runner.id}/connection`, { headers: USER })).json();
+    assert.equal(emptyConn.instanceCount, 0);
+    assert.equal(emptyConn.status, 'waiting');
   });
 
   it('lets a custom runner claim and complete a custom-mode execution', async () => {

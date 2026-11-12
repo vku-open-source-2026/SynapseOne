@@ -28,10 +28,11 @@ import {
   claimExecutionRec, heartbeatExecutionRec, releaseExecutionRec, pauseExecutionRec,
   queueExecutionResume,
   createRunnerRec, getRunnerRec, listRunnerRecs, heartbeatRunnerRec, deleteRunnerRec,
+  upsertRunnerInstance, listRunnerInstances, listRunnerInstancesForRunners, deleteRunnerInstance, updateRunnerRec,
   createSecretRec, listSecretRecs, findSecretRec, readSecretValue, rotateSecretRec,
   listSecretVersionRecs, revokeSecretRec, deleteSecretRec, toPublicSecret, toPublicSecretVersion,
 } from './store';
-import type { Principal, StoredExecution, StoredWorkflowRunner } from './store';
+import type { Principal, StoredExecution, StoredWorkflowRunner, StoredRunnerInstance } from './store';
 import {
   queueTransportEnabled, queueBackendConfigured, runnerModeForSettings, queueNameForSettings,
   ensureWorkflowQueue, publishWorkflowRun, isQueueName, queueVisibilitySeconds, queueMaxAttempts,
@@ -1440,28 +1441,97 @@ export function runnerCommand(runner: StoredWorkflowRunner, apiKey?: string | nu
     `  -e WORKFLOW_RUNNER_QUEUE=${shQuote(runner.queue)} \\`,
     `  -e WORKFLOW_RUNNER_MODE=${shQuote(runner.mode)} \\`,
     `  -e WORKFLOW_RUNNER_CONCURRENCY=1 \\`,
+    `  -e WORKFLOW_RUNNER_HEARTBEAT_SECONDS=${runnerHeartbeatSeconds()} \\`,
     `  ${runnerImage()}`,
   ].join('\n');
 }
 
-function runnerConnected(r: StoredWorkflowRunner): boolean {
-  if (!r.last_seen_at) return false;
-  return Date.now() - new Date(r.last_seen_at).getTime() < 60_000;
+function runnerHeartbeatSeconds(): number {
+  const n = Number(process.env.WORKFLOW_RUNNER_HEARTBEAT_SECONDS || 15);
+  return Math.min(Math.max(Number.isFinite(n) ? n : 15, 5), 300);
 }
 
-function toApiRunner(r: StoredWorkflowRunner): any {
-  const connected = runnerConnected(r);
+function runnerStaleAfterSeconds(): number {
+  const n = Number(process.env.WORKFLOW_RUNNER_STALE_SECONDS || 60);
+  return Math.min(Math.max(Number.isFinite(n) ? n : 60, 30), 3600);
+}
+
+function runnerMaxConcurrency(): number {
+  const n = Number(process.env.WORKFLOW_RUNNER_MAX_CONCURRENCY || 32);
+  return Math.min(Math.max(Number.isFinite(n) ? n : 32, 1), 64);
+}
+
+function runnerOptions(): any {
+  return {
+    publicUrl: runnerPublicUrl(),
+    image: runnerImage(),
+    modes: ['custom', 'hybrid'],
+    queues: {
+      custom: DEFAULT_CUSTOM_QUEUE,
+      shared: DEFAULT_SHARED_QUEUE,
+      platform: process.env.WORKFLOW_QUEUE_PLATFORM || 'synapseone-wf-platform',
+    },
+    heartbeatIntervalSeconds: runnerHeartbeatSeconds(),
+    staleAfterSeconds: runnerStaleAfterSeconds(),
+    maxConcurrency: runnerMaxConcurrency(),
+    visibilityTimeoutSeconds: queueVisibilitySeconds(),
+    platformWorker: {
+      enabled: String(process.env.WORKFLOW_WORKER_ENABLED || 'true').toLowerCase() !== 'false',
+      queue: process.env.WORKFLOW_QUEUE_PLATFORM || 'synapseone-wf-platform',
+      concurrency: Math.min(Math.max(Number(process.env.WORKFLOW_WORKER_CONCURRENCY || 4) || 4, 1), 32),
+      pollMs: Math.min(Math.max(Number(process.env.WORKFLOW_WORKER_POLL_MS || 500) || 500, 100), 10000),
+    },
+  };
+}
+
+function runnerInstancePublic(i: StoredRunnerInstance): any {
+  const ageSeconds = Math.max(0, Math.floor((Date.now() - new Date(i.last_seen_at).getTime()) / 1000));
+  const fresh = i.status === 'connected' && ageSeconds < runnerStaleAfterSeconds();
+  return {
+    id: i.id,
+    hostname: i.hostname,
+    version: i.version,
+    queue: i.queue,
+    concurrency: i.concurrency,
+    status: fresh ? 'connected' : 'offline',
+    lastSeenAt: i.last_seen_at,
+    ageSeconds,
+    startedAt: i.started_at,
+    metadata: i.metadata,
+  };
+}
+
+function runnerStatus(r: StoredWorkflowRunner, instances: StoredRunnerInstance[]): { status: string; connected: boolean; connectedInstances: number } {
+  if (r.status === 'disabled') return { status: 'disabled', connected: false, connectedInstances: 0 };
+  const shown = instances.map(runnerInstancePublic);
+  const connectedInstances = shown.filter((i) => i.status === 'connected').length;
+  if (connectedInstances > 0) {
+    return { status: connectedInstances < shown.length ? 'degraded' : 'connected', connected: true, connectedInstances };
+  }
+  return { status: shown.length ? 'offline' : 'waiting', connected: false, connectedInstances: 0 };
+}
+
+function toApiRunner(r: StoredWorkflowRunner, instances: StoredRunnerInstance[] = []): any {
+  const instancesOut = instances.map(runnerInstancePublic);
+  const status = runnerStatus(r, instances);
+  const lastSeenAt = instancesOut.length
+    ? instancesOut.reduce((max, i) => (i.lastSeenAt > max ? i.lastSeenAt : max), instancesOut[0].lastSeenAt)
+    : r.last_seen_at;
+  const version = r.version || instancesOut.find((i) => i.version)?.version || null;
   return {
     id: r.id,
     name: r.name,
     mode: r.mode,
     queue: r.queue,
-    status: connected ? 'connected' : r.last_seen_at ? 'stale' : 'waiting',
-    connected,
-    version: r.version,
+    status: status.status,
+    connected: status.connected,
+    connectedInstances: status.connectedInstances,
+    instanceCount: instancesOut.length,
+    instances: instancesOut,
+    version,
     keyPrefix: r.key_prefix,
     apiKeyId: r.api_key_id,
-    lastSeenAt: r.last_seen_at,
+    lastSeenAt,
     lastError: r.last_error,
     metadata: r.metadata,
     createdAt: r.created_at,
@@ -2258,6 +2328,9 @@ function tenantBinding(
     }
     const apiKeyId = b.apiKeyId ? String(b.apiKeyId).slice(0, 128) : null;
     const keyPrefix = b.keyPrefix ? String(b.keyPrefix).slice(0, 32) : null;
+    const scopes = Array.isArray(b.scopes) && b.scopes.length
+      ? b.scopes.map(String).filter((s: string) => s && s.length <= 200).slice(0, 100)
+      : RUNNER_KEY_SCOPES;
     const runner = await createRunnerRec({
       name,
       mode,
@@ -2267,21 +2340,26 @@ function tenantBinding(
       api_key_id: apiKeyId,
       key_prefix: keyPrefix,
       created_by: principal.sub,
-      metadata: b.metadata && typeof b.metadata === 'object' ? b.metadata : {},
+      metadata: {
+        ...(b.metadata && typeof b.metadata === 'object' ? b.metadata : {}),
+        scopes,
+      },
     });
-    const scopes = Array.isArray(b.scopes) && b.scopes.length
-      ? b.scopes.map(String).filter((s: string) => s && s.length <= 200).slice(0, 100)
-      : RUNNER_KEY_SCOPES;
     if (typeof b.apiKey === 'string' && b.apiKey) res.setHeader('Cache-Control', 'no-store');
     res.status(201).json({
       runner: toApiRunner(runner),
       queue: runner.queue,
       scopes,
       command: runnerCommand(runner, typeof b.apiKey === 'string' ? b.apiKey : null),
+      options: runnerOptions(),
       warning: typeof b.apiKey === 'string' && b.apiKey
         ? 'The API key is only echoed in this response and is never stored by workflow-service.'
         : 'Pass the API key to POST /v1/workflow-runners/:id/command to render a copy-paste command.',
     });
+  });
+
+  app.get('/v1/workflow-runners/options', async (_req, res) => {
+    res.json(runnerOptions());
   });
 
   app.get('/v1/workflow-runners', async (req, res) => {
@@ -2289,13 +2367,69 @@ function tenantBinding(
     const scope = humanTaskScope(principal);
     if (scope === null) return res.status(403).json({ error: 'tenant_required' });
     const runners = await listRunnerRecs({ ...scope, limit: Number((req.query as any).limit) || 100 });
-    res.json({ data: runners.map(toApiRunner) });
+    const instances = await listRunnerInstancesForRunners(runners.map((r) => r.id));
+    const byRunner = new Map<string, StoredRunnerInstance[]>();
+    for (const inst of instances) {
+      const list = byRunner.get(inst.runner_id) || [];
+      list.push(inst);
+      byRunner.set(inst.runner_id, list);
+    }
+    res.json({
+      data: runners.map((r) => toApiRunner(r, byRunner.get(r.id) || [])),
+      options: runnerOptions(),
+    });
   });
 
   app.get('/v1/workflow-runners/:id', async (req, res) => {
     const runner = await loadRunnerForRequest(req, res);
     if (!runner) return;
-    res.json({ runner: toApiRunner(runner), command: runnerCommand(runner) });
+    const instances = await listRunnerInstances(runner.id);
+    res.json({
+      runner: toApiRunner(runner, instances),
+      command: runnerCommand(runner),
+      config: {
+        ...runnerOptions(),
+        runnerId: runner.id,
+        queue: runner.queue,
+        mode: runner.mode,
+      },
+    });
+  });
+
+  app.patch('/v1/workflow-runners/:id', async (req, res) => {
+    const runner = await loadRunnerForRequest(req, res);
+    if (!runner) return;
+    const b = (req.body || {}) as any;
+    const patch: { name?: string; mode?: 'custom' | 'hybrid'; queue?: string; metadata?: Record<string, any> } = {};
+    if (b.name !== undefined) {
+      const name = String(b.name).trim();
+      if (!RUNNER_NAME_RE.test(name)) return res.status(400).json({ error: 'invalid_name', message: 'name must be 1..100 printable chars' });
+      patch.name = name;
+    }
+    if (b.mode !== undefined) {
+      if (b.mode !== 'custom' && b.mode !== 'hybrid') return res.status(400).json({ error: 'invalid_mode', message: 'mode must be custom|hybrid' });
+      patch.mode = b.mode;
+    }
+    if (b.queue !== undefined) {
+      const queue = String(b.queue).trim();
+      if (!isQueueName(queue)) return res.status(400).json({ error: 'invalid_queue', message: 'queue must match [A-Za-z][A-Za-z0-9_-]{0,63}' });
+      patch.queue = queue;
+    }
+    if (b.metadata !== undefined) {
+      if (!b.metadata || typeof b.metadata !== 'object' || Array.isArray(b.metadata)) return res.status(400).json({ error: 'invalid_metadata' });
+      patch.metadata = { ...(runner.metadata || {}), ...b.metadata };
+    }
+    const changingQueue = (patch.queue && patch.queue !== runner.queue) || (patch.mode && patch.mode !== runner.mode);
+    if (changingQueue) {
+      const instances = await listRunnerInstances(runner.id);
+      if (runnerStatus(runner, instances).connected) {
+        return res.status(409).json({ error: 'runner_connected', message: 'disconnect or delete the connector instances before changing queue/mode' });
+      }
+    }
+    const updated = await updateRunnerRec(runner.id, patch);
+    if (!updated) return res.status(404).json({ error: 'not_found' });
+    const instances = await listRunnerInstances(updated.id);
+    res.json({ runner: toApiRunner(updated, instances), options: runnerOptions() });
   });
 
   app.get('/v1/workflow-runners/:id/config', async (req, res) => {
@@ -2307,10 +2441,13 @@ function tenantBinding(
       mode: runner.mode,
       queue: runner.queue,
       apiBaseUrl: runnerPublicUrl(),
-      heartbeatIntervalSeconds: 15,
+      heartbeatIntervalSeconds: runnerHeartbeatSeconds(),
+      staleAfterSeconds: runnerStaleAfterSeconds(),
       pollIntervalMs: 500,
       visibilityTimeoutSeconds: queueVisibilitySeconds(),
+      maxConcurrency: runnerMaxConcurrency(),
       workerImage: runnerImage(),
+      options: runnerOptions(),
     });
   });
 
@@ -2318,6 +2455,26 @@ function tenantBinding(
     const runner = await loadRunnerForRequest(req, res);
     if (!runner) return;
     const b = (req.body || {}) as any;
+    const instanceId = String(b.instanceId || b.instance_id || runner.id).trim();
+    if (!instanceId || instanceId.length > 128 || /[\r\n]/.test(instanceId)) {
+      return res.status(400).json({ error: 'invalid_instance', message: 'instanceId must be 1..128 printable chars' });
+    }
+    const status: 'connected' | 'offline' = b.status === 'offline' ? 'offline' : 'connected';
+    const queue = b.queue !== undefined ? String(b.queue) : runner.queue;
+    if (!isQueueName(queue)) return res.status(400).json({ error: 'invalid_queue' });
+    const concurrency = Math.min(Math.max(Number(b.concurrency) || 1, 1), runnerMaxConcurrency());
+    const startedAt = b.startedAt && !Number.isNaN(new Date(String(b.startedAt)).getTime()) ? new Date(String(b.startedAt)).toISOString() : null;
+    const instance = await upsertRunnerInstance({
+      id: instanceId,
+      runner_id: runner.id,
+      hostname: b.hostname ? String(b.hostname).slice(0, 255) : '',
+      version: b.version !== undefined ? String(b.version) : undefined,
+      queue,
+      concurrency,
+      status,
+      started_at: startedAt,
+      metadata: b.metadata && typeof b.metadata === 'object' ? b.metadata : {},
+    });
     const updated = await heartbeatRunnerRec(runner.id, {
       version: b.version !== undefined ? String(b.version) : undefined,
       status: 'connected',
@@ -2325,25 +2482,47 @@ function tenantBinding(
       metadata: b.metadata && typeof b.metadata === 'object' ? b.metadata : undefined,
     });
     if (!updated) return res.status(404).json({ error: 'not_found' });
-    res.json({ ok: true, runner: toApiRunner(updated) });
+    const instances = await listRunnerInstances(updated.id);
+    res.json({
+      ok: true,
+      instance: runnerInstancePublic(instance),
+      runner: toApiRunner(updated, instances),
+      heartbeatIntervalSeconds: runnerHeartbeatSeconds(),
+      staleAfterSeconds: runnerStaleAfterSeconds(),
+    });
   });
 
   app.get('/v1/workflow-runners/:id/connection', async (req, res) => {
     const runner = await loadRunnerForRequest(req, res);
     if (!runner) return;
-    const connected = runnerConnected(runner);
-    const ageSeconds = runner.last_seen_at ? Math.max(0, Math.floor((Date.now() - new Date(runner.last_seen_at).getTime()) / 1000)) : null;
+    const instances = await listRunnerInstances(runner.id);
+    const api = toApiRunner(runner, instances);
     res.json({
-      connected,
-      status: connected ? 'connected' : runner.last_seen_at ? 'stale' : 'waiting',
-      runner: { ...toApiRunner(runner), status: connected ? 'connected' : runner.last_seen_at ? 'stale' : 'waiting' },
-      lastSeenAt: runner.last_seen_at,
-      ageSeconds,
+      connected: api.connected,
+      status: api.status,
+      checkedAt: new Date().toISOString(),
+      runner: api,
+      instances: api.instances,
+      instanceCount: api.instanceCount,
+      connectedInstances: api.connectedInstances,
+      lastSeenAt: api.lastSeenAt,
       queue: runner.queue,
       mode: runner.mode,
-      version: runner.version,
+      version: api.version,
       lastError: runner.last_error,
+      heartbeatIntervalSeconds: runnerHeartbeatSeconds(),
+      staleAfterSeconds: runnerStaleAfterSeconds(),
     });
+  });
+
+  app.delete('/v1/workflow-runners/:id/instances/:instanceId', async (req, res) => {
+    const runner = await loadRunnerForRequest(req, res);
+    if (!runner) return;
+    const instanceId = String(req.params.instanceId || '');
+    if (!instanceId || instanceId.length > 128 || /[\r\n]/.test(instanceId)) return res.status(400).json({ error: 'invalid_instance' });
+    const deleted = await deleteRunnerInstance(runner.id, instanceId);
+    if (!deleted) return res.status(404).json({ error: 'not_found' });
+    res.json({ ok: true, runnerId: runner.id, instanceId, deleted: true });
   });
 
   app.post('/v1/workflow-runners/:id/command', async (req, res) => {
@@ -2357,6 +2536,7 @@ function tenantBinding(
       queue: runner.queue,
       mode: runner.mode,
       hasApiKey: !!apiKey,
+      options: runnerOptions(),
     });
   });
 

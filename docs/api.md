@@ -381,17 +381,29 @@ Per-workflow mode (`settings.execution.mode`, also accepted as
 Runner management (JWT or a runner-scoped API key):
 
 - `POST /v1/workflow-runners {name, mode?, queue?, apiKeyId?, keyPrefix?, scopes?, apiKey?}`
-  → `{runner, queue, scopes, command}`. Default key scopes:
+  → `{runner, queue, scopes, command, options}`. Default key scopes:
   `workflow:*,queue:*,*:read,base:query,base:vector-search,inference:*`.
   `command` is a copy-paste `docker run` with the API key **when the caller
   passes `apiKey`**; the key is echoed only in this response and never stored.
-- `GET /v1/workflow-runners`, `GET /v1/workflow-runners/:id`,
-  `DELETE /v1/workflow-runners/:id`
-- `GET /v1/workflow-runners/:id/config` (runner bootstrap: queue/mode/base URL)
-- `POST /v1/workflow-runners/:id/heartbeat` (runner liveness)
+- `GET /v1/workflow-runners/options` → public URL, image, queues, heartbeat /
+  stale windows, max concurrency and built-in platform-worker config.
+- `GET /v1/workflow-runners` → `{data: [{...runner, instances, connected,
+  connectedInstances, instanceCount, status}], options}`.
+  `GET /v1/workflow-runners/:id` also returns `command` + `config`;
+  `PATCH /v1/workflow-runners/:id {name?, mode?, queue?, metadata?}` (queue/mode
+  changes are `409 runner_connected` while a connector is online);
+  `DELETE /v1/workflow-runners/:id`.
+- `GET /v1/workflow-runners/:id/config` (runner bootstrap: queue/mode/base URL,
+  heartbeat/stale/max-concurrency, image)
+- `POST /v1/workflow-runners/:id/heartbeat {instanceId, hostname?, version?,
+  queue?, concurrency?, startedAt?, status?: connected|offline, metadata?}`
+  upserts a **connector instance**; `offline` is sent on graceful shutdown.
 - `GET /v1/workflow-runners/:id/connection`
-  → `{connected, status: wait|connected|stale, lastSeenAt, ageSeconds, queue, mode, version}`
-  (connected = heartbeat within 60s)
+  → `{connected, status: waiting|connected|degraded|offline, checkedAt,
+  instances[], connectedInstances, instanceCount, lastSeenAt, queue, mode,
+  version, heartbeatIntervalSeconds, staleAfterSeconds}`.
+  A connector is fresh for `WORKFLOW_RUNNER_STALE_SECONDS` (default 60s).
+- `DELETE /v1/workflow-runners/:id/instances/:instanceId` (remove a stale connector)
 - `POST /v1/workflow-runners/:id/command {apiKey?}` (render the command later)
 
 Runner job protocol (API key + `X-Workflow-Runner-Id`):

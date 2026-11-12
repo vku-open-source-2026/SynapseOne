@@ -94,6 +94,7 @@ jobs:
       - run: pip install ./sdks/sdk-python -q && SYNAPSEONE_BASE_URL=http://localhost:8080 python tests/e2e/sdk-check.py
       - run: npm install --workspaces --no-audit --no-fund -q && npm run build --workspaces --if-present -q && SYNAPSEONE_BASE_URL=http://localhost:8080 node tests/e2e/sdk-check.js
       - run: SYNAPSEONE_BASE_URL=http://localhost:8080 node tests/e2e/services-check.js
+      - run: SYNAPSEONE_BASE_URL=http://localhost:8080 WORKFLOW_HEALTH_URL=http://localhost:4002/health node tests/e2e/workflow-runner-e2e.mjs
       - run: SYNAPSEONE_BASE_URL=http://localhost:8080 node tests/e2e/ocs-check.js
       # IAM integration nodes authenticate as the workflow service with a real
       # API key (the internal secret alone is not a caller identity).

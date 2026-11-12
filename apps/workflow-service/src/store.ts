@@ -15,7 +15,7 @@ import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, or, sql } from 'dri
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { isWebhookType, isCronType, normalizeNodeType } from './engine';
-import { credentials, executions, humanTasks, secrets, secretVersions, workflowRunners, workflows } from './schema';
+import { credentials, executions, humanTasks, secrets, secretVersions, workflowRunnerInstances, workflowRunners, workflows } from './schema';
 
 /** Caller principal stamped by the gateway (P0-2). Anonymous when called
  *  directly with only the internal secret (dev/tests). */
@@ -100,13 +100,28 @@ export interface StoredWorkflowRunner {
   updated_at: string;
 }
 
+export interface StoredRunnerInstance {
+  id: string;
+  runner_id: string;
+  hostname: string;
+  version?: string | null;
+  queue: string;
+  concurrency: number;
+  status: 'connected' | 'offline';
+  last_seen_at: string;
+  started_at?: string | null;
+  metadata: Record<string, any>;
+  created_at: string;
+  updated_at: string;
+}
+
 const DATABASE_URL = process.env.DATABASE_URL || '';
 let pool: Pool | null = null;
 if (DATABASE_URL) {
   pool = new Pool({ connectionString: DATABASE_URL });
   pool.on('error', (e) => console.error('[workflow][db] pool error', (e as any)?.message || e));
 }
-const db = pool ? drizzle(pool, { schema: { credentials, executions, workflowRunners, workflows } }) : null;
+const db = pool ? drizzle(pool, { schema: { credentials, executions, workflowRunnerInstances, workflowRunners, workflows } }) : null;
 
 export function useDb(): boolean {
   return !!db;
@@ -116,6 +131,7 @@ export function useDb(): boolean {
 const memWorkflows = new Map<string, StoredWorkflow>();
 const memExecutions = new Map<string, StoredExecution>();
 const memRunners = new Map<string, StoredWorkflowRunner>();
+const memRunnerInstances = new Map<string, StoredRunnerInstance>();
 // newest-first ordering helper
 const memExecOrder: string[] = [];
 
@@ -142,7 +158,7 @@ export async function ensureTables(): Promise<void> {
     try {
       // Hold the advisory lock on the same dedicated session that runs the
       // migration (pool connections are not guaranteed to be reused).
-      const migrationDb = drizzle(client, { schema: { credentials, executions, workflowRunners, workflows } });
+      const migrationDb = drizzle(client, { schema: { credentials, executions, workflowRunnerInstances, workflowRunners, workflows } });
       await migrationDb.execute(sql`select pg_advisory_lock(hashtext('synapseone_workflow_migrations'))`);
       try {
         await migrate(migrationDb, {
@@ -826,6 +842,7 @@ export function __clearCredentials(): void {
   memSecrets.clear();
   memSecretVersions.clear();
   memRunners.clear();
+  memRunnerInstances.clear();
 }
 
 export function __clearMem(): void {
@@ -837,6 +854,7 @@ export function __clearMem(): void {
   memSecrets.clear();
   memSecretVersions.clear();
   memRunners.clear();
+  memRunnerInstances.clear();
 }
 
 
@@ -1391,6 +1409,175 @@ export function __clearSecrets(): void {
 
 // ---------- self-hosted workflow runners ----------
 
+function rowToRunnerInstance(r: typeof workflowRunnerInstances.$inferSelect): StoredRunnerInstance {
+  return {
+    id: String(r.id),
+    runner_id: String(r.runnerId),
+    hostname: String(r.hostname || ''),
+    version: r.version != null ? String(r.version) : null,
+    queue: String(r.queue || ''),
+    concurrency: Number.isFinite(Number(r.concurrency)) ? Number(r.concurrency) : 1,
+    status: r.status === 'offline' ? 'offline' : 'connected',
+    last_seen_at: iso(r.lastSeenAt),
+    started_at: r.startedAt ? iso(r.startedAt) : null,
+    metadata: r.metadata && typeof r.metadata === 'object' ? r.metadata : {},
+    created_at: iso(r.createdAt),
+    updated_at: iso(r.updatedAt),
+  };
+}
+
+/** Create or refresh one connector instance for a runner registration. */
+export async function upsertRunnerInstance(data: {
+  id: string;
+  runner_id: string;
+  hostname?: string;
+  version?: string | null;
+  queue?: string;
+  concurrency?: number;
+  status?: 'connected' | 'offline';
+  started_at?: string | null;
+  metadata?: Record<string, any>;
+}): Promise<StoredRunnerInstance> {
+  const now = nowIso();
+  const next: StoredRunnerInstance = {
+    id: data.id,
+    runner_id: data.runner_id,
+    hostname: String(data.hostname || '').slice(0, 255),
+    version: data.version ? String(data.version).slice(0, 64) : null,
+    queue: String(data.queue || '').slice(0, 64),
+    concurrency: Math.min(Math.max(Number(data.concurrency) || 1, 1), 64),
+    status: data.status === 'offline' ? 'offline' : 'connected',
+    last_seen_at: now,
+    started_at: data.started_at || null,
+    metadata: data.metadata && typeof data.metadata === 'object' ? data.metadata : {},
+    created_at: now,
+    updated_at: now,
+  };
+  if (db) {
+    await ensureTables();
+    const existing = await db.select().from(workflowRunnerInstances).where(eq(workflowRunnerInstances.id, data.id)).limit(1);
+    if (existing[0]) {
+      const rows = await db.update(workflowRunnerInstances).set({
+        hostname: next.hostname,
+        version: next.version,
+        queue: next.queue,
+        concurrency: next.concurrency,
+        status: next.status,
+        lastSeenAt: new Date(now),
+        startedAt: next.started_at ? new Date(next.started_at) : existing[0].startedAt,
+        metadata: next.metadata,
+        updatedAt: new Date(now),
+      }).where(eq(workflowRunnerInstances.id, data.id)).returning();
+      return rowToRunnerInstance(rows[0]);
+    }
+    const rows = await db.insert(workflowRunnerInstances).values({
+      id: next.id,
+      runnerId: next.runner_id,
+      hostname: next.hostname,
+      version: next.version,
+      queue: next.queue,
+      concurrency: next.concurrency,
+      status: next.status,
+      lastSeenAt: new Date(now),
+      startedAt: next.started_at ? new Date(next.started_at) : null,
+      metadata: next.metadata,
+      createdAt: new Date(now),
+      updatedAt: new Date(now),
+    }).returning();
+    return rowToRunnerInstance(rows[0]);
+  }
+  const cur = memRunnerInstances.get(next.id);
+  const merged: StoredRunnerInstance = cur
+    ? { ...cur, ...next, started_at: next.started_at || cur.started_at, created_at: cur.created_at }
+    : next;
+  memRunnerInstances.set(next.id, merged);
+  return merged;
+}
+
+export async function listRunnerInstances(runnerId: string): Promise<StoredRunnerInstance[]> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.select().from(workflowRunnerInstances)
+      .where(eq(workflowRunnerInstances.runnerId, runnerId))
+      .orderBy(desc(workflowRunnerInstances.lastSeenAt));
+    return rows.map(rowToRunnerInstance);
+  }
+  return [...memRunnerInstances.values()]
+    .filter((i) => i.runner_id === runnerId)
+    .sort((a, b) => b.last_seen_at.localeCompare(a.last_seen_at));
+}
+
+export async function listRunnerInstancesForRunners(runnerIds: string[]): Promise<StoredRunnerInstance[]> {
+  const ids = [...new Set(runnerIds.filter(Boolean))];
+  if (!ids.length) return [];
+  if (db) {
+    await ensureTables();
+    const rows = await db.select().from(workflowRunnerInstances)
+      .where(inArray(workflowRunnerInstances.runnerId, ids))
+      .orderBy(desc(workflowRunnerInstances.lastSeenAt));
+    return rows.map(rowToRunnerInstance);
+  }
+  return [...memRunnerInstances.values()]
+    .filter((i) => ids.includes(i.runner_id))
+    .sort((a, b) => b.last_seen_at.localeCompare(a.last_seen_at));
+}
+
+export async function deleteRunnerInstance(runnerId: string, instanceId: string): Promise<boolean> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.delete(workflowRunnerInstances)
+      .where(and(eq(workflowRunnerInstances.id, instanceId), eq(workflowRunnerInstances.runnerId, runnerId)))
+      .returning({ id: workflowRunnerInstances.id });
+    return rows.length > 0;
+  }
+  const cur = memRunnerInstances.get(instanceId);
+  if (!cur || cur.runner_id !== runnerId) return false;
+  return memRunnerInstances.delete(instanceId);
+}
+
+export async function deleteRunnerInstancesForRunner(runnerId: string): Promise<void> {
+  if (db) {
+    await ensureTables();
+    await db.delete(workflowRunnerInstances).where(eq(workflowRunnerInstances.runnerId, runnerId));
+    return;
+  }
+  for (const [id, inst] of memRunnerInstances) {
+    if (inst.runner_id === runnerId) memRunnerInstances.delete(id);
+  }
+}
+
+export async function updateRunnerRec(id: string, patch: {
+  name?: string;
+  mode?: RunnerMode;
+  queue?: string;
+  metadata?: Record<string, any>;
+}): Promise<StoredWorkflowRunner | null> {
+  const now = new Date();
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(workflowRunners).set({
+      ...(patch.name !== undefined ? { name: patch.name } : {}),
+      ...(patch.mode !== undefined ? { mode: patch.mode } : {}),
+      ...(patch.queue !== undefined ? { queue: patch.queue } : {}),
+      ...(patch.metadata !== undefined ? { metadata: patch.metadata } : {}),
+      updatedAt: now,
+    }).where(eq(workflowRunners.id, id)).returning();
+    return rows[0] ? rowToRunner(rows[0]) : null;
+  }
+  const cur = memRunners.get(id);
+  if (!cur) return null;
+  const next: StoredWorkflowRunner = {
+    ...cur,
+    ...(patch.name !== undefined ? { name: patch.name } : {}),
+    ...(patch.mode !== undefined ? { mode: patch.mode } : {}),
+    ...(patch.queue !== undefined ? { queue: patch.queue } : {}),
+    ...(patch.metadata !== undefined ? { metadata: patch.metadata } : {}),
+    updated_at: now.toISOString(),
+  };
+  memRunners.set(id, next);
+  return next;
+}
+
 function rowToRunner(r: typeof workflowRunners.$inferSelect): StoredWorkflowRunner {
   const mode: RunnerMode = r.mode === 'hybrid' ? 'hybrid' : 'custom';
   const status = r.status === 'connected' || r.status === 'stale' || r.status === 'disabled' ? r.status : 'waiting';
@@ -1528,6 +1715,7 @@ export async function heartbeatRunnerRec(id: string, patch: {
 }
 
 export async function deleteRunnerRec(id: string): Promise<boolean> {
+  await deleteRunnerInstancesForRunner(id);
   if (db) {
     await ensureTables();
     const rows = await db.delete(workflowRunners).where(eq(workflowRunners.id, id)).returning({ id: workflowRunners.id });

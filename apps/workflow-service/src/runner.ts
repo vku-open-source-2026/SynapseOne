@@ -16,10 +16,12 @@
  *   WORKFLOW_RUNNER_ID      runner id from the console/API
  * Optional:
  *   WORKFLOW_RUNNER_QUEUE   queue override (default: server config)
+ *   WORKFLOW_RUNNER_INSTANCE_ID  stable connector id (default: host-pid-random)
  *   WORKFLOW_RUNNER_CONCURRENCY, WORKFLOW_RUNNER_POLL_MS,
  *   WORKFLOW_RUNNER_LEASE_SECONDS, WORKFLOW_RUNNER_ONCE
  */
 import './env-compat';
+import os from 'os';
 import { randomUUID } from 'crypto';
 import { runWorkflow } from './engine';
 import type { Principal } from './store';
@@ -53,6 +55,8 @@ interface RunnerConfig {
   mode: 'custom' | 'hybrid';
   queue: string;
   heartbeatIntervalSeconds: number;
+  staleAfterSeconds?: number;
+  maxConcurrency?: number;
   visibilityTimeoutSeconds: number;
 }
 
@@ -81,10 +85,14 @@ async function main(): Promise<void> {
   if (!apiKey) throw new Error('SYNAPSEONE_API_KEY is required');
   if (!runnerId) throw new Error('WORKFLOW_RUNNER_ID is required (create a runner in the console)');
 
-  const concurrency = intEnv('WORKFLOW_RUNNER_CONCURRENCY', 1, 1, 32);
+  const instanceId = String(process.env.WORKFLOW_RUNNER_INSTANCE_ID || '').trim()
+    || `${os.hostname()}-${process.pid}-${randomUUID().slice(0, 8)}`;
+  const startedAt = new Date().toISOString();
+  const hostname = os.hostname();
+
   const pollMs = intEnv('WORKFLOW_RUNNER_POLL_MS', 1000, 200, 30000);
   const leaseSeconds = intEnv('WORKFLOW_RUNNER_LEASE_SECONDS', 300, 30, 3600);
-  const heartbeatSeconds = intEnv('WORKFLOW_RUNNER_HEARTBEAT_SECONDS', 15, 5, 300);
+  const heartbeatOverride = process.env.WORKFLOW_RUNNER_HEARTBEAT_SECONDS;
   const once = String(process.env.WORKFLOW_RUNNER_ONCE || '').toLowerCase() === '1'
     || String(process.env.WORKFLOW_RUNNER_ONCE || '').toLowerCase() === 'true';
 
@@ -95,27 +103,36 @@ async function main(): Promise<void> {
     log(`warning: WORKFLOW_RUNNER_QUEUE=${process.env.WORKFLOW_RUNNER_QUEUE} differs from server queue '${config.queue}' — using the server value`);
   }
   const queue = config.queue;
-  const consumer = `runner-${runnerId}`;
-  log(`starting id=${runnerId} queue=${queue} mode=${config.mode} concurrency=${concurrency} version=${VERSION}`);
+  const maxConcurrency = Math.min(Math.max(Number(config.maxConcurrency) || 32, 1), 64);
+  const concurrency = Math.min(intEnv('WORKFLOW_RUNNER_CONCURRENCY', 1, 1, 64), maxConcurrency);
+  const heartbeatSeconds = heartbeatOverride
+    ? intEnv('WORKFLOW_RUNNER_HEARTBEAT_SECONDS', 15, 5, 300)
+    : Math.min(Math.max(Number(config.heartbeatIntervalSeconds) || 15, 5), 300);
+  const consumer = `runner-${runnerId}-${instanceId}`.slice(0, 128);
+  log(`starting runner=${runnerId} instance=${instanceId} host=${hostname} queue=${queue} mode=${config.mode} concurrency=${concurrency} version=${VERSION}`);
 
   let stopping = false;
   let ticking = false;
   const inFlight = new Set<string>();
 
-  const heartbeat = async (): Promise<void> => {
+  const heartbeat = async (status: 'connected' | 'offline' = 'connected'): Promise<void> => {
     try {
       await api.request('POST', `/v1/workflow-runners/${encodeURIComponent(runnerId)}/heartbeat`, {
+        instanceId,
+        hostname,
         version: VERSION,
-        status: 'connected',
-        metadata: { queues: [queue], concurrency, once },
+        queue,
+        concurrency,
+        startedAt,
+        status,
+        metadata: { queues: [queue], concurrency, once, pid: process.pid, platform: process.platform },
       });
     } catch (e: any) {
-      errorLog('heartbeat failed:', e?.message || e);
+      if (status !== 'offline') errorLog('heartbeat failed:', e?.message || e);
     }
   };
   await heartbeat();
   const hbTimer = setInterval(() => { void heartbeat(); }, heartbeatSeconds * 1000);
-  hbTimer.unref?.();
 
   const runJob = async (executionId: string, receipt: string): Promise<void> => {
     let job: ClaimedJob | null = null;
@@ -237,12 +254,11 @@ async function main(): Promise<void> {
     const deadline = Date.now() + 120000;
     while (inFlight.size && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
     clearInterval(hbTimer);
-    await heartbeat().catch(() => undefined);
+    await heartbeat('offline').catch(() => undefined);
     return;
   }
 
   const timer = setInterval(() => { void tick(); }, pollMs);
-  timer.unref?.();
   setTimeout(() => { void tick(); }, 100).unref?.();
 
   const shutdown = async (signal: string): Promise<void> => {
@@ -253,6 +269,7 @@ async function main(): Promise<void> {
     clearInterval(hbTimer);
     const deadline = Date.now() + 30000;
     while (inFlight.size && Date.now() < deadline) await new Promise((r) => setTimeout(r, 250));
+    await heartbeat('offline').catch(() => undefined);
     log('stopped');
     process.exit(0);
   };

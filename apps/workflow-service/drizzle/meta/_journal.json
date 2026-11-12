@@ -36,6 +36,13 @@
       "when": 1797000000000,
       "tag": "0004_demonic_sandman",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1798000000000,
+      "tag": "0005_slimy_crusher_hogan",
+      "breakpoints": true
     }
   ]
 }

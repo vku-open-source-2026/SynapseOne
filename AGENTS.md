@@ -152,8 +152,13 @@ E2E helpers: `bash tests/e2e/api-check.sh`, `node tests/e2e/services-check.js`,
   The built-in worker runs inside workflow-service; self-hosted runners use the
   `apps/workflow-runner/Dockerfile` image and the `/v1/runner/jobs/*` claim
   protocol. Queue delivery is at-least-once; `claimExecutionRec` is the
-  exactly-one-runner guard. Tests stay inline because they do not set
-  `QUEUE_SERVICE_URL`/`NODE_ENV=production`.
+  exactly-one-runner guard. A registration may have many connector instances
+  (`synapseone_workflow_runner_instances`, Cloudflare-style); status is
+  `waiting|connected|degraded|offline` and is computed from connector
+  heartbeats (`WORKFLOW_RUNNER_STALE_SECONDS`, default 60). Tests stay inline
+  because they do not set `QUEUE_SERVICE_URL`/`NODE_ENV=production`; the
+  `tests/e2e/workflow-runner-e2e.mjs` gate asserts `transport=queue` and fails
+  on any inline fallback.
 - **Workflow node types are n8n-compatible** (`n8n-nodes-base.*`) plus
   `synapseone.*` nodes and `synapseone.api` operations across IAM, Workflow,
   LDS, Base, Faststore, Queue and Inference. Preserve aliases when touching

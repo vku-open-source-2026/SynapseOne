@@ -77,7 +77,11 @@ export class WorkflowService {
 
   // ---- self-hosted workflow runners ----
   listWorkflowRunners() { return this.http.req('/v1/workflow-runners'); }
+  getWorkflowRunnerOptions() { return this.http.req('/v1/workflow-runners/options'); }
   getWorkflowRunner(id: string) { return this.http.req(`/v1/workflow-runners/${encodeURIComponent(id)}`); }
+  updateWorkflowRunner(id: string, patch: { name?: string; mode?: 'custom' | 'hybrid'; queue?: string; metadata?: Record<string, unknown> }) {
+    return this.http.req(`/v1/workflow-runners/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(patch) });
+  }
   createWorkflowRunner(body: {
     name: string;
     mode?: 'custom' | 'hybrid';
@@ -99,6 +103,9 @@ export class WorkflowService {
   }
   deleteWorkflowRunner(id: string) {
     return this.http.req(`/v1/workflow-runners/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  }
+  deleteWorkflowRunnerInstance(id: string, instanceId: string) {
+    return this.http.req(`/v1/workflow-runners/${encodeURIComponent(id)}/instances/${encodeURIComponent(instanceId)}`, { method: 'DELETE' });
   }
 
   // ---- executions ----
