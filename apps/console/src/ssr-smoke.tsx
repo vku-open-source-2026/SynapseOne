@@ -42,6 +42,13 @@ const ROUTES = [
   '/api-docs',
   '/docs',
   '/nope-not-a-route',
+  '/admin/overview',
+  '/admin/orgs',
+  '/admin/users',
+  '/admin/health',
+  '/admin/usage',
+  '/admin/audit',
+  '/admin/access',
 ];
 
 const SESSIONS = {
@@ -67,6 +74,13 @@ const GUARDED = new Set([
   '/lds',
   '/authorize',
   '/audit',
+  '/admin/overview',
+  '/admin/orgs',
+  '/admin/users',
+  '/admin/health',
+  '/admin/usage',
+  '/admin/audit',
+  '/admin/access',
 ]);
 
 let failures = 0;

@@ -7,9 +7,12 @@
 import React, { Suspense, useState } from 'react';
 import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import { useAuth } from './lib/auth.jsx';
+import { PlatformAuthProvider } from './lib/platform-auth.jsx';
 import Sidebar from './components/Sidebar.jsx';
 import ServicesSidebar from './components/ServicesSidebar.jsx';
 import Topbar from './components/Topbar.jsx';
+import AdminLayout from './components/AdminLayout.jsx';
+import PlatformGuard from './components/PlatformGuard.jsx';
 import PublicHeader from './components/PublicHeader.jsx';
 import PublicFooter from './components/PublicFooter.jsx';
 import ConsoleFooter from './components/ConsoleFooter.jsx';
@@ -45,6 +48,15 @@ const Audit = React.lazy(() => import('./pages/Audit.jsx'));
 const Security = React.lazy(() => import('./pages/Security.jsx'));
 const ApiDocs = React.lazy(() => import('./pages/ApiDocs.jsx'));
 const Docs = React.lazy(() => import('./pages/Docs.jsx'));
+const AdminOverview = React.lazy(() => import('./pages/admin/Overview.jsx'));
+const AdminOrganizations = React.lazy(() => import('./pages/admin/Organizations.jsx'));
+const AdminOrganizationDetail = React.lazy(() => import('./pages/admin/OrganizationDetail.jsx'));
+const AdminUsers = React.lazy(() => import('./pages/admin/Users.jsx'));
+const AdminUserDetail = React.lazy(() => import('./pages/admin/UserDetail.jsx'));
+const AdminServiceHealth = React.lazy(() => import('./pages/admin/ServiceHealth.jsx'));
+const AdminUsage = React.lazy(() => import('./pages/admin/Usage.jsx'));
+const AdminAudit = React.lazy(() => import('./pages/admin/Audit.jsx'));
+const AdminPlatformAdmins = React.lazy(() => import('./pages/admin/PlatformAdmins.jsx'));
 
 import { appLoginUrl, isCanonicalAppHost } from './lib/site.js';
 import { LanguageProvider } from './lib/i18n.jsx';
@@ -138,7 +150,9 @@ export default function App() {
   return (
     <ThemeProvider>
       <LanguageProvider>
-        <AppRoutes />
+        <PlatformAuthProvider>
+          <AppRoutes />
+        </PlatformAuthProvider>
       </LanguageProvider>
     </ThemeProvider>
   );
@@ -179,6 +193,16 @@ function AppRoutes() {
           <Route path="/authorize" element={<Guard><ConsoleLayout><Authorize /></ConsoleLayout></Guard>} />
           <Route path="/audit" element={<Guard><ConsoleLayout><Audit /></ConsoleLayout></Guard>} />
           <Route path="/security" element={<Guard><ConsoleLayout><Security /></ConsoleLayout></Guard>} />
+          <Route path="/admin" element={<Navigate to="/admin/overview" replace />} />
+          <Route path="/admin/overview" element={<PlatformGuard><AdminLayout><AdminOverview /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/orgs" element={<PlatformGuard><AdminLayout><AdminOrganizations /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/orgs/:orgId" element={<PlatformGuard><AdminLayout><AdminOrganizationDetail /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/users" element={<PlatformGuard><AdminLayout><AdminUsers /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/users/:userId" element={<PlatformGuard><AdminLayout><AdminUserDetail /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/health" element={<PlatformGuard><AdminLayout><AdminServiceHealth /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/usage" element={<PlatformGuard><AdminLayout><AdminUsage /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/audit" element={<PlatformGuard><AdminLayout><AdminAudit /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/access" element={<PlatformGuard><AdminLayout><AdminPlatformAdmins /></AdminLayout></PlatformGuard>} />
           <Route path="*" element={<Landing />} />
         </Routes>
       </Suspense>
