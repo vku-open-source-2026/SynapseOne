@@ -80,6 +80,10 @@ accessors + seed), `src/tokens.ts` (JWT/refresh/API keys), `src/policy.ts`
   `POST /v1/service-accounts/:id/token`.
 - Usage: `POST /v1/usage/ingest` (internal), `GET /v1/usage/summary`,
   `GET /v1/usage/events`.
+- Platform Super Admin: `/v1/platform/session`, `/step-up`, `/me`, `/overview`,
+  `/orgs`, `/users`, `/usage/*`, `/audit`, `/admins`; internal one-time
+  `/internal/platform/bootstrap|recovery`. Requires a `kind=platform-admin`
+  token; see `docs/platform-superadmin.md`.
 
 **Data:** `organizations`, `accounts`, `users`, `roles`, `policies`,
 `role_policies`, `user_roles`, `api_keys`, `service_accounts`,
@@ -473,16 +477,22 @@ No auth beyond the internal secret.
 **Files:** `src/App.jsx` (routes), `src/pages/*` (Dashboard, Orgs, Accounts,
 Users, Roles, Policies, Keys, ServiceAccounts, Workflows, SynapseBase,
 SynapseQueue, SynapseFaststore, SynapseInference, LinkedData, Authorize, Audit,
-ApiDocs, Docs, Login, OidcCallback, Landing), `src/lib/api.js` (fetch client +
-single-flight refresh rotation), `src/lib/auth.jsx` (session context),
+ApiDocs, Docs, Login, OidcCallback, Landing), `src/pages/admin/*` (platform
+Overview, Organizations, Users, Service Health, Usage, Audit, Platform Admins),
+`src/lib/api.js` (fetch client + single-flight refresh rotation),
+`src/lib/platform-auth.jsx` (isolated platform session/step-up),
+`src/lib/auth.jsx` (session context),
 `src/components/WorkflowEditor.jsx`, `src/components/Chatbot.jsx`,
 `public/config.js` (runtime `SYNAPSEONE_CONFIG.BASE_URL`), `nginx.conf`,
 `docker-entrypoint.sh`.
 
 **Rules:** calls the gateway only; API base URL comes from runtime config
 (`SYNAPSEONE_PUBLIC_BASE_URL` substituted at container start) or
-`VITE_SYNAPSEONE_BASE_URL` in dev. Auth tokens in local storage; 401 triggers one
-single-flight refresh, then clears session. Dev proxy: `/api` → gateway.
+`VITE_SYNAPSEONE_BASE_URL` in dev. Tenant auth tokens live in local storage;
+the platform token is sessionStorage-only and only used on `/v1/platform/*`.
+401 triggers one single-flight refresh, then clears session. Dev proxy:
+`/api` → gateway. Platform admin access is documented in
+`docs/platform-superadmin.md`.
 
 ---
 

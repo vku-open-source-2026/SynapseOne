@@ -256,13 +256,19 @@ headers; `_core` is never read.
   `tenantBinding`). Treat the doc as historical.
 - `docs/configuration.md` claims Redis-backed gateway rate limiting. The current
   gateway uses an in-memory per-IP limiter; no Redis client is imported there.
-- API-key **scopes** are stored and returned by IAM, but the gateway does not
-  enforce them yet (roadmap). Do not assume scope-based restrictions.
+- API-key **scopes** are enforced by the gateway. The required service is
+  derived from the matched route (including action overrides), so keep
+  `routes.yaml` `service` fields accurate. `AUTHZ_MODE` adds policy enforcement
+  on top; production should set `AUTHZ_MODE=enforce` and
+  `AUTHZ_MODE_REQUIRED=true`.
+- The Platform Super Admin control plane lives at `/v1/platform` and `/admin`;
+  it uses a separate `platform_admins` identity, MFA session exchange and
+  step-up. It is documented in `docs/platform-superadmin.md`.
 - Object storage is exposed by `SynapseOCS` (`/v1/ocs`; legacy `/v1/storage`); notifications by
   `notifications-service` (`/v1/notifications`).
 - `apps/tunnel-service/` contains only stale `dist/` artifacts and no source or
   package manifest; it is not part of the workspace.
-- `/ready` probes IAM, Workflow, AI, LDS, Base, Faststore, Queue, but not
-  Inference.
+- `/ready` probes IAM, Workflow, AI, LDS, Base, Faststore, Queue and, when their
+  URLs are configured, Stream, Inference, OCS and Notifications.
 - The AI service is guidance-only and intentionally absent from the public API
   catalog used for authorization decisions.

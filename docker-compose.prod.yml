@@ -12,6 +12,9 @@ services:
       NODE_ENV: production
       HSTS_ENABLED: "true"
       GATEWAY_VERIFY_APIKEY: "true"
+      # Central policy enforcement must be explicit in production.
+      AUTHZ_MODE: ${AUTHZ_MODE:-audit}
+      AUTHZ_MODE_REQUIRED: ${AUTHZ_MODE_REQUIRED:-true}
       # nginx is the only edge: one trusted proxy hop for the real client IP.
       TRUST_PROXY: ${TRUST_PROXY:-1}
     networks:
@@ -26,6 +29,13 @@ services:
       IAM_ALLOW_OIDC_DEMO_CALLBACK: "false"
       # Never echo reset/verification tokens on the public API.
       IAM_EXPOSE_LIFECYCLE_TOKENS: "false"
+      # Privileged IAM mutations require an org administrator in production.
+      IAM_SENSITIVE_MUTATION_MODE: ${IAM_SENSITIVE_MUTATION_MODE:-enforce}
+      IAM_ALLOW_DIRECT_ORG_CREATE: "false"
+      # Super Admin control plane; bootstrap the first owner explicitly.
+      PLATFORM_ADMIN_ENABLED: ${PLATFORM_ADMIN_ENABLED:-true}
+      PLATFORM_ADMIN_REQUIRE_MFA: "true"
+      PLATFORM_ADMIN_REQUIRE_STEP_UP: "true"
     # Unpublish internal API in prod (gateway-only access via docker network).
     # Requires Compose v2.24+ (!reset). Fallback is .env bind 127.0.0.1.
     ports: !reset []

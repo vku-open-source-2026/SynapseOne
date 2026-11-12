@@ -21,6 +21,15 @@ reads which key (audited from source):
 | `NOTIFICATIONS_SERVICE_URL` | `http://notifications:4011` | SynapseNotifications upstream |
 | `AUTHZ_MODE` | `off` | central policy enforcement: `off` = tenant isolation only; `audit` = decide every authenticated request via IAM, log + header `x-synapseone-authz: would-deny`, never block; `enforce` = `403 access_denied`, IAM unreachable → `503 authz_unavailable` |
 | `AUTHZ_CACHE_TTL_MS` | 30000 | decision cache per principal/action/resource (0 disables, max 300000) — policy changes take effect after at most this long |
+| `AUTHZ_MODE_REQUIRED` | `false` | production fail-closed guard: when `true`, gateway refuses to boot with `AUTHZ_MODE=off` |
+| `PLATFORM_ADMIN_ENABLED` | `true` dev / `false` prod unless set | enables `/v1/platform/*` and the `/admin` console |
+| `PLATFORM_ADMIN_REQUIRE_MFA` | `true` | platform session exchange requires an enrolled TOTP factor and a fresh code |
+| `PLATFORM_ADMIN_REQUIRE_STEP_UP` | `true` | destructive platform actions require `x-platform-step-up` |
+| `PLATFORM_ORG_SLUG` | `synapseone-platform` | reserved organization for platform staff |
+| `PLATFORM_BOOTSTRAP_SECRET` | — | one-time internal first-owner bootstrap; empty disables the endpoint |
+| `PLATFORM_RECOVERY_SECRET` | — | internal break-glass reset for a platform administrator who lost MFA |
+| `IAM_SENSITIVE_MUTATION_MODE` | `audit` | `audit` logs would-deny; `enforce` requires an org administrator for privileged IAM mutations |
+| `IAM_ALLOW_DIRECT_ORG_CREATE` | `true` dev / `false` prod | direct `POST /v1/orgs`; platform API creates orgs with a first admin |
 | `IAM_JWT_SECRET` | — | **must match** IAM, used to verify Bearer tokens |
 | `GATEWAY_ROUTES_PATH` | `./routes.yaml` | routing table |
 | `GATEWAY_VERIFY_APIKEY` | `true` | `true` → centralized `X-API-Key` verification via IAM (fail-closed 503 when IAM is down); `false` → edge presence check, upstream verifies (dev-only, forbidden in production) |

@@ -152,6 +152,16 @@ services:
       IAM_API_KEY_PEPPER: ${IAM_API_KEY_PEPPER:-}
       IAM_ALLOW_DEV_LOGIN: ${IAM_ALLOW_DEV_LOGIN:-true}
       IAM_ALLOW_OIDC_DEMO_CALLBACK: ${IAM_ALLOW_OIDC_DEMO_CALLBACK:-true}
+      # Sensitive IAM mutations: audit logs would-deny; enforce requires org admin.
+      IAM_SENSITIVE_MUTATION_MODE: ${IAM_SENSITIVE_MUTATION_MODE:-audit}
+      IAM_ALLOW_DIRECT_ORG_CREATE: ${IAM_ALLOW_DIRECT_ORG_CREATE:-true}
+      # Platform Super Admin control plane (see docs/platform-superadmin.md).
+      PLATFORM_ADMIN_ENABLED: ${PLATFORM_ADMIN_ENABLED:-true}
+      PLATFORM_ADMIN_REQUIRE_MFA: ${PLATFORM_ADMIN_REQUIRE_MFA:-true}
+      PLATFORM_ADMIN_REQUIRE_STEP_UP: ${PLATFORM_ADMIN_REQUIRE_STEP_UP:-true}
+      PLATFORM_ORG_SLUG: ${PLATFORM_ORG_SLUG:-synapseone-platform}
+      PLATFORM_BOOTSTRAP_SECRET: ${PLATFORM_BOOTSTRAP_SECRET:-}
+      PLATFORM_RECOVERY_SECRET: ${PLATFORM_RECOVERY_SECRET:-}
       # Dev convenience: echo reset/verification tokens (no mailer wired).
       # Opt-in by design — the prod overlay pins it to "false".
       IAM_EXPOSE_LIFECYCLE_TOKENS: ${IAM_EXPOSE_LIFECYCLE_TOKENS:-true}
@@ -624,6 +634,7 @@ services:
       GATEWAY_VERIFY_APIKEY: ${GATEWAY_VERIFY_APIKEY:-true}
       # Central policy enforcement (off|audit|enforce); see docs/iam-model.md.
       AUTHZ_MODE: ${AUTHZ_MODE:-off}
+      AUTHZ_MODE_REQUIRED: ${AUTHZ_MODE_REQUIRED:-false}
       AUTHZ_CACHE_TTL_MS: ${AUTHZ_CACHE_TTL_MS:-30000}
       PROXY_TIMEOUT_MS: ${PROXY_TIMEOUT_MS:-30000}
       CORS_ORIGIN: ${CORS_ORIGIN:-}

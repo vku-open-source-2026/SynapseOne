@@ -157,6 +157,35 @@ The first user of an organization becomes its administrator (`is_org_admin`, AWS
 users start with **no permissions**. Admins manage admins with
 `PUT /v1/users/:userId/org-admin {isOrgAdmin}`; the last admin cannot be demoted.
 
+## Platform administrators
+
+`platform_admins` is a separate, cross-tenant control plane. It is **not**
+`is_org_admin` and does not grant tenant data access. A platform administrator:
+
+- must be a member of the reserved `PLATFORM_ORG_SLUG` organization;
+- must have TOTP MFA enabled and provide a fresh code at
+  `POST /v1/platform/session`;
+- receives a short-lived token (`kind=platform-admin`,
+  `aud=synapseone-platform-admin`, no tenant org claim);
+- only reaches `/v1/platform/*`; tenant APIs reject that token;
+- has `owner`, `operator` or `auditor` role, checked server-side.
+
+Destructive actions require a second TOTP step-up
+(`POST /v1/platform/step-up`, header `x-platform-step-up`). The first owner is
+created through the internal one-time bootstrap endpoint (see
+[`platform-superadmin.md`](platform-superadmin.md)).
+
+## Privileged IAM mutations
+
+`IAM_SENSITIVE_MUTATION_MODE` controls whether account/user/role/policy/key/SA
+mutations require an organization administrator:
+
+- `audit` (default): evaluate, write a would-deny audit row, allow;
+- `enforce`: return `403 org_admin_required` for members.
+
+Production should use `enforce`. API-key owner binding is stricter: a member can
+only bind a key to themselves; binding another user requires an org admin.
+
 ## Managed policies
 
 `GET /v1/managed-policies` lists ready-made documents — `AdministratorAccess`,

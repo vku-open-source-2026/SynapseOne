@@ -843,6 +843,40 @@ The chat proxy is also mounted at `/v1/chat/completions`; the other inference
 handlers accept the `/v1/embeddings` and `/v1/decision*` aliases. The public
 gateway only exposes `/v1/ai` and `/v1/inference` (the aliases stay internal).
 
+## Platform Super Admin (`/v1/platform`)
+
+These routes are **not** part of the tenant API catalog and are not exposed to
+the AI assistant. They require a platform-administrator token
+(`kind=platform-admin`, audience `synapseone-platform-admin`) obtained from
+`POST /v1/platform/session` with a normal user JWT **and a fresh TOTP code**.
+Tenant JWTs, API keys and service-account tokens are rejected.
+
+| Method | Route | Description |
+| --- | --- | --- |
+| POST | `/v1/platform/session` | Exchange a normal user JWT + TOTP for a 15-minute platform token. |
+| POST | `/v1/platform/step-up` | Fresh TOTP step-up token for destructive actions (`x-platform-step-up`). |
+| GET | `/v1/platform/me` | Current platform role, user and MFA state. |
+| GET | `/v1/platform/overview?from&to` | Cross-tenant counts, usage totals and audit signals. |
+| GET | `/v1/platform/orgs?q&limit&offset` | Tenant organizations with counts. |
+| POST | `/v1/platform/orgs` | Create an organization and its first org admin. |
+| GET | `/v1/platform/orgs/:orgId` | Organization detail, accounts and admins. |
+| GET | `/v1/platform/users?q&orgId&active&isOrgAdmin&limit&offset` | Cross-tenant users. |
+| GET | `/v1/platform/users/:userId` | User, roles, policies, MFA and sessions. |
+| PUT | `/v1/platform/users/:userId/org-admin` | Grant/revoke org admin (step-up). |
+| POST | `/v1/platform/users/:userId/reset-mfa` | Reset MFA (step-up). |
+| POST | `/v1/platform/users/:userId/unlock` | Clear a sign-in lockout. |
+| POST | `/v1/platform/users/:userId/revoke-sessions` | Revoke refresh sessions (step-up). |
+| POST | `/v1/platform/users/:userId/disable` | Deactivate a user (step-up). |
+| POST | `/v1/platform/users/:userId/enable` | Reactivate a user. |
+| GET | `/v1/platform/usage/summary` | Platform-wide usage summary (optional `orgId`). |
+| GET | `/v1/platform/usage/events` | Platform-wide request log (optional `orgId`). |
+| GET | `/v1/platform/audit` | Platform-wide audit (optional `orgId`). |
+| GET/POST/DELETE | `/v1/platform/admins[/:userId]` | Owner-only platform administrator management. |
+
+Internal bootstrap/recovery endpoints (`/internal/platform/bootstrap`,
+`/internal/platform/recovery`) are reachable only over the service network and
+require separate secrets. See [`platform-superadmin.md`](platform-superadmin.md).
+
 ## Health / Metrics
 
 - `GET /health` (each service + gateway)

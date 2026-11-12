@@ -6,6 +6,37 @@ Format based on Keep a Changelog; versioning follows SemVer.
 ## [Unreleased]
 
 ### Added
+- **Platform Super Admin** (`/admin`, `/v1/platform/*`): dedicated cross-tenant
+  control plane with Overview, Organizations, Users & Access, Service Health,
+  Usage and Audit & Security. Platform administrators are stored separately from
+  tenant `is_org_admin`, exchange a normal user JWT plus a fresh TOTP code for a
+  short-lived `kind=platform-admin` token, and require step-up for destructive
+  actions. Owner/operator/auditor roles are enforced server-side.
+- IAM migration `0007_fluffy_scarecrow.sql`: `platform_admins`,
+  `organizations.kind`, `audit_log.org_id` + index, and platform list indexes.
+- `tools/backfill-audit-org.mjs` for the legacy audit context backfill.
+- Docs: `docs/platform-superadmin.md` (bootstrap, MFA, recovery, rollback).
+
+### Security
+- Gateway scope enforcement now derives the required service from the matched
+  route (including action overrides), closing write bypasses on OCS,
+  notifications, warehouse, search, secrets, human tasks and SCIM for narrow
+  API keys.
+- API keys can only be bound to their owner unless the caller is an org admin;
+  ordinary members can no longer mint a key that inherits an administrator's
+  policies.
+- SCIM provisioning token creation/revocation follows the sensitive-mutation
+  policy; `IAM_SENSITIVE_MUTATION_MODE=enforce` requires an org admin for
+  privileged account/user/role/policy/key/service-account mutations.
+- Organization administrator grant/revoke now writes a full audit record
+  (actor, target, old/new value, reason).
+- Audit reads are org-admin only. Direct `POST /v1/orgs` can be disabled with
+  `IAM_ALLOW_DIRECT_ORG_CREATE=false`; the platform API creates orgs with a
+  first admin transactionally.
+- `AUTHZ_MODE_REQUIRED=true` makes the gateway fail boot when central
+  authorization is `off`.
+
+### Added
 - **Synapse Warehouse** (`apps/warehouse-service`, `/v1/warehouse`): tenant-scoped
   DuckDB OLAP datasets, read-only SQL with file/DDL blocking, batch SQL
   transforms, SynapseStream-driven stream ETL jobs, ETL templates and a

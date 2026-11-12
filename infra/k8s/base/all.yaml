@@ -37,6 +37,14 @@ spec:
             - { name: NODE_ENV, value: "production" }
             - { name: IAM_ALLOW_DEV_LOGIN, value: "false" }
             - { name: IAM_ALLOW_OIDC_DEMO_CALLBACK, value: "false" }
+            - { name: IAM_SENSITIVE_MUTATION_MODE, value: "enforce" }
+            - { name: IAM_ALLOW_DIRECT_ORG_CREATE, value: "false" }
+            - { name: PLATFORM_ADMIN_ENABLED, value: "true" }
+            - { name: PLATFORM_ADMIN_REQUIRE_MFA, value: "true" }
+            - { name: PLATFORM_ADMIN_REQUIRE_STEP_UP, value: "true" }
+            - { name: PLATFORM_ORG_SLUG, value: "synapseone-platform" }
+            - { name: PLATFORM_BOOTSTRAP_SECRET, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: platform-bootstrap-secret, optional: true } } }
+            - { name: PLATFORM_RECOVERY_SECRET, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: platform-recovery-secret, optional: true } } }
             - { name: HSTS_ENABLED, value: "true" }
           securityContext: { runAsNonRoot: true, runAsUser: 1000, allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } }
           resources: { requests: { cpu: "100m", memory: "128Mi" }, limits: { cpu: "500m", memory: "512Mi" } }
@@ -89,6 +97,8 @@ spec:
             - { name: HSTS_ENABLED, value: "true" }
             - { name: CORS_ORIGIN, value: "https://console.example.com" }
             - { name: GATEWAY_VERIFY_APIKEY, value: "true" }
+            - { name: AUTHZ_MODE, value: "audit" }
+            - { name: AUTHZ_MODE_REQUIRED, value: "true" }
             - { name: PROXY_TIMEOUT_MS, value: "30000" }
             # Trust exactly one hop (the Ingress controller) for client IPs.
             - { name: TRUST_PROXY, value: "1" }

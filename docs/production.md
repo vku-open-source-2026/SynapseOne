@@ -17,6 +17,16 @@ Use when taking SynapseOne off your laptop. Every item already has a mechanism â
 - [ ] `IAM_ALLOW_OIDC_DEMO_CALLBACK=false` (the demo callback accepts any caller-supplied email).
 - [ ] Random `IAM_API_KEY_PEPPER` (HMAC for at-rest key hashes).
 - [ ] `GATEWAY_VERIFY_APIKEY=true` when clients use API keys (centralized verification, fail-closed).
+- [ ] Set `AUTHZ_MODE=audit` first, inspect `GET /v1/audit?allowed=false`, then
+      `AUTHZ_MODE=enforce`; keep `AUTHZ_MODE_REQUIRED=true` so a missing config
+      cannot boot with policy enforcement disabled.
+- [ ] Set `IAM_SENSITIVE_MUTATION_MODE=enforce` (after an `audit` observation
+      window) so privileged IAM mutations require an organization administrator.
+- [ ] Set `IAM_ALLOW_DIRECT_ORG_CREATE=false`; create tenants through the
+      Platform Super Admin API or self-service registration.
+- [ ] Provision `PLATFORM_BOOTSTRAP_SECRET` (32+ random chars), run the one-time
+      bootstrap from `docs/platform-superadmin.md`, then remove/rotate the secret.
+      Keep `PLATFORM_RECOVERY_SECRET` in a break-glass store.
 - [ ] Authentik/Keycloak behind **public TLS**: `OIDC_ISSUER` must be a public
       HTTPS URL a browser can reach (e.g. `https://auth.example.com/application/o/synapseone/`).
       The old internal `http://authentik-server:9000` value is rejected at boot in
