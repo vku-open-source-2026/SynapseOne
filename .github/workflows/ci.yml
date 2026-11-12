@@ -80,7 +80,26 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
       - run: cp .env.example .env
-      - run: docker compose up -d --build postgres redis s3 s3-init iam workflow queue inference ocs gateway
+      - name: Compose up (single retry for transient registry/health failures)
+        run: |
+          set -e
+          ok=0
+          for attempt in 1 2; do
+            echo "docker compose up — attempt ${attempt}"
+            if docker compose up -d --build postgres redis s3 s3-init iam workflow queue inference ocs gateway; then
+              ok=1
+              break
+            fi
+            echo "compose attempt ${attempt} failed; collecting diagnostics" >&2
+            docker compose ps || true
+            docker compose logs --tail=120 || true
+            docker compose down -v || true
+            sleep 10
+          done
+          if [ "$ok" != "1" ]; then
+            echo "docker compose up failed after retry" >&2
+            exit 1
+          fi
       - run: |
           set -e
           for i in $(seq 1 36); do
