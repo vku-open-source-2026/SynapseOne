@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import { createApp } from './index';
 import { base32Decode, totp } from './mfa';
+import { queryAudit } from './db';
 
 const BOOTSTRAP = 'bootstrap-test-secret';
 const saved: Record<string, string | undefined> = {};
@@ -101,12 +102,18 @@ describe('platform super admin', () => {
     return new Promise<void>((resolve) => (server ? server.close(() => resolve()) : resolve()));
   });
 
-  it('rejects platform routes for tenant users and API keys', async () => {
+  it('rejects platform routes for tenant users and audits the session denial', async () => {
     const tenant = await call('POST', '/v1/auth/login', { email: 'tenant@test.local', orgSlug: 'tenantorg' });
     assert.equal(tenant.status, 200);
     const r = await call('GET', '/v1/platform/me', undefined, tenant.json.accessToken);
     assert.equal(r.status, 403);
     assert.equal(r.json.error, 'platform_admin_required');
+
+    const exchange = await call('POST', '/v1/platform/session', { code: '000000' }, tenant.json.accessToken);
+    assert.equal(exchange.status, 403);
+    assert.equal(exchange.json.error, 'platform_admin_required');
+    const rows = await queryAudit({ limit: 20, action: 'platform:session:exchange' });
+    assert.ok(rows.some((a: any) => a.decision === false && a.context?.reason === 'not_platform_admin'));
   });
 
   it('returns the platform profile and overview', async () => {

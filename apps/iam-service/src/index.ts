@@ -363,6 +363,29 @@ async function auditPlatformAction(
   }).catch(() => undefined);
 }
 
+/** Denied platform-plane attempts are security events too. */
+async function auditPlatformDenied(
+  req: express.Request,
+  actorId: string,
+  targetOrgId: string | null | undefined,
+  action: string,
+  reason: string,
+): Promise<void> {
+  await logAudit({
+    actor_type: 'user',
+    actor_id: actorId || '',
+    action,
+    resource: String(req.path || ''),
+    decision: false,
+    org_id: targetOrgId || null,
+    context: {
+      platformAdmin: false,
+      reason,
+      requestId: firstHeader(req.headers['x-request-id'] as any) || '',
+    },
+  }).catch(() => undefined);
+}
+
 function parsePlatformRange(req: express.Request, res: express.Response, defaultHours = 24): { from: Date; to: Date } | null {
   const to = req.query.to ? new Date(String(req.query.to)) : new Date();
   const from = req.query.from ? new Date(String(req.query.from)) : new Date(to.getTime() - defaultHours * 3600_000);
@@ -2971,14 +2994,22 @@ async function auditMutation(req: express.Request, action: string, resource: str
     let claims: any;
     try { claims = verifyAccess(h.slice(7)); } catch { return res.status(401).json({ error: 'invalid_token' }); }
     if (claims.kind && claims.kind !== 'user') {
+      await auditPlatformDenied(req, String(claims.sub || ''), null, 'platform:session:exchange', 'non_user_credential');
       return res.status(403).json({ error: 'platform_session_requires_user', message: 'sign in as a user before opening the platform console' });
     }
     const user = await getUserById(claims.sub);
-    if (!user || user.active === false) return res.status(403).json({ error: 'platform_admin_inactive' });
+    if (!user || user.active === false) {
+      await auditPlatformDenied(req, String(claims.sub || ''), user?.org_id || null, 'platform:session:exchange', 'account_inactive');
+      return res.status(403).json({ error: 'platform_admin_inactive' });
+    }
     const admin = await getPlatformAdmin(user.id);
-    if (!admin || admin.revoked_at) return res.status(403).json({ error: 'platform_admin_required' });
+    if (!admin || admin.revoked_at) {
+      await auditPlatformDenied(req, user.id, user.org_id, 'platform:session:exchange', 'not_platform_admin');
+      return res.status(403).json({ error: 'platform_admin_required' });
+    }
     const requireMfa = (process.env.PLATFORM_ADMIN_REQUIRE_MFA ?? 'true') === 'true';
     if (requireMfa && !(await mfaEnabled(user.id))) {
+      await auditPlatformDenied(req, user.id, user.org_id, 'platform:session:exchange', 'mfa_not_enabled');
       return res.status(403).json({ error: 'platform_mfa_required', message: 'enable TOTP MFA before using the platform console' });
     }
     // Proof of a fresh second factor for THIS session: do not treat
@@ -2989,10 +3020,14 @@ async function auditMutation(req: express.Request, action: string, resource: str
         recoveryCode: z.string().trim().max(32).nullish(),
       }).safeParse(req.body);
       if (!parsed.success || (!parsed.data.code && !parsed.data.recoveryCode)) {
+        await auditPlatformDenied(req, user.id, user.org_id, 'platform:session:exchange', 'fresh_mfa_required');
         return res.status(403).json({ error: 'platform_mfa_required', message: 'enter a fresh authenticator code to open the platform console' });
       }
       const check = await checkSecondFactor(user.id, parsed.data);
-      if (!check.ok) return res.status(401).json({ error: 'invalid_mfa_code', message: 'The verification code is incorrect' });
+      if (!check.ok) {
+        await auditPlatformDenied(req, user.id, user.org_id, 'platform:session:exchange', 'invalid_mfa_code');
+        return res.status(401).json({ error: 'invalid_mfa_code', message: 'The verification code is incorrect' });
+      }
     }
     const session = signPlatformAccess({ userId: user.id, role: admin.role });
     await auditPlatformAction(req, user.id, 'platform:session:exchange', user.org_id, { role: admin.role });

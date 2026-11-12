@@ -711,6 +711,14 @@ export function createApp(): express.Express {
         (req as any).synapseoneError = 'platform_token_tenant_forbidden';
         return res.status(403).json({ error: 'platform_token_tenant_forbidden', message: 'platform tokens cannot call tenant APIs' });
       }
+      // The session exchange is the boundary where a normal user proves platform
+      // administrator status + a fresh second factor. Central tenant-policy
+      // enforcement must not pre-empt it (a tenant admin is not a platform
+      // admin, but IAM owns that decision and writes the denial audit record).
+      if (isPlatformSession) {
+        propagatePrincipal(req);
+        return next();
+      }
       const scopeAction = route.service ? actionFor(route as any, req.method, req.path) : null;
       if (principal && route.auth !== 'none' && !scopeAllows(principal.scopes || [], req.path, req.method, {
         service: route.service,
