@@ -76,6 +76,18 @@ routes:
     auth: either
     service: iam
 
+  - path: /v1/workflow-runners
+    target: ${WORKFLOW_SERVICE_URL:http://workflow:4002}
+    auth: either
+    service: workflow
+
+  # Self-hosted runner job protocol (claim/complete/heartbeat/credentials).
+  # API-key authenticated; never exposed without the gateway's key verification.
+  - path: /v1/runner
+    target: ${WORKFLOW_SERVICE_URL:http://workflow:4002}
+    auth: either
+    service: workflow
+
   - path: /v1/workflows
     target: ${WORKFLOW_SERVICE_URL:http://workflow:4002}
     auth: either

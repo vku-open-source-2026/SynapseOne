@@ -29,6 +29,8 @@ const SERVICE_BY_PREFIX: Array<[string, string]> = [
   ['/v1/audit', 'iam'],
   ['/v1/usage', 'iam'],
   ['/v1/workflows', 'workflow'],
+  ['/v1/workflow-runners', 'workflow'],
+  ['/v1/runner', 'workflow'],
   ['/v1/templates', 'workflow'],
   ['/v1/executions', 'workflow'],
   ['/v1/credentials', 'workflow'],

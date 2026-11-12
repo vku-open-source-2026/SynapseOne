@@ -105,10 +105,90 @@ class WorkflowService:
         """Deactivate a workflow (triggers stop, history is kept)."""
         return self._req("POST", f"/v1/workflows/{quote(wf_id, safe='')}/deactivate")
 
-    def execute_workflow(self, wf_id: str, payload: dict | None = None) -> Any:
-        """Trigger a manual execution (local engine)."""
+    def execute_workflow(
+        self,
+        wf_id: str,
+        payload: dict | None = None,
+        *,
+        wait: bool = False,
+        timeout_ms: int = 30000,
+    ) -> Any:
+        """Trigger a manual execution.
+
+        Queue mode returns 202 with an ``executionId``. Pass ``wait=True`` to
+        block until the worker finishes (bounded by ``timeout_ms``).
+        """
+        qs = ""
+        if wait:
+            bounded = max(1000, min(int(timeout_ms), 300000))
+            qs = f"?wait=1&timeoutMs={bounded}"
         return self._req(
-            "POST", f"/v1/workflows/{quote(wf_id, safe='')}/execute", payload or {}
+            "POST", f"/v1/workflows/{quote(wf_id, safe='')}/execute{qs}", payload or {}
+        )
+
+    def wait_for_execution(
+        self, exec_id: str, timeout_ms: int = 30000, poll_ms: int = 500
+    ) -> Any:
+        """Poll an execution until it leaves queued/running."""
+        import time as _time
+
+        deadline = _time.time() + max(1000, min(int(timeout_ms), 300000)) / 1000
+        current = self.get_execution(exec_id, include_data=True)
+        while (
+            isinstance(current, dict)
+            and current.get("status") in ("queued", "running")
+            and _time.time() < deadline
+        ):
+            _time.sleep(max(100, min(int(poll_ms), 5000)) / 1000)
+            current = self.get_execution(exec_id, include_data=True)
+        return current
+
+    # ---- self-hosted workflow runners ----
+    def list_workflow_runners(self) -> Any:
+        return self._req("GET", "/v1/workflow-runners")
+
+    def get_workflow_runner(self, runner_id: str) -> Any:
+        return self._req("GET", f"/v1/workflow-runners/{quote(runner_id, safe='')}")
+
+    def create_workflow_runner(
+        self,
+        name: str,
+        mode: str = "custom",
+        queue: str | None = None,
+        api_key_id: str | None = None,
+        key_prefix: str | None = None,
+        scopes: list[str] | None = None,
+        metadata: dict | None = None,
+    ) -> Any:
+        body: dict = {"name": name, "mode": mode}
+        if queue:
+            body["queue"] = queue
+        if api_key_id:
+            body["apiKeyId"] = api_key_id
+        if key_prefix:
+            body["keyPrefix"] = key_prefix
+        if scopes:
+            body["scopes"] = scopes
+        if metadata:
+            body["metadata"] = metadata
+        return self._req("POST", "/v1/workflow-runners", body)
+
+    def get_workflow_runner_connection(self, runner_id: str) -> Any:
+        return self._req(
+            "GET", f"/v1/workflow-runners/{quote(runner_id, safe='')}/connection"
+        )
+
+    def get_workflow_runner_command(self, runner_id: str, api_key: str | None = None) -> Any:
+        body = {"apiKey": api_key} if api_key else {}
+        return self._req(
+            "POST",
+            f"/v1/workflow-runners/{quote(runner_id, safe='')}/command",
+            body,
+        )
+
+    def delete_workflow_runner(self, runner_id: str) -> Any:
+        return self._req(
+            "DELETE", f"/v1/workflow-runners/{quote(runner_id, safe='')}"
         )
 
     # ---- executions ----

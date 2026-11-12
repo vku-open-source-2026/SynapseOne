@@ -45,12 +45,22 @@ export const executions = pgTable(
     triggeredBy: text('triggered_by').notNull().default('manual'),
     principal: jsonb('principal').$type<Record<string, any> | null>(),
     actor: text('actor'),
+    /** Queue dispatch metadata (queue execution mode). */
+    queueName: text('queue_name'),
+    runner: text('runner'),
+    workerId: text('worker_id'),
+    attempt: integer('attempt').notNull().default(0),
+    leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }),
+    workflowRevision: integer('workflow_revision'),
+    resumeNode: text('resume_node'),
+    resumeOutput: jsonb('resume_output').$type<any>(),
     startedAt: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
     finishedAt: timestamp('finished_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
     index('idx_synapseone_exec_workflow').on(t.workflowId, t.startedAt.desc()),
     index('idx_synapseone_exec_status').on(t.status, t.startedAt.desc()),
+    index('idx_synapseone_exec_queue').on(t.status, t.queueName),
     index('idx_synapseone_exec_time').on(t.startedAt.desc()),
     index('idx_synapseone_exec_principal_org')
       .on(sql`(${t.principal}->>'org')`)
@@ -151,5 +161,38 @@ export const secretVersions = pgTable(
   (t) => [
     uniqueIndex('synapseone_secret_versions_key').on(t.secretId, t.version),
     index('idx_synapseone_secret_versions_secret').on(t.secretId, t.version.desc()),
+  ],
+);
+
+/**
+ * Self-hosted workflow runners. A runner is a tenant-owned worker that
+ * consumes a SynapseQueue workflow queue and executes DAGs with a SynapseOne
+ * API key. The plaintext key is never stored here — only IAM key metadata.
+ */
+export const workflowRunners = pgTable(
+  'synapseone_workflow_runners',
+  {
+    id: text('id').primaryKey(),
+    name: text('name').notNull(),
+    /** custom | hybrid (platform workers are built into workflow-service). */
+    mode: text('mode').notNull().default('custom'),
+    queue: text('queue').notNull(),
+    orgId: text('org_id'),
+    accountId: text('account_id'),
+    apiKeyId: text('api_key_id'),
+    keyPrefix: text('key_prefix'),
+    status: text('status').notNull().default('waiting'),
+    version: text('version'),
+    lastSeenAt: timestamp('last_seen_at', { withTimezone: true }),
+    lastError: text('last_error'),
+    createdBy: text('created_by'),
+    metadata: jsonb('metadata').$type<Record<string, any>>().notNull().default(sql`'{}'::jsonb`),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index('idx_synapseone_runners_tenant').on(t.orgId, t.accountId),
+    index('idx_synapseone_runners_queue').on(t.queue),
+    index('idx_synapseone_runners_seen').on(t.lastSeenAt.desc()),
   ],
 );

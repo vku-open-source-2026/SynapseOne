@@ -73,6 +73,15 @@ jobs:
               -t "ghcr.io/${OWNER}/synapseone-${name}:latest" \
               "${context}"
           done
+          # Self-hosted workflow runner: shares the workflow engine source, so
+          # its Dockerfile is built from the repository root context.
+          docker buildx build --push --provenance=true --sbom=true \
+            -f apps/workflow-runner/Dockerfile \
+            -t "ghcr.io/${OWNER}/synapseone-workflow-runner:${TAG}" \
+            -t "ghcr.io/${OWNER}/synapseone-workflow-runner:${SEMVER}" \
+            -t "ghcr.io/${OWNER}/synapseone-workflow-runner:sha-${SHA}" \
+            -t "ghcr.io/${OWNER}/synapseone-workflow-runner:latest" \
+            .
       - name: Sign images with cosign (keyless)
         env:
           OWNER: ${{ github.repository_owner }}
@@ -80,23 +89,13 @@ jobs:
         run: |
           set -euo pipefail
           OWNER="$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')"
-          for name in gateway iam workflow ai lds base faststore queue stream inference ocs notifications console postgres edge; do
+          for name in gateway iam workflow workflow-runner ai lds base faststore queue stream inference ocs notifications console postgres edge; do
             cosign sign --yes "ghcr.io/${OWNER}/synapseone-${name}:${TAG}"
             cosign sign --yes "ghcr.io/${OWNER}/synapseone-${name}:latest"
           done
-      - name: Make GHCR packages public
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
-          OWNER: ${{ github.repository_owner }}
+      - name: GHCR visibility reminder
         run: |
-          set -uo pipefail
-          OWNER="$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')"
-          for name in gateway iam workflow ai lds base faststore queue stream inference ocs notifications console postgres edge; do
-            if ! gh api --method PATCH "/orgs/${OWNER}/packages/container/synapseone-${name}" -f visibility=public >/dev/null 2>&1; then
-              echo "::warning::Could not set synapseone-${name} public; set it in GitHub package settings."
-            fi
-          done
+          echo "::notice::GHCR packages are private by default. GitHub has no REST API to change package visibility; an org owner must set each package to Public once in Organization → Packages → <package> → Package settings → Change visibility."
 
 
   publish-sdk-js:

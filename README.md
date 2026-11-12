@@ -33,7 +33,7 @@ standard OIDC. Everything else is SynapseOne code, pure Apache-2.0.
 | **Synapse Warehouse** | Tenant-scoped OLAP: DuckDB datasets, read-only SQL, batch SQL transforms and SynapseStream-driven stream ETL, plus workflow templates (`/v1/warehouse`) |
 | **SynapseOCS** | Tenant-scoped buckets/objects with direct + multipart upload, presigned URLs, checksums, size/type limits and quotas (`/v1/ocs`, legacy `/v1/storage`) |
 | **SynapseNotifications** | Durable outbox + `{{var}}` templates, per-recipient preferences/unsubscribe, email/SMS/push relays, webhooks, retries and dead letters (`/v1/notifications`) |
-| **Workflows** | Built-in workflow engine (Apache-2.0): DAG runner, versioned templates, activate/deactivate/execute (real webhook & cron triggers), sandboxed code execution, execution history, visual graph editor |
+| **Workflows** | Built-in workflow engine (Apache-2.0): queue-backed DAG runner, versioned templates, activate/deactivate/execute (real webhook & cron triggers), sandboxed code execution, execution history, visual graph editor, and self-hosted runner image for hybrid/private execution |
 | **Linked Data (SynapseLDS)** | Licence-picked NGSI-LD datasources: structural-allowlist projection (`_core` never serialized), per-attribute visibility (public/restricted/internal), default-deny schema registry, workflow publish node (`lds.publish-record`) |
 | **AI assistant** | Chatbot on the API Docs page: decision model picks the endpoint, LLM pre-fills the try-it form (server-side key, guidance-only, never public) |
 | **Clients** | TypeScript, Python and Go SDKs with full API parity, zero-dependency CLI, admin Console |

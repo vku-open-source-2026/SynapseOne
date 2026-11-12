@@ -9,6 +9,7 @@
 | [synapsebase.md](synapsebase.md) | SynapseBase — documents, object↔data mapping, queries, changes |
 | [faststore.md](faststore.md) | Synapse Faststore — cache, key/value, hashes, lists, sets, locks |
 | [queue.md](queue.md) | SynapseQueue — publish, consume, leases, retries, dead letters |
+| [workflow-runners.md](workflow-runners.md) | Queue-backed workflow execution + self-hosted runner image |
 | [configuration.md](configuration.md) | Environment table for the whole stack |
 | [object-storage.md](object-storage.md) | SynapseOCS bucket/object API, SeaweedFS backend, object backups |
 | [notifications.md](notifications.md) | SynapseNotifications — outbox, templates, preferences, delivery, retries |

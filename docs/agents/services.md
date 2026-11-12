@@ -123,8 +123,12 @@ Migrations seed demo org `acme` and account `prod`; the memory fallback seeds
 **API:**
 - `GET/POST /v1/workflows`, `GET/PUT/DELETE /v1/workflows/:id`,
   `POST /v1/workflows/:id/execute|activate|deactivate`,
-  `POST /v1/workflows/test-run`.
+  `POST /v1/workflows/test-run` (`execute` returns 202 queued in queue mode;
+  `?wait=1` blocks).
 - `GET /v1/executions`, `GET /v1/executions/:id`.
+- `GET/POST /v1/workflow-runners`, `GET/DELETE /v1/workflow-runners/:id`,
+  `GET .../config|connection`, `POST .../heartbeat|command`,
+  `POST /v1/runner/jobs/:id/claim|heartbeat|complete|release|credentials`.
 - `GET /v1/templates`, `GET /v1/templates/:name`.
 - `GET/POST /v1/credentials`, `DELETE /v1/credentials/:id` (secrets never
   returned).
@@ -132,7 +136,10 @@ Migrations seed demo org `acme` and account `prod`; the memory fallback seeds
 - `GET /health`, `GET /metrics`.
 
 **Engine:** executes a DAG with a queue/fan-out model; expressions support
-`={{ ... }}` and `{{ ... }}` with `$json`, `$input`, `$now`. Node families:
+`={{ ... }}` and `{{ ... }}` with `$json`, `$input`, `$now`. In queue execution
+mode the *trigger* publishes a SynapseQueue job and workers run the DAG
+(`queue.ts`, `worker.ts`, `runner.ts`); the in-memory node queue remains the DAG
+fan-out mechanism. Node families:
 - native/aliases: `webhook`, `cron`, `manualTrigger`, `noOp`, `set`, `if`,
   `httpRequest`, `code`, `decision`, `aiAgent`, `synapseone.api`;
 - integration nodes: `synapseone.iam|base|faststore|queue|lds|inference|flow`;
@@ -146,6 +153,16 @@ Migrations seed demo org `acme` and account `prod`; the memory fallback seeds
 `hmac-sha256`, or `jwt` auth, per-workflow rate limit and optional idempotency
 header/TTL; cron scheduler tick (`WORKFLOW_CRON_TICK_MS`, default 15 s) runs
 active cron workflows. Activation gates cron + webhooks, not manual runs.
+With `QUEUE_SERVICE_URL` set (default in Compose), triggers enqueue a job:
+platform worker (`WORKFLOW_WORKER_ENABLED`, concurrency 4), tenant custom
+runner, or hybrid shared queue. `WORKFLOW_EXECUTION_MODE=queue|inline|auto`
+controls the transport; tests/unit runs stay inline.
+
+**Self-hosted runners:** `POST/GET /v1/workflow-runners`, heartbeat/connection
+check, and `/v1/runner/jobs/*` claim/heartbeat/complete/release/credentials.
+The runner image is `apps/workflow-runner/Dockerfile` (release + CD publish
+`synapseone-workflow-runner`). Credentials are resolved per claimed execution,
+never embedded in queue messages. See `docs/workflow-runners.md`.
 
 **Templates (10):** `webhook-to-log`, `cron-etl`, `iam-webhook`,
 `code-transform`, `manual-starter`, `synapseone-self-check`, `webhook-to-lds`,
@@ -153,8 +170,10 @@ active cron workflows. Activation gates cron + webhooks, not manual runs.
 
 **Data:** `synapseone_workflows` (nodes/connections/settings/active/tenant/
 run_as/revision), `synapseone_executions` (input/output/node runs/principal/
-trigger), `synapseone_credentials` (AES-256-GCM envelope, `SYNAPSEONE_CREDENTIAL_KEY`
-32-byte hex required in prod; dev uses an ephemeral key).
+trigger + queue/runner/worker/attempt/lease/resume), `synapseone_workflow_runners`
+(queue/mode/tenant/API-key metadata/last heartbeat), `synapseone_credentials`
+(AES-256-GCM envelope, `SYNAPSEONE_CREDENTIAL_KEY` 32-byte hex required in
+prod; dev uses an ephemeral key).
 
 **Rules:**
 - Workflows are tenant-scoped: visibility = account match OR org match; create/

@@ -151,7 +151,7 @@ async function main() {
 
   // 6. Execute the saved workflow
   console.log('[6] Executing saved workflow in SynapseFlow runtime...');
-  const execRes = await c.workflow.executeWorkflow(createdWf.id, {});
+  const execRes = await c.workflow.executeWorkflow(createdWf.id, {}, { wait: true, timeoutMs: 60000 });
   console.log('Execution result status:', execRes.status);
   console.log('Execution result output:', JSON.stringify(execRes.output, null, 2));
 

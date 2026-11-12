@@ -5,8 +5,9 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * Workflow service: local built-in engine (Apache-2.0, no external engine).
  * Stores workflows + executions in Postgres (DATABASE_URL) with in-memory
- * fallback for dev/test. Executes webhook/cron/manual/httpRequest/code/
- * set/if/noOp DAGs via ./engine (sandboxed code).
+ * fallback for dev/test. Triggers publish SynapseQueue jobs; the built-in
+ * worker or a self-hosted runner executes webhook/cron/manual/httpRequest/
+ * code/set/if/noOp DAGs via ./engine (sandboxed code).
  */
 import './env-compat';
 import express from 'express';
@@ -24,10 +25,21 @@ import {
   toPublicCredential, decryptSecret,
   createHumanTaskRec, getHumanTaskRec, listHumanTaskRecs, transitionHumanTaskRec, toPublicHumanTask,
   claimExecutionResume, finishExecutionRec,
+  claimExecutionRec, heartbeatExecutionRec, releaseExecutionRec, pauseExecutionRec,
+  queueExecutionResume,
+  createRunnerRec, getRunnerRec, listRunnerRecs, heartbeatRunnerRec, deleteRunnerRec,
   createSecretRec, listSecretRecs, findSecretRec, readSecretValue, rotateSecretRec,
   listSecretVersionRecs, revokeSecretRec, deleteSecretRec, toPublicSecret, toPublicSecretVersion,
 } from './store';
-import type { Principal } from './store';
+import type { Principal, StoredExecution, StoredWorkflowRunner } from './store';
+import {
+  queueTransportEnabled, queueBackendConfigured, runnerModeForSettings, queueNameForSettings,
+  ensureWorkflowQueue, publishWorkflowRun, isQueueName, queueVisibilitySeconds, queueMaxAttempts,
+  pingWorkflowQueue,
+  DEFAULT_CUSTOM_QUEUE, DEFAULT_SHARED_QUEUE,
+} from './queue';
+import type { WorkflowRunnerMode } from './queue';
+import { startPlatformWorker, platformWorkerId } from './worker';
 import { runWorkflow, HumanTaskPause, detectCycle, workflowCronIntervalMs, workflowCronNextRunAt, validateCronParams, validateSynapseOneParams, validateIntegrationParams, validateAgentToolIds, extractEmbeddingVector, isBlockedUrl as engineIsBlockedUrl, isAllowedSelfUrl, selfAllowlist, actorFor, isWebhookType, isCronType, isTriggerType, isCodeType, isHttpRequestType, isIfType, isSetType, isNoOpType, isAiAgentType, isDecisionType, isModelType, isIntegrationType, normalizeNodeType, edgeTargetPort, auxiliaryEdges } from './engine';
 import type { CredentialResolver, RunPrincipal, SynapseOneCall, EngineNode, Connections } from './engine';
 
@@ -1116,6 +1128,31 @@ function validateDefinition(definition: any, opts: { requireTrigger?: boolean } 
   return null;
 }
 
+function validateExecutionSettings(settings: any): string | null {
+  if (!settings || typeof settings !== 'object') return null;
+  const execution = settings.execution;
+  if (execution === undefined || execution === null) return null;
+  if (typeof execution !== 'object' || Array.isArray(execution)) return 'settings.execution must be an object';
+  if (execution.mode !== undefined) {
+    const mode = String(execution.mode).toLowerCase();
+    if (!['platform', 'custom', 'hybrid', 'inline'].includes(mode)) {
+      return 'settings.execution.mode must be platform|custom|hybrid|inline';
+    }
+  }
+  if (execution.queue !== undefined && execution.queue !== null && String(execution.queue) !== '' && !isQueueName(execution.queue)) {
+    return 'settings.execution.queue must match [A-Za-z][A-Za-z0-9_-]{0,63}';
+  }
+  if (execution.maxAttempts !== undefined) {
+    const n = Number(execution.maxAttempts);
+    if (!Number.isInteger(n) || n < 1 || n > 100) return 'settings.execution.maxAttempts must be 1..100';
+  }
+  if (execution.visibilityTimeoutSeconds !== undefined) {
+    const n = Number(execution.visibilityTimeoutSeconds);
+    if (!Number.isInteger(n) || n < 30 || n > 3600) return 'settings.execution.visibilityTimeoutSeconds must be 30..3600';
+  }
+  return null;
+}
+
 function toApiWorkflow(w: StoredWorkflow): any {
   return {
     id: w.id,
@@ -1168,6 +1205,12 @@ function toApiExecution(e: any, includeData: boolean): any {
     triggeredBy: e.triggered_by,
     principal: e.principal ?? undefined,
     actor: e.actor ?? undefined,
+    queue: e.queue_name ?? undefined,
+    runner: e.runner ?? undefined,
+    workerId: e.worker_id ?? undefined,
+    attempt: e.attempt ?? undefined,
+    leaseExpiresAt: e.lease_expires_at ?? undefined,
+    workflowRevision: e.workflow_revision ?? undefined,
     startedAt: e.startedAt,
     finishedAt: e.finishedAt,
     error: e.error,
@@ -1235,6 +1278,226 @@ export function workflowRunPrincipal(wf: {
   return { sub: sub || 'workflow', org: wf.org_id || undefined, account: wf.account_id || undefined, kind: 'workflow' };
 }
 
+// ---------- queue dispatch helpers ----------
+
+function httpError(status: number, code: string, message: string): Error & { status: number; code: string } {
+  const e: any = new Error(message);
+  e.status = status;
+  e.code = code;
+  return e;
+}
+
+/** Create a queued execution row and publish its job. Inputs and definitions
+ *  stay in Postgres; only `{executionId}` travels through SynapseQueue. */
+async function enqueueExecution(args: {
+  wf: StoredWorkflow;
+  input: any;
+  triggeredBy: string;
+  principal: Principal | null;
+  delaySeconds?: number;
+}): Promise<{ execution: StoredExecution; queue: string; mode: WorkflowRunnerMode }> {
+  const mode = runnerModeForSettings(args.wf.settings);
+  if (mode === 'inline') throw httpError(400, 'inline_mode', 'this workflow is configured for inline execution');
+  if (!queueTransportEnabled()) {
+    throw httpError(503, 'queue_unavailable', 'workflow execution requires SynapseQueue (QUEUE_SERVICE_URL / WORKFLOW_EXECUTION_MODE)');
+  }
+  const queue = queueNameForSettings(args.wf.settings, mode);
+  if (!isQueueName(queue)) throw httpError(500, 'invalid_queue', `workflow runner queue '${queue}' is invalid`);
+
+  const execution = await createExecutionRec({
+    workflow_id: args.wf.id,
+    workflow_name: args.wf.name,
+    status: 'queued',
+    input: args.input,
+    output: null,
+    node_runs: [],
+    error: null,
+    triggered_by: args.triggeredBy,
+    principal: args.principal,
+    actor: actorFor(args.wf.id, args.principal),
+    startedAt: new Date().toISOString(),
+    queue_name: queue,
+    runner: mode,
+    workflow_revision: args.wf.revision,
+  });
+
+  try {
+    const settings = args.wf.settings && typeof args.wf.settings === 'object' ? args.wf.settings : {};
+    const executionSettings = settings.execution && typeof settings.execution === 'object' ? settings.execution : {};
+    await ensureWorkflowQueue(queue, args.principal, {
+      maxAttempts: Number(executionSettings.maxAttempts) || queueMaxAttempts(),
+      visibilityTimeoutSeconds: Number(executionSettings.visibilityTimeoutSeconds) || queueVisibilitySeconds(),
+    });
+    await publishWorkflowRun(queue, execution.id, args.principal, { delaySeconds: args.delaySeconds });
+  } catch (e: any) {
+    await finishExecutionRec(execution.id, {
+      status: 'error',
+      output: null,
+      node_runs: [],
+      error: `queue dispatch failed: ${String(e?.message || e).slice(0, 500)}`,
+      finishedAt: new Date().toISOString(),
+      allowedStatuses: ['queued'],
+    }).catch(() => null);
+    throw e;
+  }
+  return { execution, queue, mode };
+}
+
+async function publishExistingExecution(execution: StoredExecution, delaySeconds?: number): Promise<void> {
+  if (!execution.queue_name) throw httpError(409, 'not_queued', 'execution has no runner queue');
+  if (!queueTransportEnabled()) {
+    throw httpError(503, 'queue_unavailable', 'workflow execution requires SynapseQueue');
+  }
+  await ensureWorkflowQueue(execution.queue_name, execution.principal || null, {
+    maxAttempts: queueMaxAttempts(),
+    visibilityTimeoutSeconds: queueVisibilitySeconds(),
+  });
+  await publishWorkflowRun(execution.queue_name, execution.id, execution.principal || null, {
+    delaySeconds,
+  });
+}
+
+async function waitForExecution(id: string, timeoutMs = 30000): Promise<StoredExecution | null> {
+  const deadline = Date.now() + Math.min(Math.max(Number(timeoutMs) || 30000, 1000), 300000);
+  let current = await getExecutionRec(id);
+  while (current && (current.status === 'queued' || current.status === 'running') && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 250));
+    current = await getExecutionRec(id);
+  }
+  return current;
+}
+
+function queuedResponse(execution: StoredExecution, queue: string, extra: Record<string, any> = {}): any {
+  return {
+    ok: true,
+    queued: true,
+    status: execution.status,
+    executionId: execution.id,
+    queue,
+    runner: execution.runner,
+    ...extra,
+  };
+}
+
+function finishedResponse(execution: StoredExecution): { status: number; body: any } {
+  if (execution.status === 'paused') {
+    return {
+      status: 202,
+      body: {
+        ok: true, paused: true, status: 'paused', output: execution.output,
+        executionId: execution.id, task: execution.output?.humanTask,
+        taskId: execution.output?.humanTask?.id,
+      },
+    };
+  }
+  if (execution.status === 'queued' || execution.status === 'running') {
+    return { status: 202, body: queuedResponse(execution, execution.queue_name || '', { output: undefined }) };
+  }
+  return {
+    status: execution.status === 'success' ? 200 : 500,
+    body: {
+      ok: execution.status === 'success',
+      output: execution.output,
+      executionId: execution.id,
+      status: execution.status,
+      ...(execution.status === 'error' ? { error: execution.error } : {}),
+    },
+  };
+}
+
+// ---------- self-hosted runner API helpers ----------
+
+const RUNNER_KEY_SCOPES = [
+  'workflow:*', 'queue:*', '*:read',
+  // POST-based read routes (scopeAllows treats non-GET as write unless the
+  // exact action verb is present): document queries, vector search, LLM calls.
+  'base:query', 'base:vector-search', 'inference:*',
+];
+
+function runnerPublicUrl(): string {
+  return String(process.env.SYNAPSEONE_PUBLIC_URL || 'https://api.synapseone.space').replace(/\/$/, '');
+}
+
+function runnerImage(): string {
+  return String(process.env.WORKFLOW_RUNNER_IMAGE || 'ghcr.io/vku-open-source-2026/synapseone-workflow-runner:latest');
+}
+
+function shQuote(v: string): string {
+  return /^[A-Za-z0-9._~:/@%+-]+$/.test(v) ? v : `'${v.replace(/'/g, `'\\''`)}'`;
+}
+
+/** Copy-paste docker run command for a runner. The API key is supplied by the
+ *  caller and is never persisted by workflow-service. */
+export function runnerCommand(runner: StoredWorkflowRunner, apiKey?: string | null): string {
+  const raw = apiKey && apiKey.trim() && !/[\r\n\u0000]/.test(apiKey) ? apiKey.trim().slice(0, 512) : '';
+  const key = raw || '<YOUR_SYNAPSEONE_API_KEY>';
+  const container = `synapseone-runner-${runner.id.slice(0, 8)}`;
+  return [
+    `docker run -d --name ${shQuote(container)} --restart unless-stopped \\`,
+    `  -e SYNAPSEONE_URL=${shQuote(runnerPublicUrl())} \\`,
+    `  -e SYNAPSEONE_API_KEY=${shQuote(key)} \\`,
+    `  -e WORKFLOW_RUNNER_ID=${shQuote(runner.id)} \\`,
+    `  -e WORKFLOW_RUNNER_QUEUE=${shQuote(runner.queue)} \\`,
+    `  -e WORKFLOW_RUNNER_MODE=${shQuote(runner.mode)} \\`,
+    `  -e WORKFLOW_RUNNER_CONCURRENCY=1 \\`,
+    `  ${runnerImage()}`,
+  ].join('\n');
+}
+
+function runnerConnected(r: StoredWorkflowRunner): boolean {
+  if (!r.last_seen_at) return false;
+  return Date.now() - new Date(r.last_seen_at).getTime() < 60_000;
+}
+
+function toApiRunner(r: StoredWorkflowRunner): any {
+  const connected = runnerConnected(r);
+  return {
+    id: r.id,
+    name: r.name,
+    mode: r.mode,
+    queue: r.queue,
+    status: connected ? 'connected' : r.last_seen_at ? 'stale' : 'waiting',
+    connected,
+    version: r.version,
+    keyPrefix: r.key_prefix,
+    apiKeyId: r.api_key_id,
+    lastSeenAt: r.last_seen_at,
+    lastError: r.last_error,
+    metadata: r.metadata,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+function canAccessRunner(r: StoredWorkflowRunner, p: Principal | null | undefined): boolean {
+  if (!p) return true;
+  if (p.account && r.account_id === p.account) return true;
+  if (p.org && r.org_id === p.org) return true;
+  return false;
+}
+
+function runnerForRequest(req: express.Request, res: express.Response, id?: string, useParams = true): string | null {
+  const runnerId = String(id || (useParams ? (req.params as any)?.id : '') || (req.body && (req.body.runnerId || req.body.runner_id)) || req.headers['x-workflow-runner-id'] || '').trim();
+  if (!runnerId || runnerId.length > 128 || /[\r\n]/.test(runnerId)) {
+    res.status(400).json({ error: 'invalid_runner', message: 'runnerId is required' });
+    return null;
+  }
+  return runnerId;
+}
+
+async function loadRunnerForRequest(req: express.Request, res: express.Response, id?: string, useParams = true): Promise<StoredWorkflowRunner | null> {
+  const runnerId = runnerForRequest(req, res, id, useParams);
+  if (!runnerId) return null;
+  const runner = await getRunnerRec(runnerId);
+  const principal = principalFromHeaders(req);
+  if (!runner || !canAccessRunner(runner, principal)) {
+    res.status(404).json({ error: 'not_found', message: 'runner not found' });
+    return null;
+  }
+  return runner;
+}
+
+
 export function createApp(): express.Express {
   if (IS_PROD_WF) {
     if (!process.env.SYNAPSEONE_INTERNAL_SECRET) {
@@ -1242,6 +1505,10 @@ export function createApp(): express.Express {
     }
     if (!process.env.DATABASE_URL) {
       throw new Error('[workflow] DATABASE_URL must be set in production (in-memory fallback would split-brain)');
+    }
+    const mode = String(process.env.WORKFLOW_EXECUTION_MODE || 'auto').toLowerCase();
+    if (mode !== 'inline' && mode !== 'local' && mode !== 'sync' && !queueBackendConfigured()) {
+      throw new Error('[workflow] queue execution requires QUEUE_SERVICE_URL in production (set WORKFLOW_EXECUTION_MODE=inline only for an explicit dev override)');
     }
   }
   const app = express();
@@ -1433,6 +1700,25 @@ export function createApp(): express.Express {
       }
       const startedAt = new Date().toISOString();
       const runPrincipal = workflowRunPrincipal(wf);
+      const runnerMode = runnerModeForSettings(wf.settings);
+      const waitForResult = req.query.wait === '1' || req.query.wait === 'true';
+      if (!queueTransportEnabled() && (runnerMode === 'custom' || runnerMode === 'hybrid')) {
+        return res.status(503).json({ error: 'queue_unavailable', message: `workflow requires a ${runnerMode} runner queue but SynapseQueue is not configured` });
+      }
+      if (queueTransportEnabled() && runnerMode !== 'inline') {
+        const { execution, queue } = await enqueueExecution({
+          wf, input, triggeredBy: 'webhook', principal: runPrincipal,
+        });
+        recordRun('webhook', 'queued');
+        if (waitForResult) {
+          const final = await waitForExecution(execution.id, Number(req.query.timeoutMs) || 30000);
+          if (final) {
+            const out = finishedResponse(final);
+            return res.status(out.status).json(out.body);
+          }
+        }
+        return res.status(202).json(queuedResponse(execution, queue));
+      }
       const r = await runWorkflow(
         { nodes: wf.nodes as any, connections: wf.connections as any, name: wf.name, settings: wf.settings as any },
         input,
@@ -1506,7 +1792,16 @@ export function createApp(): express.Express {
       counts = { workflows: wfs.length };
       void execs;
     } catch { /* health never fails on db */ }
-    res.json({ status: 'ok', service: 'workflow', version: VERSION, engine: 'local', db: useDb() ? 'postgres' : 'memory', selfAllowlist: selfAllowlist().length, ...counts, time: new Date().toISOString() });
+    const queueOk = await pingWorkflowQueue();
+    res.json({
+      status: queueOk === false ? 'degraded' : 'ok',
+      service: 'workflow', version: VERSION, engine: 'local',
+      db: useDb() ? 'postgres' : 'memory',
+      transport: queueTransportEnabled() ? 'queue' : 'inline',
+      queue: queueOk === null ? 'inline' : queueOk ? 'ok' : 'down',
+      worker: queueTransportEnabled() && String(process.env.WORKFLOW_WORKER_ENABLED || 'true').toLowerCase() !== 'false' ? 'platform' : 'off',
+      selfAllowlist: selfAllowlist().length, ...counts, time: new Date().toISOString(),
+    });
   });
 
 /** Path :id guard shared by the single-workflow routes (length + CRLF). */
@@ -1687,6 +1982,8 @@ function tenantBinding(
       } catch { return res.status(400).json({ error: 'invalid_settings', message: 'settings must be JSON-serializable' }); }
       settingsOut = settingsCand;
     }
+    const execSettingsErr = validateExecutionSettings(settingsOut);
+    if (execSettingsErr) return res.status(400).json({ error: 'invalid_settings', message: execSettingsErr });
     // P0-3: tenant binding — explicit body org/account must stay inside the
     // caller's own org; otherwise inherit from the stamped principal.
     const tenant = tenantBinding(req, req.body || {});
@@ -1720,6 +2017,8 @@ function tenantBinding(
     if (!cur || !canAccessWorkflow(cur, principalFromHeaders(req))) {
       return res.status(404).json({ error: 'not_found', message: 'workflow not found' });
     }
+    const execSettingsErr = validateExecutionSettings(settings ?? cur.settings);
+    if (execSettingsErr) return res.status(400).json({ error: 'invalid_settings', message: execSettingsErr });
     let nodes = cur.nodes;
     let connections = cur.connections;
     if (definition != null) {
@@ -1752,6 +2051,10 @@ function tenantBinding(
   app.post('/v1/workflows/:id/execute', async (req, res) => {
     const id = String(req.params.id || '');
     if (!id || id.length > 128 || /[\r\n]/.test(id)) return res.status(400).json({ error: 'invalid_id' });
+    const nestedDepth = Number(req.headers['x-workflow-depth'] || 0);
+    if (!Number.isFinite(nestedDepth) || nestedDepth < 0 || nestedDepth > 3) {
+      return res.status(400).json({ error: 'nesting_limit', message: 'workflow nesting depth must be 0..3' });
+    }
     let bodySize = 0;
     try { bodySize = Buffer.byteLength(JSON.stringify(req.body || {}), 'utf8'); } catch { return res.status(400).json({ error: 'invalid_body' }); }
     if (bodySize > 200 * 1024) return res.status(400).json({ error: 'payload_too_large', message: 'execute body ≤200KB' });
@@ -1761,7 +2064,30 @@ function tenantBinding(
     const input = (req.body && typeof req.body === 'object' ? req.body : { value: req.body }) || {};
     const startedAt = new Date().toISOString();
     const executionId = randomUUID();
-    const r = await runWorkflow(
+    const runnerMode = runnerModeForSettings(wf.settings);
+    const wantsWait = req.query.wait === '1' || req.query.wait === 'true';
+    // Nested/queued workflows can opt into inline execution to avoid a worker
+    // waiting on another worker (self-deadlock). The public API still queues by
+    // default; this is used by the remote runner's `workflows.execute` shim.
+    const forceInline = req.query.inline === '1' || req.query.inline === 'true';
+    if (!queueTransportEnabled() && !forceInline && (runnerMode === 'custom' || runnerMode === 'hybrid')) {
+      return res.status(503).json({ error: 'queue_unavailable', message: `workflow requires a ${runnerMode} runner queue but SynapseQueue is not configured` });
+    }
+    if (queueTransportEnabled() && runnerMode !== 'inline' && !forceInline) {
+      const { execution, queue } = await enqueueExecution({
+        wf, input, triggeredBy: 'manual', principal,
+      });
+      recordRun('manual', 'queued');
+      if (wantsWait) {
+        const final = await waitForExecution(execution.id, Number(req.query.timeoutMs) || 30000);
+        if (final) {
+          const out = finishedResponse(final);
+          return res.status(out.status).json(out.body);
+        }
+      }
+      return res.status(202).json(queuedResponse(execution, queue));
+    }
+    const runInline = () => runWorkflow(
       { nodes: wf.nodes as any, connections: wf.connections as any, name: wf.name, settings: wf.settings as any },
       input,
       {
@@ -1781,6 +2107,9 @@ function tenantBinding(
         },
       },
     );
+    const r = nestedDepth > 0
+      ? await workflowRunContext.run({ depth: nestedDepth }, runInline)
+      : await runInline();
     const finishedAt = new Date().toISOString();
     recordRun('manual', r.status, r.nodeRuns);
     const exec = await createExecutionRec({
@@ -1876,14 +2205,14 @@ function tenantBinding(
     const workflowId = typeof q.workflowId === 'string' && q.workflowId.length <= 256 ? q.workflowId : undefined;
     if (workflowId && /[\r\n]/.test(workflowId)) return res.status(400).json({ error: 'invalid_query', message: 'bad workflowId' });
     const status = typeof q.status === 'string' && q.status.length <= 32 ? q.status : undefined;
-    if (status && !['success', 'error', 'running'].includes(status)) {
-      return res.status(400).json({ error: 'invalid_query', message: 'status must be success|error|running' });
+    if (status && !['queued', 'running', 'paused', 'success', 'error', 'cancelled'].includes(status)) {
+      return res.status(400).json({ error: 'invalid_query', message: 'status must be queued|running|paused|success|error|cancelled' });
     }
     // M10: test runs persist server-side — filterable so history views can
     // include or exclude them (triggeredBy=manual|webhook|cron|test).
     const triggeredBy = typeof q.triggeredBy === 'string' && q.triggeredBy.length <= 32 ? q.triggeredBy : undefined;
-    if (triggeredBy && !['manual', 'webhook', 'cron', 'test'].includes(triggeredBy)) {
-      return res.status(400).json({ error: 'invalid_query', message: 'triggeredBy must be manual|webhook|cron|test' });
+    if (triggeredBy && !['manual', 'webhook', 'cron', 'test', 'human-task', 'workflow'].includes(triggeredBy)) {
+      return res.status(400).json({ error: 'invalid_query', message: 'triggeredBy must be manual|webhook|cron|test|human-task|workflow' });
     }
     const includeData = q.includeData === 'true';
     const principal = principalFromHeaders(req);
@@ -1906,6 +2235,291 @@ function tenantBinding(
     }
     const includeData = (req.query as any).includeData === 'true';
     res.json(toApiExecution(e, includeData));
+  });
+
+  // ---------- self-hosted workflow runners ----------
+  // A runner is a tenant-owned worker that consumes a SynapseQueue workflow
+  // queue. Users create a runner, mint an IAM API key for it, and deploy the
+  // published runner image with the generated command.
+  const RUNNER_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9 _./:-]{0,99}$/;
+
+  app.post('/v1/workflow-runners', async (req, res) => {
+    const principal = principalFromHeaders(req);
+    if (!principal) return res.status(401).json({ error: 'unauthenticated', message: 'a verified principal is required' });
+    const b = (req.body || {}) as any;
+    const name = String(b.name || '').trim();
+    if (!RUNNER_NAME_RE.test(name)) {
+      return res.status(400).json({ error: 'invalid_name', message: 'name must be 1..100 printable chars' });
+    }
+    const mode: 'custom' | 'hybrid' = b.mode === 'hybrid' ? 'hybrid' : 'custom';
+    const queue = String(b.queue || (mode === 'hybrid' ? DEFAULT_SHARED_QUEUE : DEFAULT_CUSTOM_QUEUE)).trim();
+    if (!isQueueName(queue)) {
+      return res.status(400).json({ error: 'invalid_queue', message: 'queue must match [A-Za-z][A-Za-z0-9_-]{0,63}' });
+    }
+    const apiKeyId = b.apiKeyId ? String(b.apiKeyId).slice(0, 128) : null;
+    const keyPrefix = b.keyPrefix ? String(b.keyPrefix).slice(0, 32) : null;
+    const runner = await createRunnerRec({
+      name,
+      mode,
+      queue,
+      org_id: principal.org || null,
+      account_id: principal.account || null,
+      api_key_id: apiKeyId,
+      key_prefix: keyPrefix,
+      created_by: principal.sub,
+      metadata: b.metadata && typeof b.metadata === 'object' ? b.metadata : {},
+    });
+    const scopes = Array.isArray(b.scopes) && b.scopes.length
+      ? b.scopes.map(String).filter((s: string) => s && s.length <= 200).slice(0, 100)
+      : RUNNER_KEY_SCOPES;
+    if (typeof b.apiKey === 'string' && b.apiKey) res.setHeader('Cache-Control', 'no-store');
+    res.status(201).json({
+      runner: toApiRunner(runner),
+      queue: runner.queue,
+      scopes,
+      command: runnerCommand(runner, typeof b.apiKey === 'string' ? b.apiKey : null),
+      warning: typeof b.apiKey === 'string' && b.apiKey
+        ? 'The API key is only echoed in this response and is never stored by workflow-service.'
+        : 'Pass the API key to POST /v1/workflow-runners/:id/command to render a copy-paste command.',
+    });
+  });
+
+  app.get('/v1/workflow-runners', async (req, res) => {
+    const principal = principalFromHeaders(req);
+    const scope = humanTaskScope(principal);
+    if (scope === null) return res.status(403).json({ error: 'tenant_required' });
+    const runners = await listRunnerRecs({ ...scope, limit: Number((req.query as any).limit) || 100 });
+    res.json({ data: runners.map(toApiRunner) });
+  });
+
+  app.get('/v1/workflow-runners/:id', async (req, res) => {
+    const runner = await loadRunnerForRequest(req, res);
+    if (!runner) return;
+    res.json({ runner: toApiRunner(runner), command: runnerCommand(runner) });
+  });
+
+  app.get('/v1/workflow-runners/:id/config', async (req, res) => {
+    const runner = await loadRunnerForRequest(req, res);
+    if (!runner) return;
+    res.json({
+      runnerId: runner.id,
+      name: runner.name,
+      mode: runner.mode,
+      queue: runner.queue,
+      apiBaseUrl: runnerPublicUrl(),
+      heartbeatIntervalSeconds: 15,
+      pollIntervalMs: 500,
+      visibilityTimeoutSeconds: queueVisibilitySeconds(),
+      workerImage: runnerImage(),
+    });
+  });
+
+  app.post('/v1/workflow-runners/:id/heartbeat', async (req, res) => {
+    const runner = await loadRunnerForRequest(req, res);
+    if (!runner) return;
+    const b = (req.body || {}) as any;
+    const updated = await heartbeatRunnerRec(runner.id, {
+      version: b.version !== undefined ? String(b.version) : undefined,
+      status: 'connected',
+      lastError: b.lastError !== undefined ? (b.lastError ? String(b.lastError) : null) : undefined,
+      metadata: b.metadata && typeof b.metadata === 'object' ? b.metadata : undefined,
+    });
+    if (!updated) return res.status(404).json({ error: 'not_found' });
+    res.json({ ok: true, runner: toApiRunner(updated) });
+  });
+
+  app.get('/v1/workflow-runners/:id/connection', async (req, res) => {
+    const runner = await loadRunnerForRequest(req, res);
+    if (!runner) return;
+    const connected = runnerConnected(runner);
+    const ageSeconds = runner.last_seen_at ? Math.max(0, Math.floor((Date.now() - new Date(runner.last_seen_at).getTime()) / 1000)) : null;
+    res.json({
+      connected,
+      status: connected ? 'connected' : runner.last_seen_at ? 'stale' : 'waiting',
+      runner: { ...toApiRunner(runner), status: connected ? 'connected' : runner.last_seen_at ? 'stale' : 'waiting' },
+      lastSeenAt: runner.last_seen_at,
+      ageSeconds,
+      queue: runner.queue,
+      mode: runner.mode,
+      version: runner.version,
+      lastError: runner.last_error,
+    });
+  });
+
+  app.post('/v1/workflow-runners/:id/command', async (req, res) => {
+    const runner = await loadRunnerForRequest(req, res);
+    if (!runner) return;
+    const apiKey = typeof (req.body || {}).apiKey === 'string' ? (req.body as any).apiKey : null;
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      command: runnerCommand(runner, apiKey),
+      apiBaseUrl: runnerPublicUrl(),
+      queue: runner.queue,
+      mode: runner.mode,
+      hasApiKey: !!apiKey,
+    });
+  });
+
+  app.delete('/v1/workflow-runners/:id', async (req, res) => {
+    const runner = await loadRunnerForRequest(req, res);
+    if (!runner) return;
+    res.json({ ok: true, id: runner.id, deleted: await deleteRunnerRec(runner.id) });
+  });
+
+  // ---- runner job protocol (API-key authenticated) ----
+  async function runnerJob(req: any, res: any, opts: { requireRunning?: boolean } = {}): Promise<{ runner: StoredWorkflowRunner; execution: StoredExecution } | null> {
+    const runner = await loadRunnerForRequest(req, res, undefined, false);
+    if (!runner) return null;
+    const id = String(req.params.id || '');
+    if (!id || id.length > 128 || /[\r\n]/.test(id)) {
+      res.status(400).json({ error: 'invalid_id' });
+      return null;
+    }
+    const execution = await getExecutionRec(id);
+    const principal = principalFromHeaders(req);
+    if (!execution || !canAccessExecution(execution, principal)) {
+      res.status(404).json({ error: 'not_found', message: 'execution not found' });
+      return null;
+    }
+    if (!execution.queue_name || execution.queue_name !== runner.queue || execution.runner !== runner.mode) {
+      res.status(403).json({ error: 'runner_mismatch', message: `execution belongs to queue '${execution.queue_name || '-'}' / mode '${execution.runner || '-'}'` });
+      return null;
+    }
+    if (opts.requireRunning) {
+      if (execution.status !== 'running' || execution.worker_id !== runner.id) {
+        res.status(409).json({ error: 'not_claimed', message: 'execution is not claimed by this runner' });
+        return null;
+      }
+    }
+    return { runner, execution };
+  }
+
+  app.post('/v1/runner/jobs/:id/claim', async (req, res) => {
+    const ctx = await runnerJob(req, res);
+    if (!ctx) return;
+    const leaseSeconds = Math.min(Math.max(Number((req.body || {}).leaseSeconds) || queueVisibilitySeconds(), 15), 3600);
+    const claimed = await claimExecutionRec(ctx.execution.id, { workerId: ctx.runner.id, leaseSeconds });
+    if (!claimed) return res.status(409).json({ error: 'not_claimable', message: 'execution is already claimed or finished' });
+    const wf = await getWorkflowRec(claimed.workflow_id);
+    if (!wf) {
+      await finishExecutionRec(claimed.id, {
+        status: 'error', output: null, node_runs: [],
+        error: `workflow '${claimed.workflow_id}' no longer exists`,
+        finishedAt: new Date().toISOString(), workerId: ctx.runner.id, allowedStatuses: ['running'],
+      });
+      return res.status(410).json({ error: 'workflow_not_found' });
+    }
+    await heartbeatRunnerRec(ctx.runner.id, { status: 'connected' }).catch(() => null);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      executionId: claimed.id,
+      workflow: {
+        id: wf.id, name: wf.name, revision: wf.revision,
+        nodes: wf.nodes, connections: wf.connections, settings: wf.settings,
+      },
+      input: claimed.input,
+      principal: claimed.principal || null,
+      triggeredBy: claimed.triggered_by,
+      attempt: claimed.attempt,
+      leaseExpiresAt: claimed.lease_expires_at,
+      resumeFrom: claimed.resume_node ? { node: claimed.resume_node, output: claimed.resume_output } : null,
+    });
+  });
+
+  app.post('/v1/runner/jobs/:id/heartbeat', async (req, res) => {
+    const ctx = await runnerJob(req, res, { requireRunning: true });
+    if (!ctx) return;
+    const leaseSeconds = Math.min(Math.max(Number((req.body || {}).leaseSeconds) || queueVisibilitySeconds(), 15), 3600);
+    const updated = await heartbeatExecutionRec(ctx.execution.id, { workerId: ctx.runner.id, leaseSeconds });
+    if (!updated) return res.status(409).json({ error: 'not_running' });
+    await heartbeatRunnerRec(ctx.runner.id, { status: 'connected' }).catch(() => null);
+    res.json({ ok: true, leaseExpiresAt: updated.lease_expires_at });
+  });
+
+  app.post('/v1/runner/jobs/:id/release', async (req, res) => {
+    const ctx = await runnerJob(req, res);
+    if (!ctx) return;
+    const error = (req.body || {}).error ? String((req.body || {}).error).slice(0, 1000) : null;
+    const released = await releaseExecutionRec(ctx.execution.id, { workerId: ctx.runner.id, error: error || undefined });
+    if (!released) return res.status(409).json({ error: 'not_releasable' });
+    res.json({ ok: true, status: released.status });
+  });
+
+  app.post('/v1/runner/jobs/:id/credentials', async (req, res) => {
+    const ctx = await runnerJob(req, res, { requireRunning: true });
+    if (!ctx) return;
+    const credentialId = String((req.body || {}).credentialId || '');
+    if (!credentialId || credentialId.length > 128 || /[\r\n]/.test(credentialId)) {
+      return res.status(400).json({ error: 'invalid_credential', message: 'credentialId is required' });
+    }
+    const rec = await getCredentialRec(credentialId);
+    if (!rec || !credentialVisibleTo(rec, ctx.execution.principal || principalFromHeaders(req))) {
+      return res.status(404).json({ error: 'not_found' });
+    }
+    let secret: string;
+    try {
+      secret = decryptSecret(rec.secret_enc);
+    } catch {
+      return res.status(500).json({ error: 'decrypt_failed' });
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ credentialId: rec.id, kind: rec.kind, secret });
+  });
+
+  app.post('/v1/runner/jobs/:id/complete', async (req, res) => {
+    const ctx = await runnerJob(req, res, { requireRunning: true });
+    if (!ctx) return;
+    const b = (req.body || {}) as any;
+    const status = String(b.status || '');
+    if (!['success', 'error', 'paused'].includes(status)) {
+      return res.status(400).json({ error: 'invalid_status', message: 'status must be success|error|paused' });
+    }
+    const output = b.output ?? null;
+    const nodeRunsIn = Array.isArray(b.nodeRuns) ? b.nodeRuns.slice(0, 2000) : [];
+    const nodeRuns = ctx.execution.resume_node
+      ? [...(ctx.execution.node_runs || []), ...nodeRunsIn]
+      : nodeRunsIn;
+    const error = b.error ? String(b.error).slice(0, 2000) : null;
+    if (status === 'paused') {
+      const pause = b.pause && typeof b.pause === 'object' ? b.pause : null;
+      if (!pause || !pause.node || !pause.task) {
+        return res.status(400).json({ error: 'invalid_pause', message: 'pause.node and pause.task are required' });
+      }
+      const task = pause.task || {};
+      const wf = await getWorkflowRec(ctx.execution.workflow_id);
+      await createHumanTaskRec({
+        execution_id: ctx.execution.id,
+        workflow_id: ctx.execution.workflow_id,
+        node_name: String(pause.node).slice(0, 128),
+        title: String(task.title || 'Human approval').slice(0, 300),
+        description: String(task.description || '').slice(0, 4000),
+        assignee: task.assignee ? String(task.assignee).slice(0, 128) : null,
+        candidate_roles: Array.isArray(task.candidateRoles) ? task.candidateRoles.map(String).slice(0, 20) : [],
+        decision_schema: task.decisionSchema && typeof task.decisionSchema === 'object' ? task.decisionSchema : {},
+        payload: task.payload && typeof task.payload === 'object' ? task.payload : {},
+        deadline: task.deadline ? String(task.deadline) : null,
+        org_id: ctx.execution.principal?.org || wf?.org_id || null,
+        account_id: ctx.execution.principal?.account || wf?.account_id || null,
+      });
+      const paused = await pauseExecutionRec(ctx.execution.id, {
+        output, node_runs: nodeRuns, error, workerId: ctx.runner.id,
+      });
+      if (!paused) return res.status(409).json({ error: 'not_running' });
+      await heartbeatRunnerRec(ctx.runner.id, { status: 'connected' }).catch(() => null);
+      res.status(202).json({ ok: true, status: 'paused', execution: toApiExecution(paused, true) });
+      return;
+    }
+    const finished = await finishExecutionRec(ctx.execution.id, {
+      status: status === 'success' ? 'success' : 'error',
+      output, node_runs: nodeRuns, error,
+      finishedAt: new Date().toISOString(),
+      workerId: ctx.runner.id,
+      allowedStatuses: ['running'],
+    });
+    if (!finished) return res.status(409).json({ error: 'already_finished' });
+    recordRun(ctx.execution.runner === 'hybrid' ? 'runner-hybrid' : 'runner-custom', finished.status, nodeRuns);
+    await heartbeatRunnerRec(ctx.runner.id, { status: 'connected' }).catch(() => null);
+    res.json({ ok: true, status: finished.status, execution: toApiExecution(finished, true) });
   });
 
   // Delete a workflow.
@@ -2167,9 +2781,34 @@ function tenantBinding(
       const exec = await getExecutionRec(updated.execution_id);
       const wf = updated.workflow_id ? await getWorkflowRec(updated.workflow_id) : null;
       if (exec && exec.status === 'paused' && wf && canAccessWorkflow(wf, exec.principal || principal)) {
+        const output = { humanTask: { id: updated.id, status: updated.status, decision: updated.decision, note: updated.note }, ...(updated.decision || {}) };
+        // Queue-mode executions resume on a worker: persist the checkpoint,
+        // put the row back to `queued`, and publish a fresh job. The queue
+        // message from the original run was already acked when it paused.
+        if (exec.queue_name && exec.runner !== 'inline') {
+          const queued = await queueExecutionResume(exec.id, { node: updated.node_name, output });
+          if (queued) {
+            try {
+              await publishExistingExecution(queued);
+              resumed = { executionId: exec.id, status: 'queued', queued: true, queue: queued.queue_name, workflowId: wf.id };
+            } catch (e: any) {
+              // Dispatch failed: put the paused checkpoint back so the user can
+              // retry the decision instead of losing the execution.
+              await finishExecutionRec(exec.id, {
+                status: 'error', output: exec.output, node_runs: exec.node_runs,
+                error: `resume dispatch failed: ${String(e?.message || e).slice(0, 500)}`,
+                finishedAt: new Date().toISOString(), allowedStatuses: ['queued'],
+              }).catch(() => null);
+              throw e;
+            }
+          } else {
+            resumed = { executionId: exec.id, status: 'already_resumed' };
+          }
+          res.json({ task: toPublicHumanTask(updated), resumed });
+          return;
+        }
         const won = await claimExecutionResume(exec.id);
         if (won) {
-          const output = { humanTask: { id: updated.id, status: updated.status, decision: updated.decision, note: updated.note }, ...(updated.decision || {}) };
           const r = await runWorkflow(
             { nodes: wf.nodes as any, connections: wf.connections as any, name: wf.name, settings: wf.settings as any },
             exec.input,
@@ -3182,8 +3821,21 @@ function startCronLoop(): void {
         }
         lastCronRun.set(wf.id, now);
         try {
-          const startedAt = new Date().toISOString();
           const runPrincipal = workflowRunPrincipal(wf);
+          const mode = runnerModeForSettings(wf.settings);
+          if (!queueTransportEnabled() && (mode === 'custom' || mode === 'hybrid')) {
+            console.error(`[workflow][cron] ${wf.name} (${wf.id}) requires a ${mode} queue but SynapseQueue is not configured — skipped`);
+            continue;
+          }
+          if (queueTransportEnabled() && mode !== 'inline') {
+            const { execution, queue } = await enqueueExecution({
+              wf, input: { scheduledAt: new Date().toISOString() }, triggeredBy: 'cron', principal: runPrincipal,
+            });
+            recordRun('cron', 'queued');
+            console.log(`[workflow][cron] ${wf.name} (${wf.id}) queued on ${queue} as ${execution.id}`);
+            continue;
+          }
+          const startedAt = new Date().toISOString();
           const r = await runWorkflow(
             { nodes: wf.nodes as any, connections: wf.connections as any, name: wf.name, settings: wf.settings as any },
             { scheduledAt: startedAt },
@@ -3215,9 +3867,12 @@ if (require.main === module) {
   ensureTables().catch(() => undefined).finally(() => {
     const app = createApp();
     startCronLoop();
-    const server = app.listen(PORT, () => console.log(`[workflow] listening on :${PORT} engine=local db=${useDb() ? 'postgres' : 'memory'}`));
+    const workerEnabled = queueTransportEnabled() && String(process.env.WORKFLOW_WORKER_ENABLED || 'true').toLowerCase() !== 'false';
+    const worker = workerEnabled ? startPlatformWorker({ synapseoneCall, makeCredentialResolver, recordRun }) : null;
+    const server = app.listen(PORT, () => console.log(`[workflow] listening on :${PORT} engine=local db=${useDb() ? 'postgres' : 'memory'} transport=${queueTransportEnabled() ? 'queue' : 'inline'} worker=${workerEnabled ? platformWorkerId() : 'off'}`));
     const shutdown = () => {
       console.log('[workflow] shutting down...');
+      worker?.stop();
       server.close(() => process.exit(0));
       setTimeout(() => process.exit(0), 8000).unref();
     };

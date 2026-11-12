@@ -507,14 +507,17 @@ deactivateWorkflow(id: string): Promise<any>
 ```
 Deactivates a workflow.
 
-#### `executeWorkflow(id, payload?)`
+#### `executeWorkflow(id, payload?, opts?)`
 ```ts
-executeWorkflow(id: string, payload?: Record<string, unknown>): Promise<any>
+executeWorkflow(id: string, payload?: Record<string, unknown>, opts?: { wait?: boolean; timeoutMs?: number }): Promise<any>
 ```
-Triggers a manual execution (proxied to the engine).
+Triggers a manual execution. Queue mode returns `202 {queued:true, executionId}`;
+pass `{ wait: true }` to block for the final result. `waitForExecution(id)`
+polls a queued/running execution.
 
 ```ts
-await c.executeWorkflow(wfId, { url: 'https://example.com/hook' });
+const run = await c.executeWorkflow(wfId, { url: 'https://example.com/hook' }, { wait: true });
+const same = await c.workflow.waitForExecution(run.executionId);
 ```
 
 #### `updateWorkflow(id, patch)`

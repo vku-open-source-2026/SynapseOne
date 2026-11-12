@@ -32,6 +32,7 @@ const Policies = React.lazy(() => import('./pages/Policies.jsx'));
 const Keys = React.lazy(() => import('./pages/Keys.jsx'));
 const ServiceAccounts = React.lazy(() => import('./pages/ServiceAccounts.jsx'));
 const Workflows = React.lazy(() => import('./pages/Workflows.jsx'));
+const WorkflowRunners = React.lazy(() => import('./pages/WorkflowRunners.jsx'));
 const SynapseBase = React.lazy(() => import('./pages/SynapseBase.jsx'));
 const SynapseQueue = React.lazy(() => import('./pages/SynapseQueue.jsx'));
 const SynapseStream = React.lazy(() => import('./pages/SynapseStream.jsx'));
@@ -166,6 +167,7 @@ function AppRoutes() {
           <Route path="/keys" element={<Guard><ConsoleLayout><Keys /></ConsoleLayout></Guard>} />
           <Route path="/service-accounts" element={<Guard><ConsoleLayout><ServiceAccounts /></ConsoleLayout></Guard>} />
           <Route path="/workflows" element={<Guard><ConsoleLayout><Workflows /></ConsoleLayout></Guard>} />
+          <Route path="/workflow-runners" element={<Guard><ConsoleLayout><WorkflowRunners /></ConsoleLayout></Guard>} />
           <Route path="/base" element={<Guard><ConsoleLayout><SynapseBase /></ConsoleLayout></Guard>} />
           <Route path="/queue" element={<Guard><ConsoleLayout><SynapseQueue /></ConsoleLayout></Guard>} />
           <Route path="/stream" element={<Guard><ConsoleLayout><SynapseStream /></ConsoleLayout></Guard>} />

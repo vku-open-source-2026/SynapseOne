@@ -20,6 +20,9 @@ bootstrap:
 build:
 	npm run build --workspaces --if-present
 
+runner-image:
+	docker build -f apps/workflow-runner/Dockerfile -t synapseone-workflow-runner:latest .
+
 test:
 	npm run test --workspaces --if-present
 

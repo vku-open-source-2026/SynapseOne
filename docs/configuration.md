@@ -70,6 +70,18 @@ reads which key (audited from source):
 | `DATABASE_URL` | — (memory) | `postgres://...` → Postgres backend (`synapseone_workflows` + `synapseone_executions`); required in production |
 | `WORKFLOW_CRON_TICK_MS` | 15000 | cron scheduler tick (ms, clamped ≥10000) |
 | `WORKFLOW_TIMEOUT_MS` | 60000 | hard execution budget for workflows without `settings.timeoutMs` (clamped 1000–300000). AI templates set 300000 |
+| `WORKFLOW_EXECUTION_MODE` | `queue` (Compose) / `auto` | `queue` requires SynapseQueue; `inline` runs in the request; `auto` picks queue when `QUEUE_SERVICE_URL` is set |
+| `QUEUE_SERVICE_URL` | `http://queue:4007` | internal SynapseQueue base URL for publishing/consuming workflow jobs |
+| `WORKFLOW_WORKER_ENABLED` | true | run the built-in platform worker |
+| `WORKFLOW_WORKER_CONCURRENCY` | 4 | parallel platform jobs (1–32) |
+| `WORKFLOW_WORKER_POLL_MS` | 500 | platform worker queue poll interval |
+| `WORKFLOW_QUEUE_VISIBILITY_SECONDS` | 300 | job lease / visibility timeout (30–3600) |
+| `WORKFLOW_QUEUE_MAX_ATTEMPTS` | 5 | queue delivery attempts before DLQ |
+| `WORKFLOW_QUEUE_PLATFORM` | `synapseone-wf-platform` | queue for `platform` workflows |
+| `WORKFLOW_QUEUE_CUSTOM` | `synapseone-wf-custom` | queue for `custom` workflows |
+| `WORKFLOW_QUEUE_SHARED` | `synapseone-wf-shared` | queue for `hybrid` workflows |
+| `SYNAPSEONE_PUBLIC_URL` | `https://api.synapseone.space` | gateway URL embedded in runner commands |
+| `WORKFLOW_RUNNER_IMAGE` | `ghcr.io/.../synapseone-workflow-runner:latest` | runner image embedded in commands |
 | `INFERENCE_TIMEOUT_MS` | 120000 | per-call budget for workflow → inference LLM requests (clamped 1000–300000) |
 | `IAM_SERVICE_URL` | `http://iam:4001` | internal base URL for `synapseone.api` IAM nodes (users/roles/policies/audit/keys) |
 | `SYNAPSEONE_IAM_API_KEY` | — | service API key sent as `X-API-Key` on `synapseone.api` IAM calls; IAM requires a real caller credential even with the internal secret. Create it on the workflow service account (`POST /v1/accounts/:accountId/keys`, scope `*`). Unset → IAM nodes fail with a clear configuration error |

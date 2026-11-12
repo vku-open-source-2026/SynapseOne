@@ -611,18 +611,37 @@ synapseone workflows deactivate wf_abc123
 
 #### `workflows exec`
 ```bash
-synapseone workflows exec <workflow-id> [--data '{"k":v}'|input.json] [--file payload.json]
-synapseone workflows execute <workflow-id> [--data ...] [--file ...]
+synapseone workflows exec <workflow-id> [--data '{"k":v}'|input.json] [--file payload.json] [--wait] [--timeout MS]
+synapseone workflows execute <workflow-id> [--data ...] [--file ...] [--wait]
 ```
 Triggers a manual execution (the request body IS the workflow input).
 `--data` takes inline JSON or a path to a JSON file; `--file` reads the
 payload from a file (a bare input object, or `{input: {...}}`).
 
+Queue mode returns `{queued:true, executionId}`; add `--wait` to block for the
+result (default timeout 60s, override with `--timeout MS`).
+
 ```bash
 synapseone workflows exec wf_abc123
-synapseone workflows exec wf_abc123 --data '{"value":21}'
+synapseone workflows exec wf_abc123 --data '{"value":21}' --wait
 echo '{"value":21}' > input.json
 synapseone workflows exec wf_abc123 --data input.json
+```
+
+#### `runners`
+```bash
+synapseone runners [list]
+synapseone runners create --name <name> --account <account-id> [--mode custom|hybrid] [--queue Q] [--scopes S]
+synapseone runners get|connection|command|delete <runner-id>
+```
+Creates a self-hosted workflow runner: mints a scoped API key, registers the
+runner, and prints a copy-paste `docker run` command **including the API key**
+(shown once). `runners connection <id>` returns `connected: true` once the
+runner heartbeat arrives.
+
+```bash
+synapseone runners create --name edge-eu --account "$ACCOUNT_ID"
+synapseone runners connection <runner-id>
 ```
 
 #### `workflows test-run`

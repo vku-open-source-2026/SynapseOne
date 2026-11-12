@@ -66,6 +66,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
       - run: docker compose build
+      - name: Build self-hosted workflow runner image
+        run: docker build -f apps/workflow-runner/Dockerfile -t synapseone-workflow-runner:ci .
   e2e-compose:
     runs-on: ubuntu-latest
     needs: build-test
@@ -77,7 +79,7 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
       - run: cp .env.example .env
-      - run: docker compose up -d --build postgres redis s3 s3-init iam workflow inference ocs gateway
+      - run: docker compose up -d --build postgres redis s3 s3-init iam workflow queue inference ocs gateway
       - run: |
           set -e
           for i in $(seq 1 36); do

@@ -94,11 +94,16 @@ jobs:
             docker push "ghcr.io/$OWNER/synapseone-$SVC:main"
             docker push "ghcr.io/$OWNER/synapseone-$SVC:main-$SHA"
           done
+          docker build -f apps/workflow-runner/Dockerfile \
+            -t "ghcr.io/$OWNER/synapseone-workflow-runner:main" \
+            -t "ghcr.io/$OWNER/synapseone-workflow-runner:main-$SHA" .
+          docker push "ghcr.io/$OWNER/synapseone-workflow-runner:main"
+          docker push "ghcr.io/$OWNER/synapseone-workflow-runner:main-$SHA"
 
       - name: Summary
         run: |
           {
             echo "## CD (dev channel) — ${{ github.sha }}";
             echo "- npm: \`@synapseone/sdk@${{ steps.ver.outputs.npm }}\`, \`@synapseone/cli@${{ steps.ver.outputs.npm }}\` (tag \`dev\`)";
-            echo "- GHCR: \`ghcr.io/${{ github.repository_owner }}/synapseone-{gateway,iam,workflow,console}:main(-${{ steps.ver.outputs.sha }})\`";
+            echo "- GHCR: \`ghcr.io/${{ github.repository_owner }}/synapseone-{gateway,iam,workflow,workflow-runner,console}:main(-${{ steps.ver.outputs.sha }})\`";
           } >> "$GITHUB_STEP_SUMMARY"

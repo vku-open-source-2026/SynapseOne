@@ -219,6 +219,13 @@ export const api = {
   activateWorkflow: (id, a) => post(`/v1/workflows/${encodeURIComponent(id)}/activate`, {}, a),
   deactivateWorkflow: (id, a) => post(`/v1/workflows/${encodeURIComponent(id)}/deactivate`, {}, a),
   executeWorkflow: (id, input, a) => post(`/v1/workflows/${encodeURIComponent(id)}/execute`, input ?? {}, a),
+  executeWorkflowWait: (id, input, a, timeoutMs = 60000) => post(`/v1/workflows/${encodeURIComponent(id)}/execute?wait=1&timeoutMs=${encodeURIComponent(timeoutMs)}`, input ?? {}, a),
+  workflowRunners: (a) => get('/v1/workflow-runners', a),
+  createWorkflowRunner: (body, a) => post('/v1/workflow-runners', body, a),
+  workflowRunner: (id, a) => get(`/v1/workflow-runners/${encodeURIComponent(id)}`, a),
+  deleteWorkflowRunner: (id, a) => del(`/v1/workflow-runners/${encodeURIComponent(id)}`, a),
+  workflowRunnerConnection: (id, a) => get(`/v1/workflow-runners/${encodeURIComponent(id)}/connection`, a),
+  workflowRunnerCommand: (id, apiKey, a) => post(`/v1/workflow-runners/${encodeURIComponent(id)}/command`, { apiKey }, a),
   testRun: (definition, input, a, workflowId) => post('/v1/workflows/test-run', { definition, input: input ?? {}, ...(workflowId ? { workflowId } : {}) }, a),
   executions: (params, a) => {
     const qs = new URLSearchParams();

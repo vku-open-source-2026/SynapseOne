@@ -8,6 +8,11 @@ Use when taking SynapseOne off your laptop. Every item already has a mechanism â
       identical on gateway + IAM; production boot fails on defaults).
 - [ ] Same `SYNAPSEONE_INTERNAL_SECRET` on gateway + iam + workflow, then remove the
       `ports:` of IAM/workflow from host/internet (gateway only is public).
+- [ ] Workflow execution is queue-backed: keep `QUEUE_SERVICE_URL` reachable,
+      `WORKFLOW_EXECUTION_MODE=queue` (or `auto`) and at least one worker
+      (`WORKFLOW_WORKER_ENABLED=true` or a self-hosted runner). See
+      [workflow-runners.md](workflow-runners.md). A queue-down deployment fails
+      closed instead of silently running inline.
 - [ ] `IAM_ALLOW_DEV_LOGIN=false` (password login, SSO and API keys only â€” passwordless dev login is off).
 - [ ] `IAM_ALLOW_OIDC_DEMO_CALLBACK=false` (the demo callback accepts any caller-supplied email).
 - [ ] Random `IAM_API_KEY_PEPPER` (HMAC for at-rest key hashes).

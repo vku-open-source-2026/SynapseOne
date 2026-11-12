@@ -146,6 +146,14 @@ E2E helpers: `bash tests/e2e/api-check.sh`, `node tests/e2e/services-check.js`,
   Postgres branches are exercised only by the Compose e2e stack.
 - **E2E scripts create fixed slugs** (`e2e`, `sdkacc`, `pyfull`); they are not
   rerunnable against a dirty database.
+- **Workflow execution is queue-backed by default.** Triggers create a `queued`
+  execution and publish `{executionId}` to SynapseQueue (`synapseone-wf-platform`
+  / `-custom` / `-shared`). Manual execute returns `202` unless `?wait=1`.
+  The built-in worker runs inside workflow-service; self-hosted runners use the
+  `apps/workflow-runner/Dockerfile` image and the `/v1/runner/jobs/*` claim
+  protocol. Queue delivery is at-least-once; `claimExecutionRec` is the
+  exactly-one-runner guard. Tests stay inline because they do not set
+  `QUEUE_SERVICE_URL`/`NODE_ENV=production`.
 - **Workflow node types are n8n-compatible** (`n8n-nodes-base.*`) plus
   `synapseone.*` nodes and `synapseone.api` operations across IAM, Workflow,
   LDS, Base, Faststore, Queue and Inference. Preserve aliases when touching

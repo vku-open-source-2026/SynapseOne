@@ -11,11 +11,11 @@ import './env-compat';
 import path from 'path';
 import { Pool } from 'pg';
 import { randomUUID } from 'crypto';
-import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, or, sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { isWebhookType, isCronType, normalizeNodeType } from './engine';
-import { credentials, executions, humanTasks, secrets, secretVersions, workflows } from './schema';
+import { credentials, executions, humanTasks, secrets, secretVersions, workflowRunners, workflows } from './schema';
 
 /** Caller principal stamped by the gateway (P0-2). Anonymous when called
  *  directly with only the internal secret (dev/tests). */
@@ -47,7 +47,7 @@ export interface StoredExecution {
   id: string;
   workflow_id: string;
   workflow_name?: string;
-  status: 'success' | 'error' | 'running' | 'paused';
+  status: 'queued' | 'running' | 'success' | 'error' | 'paused' | 'cancelled';
   input: any;
   output: any;
   node_runs: Array<{
@@ -66,8 +66,38 @@ export interface StoredExecution {
   /** Principal snapshot at run time (P0-2/P0-3) + audit actor string. */
   principal?: Principal | null;
   actor?: string | null;
+  /** Queue dispatch metadata (queue execution mode). */
+  queue_name?: string | null;
+  runner?: string | null;
+  worker_id?: string | null;
+  attempt?: number;
+  lease_expires_at?: string | null;
+  workflow_revision?: number | null;
+  resume_node?: string | null;
+  resume_output?: any;
   startedAt: string;
   finishedAt: string;
+}
+
+export type RunnerMode = 'custom' | 'hybrid';
+
+export interface StoredWorkflowRunner {
+  id: string;
+  name: string;
+  mode: RunnerMode;
+  queue: string;
+  org_id?: string | null;
+  account_id?: string | null;
+  api_key_id?: string | null;
+  key_prefix?: string | null;
+  status: 'waiting' | 'connected' | 'stale' | 'disabled';
+  version?: string | null;
+  last_seen_at?: string | null;
+  last_error?: string | null;
+  created_by?: string | null;
+  metadata: Record<string, any>;
+  created_at: string;
+  updated_at: string;
 }
 
 const DATABASE_URL = process.env.DATABASE_URL || '';
@@ -76,7 +106,7 @@ if (DATABASE_URL) {
   pool = new Pool({ connectionString: DATABASE_URL });
   pool.on('error', (e) => console.error('[workflow][db] pool error', (e as any)?.message || e));
 }
-const db = pool ? drizzle(pool, { schema: { credentials, executions, workflows } }) : null;
+const db = pool ? drizzle(pool, { schema: { credentials, executions, workflowRunners, workflows } }) : null;
 
 export function useDb(): boolean {
   return !!db;
@@ -85,6 +115,7 @@ export function useDb(): boolean {
 // ---- in-memory fallback ----
 const memWorkflows = new Map<string, StoredWorkflow>();
 const memExecutions = new Map<string, StoredExecution>();
+const memRunners = new Map<string, StoredWorkflowRunner>();
 // newest-first ordering helper
 const memExecOrder: string[] = [];
 
@@ -111,7 +142,7 @@ export async function ensureTables(): Promise<void> {
     try {
       // Hold the advisory lock on the same dedicated session that runs the
       // migration (pool connections are not guaranteed to be reused).
-      const migrationDb = drizzle(client, { schema: { credentials, executions, workflows } });
+      const migrationDb = drizzle(client, { schema: { credentials, executions, workflowRunners, workflows } });
       await migrationDb.execute(sql`select pg_advisory_lock(hashtext('synapseone_workflow_migrations'))`);
       try {
         await migrate(migrationDb, {
@@ -170,7 +201,11 @@ function rowToExecution(r: typeof executions.$inferSelect): StoredExecution {
     id: String(r.id),
     workflow_id: String(r.workflowId || ''),
     workflow_name: String(r.workflowName || ''),
-    status: r.status === 'error' ? 'error' : r.status === 'running' ? 'running' : r.status === 'paused' ? 'paused' : 'success',
+    status: r.status === 'error' ? 'error'
+      : r.status === 'running' ? 'running'
+        : r.status === 'paused' ? 'paused'
+          : r.status === 'queued' ? 'queued'
+            : r.status === 'cancelled' ? 'cancelled' : 'success',
     input: r.input ?? {},
     output: r.output ?? null,
     node_runs: Array.isArray(r.nodeRuns) ? r.nodeRuns : [],
@@ -178,6 +213,14 @@ function rowToExecution(r: typeof executions.$inferSelect): StoredExecution {
     triggered_by: String(r.triggeredBy || 'manual'),
     principal,
     actor: r.actor != null ? String(r.actor) : null,
+    queue_name: r.queueName != null ? String(r.queueName) : null,
+    runner: r.runner != null ? String(r.runner) : null,
+    worker_id: r.workerId != null ? String(r.workerId) : null,
+    attempt: Number.isFinite(Number(r.attempt)) ? Number(r.attempt) : 0,
+    lease_expires_at: r.leaseExpiresAt ? iso(r.leaseExpiresAt) : null,
+    workflow_revision: r.workflowRevision != null ? Number(r.workflowRevision) : null,
+    resume_node: r.resumeNode != null ? String(r.resumeNode) : null,
+    resume_output: r.resumeOutput ?? null,
     startedAt: iso(r.startedAt),
     finishedAt: iso(r.finishedAt),
   };
@@ -311,7 +354,7 @@ export async function deleteWorkflowRec(id: string): Promise<boolean> {
 export async function createExecutionRec(data: {
   workflow_id: string;
   workflow_name?: string;
-  status: 'success' | 'error' | 'running' | 'paused';
+  status: StoredExecution['status'];
   input: any;
   output: any;
   node_runs: StoredExecution['node_runs'];
@@ -320,8 +363,16 @@ export async function createExecutionRec(data: {
   principal?: Principal | null;
   actor?: string | null;
   startedAt: string;
-  finishedAt: string;
+  finishedAt?: string;
   id?: string;
+  queue_name?: string | null;
+  runner?: string | null;
+  worker_id?: string | null;
+  attempt?: number;
+  lease_expires_at?: string | null;
+  workflow_revision?: number | null;
+  resume_node?: string | null;
+  resume_output?: any;
 }): Promise<StoredExecution> {
   const rec: StoredExecution = {
     id: data.id || randomUUID(),
@@ -335,8 +386,16 @@ export async function createExecutionRec(data: {
     triggered_by: data.triggered_by || 'manual',
     principal: data.principal ?? null,
     actor: data.actor ?? null,
+    queue_name: data.queue_name ?? null,
+    runner: data.runner ?? null,
+    worker_id: data.worker_id ?? null,
+    attempt: data.attempt ?? 0,
+    lease_expires_at: data.lease_expires_at ?? null,
+    workflow_revision: data.workflow_revision ?? null,
+    resume_node: data.resume_node ?? null,
+    resume_output: data.resume_output ?? null,
     startedAt: data.startedAt,
-    finishedAt: data.finishedAt,
+    finishedAt: data.finishedAt || data.startedAt,
   };
   if (db) {
     await ensureTables();
@@ -352,6 +411,14 @@ export async function createExecutionRec(data: {
       triggeredBy: rec.triggered_by,
       principal: rec.principal,
       actor: rec.actor,
+      queueName: rec.queue_name,
+      runner: rec.runner,
+      workerId: rec.worker_id,
+      attempt: rec.attempt ?? 0,
+      leaseExpiresAt: rec.lease_expires_at ? new Date(rec.lease_expires_at) : null,
+      workflowRevision: rec.workflow_revision,
+      resumeNode: rec.resume_node,
+      resumeOutput: rec.resume_output ?? null,
       startedAt: new Date(rec.startedAt),
       finishedAt: new Date(rec.finishedAt),
     }).returning();
@@ -412,8 +479,160 @@ export async function listExecutionRecs(opts: {
   return { items: arr.slice(offset, offset + limit) };
 }
 
-export async function findActiveWebhookWorkflow(path: string): Promise<StoredWorkflow | null> {
-  const clean = String(path || '').replace(/^\/+|\/+$/g, '');
+/** Atomically claim a queued execution (or an expired running lease) for a
+ *  worker. Returns null when another worker already owns it or it finished.
+ *  This is the cross-worker exactly-one-runner guard; the queue itself is
+ *  at-least-once, so duplicates are expected and discarded here. */
+export async function claimExecutionRec(id: string, opts: { workerId: string; leaseSeconds: number }): Promise<StoredExecution | null> {
+  const leaseSeconds = Math.min(Math.max(Number(opts.leaseSeconds) || 300, 15), 3600);
+  const workerId = String(opts.workerId || '').slice(0, 128) || 'worker';
+  const now = new Date();
+  const lease = new Date(now.getTime() + leaseSeconds * 1000);
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(executions).set({
+      status: 'running',
+      workerId,
+      leaseExpiresAt: lease,
+      attempt: sql`${executions.attempt} + 1`,
+      startedAt: sql`case when ${executions.status} = 'queued' then ${now} else ${executions.startedAt} end`,
+      error: null,
+    }).where(and(
+      eq(executions.id, id),
+      or(
+        eq(executions.status, 'queued'),
+        and(eq(executions.status, 'running'), or(isNull(executions.leaseExpiresAt), lt(executions.leaseExpiresAt, now))),
+      ),
+    )).returning();
+    return rows[0] ? rowToExecution(rows[0]) : null;
+  }
+  const cur = memExecutions.get(id);
+  if (!cur) return null;
+  const expired = cur.status === 'running'
+    && (!cur.lease_expires_at || new Date(cur.lease_expires_at).getTime() < now.getTime());
+  if (cur.status !== 'queued' && !expired) return null;
+  const next: StoredExecution = {
+    ...cur,
+    status: 'running',
+    worker_id: workerId,
+    lease_expires_at: lease.toISOString(),
+    attempt: (cur.attempt || 0) + 1,
+    error: null,
+  };
+  memExecutions.set(id, next);
+  return next;
+}
+
+/** Extend the execution lease while a runner is still working. */
+export async function heartbeatExecutionRec(id: string, opts: { workerId: string; leaseSeconds: number }): Promise<StoredExecution | null> {
+  const leaseSeconds = Math.min(Math.max(Number(opts.leaseSeconds) || 300, 15), 3600);
+  const lease = new Date(Date.now() + leaseSeconds * 1000);
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(executions).set({
+      leaseExpiresAt: lease,
+      workerId: String(opts.workerId || '').slice(0, 128) || 'worker',
+    }).where(and(eq(executions.id, id), eq(executions.status, 'running'))).returning();
+    return rows[0] ? rowToExecution(rows[0]) : null;
+  }
+  const cur = memExecutions.get(id);
+  if (!cur || cur.status !== 'running') return null;
+  const next: StoredExecution = { ...cur, lease_expires_at: lease.toISOString() };
+  memExecutions.set(id, next);
+  return next;
+}
+
+/** Put a claimed execution back in the queue after a retryable failure. The
+ *  queue message is nacked separately; the next delivery can claim it again. */
+export async function releaseExecutionRec(id: string, opts: { workerId?: string; error?: string }): Promise<StoredExecution | null> {
+  if (db) {
+    await ensureTables();
+    const conds: any[] = [eq(executions.id, id), eq(executions.status, 'running')];
+    if (opts.workerId) conds.push(eq(executions.workerId, opts.workerId));
+    const rows = await db.update(executions).set({
+      status: 'queued',
+      workerId: null,
+      leaseExpiresAt: null,
+      error: opts.error ? String(opts.error).slice(0, 1000) : null,
+    }).where(and(...conds)).returning();
+    return rows[0] ? rowToExecution(rows[0]) : null;
+  }
+  const cur = memExecutions.get(id);
+  if (!cur || cur.status !== 'running') return null;
+  if (opts.workerId && cur.worker_id && cur.worker_id !== opts.workerId) return null;
+  const next: StoredExecution = {
+    ...cur,
+    status: 'queued',
+    worker_id: null,
+    lease_expires_at: null,
+    error: opts.error ? String(opts.error).slice(0, 1000) : null,
+  };
+  memExecutions.set(id, next);
+  return next;
+}
+
+/** Mark a running execution as paused on a durable human task. */
+export async function pauseExecutionRec(id: string, patch: {
+  output: any;
+  node_runs: StoredExecution['node_runs'];
+  error?: string | null;
+  workerId?: string | null;
+}): Promise<StoredExecution | null> {
+  if (db) {
+    await ensureTables();
+    const conds: any[] = [eq(executions.id, id), eq(executions.status, 'running')];
+    if (patch.workerId) conds.push(eq(executions.workerId, patch.workerId));
+    const rows = await db.update(executions).set({
+      status: 'paused',
+      output: patch.output,
+      nodeRuns: patch.node_runs,
+      error: patch.error ?? null,
+      leaseExpiresAt: null,
+      finishedAt: new Date(),
+    }).where(and(...conds)).returning();
+    return rows[0] ? rowToExecution(rows[0]) : null;
+  }
+  const cur = memExecutions.get(id);
+  if (!cur || cur.status !== 'running') return null;
+  if (patch.workerId && cur.worker_id && cur.worker_id !== patch.workerId) return null;
+  const next: StoredExecution = {
+    ...cur,
+    status: 'paused',
+    output: patch.output,
+    node_runs: patch.node_runs,
+    error: patch.error ?? null,
+    lease_expires_at: null,
+    finishedAt: new Date().toISOString(),
+  };
+  memExecutions.set(id, next);
+  return next;
+}
+
+/** Queued/expired executions the built-in platform worker is allowed to run. */
+export async function listRunnableExecutions(limit = 50, now = new Date()): Promise<StoredExecution[]> {
+  const cap = Math.min(Math.max(Number(limit) || 50, 1), 500);
+  if (db) {
+    await ensureTables();
+    const rows = await db.select().from(executions).where(and(
+      inArray(executions.runner, ['platform', 'hybrid']),
+      isNotNull(executions.queueName),
+      or(
+        eq(executions.status, 'queued'),
+        and(eq(executions.status, 'running'), or(isNull(executions.leaseExpiresAt), lt(executions.leaseExpiresAt, now))),
+      ),
+    )).orderBy(asc(executions.startedAt)).limit(cap);
+    return rows.map(rowToExecution);
+  }
+  const arr = memExecOrder.map((id) => memExecutions.get(id)!).filter(Boolean).filter((e) =>
+    (e.runner === 'platform' || e.runner === 'hybrid')
+    && !!e.queue_name
+    && (e.status === 'queued'
+      || (e.status === 'running' && (!e.lease_expires_at || new Date(e.lease_expires_at).getTime() < now.getTime()))),
+  );
+  return arr.slice(0, cap);
+}
+
+export async function findActiveWebhookWorkflow(path: string): Promise<StoredWorkflow | null> {  const clean = String(path || '').replace(/^\/+|\/+$/g, '');
   if (!clean) return null;
   const all = await listWorkflowRecs();
   for (const w of all) {
@@ -606,6 +825,7 @@ export function __clearCredentials(): void {
   memHumanTasks.clear();
   memSecrets.clear();
   memSecretVersions.clear();
+  memRunners.clear();
 }
 
 export function __clearMem(): void {
@@ -616,6 +836,7 @@ export function __clearMem(): void {
   memHumanTasks.clear();
   memSecrets.clear();
   memSecretVersions.clear();
+  memRunners.clear();
 }
 
 
@@ -867,23 +1088,65 @@ export async function finishExecutionRec(id: string, patch: {
   node_runs: StoredExecution['node_runs'];
   error?: string | null;
   finishedAt: string;
+  workerId?: string | null;
+  allowedStatuses?: StoredExecution['status'][];
 }): Promise<StoredExecution | null> {
+  const allowed = patch.allowedStatuses && patch.allowedStatuses.length
+    ? patch.allowedStatuses
+    : ['running', 'paused'] as StoredExecution['status'][];
   if (db) {
     await ensureTables();
+    const conds: any[] = [eq(executions.id, id), inArray(executions.status, allowed)];
+    if (patch.workerId) conds.push(eq(executions.workerId, patch.workerId));
     const rows = await db.update(executions).set({
       status: patch.status,
       output: patch.output,
       nodeRuns: patch.node_runs,
       error: patch.error ?? null,
+      leaseExpiresAt: null,
       finishedAt: new Date(patch.finishedAt),
-    }).where(eq(executions.id, id)).returning();
+    }).where(and(...conds)).returning();
     return rows[0] ? rowToExecution(rows[0]) : null;
   }
   const cur = memExecutions.get(id);
-  if (!cur) return null;
+  if (!cur || !allowed.includes(cur.status)) return null;
+  if (patch.workerId && cur.worker_id && cur.worker_id !== patch.workerId) return null;
   const next: StoredExecution = {
     ...cur, status: patch.status, output: patch.output, node_runs: patch.node_runs,
-    error: patch.error ?? null, finishedAt: patch.finishedAt,
+    error: patch.error ?? null, lease_expires_at: null, finishedAt: patch.finishedAt,
+  };
+  memExecutions.set(id, next);
+  return next;
+}
+
+/** Put a paused execution back on its queue with a human-decision resume
+ *  checkpoint. The next worker claim picks up `resume_node`/`resume_output`. */
+export async function queueExecutionResume(id: string, patch: {
+  node: string;
+  output: any;
+}): Promise<StoredExecution | null> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(executions).set({
+      status: 'queued',
+      resumeNode: patch.node,
+      resumeOutput: patch.output,
+      workerId: null,
+      leaseExpiresAt: null,
+      error: null,
+    }).where(and(eq(executions.id, id), eq(executions.status, 'paused'))).returning();
+    return rows[0] ? rowToExecution(rows[0]) : null;
+  }
+  const cur = memExecutions.get(id);
+  if (!cur || cur.status !== 'paused') return null;
+  const next: StoredExecution = {
+    ...cur,
+    status: 'queued',
+    resume_node: patch.node,
+    resume_output: patch.output,
+    worker_id: null,
+    lease_expires_at: null,
+    error: null,
   };
   memExecutions.set(id, next);
   return next;
@@ -1124,4 +1387,151 @@ export async function deleteSecretRec(secret: StoredSecret): Promise<boolean> {
 export function __clearSecrets(): void {
   memSecrets.clear();
   memSecretVersions.clear();
+}
+
+// ---------- self-hosted workflow runners ----------
+
+function rowToRunner(r: typeof workflowRunners.$inferSelect): StoredWorkflowRunner {
+  const mode: RunnerMode = r.mode === 'hybrid' ? 'hybrid' : 'custom';
+  const status = r.status === 'connected' || r.status === 'stale' || r.status === 'disabled' ? r.status : 'waiting';
+  return {
+    id: String(r.id),
+    name: String(r.name || ''),
+    mode,
+    queue: String(r.queue || ''),
+    org_id: r.orgId != null ? String(r.orgId) : null,
+    account_id: r.accountId != null ? String(r.accountId) : null,
+    api_key_id: r.apiKeyId != null ? String(r.apiKeyId) : null,
+    key_prefix: r.keyPrefix != null ? String(r.keyPrefix) : null,
+    status,
+    version: r.version != null ? String(r.version) : null,
+    last_seen_at: r.lastSeenAt ? iso(r.lastSeenAt) : null,
+    last_error: r.lastError != null ? String(r.lastError) : null,
+    created_by: r.createdBy != null ? String(r.createdBy) : null,
+    metadata: r.metadata && typeof r.metadata === 'object' ? r.metadata : {},
+    created_at: iso(r.createdAt),
+    updated_at: iso(r.updatedAt),
+  };
+}
+
+export async function createRunnerRec(data: {
+  id?: string;
+  name: string;
+  mode: RunnerMode;
+  queue: string;
+  org_id?: string | null;
+  account_id?: string | null;
+  api_key_id?: string | null;
+  key_prefix?: string | null;
+  created_by?: string | null;
+  metadata?: Record<string, any>;
+}): Promise<StoredWorkflowRunner> {
+  const rec: StoredWorkflowRunner = {
+    id: data.id || randomUUID(),
+    name: data.name,
+    mode: data.mode === 'hybrid' ? 'hybrid' : 'custom',
+    queue: data.queue,
+    org_id: cleanTenant(data.org_id),
+    account_id: cleanTenant(data.account_id),
+    api_key_id: cleanTenant(data.api_key_id),
+    key_prefix: cleanTenant(data.key_prefix),
+    status: 'waiting',
+    version: null,
+    last_seen_at: null,
+    last_error: null,
+    created_by: cleanTenant(data.created_by),
+    metadata: data.metadata && typeof data.metadata === 'object' ? data.metadata : {},
+    created_at: nowIso(),
+    updated_at: nowIso(),
+  };
+  if (db) {
+    await ensureTables();
+    const rows = await db.insert(workflowRunners).values({
+      id: rec.id,
+      name: rec.name,
+      mode: rec.mode,
+      queue: rec.queue,
+      orgId: rec.org_id,
+      accountId: rec.account_id,
+      apiKeyId: rec.api_key_id,
+      keyPrefix: rec.key_prefix,
+      status: rec.status,
+      createdBy: rec.created_by,
+      metadata: rec.metadata,
+    }).returning();
+    return rowToRunner(rows[0]);
+  }
+  memRunners.set(rec.id, rec);
+  return rec;
+}
+
+export async function getRunnerRec(id: string): Promise<StoredWorkflowRunner | null> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.select().from(workflowRunners).where(eq(workflowRunners.id, id)).limit(1);
+    return rows[0] ? rowToRunner(rows[0]) : null;
+  }
+  return memRunners.get(id) || null;
+}
+
+export async function listRunnerRecs(opts: { orgId?: string; accountId?: string; limit?: number } = {}): Promise<StoredWorkflowRunner[]> {
+  const limit = Math.min(Math.max(opts.limit ?? 100, 1), 200);
+  if (db) {
+    await ensureTables();
+    const conds: any[] = [];
+    if (opts.orgId) conds.push(eq(workflowRunners.orgId, opts.orgId));
+    if (opts.accountId) conds.push(eq(workflowRunners.accountId, opts.accountId));
+    const rows = await db.select().from(workflowRunners)
+      .where(conds.length ? and(...conds) : undefined)
+      .orderBy(desc(workflowRunners.createdAt))
+      .limit(limit);
+    return rows.map(rowToRunner);
+  }
+  let arr = [...memRunners.values()];
+  if (opts.orgId) arr = arr.filter((r) => r.org_id === opts.orgId);
+  if (opts.accountId) arr = arr.filter((r) => r.account_id === opts.accountId);
+  return arr.sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, limit);
+}
+
+export async function heartbeatRunnerRec(id: string, patch: {
+  version?: string | null;
+  status?: 'waiting' | 'connected' | 'stale' | 'disabled';
+  lastError?: string | null;
+  metadata?: Record<string, any>;
+}): Promise<StoredWorkflowRunner | null> {
+  const now = new Date();
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(workflowRunners).set({
+      status: patch.status || 'connected',
+      version: patch.version !== undefined ? (patch.version ? String(patch.version).slice(0, 64) : null) : undefined,
+      lastSeenAt: now,
+      lastError: patch.lastError !== undefined ? (patch.lastError ? String(patch.lastError).slice(0, 1000) : null) : undefined,
+      metadata: patch.metadata ?? undefined,
+      updatedAt: now,
+    }).where(eq(workflowRunners.id, id)).returning();
+    return rows[0] ? rowToRunner(rows[0]) : null;
+  }
+  const cur = memRunners.get(id);
+  if (!cur) return null;
+  const next: StoredWorkflowRunner = {
+    ...cur,
+    status: patch.status || 'connected',
+    version: patch.version !== undefined ? (patch.version ? String(patch.version).slice(0, 64) : null) : cur.version,
+    last_seen_at: now.toISOString(),
+    last_error: patch.lastError !== undefined ? (patch.lastError ? String(patch.lastError).slice(0, 1000) : null) : cur.last_error,
+    metadata: patch.metadata ?? cur.metadata,
+    updated_at: now.toISOString(),
+  };
+  memRunners.set(id, next);
+  return next;
+}
+
+export async function deleteRunnerRec(id: string): Promise<boolean> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.delete(workflowRunners).where(eq(workflowRunners.id, id)).returning({ id: workflowRunners.id });
+    return rows.length > 0;
+  }
+  return memRunners.delete(id);
 }

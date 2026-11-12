@@ -204,6 +204,16 @@ services:
       WORKFLOW_CRON_TICK_MS: ${WORKFLOW_CRON_TICK_MS:-15000}
       WORKFLOW_TIMEOUT_MS: ${WORKFLOW_TIMEOUT_MS:-60000}
       INFERENCE_TIMEOUT_MS: ${INFERENCE_TIMEOUT_MS:-120000}
+      # Queue-backed execution: triggers publish a job, workers run the DAG.
+      QUEUE_SERVICE_URL: ${QUEUE_SERVICE_URL:-http://queue:4007}
+      WORKFLOW_EXECUTION_MODE: ${WORKFLOW_EXECUTION_MODE:-queue}
+      WORKFLOW_WORKER_ENABLED: ${WORKFLOW_WORKER_ENABLED:-true}
+      WORKFLOW_WORKER_CONCURRENCY: ${WORKFLOW_WORKER_CONCURRENCY:-4}
+      WORKFLOW_WORKER_POLL_MS: ${WORKFLOW_WORKER_POLL_MS:-500}
+      WORKFLOW_QUEUE_VISIBILITY_SECONDS: ${WORKFLOW_QUEUE_VISIBILITY_SECONDS:-300}
+      WORKFLOW_QUEUE_MAX_ATTEMPTS: ${WORKFLOW_QUEUE_MAX_ATTEMPTS:-5}
+      SYNAPSEONE_PUBLIC_URL: ${SYNAPSEONE_PUBLIC_URL:-https://api.synapseone.space}
+      WORKFLOW_RUNNER_IMAGE: ${WORKFLOW_RUNNER_IMAGE:-ghcr.io/vku-open-source-2026/synapseone-workflow-runner:latest}
     ports:
       - "${WORKFLOW_HOST_PORT:-4002}:4002"
     healthcheck:
@@ -216,6 +226,8 @@ services:
       postgres:
         condition: service_healthy
       iam:
+        condition: service_healthy
+      queue:
         condition: service_healthy
     networks: [synapseone-net]
 

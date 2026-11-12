@@ -19,6 +19,22 @@ const stamp = Date.now().toString(36);
 const login = await c.iam.login(`vector-sre-${stamp}@acme.local`);
 c.setToken(login.accessToken);
 
+async function waitExecution(id, timeoutMs = 60000) {
+  const deadline = Date.now() + timeoutMs;
+  let body = null;
+  while (Date.now() < deadline) {
+    const r = await fetch(`${BASE_URL}/v1/executions/${encodeURIComponent(id)}?includeData=true`, {
+      headers: { Authorization: `Bearer ${login.accessToken}` },
+    });
+    if (r.ok) {
+      body = await r.json();
+      if (!['queued', 'running'].includes(body.status)) return body;
+    }
+    await new Promise((res) => setTimeout(res, 500));
+  }
+  return body;
+}
+
 const kbCollection = `kb_rag_${stamp}`;
 const webhookPath = `rag-triage-${stamp}`;
 
@@ -187,10 +203,14 @@ try {
       incidentId: `inc-sso-live-${stamp}`,
     }),
   });
-  assert.equal(ssoWebhookRes.status, 200, 'Webhook call failed');
+  assert.ok([200, 202].includes(ssoWebhookRes.status), 'Webhook call failed');
   const ssoExec = await ssoWebhookRes.json();
   console.log(`Webhook result ok: ${ssoExec.ok}, executionId: ${ssoExec.executionId}`);
   assert.equal(ssoExec.ok, true);
+  if (ssoExec.queued) {
+    const done = await waitExecution(ssoExec.executionId);
+    assert.equal(done?.status, 'success', `queued run failed: ${done?.error || 'timeout'}`);
+  }
 
   // Verify Faststore cached key created by CacheResult node
   console.log('[6.1] Verifying Faststore cache key created by workflow...');
@@ -214,10 +234,14 @@ try {
       incidentId: `inc-escalate-${stamp}`,
     }),
   });
-  assert.equal(escalateWebhookRes.status, 200, 'Webhook call failed');
+  assert.ok([200, 202].includes(escalateWebhookRes.status), 'Webhook call failed');
   const escExec = await escalateWebhookRes.json();
   console.log(`Escalation webhook result ok: ${escExec.ok}, executionId: ${escExec.executionId}`);
   assert.equal(escExec.ok, true);
+  if (escExec.queued) {
+    const done = await waitExecution(escExec.executionId);
+    assert.equal(done?.status, 'success', `queued run failed: ${done?.error || 'timeout'}`);
+  }
 
   // Verify escalation cache record
   const escCacheVal = await c.faststore.get(`rag:incident:inc-escalate-${stamp}`);

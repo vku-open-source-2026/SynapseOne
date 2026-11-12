@@ -297,16 +297,17 @@ Deactivation sets `active:false`, revokes refresh tokens and API keys.
   explicit org/account must stay inside the caller's own org, else `403 cross_tenant`;
   every create stamps `owner` from the caller)
 - `PUT /v1/workflows/:id {name?, definition?, settings?, orgId?, accountId?, runAs?}` (structural/SSRF/size/cycle-validated, ≤200KB, ≤50 nodes, every node needs a 1..128 char `name`; every update bumps `revision`)
-- `POST /v1/workflows/:id/execute {input}` (manual run — works for ANY trigger type, active or not; the body IS the input; returns `{ok, output, executionId, status}`; `500 {ok:false, error}` when a node fails; records the caller principal + `actor: "workflow:<id> principal:<sub>"`)
-- `POST /v1/workflows/test-run {definition, input, workflowId?}` (try a definition without saving; validates + executes in the sandbox; persisted as a `triggered_by=test` execution — pass `workflowId` to attach it to that workflow's history; returns `{ok, output, nodeRuns, executionId}`)
-- `GET /v1/executions` (`limit,offset,workflowId,status,triggeredBy,includeData`; `limit/offset` 0..9999, `offset=0` = first page; `triggeredBy` is `manual|webhook|cron|test`; secret-looking keys in payloads are masked to `***`; always returns the envelope `{data: [...]}` — SDKs/Console/CLI unwrap `.data` and also accept a bare array) / `GET /v1/executions/:id` (`?includeData=true` for per-node input/output; also carries `principal` + `actor`)
+- `POST /v1/workflows/:id/execute {input}` (manual run — works for ANY trigger type, active or not; the body IS the input). With queue transport enabled (default when `QUEUE_SERVICE_URL` is set) this returns `202 {ok, queued:true, executionId, queue, runner}` after publishing a SynapseQueue job; add `?wait=1&timeoutMs=60000` for the old blocking shape `{ok, output, executionId, status}`. `500 {ok:false, error}` when a node fails. Records the caller principal + `actor: "workflow:<id> principal:<sub>"`.)
+- `POST /v1/workflows/test-run {definition, input, workflowId?}` (try a definition without saving; validates + executes inline in the sandbox; persisted as a `triggered_by=test` execution — pass `workflowId` to attach it to that workflow's history; returns `{ok, output, nodeRuns, executionId}`)
+- `GET /v1/executions` (`limit,offset,workflowId,status,triggeredBy,includeData`; `limit/offset` 0..9999, `offset=0` = first page; `status` is `queued|running|paused|success|error|cancelled`; `triggeredBy` is `manual|webhook|cron|test|human-task|workflow`; secret-looking keys in payloads are masked to `***`; always returns the envelope `{data: [...]}` — SDKs/Console/CLI unwrap `.data` and also accept a bare array) / `GET /v1/executions/:id` (`?includeData=true` for per-node input/output; also carries `principal`, `actor`, `queue`, `runner`, `workerId`, `attempt`, `leaseExpiresAt`, `workflowRevision`)
 - `GET/POST/DELETE /v1/credentials[?accountId=]` (account-scoped secrets, AES-256-GCM at rest via `SYNAPSEONE_CREDENTIAL_KEY`; list/create return metadata only, never secrets; duplicate names per account are `409`)
 - Public inbound webhooks: `ANY /webhook/:path` triggers the ACTIVE workflow whose webhook node declares that `path` (also proxied at the gateway as `/webhook`, auth none — per-workflow auth below still applies):
   ```bash
   curl -X POST http://localhost:4002/webhook/transform \
     -H 'Content-Type: application/json' \
     -d '{"value":21}'
-  # → {ok, output, executionId}
+  # → {ok, queued:true, executionId, queue}   (queue mode)
+  # → {ok, output, executionId}               (inline mode / ?wait=1)
   ```
   Per-workflow hardening from the webhook node's params: `auth` (`none` |
   `secret-header` | `hmac-sha256` over the raw body | `jwt` HS256 with exp/nbf +
@@ -354,6 +355,60 @@ update bumps `revision`. Export/import via the Console (portable
 `{name, nodes, connections, settings}` JSON) or the raw API payloads.
 
 Execution semantics: non-`if` nodes fan out to every branch; a diamond (`A→B, A→C, B→D, C→D`) runs `D` once per incoming edge with that edge's data. With several terminal nodes the final `output` is keyed by terminal node name (`{Left: …, Right: …}`); with one terminal it is that node's output directly. Per-node `nodeRuns[]` carry `status` (`success|error|skipped`), `input`, `output`, `error`, `durationMs`, `attempts?`.
+
+### Queue transport and self-hosted runners
+
+Triggers (manual, webhook, cron, human-task resume) create a `queued`
+execution row and publish a tiny `{v,kind:"workflow.run",executionId}` message
+to SynapseQueue. Inputs and definitions stay in Postgres; workers fetch them
+after an authenticated claim. Queue delivery is at-least-once and
+`POST /v1/runner/jobs/:id/claim` is the exactly-one-runner guard.
+
+Per-workflow mode (`settings.execution.mode`, also accepted as
+`settings.runner`):
+
+| Mode | Queue | Who runs it |
+| --- | --- | --- |
+| `platform` (default) | `synapseone-wf-platform` (`WORKFLOW_QUEUE_PLATFORM`) | Built-in worker in workflow-service (`WORKFLOW_WORKER_ENABLED=true`) |
+| `custom` | `synapseone-wf-custom` (`WORKFLOW_QUEUE_CUSTOM`) | A tenant-deployed runner |
+| `hybrid` | `synapseone-wf-shared` (`WORKFLOW_QUEUE_SHARED`) | Platform worker + tenant runners compete |
+| `inline` | — | Runs in the request (dev/test, nested calls) |
+
+`settings.execution.queue` overrides the queue name (1..64 chars,
+`[A-Za-z][A-Za-z0-9_-]*`) to dedicate a runner. `maxAttempts` and
+`visibilityTimeoutSeconds` are also read from `settings.execution`.
+
+Runner management (JWT or a runner-scoped API key):
+
+- `POST /v1/workflow-runners {name, mode?, queue?, apiKeyId?, keyPrefix?, scopes?, apiKey?}`
+  → `{runner, queue, scopes, command}`. Default key scopes:
+  `workflow:*,queue:*,*:read,base:query,base:vector-search,inference:*`.
+  `command` is a copy-paste `docker run` with the API key **when the caller
+  passes `apiKey`**; the key is echoed only in this response and never stored.
+- `GET /v1/workflow-runners`, `GET /v1/workflow-runners/:id`,
+  `DELETE /v1/workflow-runners/:id`
+- `GET /v1/workflow-runners/:id/config` (runner bootstrap: queue/mode/base URL)
+- `POST /v1/workflow-runners/:id/heartbeat` (runner liveness)
+- `GET /v1/workflow-runners/:id/connection`
+  → `{connected, status: wait|connected|stale, lastSeenAt, ageSeconds, queue, mode, version}`
+  (connected = heartbeat within 60s)
+- `POST /v1/workflow-runners/:id/command {apiKey?}` (render the command later)
+
+Runner job protocol (API key + `X-Workflow-Runner-Id`):
+
+- `POST /v1/runner/jobs/:id/claim {runnerId, leaseSeconds}` → job snapshot
+  `{executionId, workflow, input, principal, triggeredBy, attempt, leaseExpiresAt, resumeFrom}`;
+  `409 not_claimable` when another worker owns it.
+- `POST /v1/runner/jobs/:id/heartbeat {runnerId, leaseSeconds}` (extends the DB lease)
+- `POST /v1/runner/jobs/:id/complete {runnerId, status: success|error|paused, output, nodeRuns, error?, pause?}`
+- `POST /v1/runner/jobs/:id/release {runnerId, error?}` (retryable failure; nack the queue message)
+- `POST /v1/runner/jobs/:id/credentials {runnerId, credentialId}`
+  → `{kind, secret}` for exactly this claimed execution. Custom runners hold
+  plaintext credentials only in memory for that run.
+
+The published image is `ghcr.io/<owner>/synapseone-workflow-runner:<tag>`
+(also built as `:main` on CD). See [`workflow-runners.md`](workflow-runners.md)
+for the operational guide.
 
 ## Linked Data (SynapseLDS — `lds-service:4004`, gateway `/v1/lds`)
 

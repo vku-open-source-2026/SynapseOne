@@ -215,6 +215,19 @@ function parse(argv) {
     else if (a.startsWith('--workflow-id=')) opts.workflow = a.slice(14);
     else if (a === '--include-data' || a === '--includeData') opts.includeData = 'true';
     else if (a.startsWith('--include-data=')) opts.includeData = a.slice(15);
+    else if (a === '--wait') opts.wait = true;
+    else if (a === '--timeout') opts.timeout = argv[++i];
+    else if (a.startsWith('--timeout=')) opts.timeout = a.slice(10);
+    else if (a === '--account') opts.account = argv[++i];
+    else if (a.startsWith('--account=')) opts.account = a.slice(10);
+    else if (a === '--mode') opts.mode = argv[++i];
+    else if (a.startsWith('--mode=')) opts.mode = a.slice(7);
+    else if (a === '--queue') opts.queue = argv[++i];
+    else if (a.startsWith('--queue=')) opts.queue = a.slice(8);
+    else if (a === '--scopes') opts.scopes = argv[++i];
+    else if (a.startsWith('--scopes=')) opts.scopes = a.slice(9);
+    else if (a === '--runner-key') opts.runnerKey = argv[++i];
+    else if (a.startsWith('--runner-key=')) opts.runnerKey = a.slice(13);
     else if (a.startsWith('--includeData=')) opts.includeData = a.slice(14);
     else if (a === '--path') opts.path = argv[++i];
     else if (a.startsWith('--path=')) opts.path = a.slice(7);
@@ -664,7 +677,7 @@ async function cmdWorkflows(o) {
       const raw = readJson(o.file);
       payload = raw && raw.input !== undefined ? raw.input : raw;
     }
-    return out(await POST(`/v1/workflows/${encodeURIComponent(rest[0])}/execute`, payload, o), o);
+    return out(await POST(`/v1/workflows/${encodeURIComponent(rest[0])}/execute${o.wait ? `?wait=1&timeoutMs=${encodeURIComponent(o.timeout || 60000)}` : ''}`, payload, o), o);
   }
   if (sub === 'test-run' || sub === 'testrun' || sub === 'try') {
     // Try a definition without saving: POST /v1/workflows/test-run {definition, input}.
@@ -702,8 +715,41 @@ async function cmdWorkflows(o) {
   }
   throw new Error(`unknown workflows subcommand '${sub}'`);
 }
-async function cmdTemplates(o) {
+async function cmdRunners(o) {
   const [sub, ...rest] = o._;
+  if (!sub || sub === 'list') {
+    const r = await GET('/v1/workflow-runners', o);
+    return out(Array.isArray(r) ? r : r.data || r, o, ['id', 'name', 'mode', 'queue', 'status']);
+  }
+  if (sub === 'create') {
+    need(o.name, '--name');
+    if (!o.account) throw new Error('runners create needs --account <account-id> (runner API keys are account-scoped)');
+    const mode = o.mode === 'hybrid' ? 'hybrid' : 'custom';
+    const scopes = (o.scopes || 'workflow:*,queue:*,*:read,base:query,base:vector-search,inference:*')
+      .split(',').map((s) => s.trim()).filter(Boolean);
+    // Mint the runner key (plaintext returned once) then register the runner.
+    const key = await POST(`/v1/accounts/${encodeURIComponent(o.account)}/keys`, {
+      name: `workflow-runner-${String(o.name).slice(0, 80)}`,
+      scopes,
+    }, o);
+    const reg = await POST('/v1/workflow-runners', {
+      name: o.name, mode, ...(o.queue ? { queue: o.queue } : {}),
+      apiKeyId: key.id, keyPrefix: key.prefix, apiKey: key.apiKey, scopes,
+    }, o);
+    return out({ runner: reg.runner, apiKey: key.apiKey, command: reg.command }, o);
+  }
+  if (sub === 'get' || sub === 'connection' || sub === 'command' || sub === 'delete') {
+    need(rest[0], 'runner-id');
+    const id = encodeURIComponent(rest[0]);
+    if (sub === 'get') return out(await GET(`/v1/workflow-runners/${id}`, o), o);
+    if (sub === 'connection') return out(await GET(`/v1/workflow-runners/${id}/connection`, o), o);
+    if (sub === 'command') return out(await POST(`/v1/workflow-runners/${id}/command`, o.runnerKey ? { apiKey: o.runnerKey } : {}, o), o);
+    return out(await DEL(`/v1/workflow-runners/${id}`, o), o);
+  }
+  throw new Error(`unknown runners subcommand '${sub}'`);
+}
+
+async function cmdTemplates(o) {  const [sub, ...rest] = o._;
   if (sub && sub !== 'list') {
     return out(await GET(`/v1/templates/${encodeURIComponent(sub)}`, o), o);
   }
@@ -1087,7 +1133,8 @@ const COMMANDS = {
   sa: { fn: cmdSa, use: 'sa <account> [list] | sa create <account> <slug> | sa token <sa-id> | sa roles <sa-id> | sa grant <sa-id> <role-id> | sa revoke-role <sa-id> <role-id>', doc: 'Service accounts + their roles' },
   credentials: { fn: cmdCredentials, use: 'credentials create <account> --name N --type bearer|basic|apiKey|oauth2 (--secret S | --secret-file F) [--expires-at ISO] | credentials [list] <account> | credentials get|delete <id> | credentials rotate <id> (--secret S | --secret-file F)', doc: 'Account credentials, secrets write-only (PROPOSED: backend in progress)' },
   call: { fn: cmdCall, use: 'call <METHOD> <path> [--data \'{...}\'|body.json] [--file body.json]', doc: 'Generic gateway call (escape hatch for new endpoints)' },
-  workflows: { fn: cmdWorkflows, use: 'workflows [list] | workflows create --template T [--name N] | workflows create --file def.json [--name N] | workflows get|activate|deactivate <id> | workflows exec|execute <id> [--data \'{...}\'|input.json] [--file payload.json] | workflows update [--name N] [--file def.json] <id> | workflows delete <id> | workflows test-run --file def.json [--input input.json|\'{...}\'] [--workflow-id ID]', doc: 'Workflows (local engine)' },
+  workflows: { fn: cmdWorkflows, use: 'workflows [list] | workflows create --template T [--name N] | workflows create --file def.json [--name N] | workflows get|activate|deactivate <id> | workflows exec|execute <id> [--data \'{...}\'|input.json] [--file payload.json] [--wait] [--timeout MS] | workflows update [--name N] [--file def.json] <id> | workflows delete <id> | workflows test-run --file def.json [--input input.json|\'{...}\'] [--workflow-id ID]', doc: 'Workflows (local engine)' },
+  runners: { fn: cmdRunners, use: 'runners [list] | runners create --name N --account ID [--mode custom|hybrid] [--queue Q] [--scopes S] | runners get|connection|command|delete <id>', doc: 'Self-hosted workflow runners (queue workers)' },
   executions: { fn: cmdExecutions, use: 'executions [list] [--limit N] [--offset N] [--workflow-id ID] [--status success|error|running] [--triggered-by manual|webhook|cron|test] [--include-data] | executions <id> [--include-data]', doc: 'Workflow executions ({data:[]} envelope)' },
   webhook: { fn: cmdWebhook, use: 'webhook <path> [--data \'{...}\'|payload.json] [--file payload.json] [--method POST] [--base http://localhost:4002]', doc: 'Fire a public inbound webhook (no auth; --base = workflow origin)' },
   templates: { fn: cmdTemplates, use: 'templates [list|<name>]', doc: 'Built-in templates' },

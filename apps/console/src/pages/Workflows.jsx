@@ -5,6 +5,7 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
 import React, { useEffect, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useAuth } from '../lib/auth.jsx';
 import { api } from '../lib/api.js';
 import { Badge, Btn, Card, Code, Empty, Err, Field, Input, ListSkeleton, Modal, PageTitle, Spinner, Table, TableSkeleton } from '../components/ui.jsx';
@@ -33,6 +34,9 @@ export default function Workflows() {
   const [execMore, setExecMore] = useState(false);
   const [execBusy, setExecBusy] = useState(false);
   const [execStatus, setExecStatus] = useState('');
+  const [runnerMode, setRunnerMode] = useState('platform');
+  const [runnerQueue, setRunnerQueue] = useState('');
+  const [runnerBusy, setRunnerBusy] = useState(false);
   const EXEC_PAGE = 20;
 
   const execQuery = (id, offset) => ({
@@ -56,6 +60,35 @@ export default function Workflows() {
   const [expandedNode, setExpandedNode] = useState(null);
   const selSeq = useRef(0);
   const selRef = useRef(null);
+
+  useEffect(() => {
+    if (!detail) return;
+    const execution = detail.settings && typeof detail.settings === 'object' && detail.settings.execution && typeof detail.settings.execution === 'object'
+      ? detail.settings.execution
+      : {};
+    const mode = String(execution.mode || detail.settings?.runner || 'platform').toLowerCase();
+    setRunnerMode(['platform', 'custom', 'hybrid', 'inline'].includes(mode) ? mode : 'platform');
+    setRunnerQueue(String(execution.queue || ''));
+  }, [detail?.id, detail?.revision]);
+
+  const saveRunnerSettings = async () => {
+    if (!sel || !detail || runnerBusy) return;
+    setRunnerBusy(true);
+    setDetailErr(null);
+    try {
+      const settings = { ...(detail.settings || {}) };
+      const execution = { ...(settings.execution || {}), mode: runnerMode };
+      if (runnerQueue.trim()) execution.queue = runnerQueue.trim();
+      else delete execution.queue;
+      settings.execution = execution;
+      const updated = await api.updateWorkflow(sel, { settings }, headers);
+      setDetail(updated);
+    } catch (e) {
+      setDetailErr(e);
+    } finally {
+      setRunnerBusy(false);
+    }
+  };
 
   // Webhook trigger + cron summary for the detail header (M7/M8).
   const webhookTrigger = (() => {
@@ -275,7 +308,7 @@ export default function Workflows() {
       setDetailErr(new Error('Execute input is not valid JSON'));
       return;
     }
-    const r = await doAction(() => api.executeWorkflow(sel, input, headers), 'Executed');
+    const r = await doAction(() => api.executeWorkflowWait(sel, input, headers, 60000), 'Executed');
     if (!r) return;
     reloadExecs(sel);
     // Pull the fresh execution so per-node input/output shows immediately.
@@ -509,6 +542,29 @@ export default function Workflows() {
                   Export
                 </button>
               </div>
+              <div className="mb-3 p-3 rounded-2xl border border-slate-200 bg-slate-50">
+                <div className="flex flex-wrap items-end gap-2">
+                  <div className="min-w-[180px]">
+                    <label className="block text-[11px] text-normal-text mb-1">Execution runner</label>
+                    <select value={runnerMode} onChange={(e) => setRunnerMode(e.target.value)} className="w-full px-3 py-1.5 rounded-xl border border-slate-200 text-xs bg-white outline-none">
+                      <option value="platform">SynapseOne platform worker</option>
+                      <option value="custom">Self-hosted runner (custom queue)</option>
+                      <option value="hybrid">Hybrid (platform + self-hosted share queue)</option>
+                      <option value="inline">Inline (bypass queue)</option>
+                    </select>
+                  </div>
+                  <div className="flex-1 min-w-[180px]">
+                    <label className="block text-[11px] text-normal-text mb-1">Queue override (optional)</label>
+                    <input value={runnerQueue} onChange={(e) => setRunnerQueue(e.target.value)} placeholder="synapseone-wf-custom" spellCheck={false} className="w-full px-3 py-1.5 rounded-xl border border-slate-200 text-xs font-mono bg-white outline-none" />
+                  </div>
+                  <button onClick={saveRunnerSettings} disabled={runnerBusy} className="px-3 py-1.5 rounded-xl text-xs font-medium bg-slate-200 text-main-text disabled:opacity-60">
+                    {runnerBusy ? 'Saving…' : 'Save runner'}
+                  </button>
+                </div>
+                <p className="text-[11px] text-normal-text mt-1">
+                  Triggers publish a SynapseQueue job; platform/custom workers consume it. <Link className="text-main-blue" to="/workflow-runners">Create a self-hosted runner</Link> to get a copy-paste command with its API key.
+                </p>
+              </div>
               <Field label="Execute input (JSON)">
                 <textarea
                   value={execInput}
@@ -527,7 +583,7 @@ export default function Workflows() {
                 {actionBusy && <Spinner size="xs" className="sdx-spinner-on-dark" />}
                 {actionBusy ? 'Running…' : 'Execute'}
               </button>
-              <p className="text-[11px] text-normal-text mb-3">Execute runs the DAG now with this input, any trigger type, active or not. Activate only gates cron + public webhooks.</p>
+              <p className="text-[11px] text-normal-text mb-3">Execute queues a run with this input (any trigger type, active or not) and waits up to 60s; slower runs stay queued/running in history. Activate only gates cron + public webhooks.</p>
               {actionOut && (
                 <div className="mb-3">
                   <Badge tone="blue">{actionOut.label}</Badge>
@@ -540,9 +596,11 @@ export default function Workflows() {
                 <h4 className="font-semibold text-main-text text-sm">Recent executions ({execs.length})</h4>
                 <select value={execStatus} onChange={(e) => applyExecStatus(e.target.value)} title="Filter by status" className="ml-auto px-2 py-1 rounded-xl border border-slate-200 text-xs bg-white outline-none">
                   <option value="">All statuses</option>
+                  <option value="queued">Queued</option>
+                  <option value="running">Running</option>
+                  <option value="paused">Paused</option>
                   <option value="success">Success</option>
                   <option value="error">Error</option>
-                  <option value="running">Running</option>
                 </select>
               </div>
               {execs.length ? (
