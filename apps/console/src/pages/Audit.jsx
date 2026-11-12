@@ -5,6 +5,7 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
 import React, { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useAuth } from '../lib/auth.jsx';
 import { api } from '../lib/api.js';
 import { Badge, Btn, Card, Empty, Err, Input, PageTitle, Table, TableSkeleton } from '../components/ui.jsx';
@@ -41,10 +42,48 @@ export default function Audit() {
     return Number.isNaN(d.getTime()) ? '–' : d.toLocaleString();
   };
 
+  const errCode = err?.body?.error || err?.code;
+  if (['org_admin_required', 'access_denied', 'forbidden'].includes(errCode)) {
+    return (
+      <>
+        <PageTitle title="Audit Log" sub="Every authorize decision, newest first" />
+        <Card className="max-w-2xl">
+          <h3 className="text-lg font-semibold text-main-text">Cần quyền quản trị tổ chức</h3>
+          <p className="text-sm text-normal-text mt-2">
+            Bạn vẫn sử dụng được các tính năng tenant khác, nhưng Audit yêu cầu quyền
+            <strong> Organization Administrator</strong>.
+          </p>
+          <p className="text-sm text-normal-text mt-2">
+            Hãy đăng nhập bằng tài khoản admin của tổ chức, hoặc nhờ admin hiện tại cấp quyền
+            <code className="mx-1 rounded bg-background px-1.5 py-0.5 text-xs">is_org_admin</code>
+            cho tài khoản của bạn.
+          </p>
+          <p className="text-xs text-normal-text mt-3 font-mono">{errCode}</p>
+          <div className="flex flex-wrap gap-2 mt-5">
+            <Link to="/dashboard"><Btn>Về Dashboard</Btn></Link>
+            <Btn kind="secondary" onClick={load} loading={filtering}>Thử lại</Btn>
+          </div>
+        </Card>
+      </>
+    );
+  }
+
+  if (err) {
+    return (
+      <>
+        <PageTitle title="Audit Log" sub="Every authorize decision, newest first" />
+        <Err e={err} />
+        <Card className="max-w-2xl">
+          <p className="text-sm text-normal-text">Không tải được audit. Kiểm tra kết nối hoặc quyền tài khoản rồi thử lại.</p>
+          <Btn kind="secondary" className="mt-4" onClick={load} loading={filtering}>Thử lại</Btn>
+        </Card>
+      </>
+    );
+  }
+
   return (
     <>
       <PageTitle title="Audit Log" sub="Every authorize decision, newest first" />
-      <Err e={err} />
       <div className="flex gap-2 mb-4">
         <Input placeholder="Filter by actor id (user)…" value={actor} onChange={(e) => setActor(e.target.value)} />
         <select value={decision} onChange={(e) => setDecision(e.target.value)} className="px-3 py-2 rounded-2xl border border-slate-200 text-sm bg-white outline-none" title="Decision">
