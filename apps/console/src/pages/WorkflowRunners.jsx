@@ -214,9 +214,10 @@ export default function WorkflowRunners() {
       }, headers);
       runnerId = reg.runner.id;
       const cmd = await api.workflowRunnerCommand(reg.runner.id, key.apiKey, headers);
+      const safeInferenceUrl = inferenceUrl.trim().replace(/'/g, `'\\''`);
       const command = kind === 'workflow'
         ? cmd.command
-        : cmd.command.replace('<YOUR_OPENAI_COMPATIBLE_BASE_URL>', inferenceUrl.trim() || 'http://localhost:8000/v1');
+        : cmd.command.replace("'<YOUR_OPENAI_COMPATIBLE_BASE_URL>'", `'${safeInferenceUrl || 'http://localhost:8000/v1'}'`);
       if (reg.options) applyOptions(reg.options);
       setCreated({ ...reg, command, apiKey: key.apiKey });
       setStep(2);

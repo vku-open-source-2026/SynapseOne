@@ -1448,7 +1448,7 @@ export function runnerCommand(runner: StoredWorkflowRunner, apiKey?: string | nu
   }
   if (runner.kind !== 'workflow') {
     lines.push(`  -e WORKFLOW_RUNNER_INFERENCE_QUEUE=${shQuote(runner.inference_queue || DEFAULT_INFERENCE_QUEUE)} \\`);
-    lines.push('  -e INFERENCE_RUNNER_URL=<YOUR_OPENAI_COMPATIBLE_BASE_URL> \\');
+    lines.push('  -e INFERENCE_RUNNER_URL=\'<YOUR_OPENAI_COMPATIBLE_BASE_URL>\' \\');
   }
   lines.push('  -e WORKFLOW_RUNNER_CONCURRENCY=1 \\');
   lines.push(`  -e WORKFLOW_RUNNER_HEARTBEAT_SECONDS=${runnerHeartbeatSeconds()} \\`);
