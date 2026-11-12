@@ -56,8 +56,8 @@ export function AuthProvider({ children }) {
     [auth],
   );
 
-  const login = useCallback(async (email, orgSlug) => {
-    const r = await api.login(email, orgSlug || 'acme');
+  const login = useCallback(async (email, orgSlug, password) => {
+    const r = await api.login(email, orgSlug || 'acme', password);
     setAuth({ token: r.accessToken, refreshToken: r.refreshToken, user: r.user, email: r.user?.email });
     return r;
   }, []);

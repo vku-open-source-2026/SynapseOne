@@ -16,6 +16,7 @@
 | [troubleshooting.md](troubleshooting.md) | Busy ports, Windows curl, gateway 404s, backup/restore, OIDC errors |
 | [console.md](console.md) | Management UI (run, configure, SSO, frontend dev) |
 | [platform-superadmin.md](platform-superadmin.md) | Platform Super Admin dashboard: bootstrap, MFA, platform admins, rollback |
+| [platform-superadmin-login.md](platform-superadmin-login.md) | Provisioned local Platform Owner: login, MFA, modules, recovery, verification |
 | [ai-assistant.md](ai-assistant.md) | AI testing assistant (agent design, models, limits, chatbot) |
 | [monitoring.md](monitoring.md) | Prometheus (run, targets, alerts, useful queries) |
 | [production.md](production.md) | Production checklist (secrets, TLS, backups, image pinning) |

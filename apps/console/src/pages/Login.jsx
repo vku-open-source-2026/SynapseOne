@@ -15,6 +15,7 @@ import { useI18n } from '../lib/i18n-context.js';
 export default function Login() {
   const [email, setEmail] = useState('demo@acme.local');
   const [org, setOrg] = useState('acme');
+  const [password, setPassword] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [mode, setMode] = useState('email');
   const [err, setErr] = useState(null);
@@ -48,7 +49,7 @@ export default function Login() {
     setErr(null);
     setBusy(true);
     try {
-      if (mode === 'email') await login(email, org || 'acme');
+      if (mode === 'email') await login(email, org || 'acme', password);
       else {
         if (!apiKey) throw new Error(t.enterKey);
         loginWithKey(apiKey);
@@ -135,10 +136,19 @@ export default function Login() {
           {mode === 'email' ? (
             <>
               <Field label={t.email}>
-                <Input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="demo@acme.local" />
+                <Input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="demo@acme.local" autoComplete="username" />
               </Field>
               <Field label={t.org}>
-                <Input value={org} onChange={(e) => setOrg(e.target.value)} placeholder="acme" />
+                <Input value={org} onChange={(e) => setOrg(e.target.value)} placeholder="acme" autoComplete="organization" />
+              </Field>
+              <Field label={t.password}>
+                <Input
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder={t.passwordPlaceholder}
+                  autoComplete="current-password"
+                />
               </Field>
             </>
           ) : (

@@ -110,10 +110,15 @@ organization.
 
 ### Open the dashboard
 
-1. Sign in at `/login` with the platform user.
+1. Sign in at `/login` with the organization slug, email and password. The
+   Console login form supports first-party password sign-in; OIDC is also
+   available when configured.
 2. Open `/security` and enable TOTP MFA (10 recovery codes are shown once).
 3. Open `/admin`; enter a fresh authenticator code.
 4. The Overview page loads platform-wide metadata.
+
+A fully provisioned local account with passwords/TOTP stored outside Git is
+documented in [`platform-superadmin-login.md`](platform-superadmin-login.md).
 
 ### Recovery when the only owner loses MFA
 

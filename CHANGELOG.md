@@ -16,6 +16,17 @@ Format based on Keep a Changelog; versioning follows SemVer.
   `organizations.kind`, `audit_log.org_id` + index, and platform list indexes.
 - `tools/backfill-audit-org.mjs` for the legacy audit context backfill.
 - Docs: `docs/platform-superadmin.md` (bootstrap, MFA, recovery, rollback).
+- Real Platform Owner account provisioned and verified on an isolated local
+  stack: password login, email verification, TOTP MFA, platform session,
+  cross-tenant reads, tenant isolation, step-up and audit. See
+  `docs/platform-superadmin-login.md` (no secrets).
+- Console login now supports first-party email + password (previously dev-only
+  email login); MFA challenge and recovery-code paths are unchanged.
+
+### Fixed
+- `/v1/platform/session` reaches IAM for a normal user JWT instead of being
+  pre-empted by tenant policy enforcement; denied exchanges are audited as
+  `platform:session:exchange` with `decision=false`.
 
 ### Security
 - Gateway scope enforcement now derives the required service from the matched

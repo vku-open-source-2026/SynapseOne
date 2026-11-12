@@ -51,3 +51,6 @@ Desktop.ini
 
 # local admin credentials (never commit)
 .notes/
+
+# local platform super admin credentials (never commit)
+.local/

@@ -26,6 +26,20 @@ Branch: `feature/platform-superadmin`
 - [x] Tests: IAM platform/security, gateway scope/platform, console SSR.
 - [x] Docs: `docs/platform-superadmin.md`, IAM/API/console docs, CHANGELOG,
   env templates, Compose/K8s flags.
+- [x] Real Platform Owner provisioning + verification on an isolated local stack
+  (PostgreSQL container, IAM on 4405, gateway on 48082, static Console on 3001):
+  - `platform.owner@synapseone.local`, org `synapseone-platform`, role `owner`.
+  - Email verified, TOTP MFA enabled, 10 recovery codes (6 unused).
+  - Platform session, six modules, tenant isolation, step-up and audit verified.
+  - Playwright/Chromium browser pass: password login, MFA, all `/admin` modules,
+    a step-up `Reset MFA` action, audit row, and a blocked tenant user.
+  - Credentials only in `.local/platform-superadmin-credentials.txt` (600).
+  - Docs: `docs/platform-superadmin-login.md`.
+- [x] Console login supports first-party email + password (the previous UI only
+  exposed dev login and API keys).
+- [x] Gateway fix: `/v1/platform/session` reaches IAM instead of being denied by
+  tenant policy enforcement; IAM audits denied exchanges. Regression test:
+  `apps/gateway/src/platform-session.test.ts`.
 
 ## Open items / limits
 

@@ -43,6 +43,7 @@ export default function PlatformGuard({ children }) {
 
   const error = localErr || platform.exchangeError;
   const errCode = error?.code;
+  const knownState = ['platform_admin_required', 'platform_admin_inactive', 'platform_mfa_required'].includes(errCode);
 
   return (
     <div className="mx-auto max-w-xl px-4 pt-24">
@@ -57,7 +58,7 @@ export default function PlatformGuard({ children }) {
           </div>
           <Badge tone="amber">MFA</Badge>
         </div>
-        {error && <div className="mt-4"><Err e={error} /></div>}
+        {error && !knownState && <div className="mt-4"><Err e={error} /></div>}
         {errCode === 'platform_mfa_required' && (
           <p className="mt-3 text-sm text-amber-600">
             TOTP MFA must be enabled on your account first. <Link to="/security" className="underline">Open Security</Link>.

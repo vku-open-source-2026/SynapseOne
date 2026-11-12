@@ -143,7 +143,11 @@ function ocsObjectPath(bucket, key) {
 
 export const api = {
   call,
-  login: (email, orgSlug) => post('/v1/auth/login', { email, orgSlug }),
+  login: (email, orgSlug, password) => post('/v1/auth/login', {
+    email,
+    orgSlug,
+    ...(typeof password === 'string' && password.length ? { password } : {}),
+  }),
   verifyMfa: (mfaToken, code, recoveryCode) => post('/v1/auth/mfa/verify', code ? { mfaToken, code } : { mfaToken, recoveryCode }),
   mfaStatus: (auth) => get('/v1/auth/mfa', auth),
   mfaSetup: (auth) => post('/v1/auth/mfa/totp/setup', {}, auth),
