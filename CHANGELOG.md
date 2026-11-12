@@ -22,11 +22,29 @@ Format based on Keep a Changelog; versioning follows SemVer.
   `docs/platform-superadmin-login.md` (no secrets).
 - Console login now supports first-party email + password (previously dev-only
   email login); MFA challenge and recovery-code paths are unchanged.
+- Admin console: secure invite/registration flow, organization account creation,
+  role-aware actions, audit pagination/resource filters, usage pagination and
+  model-token table, step-up dialog fixes, mobile/dark-mode fixes and an admin
+  404 route.
+- IAM migration `0008_shocking_grandmaster.sql`: `platform_step_ups`.
 
 ### Fixed
 - `/v1/platform/session` reaches IAM for a normal user JWT instead of being
   pre-empted by tenant policy enforcement; denied exchanges are audited as
   `platform:session:exchange` with `decision=false`.
+- Platform step-up proofs are now single-use (`jti`), bound to the issuing
+  platform session and one action; replay and cross-action reuse are rejected.
+- The only platform owner can no longer be demoted through
+  `POST /v1/platform/admins`; owner counts exclude inactive user rows.
+- The reserved platform slug is protected from registration/OIDC/direct org
+  creation, and bootstrap refuses a tenant organization with that slug.
+- Platform administrators must belong to a `kind=platform` organization.
+- Invited accounts use one-time activation codes (`/v1/auth/invite/accept`,
+  Console `/register`); email+org alone can no longer claim an existing
+  membership. Bootstrap/org creation/platform grants return `inviteToken` once.
+- Revoking MFA/sessions/disabling an account now also revokes API keys; platform
+  admin revocation clears sessions and keys.
+- Step-up JWTs are rejected as tenant access tokens by the gateway.
 
 ### Security
 - Gateway scope enforcement now derives the required service from the matched

@@ -43,6 +43,7 @@ tenant. Platform calls without a tenant fail with `400 tenant_required`.
 - `POST /v1/auth/register {email, password, orgSlug?, displayName?}` → token set (201).
   A brand-new org is self-service; joining an existing org requires an invitation
   (`403 org_membership_required` otherwise). Password policy: 12–128 chars.
+- `POST /v1/auth/invite/accept {token, password, displayName?}` → activate a one-time invited account and return a session
 - `POST /v1/auth/password/change {currentPassword, newPassword}` → `{ok, revokedSessions}`
 - `POST /v1/auth/password/forgot {email, orgSlug?}` → `202 {ok}` (no account enumeration;
   responses include `resetToken` only when the deployment opts in with
@@ -854,16 +855,18 @@ Tenant JWTs, API keys and service-account tokens are rejected.
 | Method | Route | Description |
 | --- | --- | --- |
 | POST | `/v1/platform/session` | Exchange a normal user JWT + TOTP for a 15-minute platform token. |
-| POST | `/v1/platform/step-up` | Fresh TOTP step-up token for destructive actions (`x-platform-step-up`). |
+| POST | `/v1/platform/step-up` | `{code|recoveryCode, action}` → one-time step-up proof bound to this platform session and action (`x-platform-step-up`). |
 | GET | `/v1/platform/me` | Current platform role, user and MFA state. |
 | GET | `/v1/platform/overview?from&to` | Cross-tenant counts, usage totals and audit signals. |
 | GET | `/v1/platform/orgs?q&limit&offset` | Tenant organizations with counts. |
 | POST | `/v1/platform/orgs` | Create an organization and its first org admin. |
 | GET | `/v1/platform/orgs/:orgId` | Organization detail, accounts and admins. |
+| POST | `/v1/platform/orgs/:orgId/accounts` | Create a tenant account (step-up `org:account:create`). |
 | GET | `/v1/platform/users?q&orgId&active&isOrgAdmin&limit&offset` | Cross-tenant users. |
 | GET | `/v1/platform/users/:userId` | User, roles, policies, MFA and sessions. |
 | PUT | `/v1/platform/users/:userId/org-admin` | Grant/revoke org admin (step-up). |
-| POST | `/v1/platform/users/:userId/reset-mfa` | Reset MFA (step-up). |
+| POST | `/v1/platform/users/:userId/reset-mfa` | Reset MFA and revoke sessions/API keys (step-up). |
+| POST | `/v1/platform/users/:userId/invite` | Re-issue a one-time activation code for a passwordless tenant user (step-up). |
 | POST | `/v1/platform/users/:userId/unlock` | Clear a sign-in lockout. |
 | POST | `/v1/platform/users/:userId/revoke-sessions` | Revoke refresh sessions (step-up). |
 | POST | `/v1/platform/users/:userId/disable` | Deactivate a user (step-up). |
@@ -875,7 +878,9 @@ Tenant JWTs, API keys and service-account tokens are rejected.
 
 Internal bootstrap/recovery endpoints (`/internal/platform/bootstrap`,
 `/internal/platform/recovery`) are reachable only over the service network and
-require separate secrets. See [`platform-superadmin.md`](platform-superadmin.md).
+require the internal service header plus their separate bootstrap/recovery
+secret. They issue/consume one-time activation codes; see
+[`platform-superadmin.md`](platform-superadmin.md).
 
 ## Health / Metrics
 

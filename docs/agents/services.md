@@ -80,10 +80,12 @@ accessors + seed), `src/tokens.ts` (JWT/refresh/API keys), `src/policy.ts`
   `POST /v1/service-accounts/:id/token`.
 - Usage: `POST /v1/usage/ingest` (internal), `GET /v1/usage/summary`,
   `GET /v1/usage/events`.
-- Platform Super Admin: `/v1/platform/session`, `/step-up`, `/me`, `/overview`,
-  `/orgs`, `/users`, `/usage/*`, `/audit`, `/admins`; internal one-time
+- Platform Super Admin: `/v1/platform/session`, `/step-up` (one-time,
+  session/action-bound), `/me`, `/overview`, `/orgs`, `/orgs/:id/accounts`,
+  `/users`, `/usage/*`, `/audit`, `/admins`; internal one-time
   `/internal/platform/bootstrap|recovery`. Requires a `kind=platform-admin`
-  token; see `docs/platform-superadmin.md`.
+  token; invited users activate with `/v1/auth/invite/accept` or Console
+  `/register`. See `docs/platform-superadmin.md`.
 
 **Data:** `organizations`, `accounts`, `users`, `roles`, `policies`,
 `role_policies`, `user_roles`, `api_keys`, `service_accounts`,

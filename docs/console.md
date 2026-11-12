@@ -92,5 +92,7 @@ system but has its own `AdminLayout`, `AdminSidebar`, `AdminTopbar` and
 JWT plus a fresh TOTP code to obtain a short-lived platform token
 (`kind=platform-admin`). The six modules are Overview, Organizations, Users &
 Access, Service Health, Usage, and Audit & Security, plus owner-only Platform
-Admins. Platform tokens are rejected on tenant APIs; API keys cannot open this
-console. See [`platform-superadmin.md`](platform-superadmin.md).
+Admins. Organization creation, account creation, user actions and admin grants
+require a fresh single-use step-up proof. Platform tokens are rejected on tenant
+APIs; API keys cannot open this console. Invited users activate from `/register`.
+See [`platform-superadmin.md`](platform-superadmin.md).

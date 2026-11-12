@@ -130,12 +130,12 @@ credentials file is the single local source of truth).
 
 ### Recovery codes
 
-Ten recovery codes were issued when MFA was enrolled. Codes `01-02` were used
-during provisioning and `03-04` during browser verification; **codes `05-10`
-remain unused**. Each code is single-use and works at:
+A fresh set of **10 unused recovery codes** is stored in the credentials file
+after the final verification pass. Each code is single-use and works at:
 
 - the login MFA challenge ("Use a recovery code"), and
-- the platform step-up dialog.
+- the platform step-up dialog (a proof is bound to the current platform session
+  and to one action).
 
 ### MFA lost, recovery codes lost
 
@@ -147,11 +147,17 @@ docker compose exec -T iam node -e '
 const secret = process.env.PLATFORM_RECOVERY_SECRET;
 fetch("http://localhost:4001/internal/platform/recovery", {
   method: "POST",
-  headers: { "content-type": "application/json", "x-platform-recovery-secret": secret },
+  headers: {
+    "content-type": "application/json",
+    "x-synapseone-internal": process.env.SYNAPSEONE_INTERNAL_SECRET,
+    "x-platform-recovery-secret": secret
+  },
   body: JSON.stringify({ userId: "<platform-user-id>", action: "reset-mfa" })
 }).then(async r => { console.log(r.status, await r.text()); });
 '
 ```
+
+`reset-mfa` and `revoke-sessions` also revoke refresh sessions and API keys.
 
 For this isolated stack, use the IAM port `4405` and run the equivalent
 `fetch("http://127.0.0.1:4405/internal/platform/recovery", ...)` from the host.
@@ -170,8 +176,12 @@ All checks passed:
 
 - One-time bootstrap created the platform organization (`kind=platform`) and
   the first `owner`; a second bootstrap attempt returned `409`.
-- Password registration, email verification, TOTP enrolment (10 recovery
+- One-time invite activation, email verification, TOTP enrolment (10 recovery
   codes), password login and the MFA login challenge succeeded.
+- Step-up proofs are single-use, session-bound and action-bound; replay and
+  cross-action reuse returned `403 platform_step_up_required`.
+- The only owner could not be demoted through `POST /v1/platform/admins`
+  (`409 last_owner`).
 - Platform session exchange returned a platform token with role `owner`.
 - `/v1/platform/me`, `/overview`, `/orgs`, `/users`, `/usage/summary`,
   `/audit` and `/admins` returned real database data.
@@ -182,9 +192,13 @@ All checks passed:
 - The platform token was denied on `/v1/orgs`
   (`403 platform_token_tenant_forbidden`).
 - A destructive action without step-up returned
-  `403 platform_step_up_required`; with step-up it succeeded.
-- Audit rows `platform:org:create` and `platform:user:reset-mfa` were present.
-- Deleting the only owner returned `409 last_owner`.
+  `403 platform_step_up_required`; replaying the same proof was rejected.
+- Audit rows `platform:org:create`, `platform:user:revoke-sessions` and
+  `platform:admin:grant/revoke` were present.
+- Deleting the only owner returned `409 last_owner`; demoting the only owner
+  also returned `409 last_owner`.
+- A one-time invite code worked once, was rejected on replay, and direct
+  email+org registration without a code returned `403 invite_required`.
 
 ### Browser verification (Playwright + Chromium)
 
@@ -198,9 +212,14 @@ All checks passed:
 - Usage and Audit modules rendered real API data.
 - Service Health rendered the gateway readiness probe.
 - Platform Admins listed the owner.
-- A UI "Reset MFA" action required step-up and wrote an audit record.
-- A tenant user could sign in to the tenant console but was blocked from
-  `/admin` with no platform data rendered.
+- A UI "Revoke sessions" action required step-up and wrote an audit record.
+- Organization creation through the UI required step-up and returned a one-time
+  activation code.
+- Platform administrator grant/revoke through the UI required owner + step-up
+  and returned a one-time activation code.
+- The mobile layout, dark theme, admin 404 route and registration route worked.
+- An auditor/tenant user could sign in to the tenant console but was blocked
+  from `/admin` with no platform data rendered.
 
 Screenshots (local only, Git-ignored):
 
@@ -219,12 +238,35 @@ organizations.kind       platform
 platform_admins.role     owner
 platform_admins.revoked  NULL (active)
 user_mfa.enabled         true
-user_mfa.recovery_left   6
+user_mfa.recovery_left   10
+platform_step_ups        active one-time proof table
 ```
 
 Service Health shows the other upstreams as down/degraded because this isolated
 stack only runs IAM and the gateway. That is an accurate probe result, not a UI
 failure.
+
+## Product-database compatibility verification
+
+This workspace's normally configured database is the live production database
+(`synapseone-postgres-1`). To avoid altering or deploying production without a
+separate deployment instruction, the same code was verified against a faithful
+`pg_dump` clone of that database:
+
+- Restored 46 users, 2 organizations and 44 organization administrators.
+- Applied IAM migrations `0007` and `0008` to the clone.
+- Bootstrapped a distinct Platform Owner
+  (`platform.owner.product@synapseone.local`) on the clone.
+- Verified invite activation, email verification, TOTP MFA, platform session,
+  owner role, Overview, Organizations, Users, Audit and Platform Admins.
+- Created a tenant on the clone and verified tenant isolation.
+- Ran 16 API checks + 8 Playwright checks; all passed.
+
+The clone credentials are local-only at
+`.local/platform-superadmin-product-credentials.txt` (mode 600). The production
+database and production containers were not modified. To apply this to the
+product database, follow the deployment steps in `docs/platform-superadmin.md`
+with a backup and a maintenance window.
 
 ## Stopping the isolated stack
 

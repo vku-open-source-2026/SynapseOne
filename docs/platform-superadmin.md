@@ -21,7 +21,15 @@ and from the internal `SYNAPSEONE_INTERNAL_SECRET` platform caller.
   `/v1/platform/session` for the exchange.
 - API keys and service-account tokens cannot become platform sessions.
 - Destructive actions require a second, short-lived step-up token
-  (`x-platform-step-up`, TTL 5 minutes).
+  (`x-platform-step-up`, TTL 5 minutes). A proof is **single-use**, bound to the
+  issuing platform session (`sid`) and to one action such as `org:create`,
+  `user:reset-mfa` or `admin:grant`.
+- The reserved platform slug cannot be created as a tenant. `bootstrap` refuses
+  to reuse a tenant organization with that slug, and `currentPlatformAdmin`
+  verifies the administrator's organization is `kind=platform`.
+- Invited accounts (first tenant admin, additional platform admins, tenant
+  users) are activated with a one-time code; email+org alone cannot claim an
+  existing membership. Codes expire after 7 days by default.
 - The MVP is metadata-first: no tenant document, object or secret content is
   exposed through the six dashboard modules.
 
@@ -45,8 +53,10 @@ and from the internal `SYNAPSEONE_INTERNAL_SECRET` platform caller.
 | `PLATFORM_ADMIN_REQUIRE_MFA` | `true` | requires an enrolled TOTP factor and a fresh code at session exchange |
 | `PLATFORM_ADMIN_REQUIRE_STEP_UP` | `true` | requires step-up for destructive actions |
 | `PLATFORM_ORG_SLUG` | `synapseone-platform` | reserved platform staff organization |
-| `PLATFORM_BOOTSTRAP_SECRET` | empty | one-time first-owner bootstrap; empty disables it |
-| `PLATFORM_RECOVERY_SECRET` | empty | break-glass reset for a platform admin who lost MFA |
+| `PLATFORM_STEP_UP_TTL_SECONDS` | `300` | step-up proof TTL (60–900s) |
+| `IAM_INVITE_TOKEN_TTL_SECONDS` | `604800` | invited-account activation code TTL (5 min–30 days) |
+| `PLATFORM_BOOTSTRAP_SECRET` | empty | one-time first-owner bootstrap; empty disables it; production requires 32+ chars |
+| `PLATFORM_RECOVERY_SECRET` | empty | break-glass reset for a platform admin who lost MFA; production requires 32+ chars |
 | `IAM_SENSITIVE_MUTATION_MODE` | `audit` | `enforce` requires an org administrator for privileged IAM mutations |
 | `IAM_ALLOW_DIRECT_ORG_CREATE` | `true` dev / `false` prod | direct `POST /v1/orgs` |
 | `AUTHZ_MODE_REQUIRED` | `false` dev / `true` prod | gateway fails boot if `AUTHZ_MODE=off` |
@@ -61,6 +71,7 @@ IAM_ALLOW_DIRECT_ORG_CREATE=false
 PLATFORM_ADMIN_ENABLED=true
 PLATFORM_ADMIN_REQUIRE_MFA=true
 PLATFORM_ADMIN_REQUIRE_STEP_UP=true
+PLATFORM_STEP_UP_TTL_SECONDS=300
 PLATFORM_BOOTSTRAP_SECRET=<random 32+ chars>
 PLATFORM_RECOVERY_SECRET=<random 32+ chars>
 ```
@@ -72,7 +83,9 @@ recovery endpoints through the gateway; they have no `routes.yaml` entry.
 ## First Platform Owner
 
 The bootstrap endpoint is internal-only (no gateway route) and only works while
-`platform_admins` is empty. It requires `PLATFORM_BOOTSTRAP_SECRET`.
+`platform_admins` is empty. It requires both `PLATFORM_BOOTSTRAP_SECRET` and,
+when configured, the internal service header. It refuses a tenant organization
+that already owns the reserved slug.
 
 ### Docker Compose
 
@@ -85,28 +98,35 @@ docker compose exec -T iam node -e '
 const secret = process.env.PLATFORM_BOOTSTRAP_SECRET;
 fetch("http://localhost:4001/internal/platform/bootstrap", {
   method: "POST",
-  headers: { "content-type": "application/json", "x-platform-bootstrap-secret": secret },
+  headers: {
+    "content-type": "application/json",
+    "x-synapseone-internal": process.env.SYNAPSEONE_INTERNAL_SECRET,
+    "x-platform-bootstrap-secret": secret
+  },
   body: JSON.stringify({ email: "platform-owner@example.com", displayName: "Platform Owner" })
 }).then(async r => { console.log(r.status, await r.text()); });
 '
 ```
 
-The endpoint returns `201` once and `409 bootstrap_completed` afterwards.
+The endpoint returns `201` once and `409 bootstrap_completed` afterwards. The
+response includes a one-time `inviteToken` (unless the account already has a
+password).
 
-### Set a password (first-party login)
+### Activate the account
 
-The bootstrap creates the user row without a password. Complete registration
-with the usual endpoint (the existing membership rule allows it because the
-user row already exists):
+The bootstrap creates the user row without a password and returns a one-time
+`inviteToken`. Activate it (or open `/register` in the Console and paste the
+code):
 
 ```bash
-curl -sX POST http://localhost:8080/v1/auth/register \
+curl -sX POST http://localhost:8080/v1/auth/invite/accept \
   -H 'Content-Type: application/json' \
-  -d '{"email":"platform-owner@example.com","password":"<strong-password>","orgSlug":"synapseone-platform"}'
+  -d '{"token":"<inviteToken>","password":"<strong-password>"}'
 ```
 
-OIDC works too if the IdP identity is mapped to the same email in the platform
-organization.
+The code is single-use, expires after 7 days by default, and does not require
+the email+org pair. OIDC works too if the IdP identity is mapped to the same
+email in the platform organization.
 
 ### Open the dashboard
 
@@ -129,21 +149,27 @@ docker compose exec -T iam node -e '
 const secret = process.env.PLATFORM_RECOVERY_SECRET;
 fetch("http://localhost:4001/internal/platform/recovery", {
   method: "POST",
-  headers: { "content-type": "application/json", "x-platform-recovery-secret": secret },
+  headers: {
+    "content-type": "application/json",
+    "x-synapseone-internal": process.env.SYNAPSEONE_INTERNAL_SECRET,
+    "x-platform-recovery-secret": secret
+  },
   body: JSON.stringify({ userId: "<platform-user-id>", action: "reset-mfa" })
 }).then(async r => { console.log(r.status, await r.text()); });
 '
 ```
 
-Use `action: "revoke-sessions"` to clear refresh sessions. Every bootstrap and
-recovery event is written to `audit_log`.
+Use `action: "revoke-sessions"` to clear refresh sessions. `reset-mfa` also
+revokes refresh sessions and API keys. Every bootstrap and recovery event is
+written to `audit_log`.
 
 ## Adding a second administrator
 
 Use `/admin/access` (owner only), or:
 
 ```bash
-# Owner platform token is required; step-up token is required by the API.
+# Owner platform token is required. Mint a one-time proof for this action:
+# POST /v1/platform/step-up {"code":"123456","action":"admin:grant"}
 curl -sX POST http://localhost:8080/v1/platform/admins \
   -H "Authorization: Bearer $PLATFORM_TOKEN" \
   -H "x-platform-step-up: $STEP_UP_TOKEN" \
@@ -151,19 +177,22 @@ curl -sX POST http://localhost:8080/v1/platform/admins \
   -d '{"email":"ops@example.com","role":"operator","reason":"on-call rotation"}'
 ```
 
-The account is created in the platform organization if needed. The person must
-enrol TOTP before their first platform session.
+The response includes `inviteToken` for a new account. Send it out-of-band; the
+person activates it at `/register` and enrols TOTP before their first platform
+session. The only owner cannot be demoted or revoked (`409 last_owner`).
 
 ## Database
 
-IAM migration `0007_fluffy_scarecrow.sql` adds:
+IAM migrations add:
 
-- `platform_admins` (user, role, grant metadata, revocation, reason)
-- `organizations.kind` (`tenant` or `platform`)
-- `audit_log.org_id` + `idx_audit_org_time`
-- `idx_users_email_lower`, `idx_users_created_at`
+- `0007_fluffy_scarecrow.sql`: `platform_admins` (user, role, grant metadata,
+  revocation, reason), `organizations.kind` (`tenant` or `platform`),
+  `audit_log.org_id` + `idx_audit_org_time`, `idx_users_email_lower`,
+  `idx_users_created_at`.
+- `0008_shocking_grandmaster.sql`: `platform_step_ups` (one-time `jti`,
+  user/session/action binding, expiry, used_at).
 
-The migration is additive and idempotent. Backfill existing audit rows with:
+The migrations are additive and idempotent. Backfill existing audit rows with:
 
 ```bash
 node tools/backfill-audit-org.mjs
@@ -178,9 +207,9 @@ The script batches updates and can be rerun safely.
    - set `platform_admins.revoked_at`, or
    - call `revokeAllRefresh` for the platform users.
 3. Revert the gateway/console/IAM images if needed.
-4. Keep the additive migration. Old code ignores `platform_admins`,
-   `organizations.kind` and `audit_log.org_id`; do not drop them during an
-   incident rollback.
+4. Keep the additive migrations. Old code ignores `platform_admins`,
+   `platform_step_ups`, `organizations.kind` and `audit_log.org_id`; do not drop
+   them during an incident rollback.
 5. If a security rollout must be relaxed, set
    `IAM_SENSITIVE_MUTATION_MODE=audit` and keep monitoring; do not leave it off.
 

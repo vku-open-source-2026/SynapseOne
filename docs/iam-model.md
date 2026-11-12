@@ -171,9 +171,17 @@ users start with **no permissions**. Admins manage admins with
 - has `owner`, `operator` or `auditor` role, checked server-side.
 
 Destructive actions require a second TOTP step-up
-(`POST /v1/platform/step-up`, header `x-platform-step-up`). The first owner is
-created through the internal one-time bootstrap endpoint (see
+(`POST /v1/platform/step-up {code|recoveryCode, action}`, header
+`x-platform-step-up`). Each proof is one-time, bound to the issuing platform
+session and to one action; it is stored in `platform_step_ups` and cannot be
+replayed. The first owner is created through the internal one-time bootstrap
+endpoint, which returns a one-time `inviteToken` (see
 [`platform-superadmin.md`](platform-superadmin.md)).
+
+Invited accounts (first tenant admin, additional platform admins, tenant members)
+activate with `POST /v1/auth/invite/accept {token, password}` or the Console
+`/register` page. Email+org registration cannot join an existing organization
+without an invite code.
 
 ## Privileged IAM mutations
 
