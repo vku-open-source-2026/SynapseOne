@@ -968,6 +968,15 @@ function validateDefinition(definition: any, opts: { requireTrigger?: boolean } 
         if ((params as any).description !== undefined && String((params as any).description).length > 500) {
           return `definition.nodes['${nm}'].mcpTrigger description ≤500 chars`;
         }
+        if ((params as any).public !== undefined && typeof (params as any).public !== 'boolean') {
+          return `definition.nodes['${nm}'].mcpTrigger public must be boolean`;
+        }
+        if ((params as any).readOnly !== undefined && typeof (params as any).readOnly !== 'boolean') {
+          return `definition.nodes['${nm}'].mcpTrigger readOnly must be boolean`;
+        }
+        if ((params as any).public === true && (params as any).readOnly === false) {
+          return `definition.nodes['${nm}'].mcpTrigger cannot be public when readOnly is false`;
+        }
         const schema = (params as any).inputSchema;
         if (schema !== undefined && schema !== null) {
           if (typeof schema !== 'object' || Array.isArray(schema)) {
@@ -1893,13 +1902,21 @@ export function createApp(): express.Express {
   };
 
   async function activeMcpTools(principal: Principal | null): Promise<Array<{ workflow: StoredWorkflow; tool: NonNullable<ReturnType<typeof findMcpTrigger>> }>> {
-    if (!principal) return [];
     const all = await listWorkflowRecs();
     const out: Array<{ workflow: StoredWorkflow; tool: NonNullable<ReturnType<typeof findMcpTrigger>> }> = [];
     for (const w of all) {
-      if (!w.active || !canAccessWorkflow(w, principal)) continue;
+      if (!w.active) continue;
       const tool = findMcpTrigger({ nodes: w.nodes });
-      if (tool) out.push({ workflow: w, tool });
+      if (!tool) continue;
+      // Anonymous callers only see explicitly public, read-only tools. A
+      // logged-in caller sees its tenant tools plus other tenants' public
+      // read-only docs tools.
+      if (!principal) {
+        if (!tool.public) continue;
+      } else if (!canAccessWorkflow(w, principal) && !tool.public) {
+        continue;
+      }
+      out.push({ workflow: w, tool });
     }
     return out;
   }
@@ -1911,7 +1928,7 @@ export function createApp(): express.Express {
         name: tool.toolName,
         description: tool.description || `Run SynapseFlow workflow '${workflow.name}'`,
         inputSchema: tool.inputSchema || { type: 'object', properties: {}, additionalProperties: true },
-        annotations: { title: workflow.name, readOnlyHint: true },
+        annotations: { title: workflow.name, readOnlyHint: tool.readOnly, destructiveHint: !tool.readOnly },
       })),
     };
   };
@@ -1922,7 +1939,11 @@ export function createApp(): express.Express {
     if (!hit) throw Object.assign(new Error(`Unknown MCP tool '${name}'`), { rpcCode: -32602 });
     const wf = hit.workflow;
     if (!wf) throw Object.assign(new Error(`Workflow for tool '${name}' not found`), { rpcCode: -32602 });
+    if (!principal && !hit.tool.public) {
+      throw Object.assign(new Error(`Tool '${name}' requires authentication`), { rpcCode: -32001 });
+    }
     const input = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
+    const runPrincipal = principal || workflowRunPrincipal(wf);
     const executionId = randomUUID();
     const startedAt = new Date().toISOString();
     const r = await runWorkflow(
@@ -1931,8 +1952,8 @@ export function createApp(): express.Express {
       {
         triggeredBy: 'mcp',
         timeoutMs: 60000,
-        principal,
-        credentialResolver: makeCredentialResolver(principal),
+        principal: runPrincipal,
+        credentialResolver: makeCredentialResolver(runPrincipal),
         synapseoneCall,
         humanTask: {
           create: async (task) => {
@@ -1941,8 +1962,8 @@ export function createApp(): express.Express {
               title: task.title, description: task.description, assignee: task.assignee,
               candidate_roles: task.candidateRoles, decision_schema: task.decisionSchema,
               payload: task.payload, deadline: task.deadline,
-              org_id: principal?.org || wf.org_id || null,
-              account_id: principal?.account || wf.account_id || null,
+              org_id: runPrincipal?.org || wf.org_id || null,
+              account_id: runPrincipal?.account || wf.account_id || null,
             });
             return toPublicHumanTask(rec);
           },
@@ -1955,7 +1976,7 @@ export function createApp(): express.Express {
       id: executionId, workflow_id: wf.id, workflow_name: wf.name, status: r.status,
       input, output: r.output, node_runs: r.nodeRuns as any,
       error: (r as any).error ?? null, triggered_by: 'mcp',
-      principal, actor: actorFor(wf.id, principal), startedAt, finishedAt,
+      principal: runPrincipal, actor: actorFor(wf.id, runPrincipal), startedAt, finishedAt,
     });
     if (r.status === 'paused') {
       return {
@@ -1996,9 +2017,6 @@ export function createApp(): express.Express {
         };
       }
       if (method === 'ping') return { jsonrpc: '2.0', id, result: {} };
-      if (!principal) {
-        return { jsonrpc: '2.0', id, error: { code: -32001, message: 'Authentication required: pass a SynapseOne Bearer JWT or X-API-Key.' } };
-      }
       if (method === 'tools/list') {
         return { jsonrpc: '2.0', id, result: await mcpToolsList(principal) };
       }
@@ -2459,11 +2477,15 @@ function tenantBinding(
       const mcp = findMcpTrigger({ nodes: cur.nodes });
       if (mcp) {
         const all = await listWorkflowRecs();
+        const caller = principalFromHeaders(req);
         const clash = all.find((w) => {
           if (w.id === id || !w.active) return false;
-          if (!canAccessWorkflow(w, principalFromHeaders(req))) return false;
           const other = findMcpTrigger({ nodes: w.nodes });
-          return other && other.toolName === mcp.toolName;
+          if (!other || other.toolName !== mcp.toolName) return false;
+          // Public tools are globally unique (anonymous lookup). Private tools
+          // may reuse a name only inside a different tenant.
+          if (mcp.public || other.public) return true;
+          return canAccessWorkflow(w, caller);
         });
         if (clash) {
           return res.status(409).json({
@@ -3766,7 +3788,7 @@ export function mcpToolName(node: any): string {
   return String(node?.parameters?.toolName || node?.name || '').trim();
 }
 
-export function findMcpTrigger(workflow: any): { toolName: string; description: string; inputSchema: any; node: any } | null {
+export function findMcpTrigger(workflow: any): { toolName: string; description: string; inputSchema: any; public: boolean; readOnly: boolean; node: any } | null {
   try {
     const nodes = workflow?.nodes;
     if (!Array.isArray(nodes)) return null;
@@ -3778,7 +3800,9 @@ export function findMcpTrigger(workflow: any): { toolName: string; description: 
       const inputSchema = (n as any)?.parameters?.inputSchema && typeof (n as any).parameters.inputSchema === 'object'
         ? (n as any).parameters.inputSchema
         : { type: 'object', properties: {}, additionalProperties: true };
-      return { toolName, description, inputSchema, node: n };
+      const readOnly = (n as any)?.parameters?.readOnly !== false;
+      const isPublic = (n as any)?.parameters?.public === true && readOnly;
+      return { toolName, description, inputSchema, public: isPublic, readOnly, node: n };
     }
   } catch { /* ignore */ }
   return null;
@@ -4470,6 +4494,8 @@ export function buildTemplate(name: string, workflowName?: string): any | null {
           id: wid(), name: 'MCP Trigger', type: 'mcpTrigger', typeVersion: 1, position: [200, 300],
           parameters: {
             toolName: 'read_synapseone_docs',
+            public: true,
+            readOnly: true,
             description: 'Read SynapseOne documentation pages. Pass a repository docs path such as docs/api.md or docs/README.md.',
             inputSchema: {
               type: 'object',

@@ -3005,6 +3005,14 @@ function McpTriggerForm({ params, onPatch }) {
           className={`${rowInputCls()} font-mono text-[11px]`}
         />
       </div>
+      <label className="flex items-center gap-2 text-xs text-normal-text">
+        <input type="checkbox" checked={params.readOnly !== false} onChange={(e) => onPatch({ readOnly: e.target.checked, ...(e.target.checked ? {} : { public: false }) })} />
+        Read-only tool (required for public)
+      </label>
+      <label className="flex items-center gap-2 text-xs text-normal-text">
+        <input type="checkbox" checked={params.public === true} disabled={params.readOnly === false} onChange={(e) => onPatch({ public: e.target.checked })} />
+        Public — anyone can call this tool without auth (docs/read-only only)
+      </label>
       <div className="rounded-xl bg-background p-2 text-[11px] text-normal-text">
         Activate this workflow to expose it at <span className="font-mono">POST /mcp</span>. Clients authenticate with a SynapseOne Bearer JWT or <span className="font-mono">X-API-Key</span>.
       </div>

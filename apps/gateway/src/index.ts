@@ -176,15 +176,15 @@ function loadRoutes(): RouteRule[] {
 function authMiddleware(mode: RouteRule['auth']) {
   return (req: express.Request, res: express.Response, next: express.NextFunction) => {
     if (mode === 'none') {
-      // Public routes are anonymous, BUT a Bearer token that verifies is
-      // honoured as optional auth: LDS same-tenant restricted queries and
-      // tenant tools reuse the same export paths. An invalid/absent token
-      // stays anonymous (the upstream sees the anon marker) — public flows
-      // can never break on a stray Authorization header.
+      // Public routes are anonymous, BUT a valid Bearer JWT or API key is
+      // honoured as optional auth: public read-only MCP tools and LDS
+      // exports share the same endpoint with authenticated tenant calls.
+      // An invalid/absent credential stays anonymous.
       const h = String(Array.isArray(req.headers.authorization) ? req.headers.authorization[0] : (req.headers.authorization || ''));
-      if (h.startsWith('Bearer ')) {
+      const bearer = h.startsWith('Bearer ') ? h.slice(7) : '';
+      if (bearer) {
         try {
-          const decoded: any = jwt.verify(h.slice(7), JWT_SECRET, { issuer: JWT_ISSUERS, algorithms: ['HS256'] });
+          const decoded: any = jwt.verify(bearer, JWT_SECRET, { issuer: JWT_ISSUERS, algorithms: ['HS256'] });
           (req as any).principal = {
             type: 'jwt',
             kind: decoded.kind || 'user',
@@ -193,7 +193,29 @@ function authMiddleware(mode: RouteRule['auth']) {
             account: decoded.account,
             scopes: decoded.scopes || [],
           };
-        } catch { /* anonymous */ }
+          return next();
+        } catch { /* try API key below */ }
+      }
+      const rawKey = req.headers['x-api-key'] as string | string[] | undefined;
+      const apiKey = Array.isArray(rawKey) ? (rawKey[0] || '') : (rawKey || '') || bearer;
+      if (apiKey && isVerifyApiKeyEnabled()) {
+        verifyApiKeyUpstream(apiKey).then(
+          (info) => {
+            if (info) {
+              (req as any).principal = {
+                type: 'apikey',
+                account: info.account_id,
+                org: (info as any).org_id,
+                scopes: info.scopes,
+                keyId: info.id,
+                owner: info.user_id,
+              };
+            }
+            next();
+          },
+          () => next(),
+        );
+        return;
       }
       return next();
     }

@@ -1293,7 +1293,8 @@ curl -s -XPOST http://localhost:8080/mcp \\
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_synapseone_docs","arguments":{"path":"docs/api.md"}}}'
 
-# MCP clients that only support headers can use: X-API-Key: <key>
+# Public read-only tools (mcp-docs-reader) need no credential.
+# Private/write tools require: Authorization: Bearer $TOKEN or X-API-Key: <key>
 # Built-in template: mcp-docs-reader -> AI reads the public docs repository.`;
 
 const WORKFLOW_ENDPOINTS = [

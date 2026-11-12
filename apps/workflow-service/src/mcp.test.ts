@@ -61,6 +61,8 @@ describe('MCP trigger', () => {
     const trig = findMcpTrigger(tpl);
     assert.ok(trig);
     assert.equal(trig.toolName, 'read_synapseone_docs');
+    assert.equal(trig.public, true);
+    assert.equal(trig.readOnly, true);
     const file = path.join(__dirname, '..', '..', '..', 'workflows', 'mcp-docs-reader.json');
     assert.ok(fs.existsSync(file), `missing ${file}`);
     const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -82,6 +84,8 @@ describe('MCP trigger', () => {
               name: 'MCP Trigger', type: 'mcpTrigger',
               parameters: {
                 toolName,
+                public: true,
+                readOnly: true,
                 description: 'Echo the input path',
                 inputSchema: { type: 'object', properties: { path: { type: 'string' } }, additionalProperties: false },
               },
@@ -118,10 +122,37 @@ describe('MCP trigger', () => {
     assert.equal(execBody.data[0].status, 'success');
   });
 
-  it('rejects MCP calls without a gateway identity', async () => {
-    const res = await rpc(base, 'tools/list', {}, { 'Content-Type': 'application/json', 'x-synapseone-internal': INTERNAL });
-    assert.equal(res.status, 200);
-    assert.equal(res.body.error.code, -32001);
+  it('allows anonymous MCP calls for public read-only tools only', async () => {
+    const anonHeaders = { 'Content-Type': 'application/json', 'x-synapseone-internal': INTERNAL };
+    const listed = await rpc(base, 'tools/list', {}, anonHeaders);
+    assert.equal(listed.status, 200);
+    assert.ok(listed.body.result.tools.some((t: any) => t.name === toolName));
+    const called = await rpc(base, 'tools/call', { name: toolName, arguments: { path: 'public.md' } }, anonHeaders);
+    assert.equal(called.body.result.content[0].text, 'read:public.md');
+
+    const privateName = `edit_${Date.now().toString(36)}`;
+    const created = await fetch(`${base}/v1/workflows`, {
+      method: 'POST', headers: H,
+      body: JSON.stringify({
+        name: 'mcp-private-write',
+        definition: {
+          nodes: [
+            { name: 'MCP Trigger', type: 'mcpTrigger', parameters: { toolName: privateName, public: false, readOnly: false, description: 'edit' } },
+            { name: 'Done', type: 'noOp', parameters: {} },
+          ],
+          connections: { 'MCP Trigger': { main: [[{ node: 'Done' }]] } },
+        },
+      }),
+    });
+    assert.equal(created.status, 201);
+    const wf: any = await created.json();
+    await fetch(`${base}/v1/workflows/${wf.id}/activate`, { method: 'POST', headers: H, body: '{}' });
+    const anonList = await rpc(base, 'tools/list', {}, anonHeaders);
+    assert.equal(anonList.body.result.tools.some((t: any) => t.name === privateName), false);
+    const authList = await rpc(base, 'tools/list');
+    assert.equal(authList.body.result.tools.some((t: any) => t.name === privateName), true);
+    const anonCall = await rpc(base, 'tools/call', { name: privateName, arguments: {} }, anonHeaders);
+    assert.ok(anonCall.body.error);
   });
 
   it('blocks a duplicate active MCP tool name', async () => {

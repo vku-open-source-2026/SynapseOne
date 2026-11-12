@@ -125,8 +125,7 @@ routes:
   # node are exposed as MCP tools. Clients use Bearer JWT or X-API-Key.
   - path: /mcp
     target: ${WORKFLOW_SERVICE_URL:http://workflow:4002}
-    auth: either
-    service: workflow
+    auth: none
     timeoutMs: 120000
 
   # Public inbound webhooks (P0-5): no gateway auth — the workflow-service

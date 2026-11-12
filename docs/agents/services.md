@@ -157,9 +157,11 @@ fan-out mechanism. Node families:
 **Triggers:** manual execute/test; public webhooks with `secret-header`,
 `hmac-sha256`, or `jwt` auth, per-workflow rate limit and optional idempotency
 header/TTL; cron scheduler tick (`WORKFLOW_CRON_TICK_MS`, default 15 s) runs
-active cron workflows; `mcpTrigger` exposes active workflows as MCP tools at
-`POST /mcp` (JSON-RPC `initialize`/`tools/list`/`tools/call`, gateway
-Bearer-JWT/X-API-Key auth, unique tool names, template `mcp-docs-reader`).
+active cron workflows; `mcpTrigger` exposes active workflows as MCP tools at public
+`POST /mcp` (JSON-RPC `initialize`/`tools/list`/`tools/call`). Tools marked
+`public:true` + `readOnly:true` are anonymous (docs readers); private/write
+tools require Bearer JWT/X-API-Key. Public tool names are globally unique,
+private names per tenant; template `mcp-docs-reader`.
 Activation gates cron + webhooks + MCP, not manual runs.
 With `QUEUE_SERVICE_URL` set (default in Compose), triggers enqueue a job:
 platform worker (`WORKFLOW_WORKER_ENABLED`, concurrency 4), tenant custom

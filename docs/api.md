@@ -325,14 +325,18 @@ Deactivation sets `active:false`, revokes refresh tokens and API keys.
   stored as a `bearer` credential (never in the URL).
 - **MCP trigger** (`mcpTrigger`, alias `synapseone.mcpTrigger`): an ACTIVE
   workflow that declares `parameters.toolName` is exposed as an MCP tool.
-  `POST /mcp` is a JSON-RPC 2.0 server (`initialize`, `tools/list`,
-  `tools/call`, `ping`) authenticated with a gateway Bearer JWT or
-  `X-API-Key`; calls run the workflow inline with `triggered_by=mcp` and return
-  `{content:[{type:"text",text}], structuredContent?}`. Tool names are unique
-  among active workflows (`409 mcp_tool_conflict` on activate). Built-in
-  template `mcp-docs-reader` exposes `read_synapseone_docs` and fetches the
-  requested public docs file. MCP clients can use
-  `Authorization: Bearer <api-key>` on `either` routes as a fallback.
+  `POST /mcp` is a public JSON-RPC 2.0 server (`initialize`, `tools/list`,
+  `tools/call`, `ping`). Tools marked `public: true` **and** `readOnly: true`
+  are callable anonymously (docs/read-only use). Private or write-capable
+  tools require a gateway Bearer JWT or `X-API-Key`; anonymous `tools/list`
+  only returns public read-only tools. Calls run the workflow inline with
+  `triggered_by=mcp` and return
+  `{content:[{type:"text",text}], structuredContent?}`. Public tool names are
+  globally unique and all tool names are unique per tenant
+  (`409 mcp_tool_conflict` on activate). Built-in template `mcp-docs-reader`
+  exposes public read-only `read_synapseone_docs` and fetches the requested
+  public docs file. MCP clients can use `Authorization: Bearer <api-key>` on
+  authenticated routes as a fallback.
 - `GET /metrics` (Prometheus: `synapseone_workflow_runs_total{triggered_by,status}`,
   `synapseone_workflow_webhook_rejected_total{reason}`)
 
@@ -350,7 +354,7 @@ Node types: `webhook` (trigger, `parameters.path/httpMethod`), `cron` (trigger, 
 | `webhook` | `path` (1..128, `[A-Za-z0-9_./-]`, no `..`), `httpMethod` (`GET\|POST\|PUT\|PATCH\|DELETE\|HEAD`, default `POST`), `auth` (`{mode: none\|secret-header\|hmac-sha256\|jwt, header?, credentialId?}`), `rateLimit: {rpm}` (default 600), `idempotency: {header, ttlSeconds}` | `ANY /webhook/:path` routes to the ACTIVE workflow with that path; activating with a taken path is `409`; auth/rate/idempotency enforced per node config |
 | `cron` | `rule.interval[]` (`{field: seconds\|minutes\|hours\|days, <field>Interval: N}`), or `cronExpression` (`"*/N * * * *"`, `"M H * * *"` wall-clock, `@hourly`, `@daily`), or `intervalMs`, plus optional `timezone` (wall-clock only) | Minimum 10s — faster schedules and other cron formats are rejected at save/activate; the editor shows the next run |
 | `manualTrigger` | — | Run from Console/CLI with any JSON input |
-| `mcpTrigger` | `toolName` (`[A-Za-z0-9_.-]{1,64}`), `description` (≤500), `inputSchema` (JSON Schema, ≤8KB) | Active workflow becomes an MCP tool; names unique among active workflows; `POST /mcp` JSON-RPC |
+| `mcpTrigger` | `toolName` (`[A-Za-z0-9_.-]{1,64}`), `description` (≤500), `inputSchema` (JSON Schema, ≤8KB), `public` (bool), `readOnly` (bool, default true; `public` requires readOnly) | Active workflow becomes an MCP tool; names unique among active workflows; `POST /mcp` JSON-RPC |
 | `httpRequest` | `url` (public `http(s)` or allowlisted self origin), `method`, `headers` (object), `body`/`jsonBody` (sent only when configured — the input is NOT auto-forwarded), `auth: {credentialId, header?}` (secret resolved server-side), `retry: {attempts 1–5, delayMs}`, `timeoutMs` (1–30s) | Redirects followed manually, max 5 hops, every hop re-checked against the SSRF blocklist; default 15s timeout; ≤200KB body, ≤500KB response |
 | `code` | `code` (JS, ≤50KB, default 5s timeout), `timeoutMs` (1–15s), `retry` | `$input`/`$json`/`input` in scope, `$now` ISO time, `console.*` captured; bare expressions get an implicit `return (…)`; result `_logs` key is yours — console output then lands in `_consoleLogs` |
 | `set` | `values` (object), `assignments` (`[{name, value}]`), legacy `values.assignments`/`fields` | Values support `={{ $json.x }}` / `{{ … }}` / `=expr` templating against the incoming item; merged over the input |
