@@ -26,7 +26,8 @@
     "test:inference": "node tools/run-inference-tests.cjs",
     "test:sdk-go": "docker run --rm -v $(pwd)/sdks/sdk-go:/sdk -w /sdk golang:1.22-alpine go test -v ./...",
     "test:e2e:go": "docker run --rm --network host -v $(pwd):/app -w /app/tests/e2e golang:1.22-alpine go run sdk-check.go",
-    "test:e2e:inference": "node tests/e2e/inference-check.js"
+    "test:e2e:inference": "node tests/e2e/inference-check.js",
+    "workflows:validate": "node workflows/validate.mjs"
   },
   "devDependencies": {
     "drizzle-orm": "^0.45.4"

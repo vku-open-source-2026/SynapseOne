@@ -34,6 +34,7 @@ const SERVICE_BY_PREFIX: Array<[string, string]> = [
   ['/v1/templates', 'workflow'],
   ['/v1/executions', 'workflow'],
   ['/v1/credentials', 'workflow'],
+  ['/mcp', 'workflow'],
   ['/webhook', 'workflow'],
   ['/v1/ai', 'ai'],
   ['/v1/inference-jobs', 'inference'],

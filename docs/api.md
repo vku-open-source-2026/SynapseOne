@@ -299,10 +299,9 @@ Deactivation sets `active:false`, revokes refresh tokens and API keys.
 - `PUT /v1/workflows/:id {name?, definition?, settings?, orgId?, accountId?, runAs?}` (structural/SSRF/size/cycle-validated, ≤200KB, ≤50 nodes, every node needs a 1..128 char `name`; every update bumps `revision`)
 - `POST /v1/workflows/:id/execute {input}` (manual run — works for ANY trigger type, active or not; the body IS the input). With queue transport enabled (default when `QUEUE_SERVICE_URL` is set) this returns `202 {ok, queued:true, executionId, queue, runner}` after publishing a SynapseQueue job; add `?wait=1&timeoutMs=60000` for the old blocking shape `{ok, output, executionId, status}`. `500 {ok:false, error}` when a node fails. Records the caller principal + `actor: "workflow:<id> principal:<sub>"`.)
 - `POST /v1/workflows/test-run {definition, input, workflowId?}` (try a definition without saving; validates + executes inline in the sandbox; persisted as a `triggered_by=test` execution — pass `workflowId` to attach it to that workflow's history; returns `{ok, output, nodeRuns, executionId}`)
-- `GET /v1/executions` (`limit,offset,workflowId,status,triggeredBy,includeData`; `limit/offset` 0..9999, `offset=0` = first page; `status` is `queued|running|paused|success|error|cancelled`; `triggeredBy` is `manual|webhook|cron|test|human-task|workflow`; secret-looking keys in payloads are masked to `***`; always returns the envelope `{data: [...]}` — SDKs/Console/CLI unwrap `.data` and also accept a bare array) / `GET /v1/executions/:id` (`?includeData=true` for per-node input/output; also carries `principal`, `actor`, `queue`, `runner`, `workerId`, `attempt`, `leaseExpiresAt`, `workflowRevision`)
+- `GET /v1/executions` (`limit,offset,workflowId,status,triggeredBy,includeData`; `limit/offset` 0..9999, `offset=0` = first page; `status` is `queued|running|paused|success|error|cancelled`; `triggeredBy` is `manual|webhook|cron|test|human-task|workflow|mcp`; secret-looking keys in payloads are masked to `***`; always returns the envelope `{data: [...]}` — SDKs/Console/CLI unwrap `.data` and also accept a bare array) / `GET /v1/executions/:id` (`?includeData=true` for per-node input/output; also carries `principal`, `actor`, `queue`, `runner`, `workerId`, `attempt`, `leaseExpiresAt`, `workflowRevision`)
 - `GET/POST/DELETE /v1/credentials[?accountId=]` (account-scoped secrets, AES-256-GCM at rest via `SYNAPSEONE_CREDENTIAL_KEY`; list/create return metadata only, never secrets; duplicate names per account are `409`)
-- Public inbound webhooks: `ANY /webhook/:path` triggers the ACTIVE workflow whose webhook node declares that `path` (also proxied at the gateway as `/webhook`, auth none — per-workflow auth below still applies):
-  ```bash
+- Public inbound webhooks: `ANY /webhook/:path` triggers the ACTIVE workflow whose webhook node declares that `path` (also proxied at the gateway as `/webhook`, auth none — per-workflow auth below still applies):  ```bash
   curl -X POST http://localhost:4002/webhook/transform \
     -H 'Content-Type: application/json' \
     -d '{"value":21}'
@@ -324,6 +323,16 @@ Deactivation sets `active:false`, revokes refresh tokens and API keys.
   `issues`, `pull_request` all land as the run input. Replying back (comment,
   dispatch) is a plain `httpRequest` to `https://api.github.com/...` with a PAT
   stored as a `bearer` credential (never in the URL).
+- **MCP trigger** (`mcpTrigger`, alias `synapseone.mcpTrigger`): an ACTIVE
+  workflow that declares `parameters.toolName` is exposed as an MCP tool.
+  `POST /mcp` is a JSON-RPC 2.0 server (`initialize`, `tools/list`,
+  `tools/call`, `ping`) authenticated with a gateway Bearer JWT or
+  `X-API-Key`; calls run the workflow inline with `triggered_by=mcp` and return
+  `{content:[{type:"text",text}], structuredContent?}`. Tool names are unique
+  among active workflows (`409 mcp_tool_conflict` on activate). Built-in
+  template `mcp-docs-reader` exposes `read_synapseone_docs` and fetches the
+  requested public docs file. MCP clients can use
+  `Authorization: Bearer <api-key>` on `either` routes as a fallback.
 - `GET /metrics` (Prometheus: `synapseone_workflow_runs_total{triggered_by,status}`,
   `synapseone_workflow_webhook_rejected_total{reason}`)
 
@@ -334,13 +343,14 @@ origins bypass the block AND forward the run principal as `x-synapseone-*`
 headers so downstream services can authorize. Redirects are followed manually
 with every hop re-checked (max 5).
 
-Node types: `webhook` (trigger, `parameters.path/httpMethod`), `cron` (trigger, `rule.interval` or `cronExpression`), `manualTrigger`, `httpRequest` (`url/method/headers/body`, SSRF-blocked, 15s timeout), `code` (sandboxed JS, `parameters.code`, 5s timeout, `$input/$json/input/$now` + `console` capture), `set` (`values/assignments`, supports `={{ $json.x }}` templating), `if` (`condition` JS or `value1/operation/value2` or n8n `conditions[]`; `main[0]`=true, `main[1]`=false), `noOp` (passthrough). `synapseone.api` (first-party SynapseOne block: `parameters.resource/operation/input` — resources `orgs/users/roles/policies/authorize/audit/keys/service-accounts/workflows/executions/templates/lds`; runs as your login, values support `={{ $json.x }}`; `lds` = `list-datasources` | `publish-record`). Unknown types pass data through but are recorded as `skipped` (visible in `nodeRuns`), not silent success.
+Node types: `webhook` (trigger, `parameters.path/httpMethod`), `cron` (trigger, `rule.interval` or `cronExpression`), `manualTrigger`, `mcpTrigger` (trigger; `parameters.toolName/description/inputSchema` exposes the workflow as an MCP tool at `POST /mcp`), `httpRequest` (`url/method/headers/body`, SSRF-blocked, 15s timeout), `code` (sandboxed JS, `parameters.code`, 5s timeout, `$input/$json/input/$now` + `console` capture), `set` (`values/assignments`, supports `={{ $json.x }}` templating), `if` (`condition` JS or `value1/operation/value2` or n8n `conditions[]`; `main[0]`=true, `main[1]`=false), `noOp` (passthrough). `synapseone.api` (first-party SynapseOne block: `parameters.resource/operation/input` — resources `orgs/users/roles/policies/authorize/audit/keys/service-accounts/workflows/executions/templates/lds`; runs as your login, values support `={{ $json.x }}`; `lds` = `list-datasources` | `publish-record`). Unknown types pass data through but are recorded as `skipped` (visible in `nodeRuns`), not silent success.
 
 | Node | Key `parameters` | Notes |
 | --- | --- | --- |
 | `webhook` | `path` (1..128, `[A-Za-z0-9_./-]`, no `..`), `httpMethod` (`GET\|POST\|PUT\|PATCH\|DELETE\|HEAD`, default `POST`), `auth` (`{mode: none\|secret-header\|hmac-sha256\|jwt, header?, credentialId?}`), `rateLimit: {rpm}` (default 600), `idempotency: {header, ttlSeconds}` | `ANY /webhook/:path` routes to the ACTIVE workflow with that path; activating with a taken path is `409`; auth/rate/idempotency enforced per node config |
 | `cron` | `rule.interval[]` (`{field: seconds\|minutes\|hours\|days, <field>Interval: N}`), or `cronExpression` (`"*/N * * * *"`, `"M H * * *"` wall-clock, `@hourly`, `@daily`), or `intervalMs`, plus optional `timezone` (wall-clock only) | Minimum 10s — faster schedules and other cron formats are rejected at save/activate; the editor shows the next run |
 | `manualTrigger` | — | Run from Console/CLI with any JSON input |
+| `mcpTrigger` | `toolName` (`[A-Za-z0-9_.-]{1,64}`), `description` (≤500), `inputSchema` (JSON Schema, ≤8KB) | Active workflow becomes an MCP tool; names unique among active workflows; `POST /mcp` JSON-RPC |
 | `httpRequest` | `url` (public `http(s)` or allowlisted self origin), `method`, `headers` (object), `body`/`jsonBody` (sent only when configured — the input is NOT auto-forwarded), `auth: {credentialId, header?}` (secret resolved server-side), `retry: {attempts 1–5, delayMs}`, `timeoutMs` (1–30s) | Redirects followed manually, max 5 hops, every hop re-checked against the SSRF blocklist; default 15s timeout; ≤200KB body, ≤500KB response |
 | `code` | `code` (JS, ≤50KB, default 5s timeout), `timeoutMs` (1–15s), `retry` | `$input`/`$json`/`input` in scope, `$now` ISO time, `console.*` captured; bare expressions get an implicit `return (…)`; result `_logs` key is yours — console output then lands in `_consoleLogs` |
 | `set` | `values` (object), `assignments` (`[{name, value}]`), legacy `values.assignments`/`fields` | Values support `={{ $json.x }}` / `{{ … }}` / `=expr` templating against the incoming item; merged over the input |

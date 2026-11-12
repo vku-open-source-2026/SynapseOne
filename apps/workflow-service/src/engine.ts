@@ -322,8 +322,12 @@ export function isManualTriggerType(type: unknown): boolean {
   const t = normalizeNodeType(type);
   return t === 'manualTrigger' || t === 'n8n-nodes-base.manualTrigger' || t === 'synapseone.manualTrigger';
 }
+export function isMcpTriggerType(type: unknown): boolean {
+  const t = normalizeNodeType(type);
+  return t === 'mcpTrigger' || t === 'n8n-nodes-base.mcpTrigger' || t === 'synapseone.mcpTrigger';
+}
 export function isTriggerType(type: unknown): boolean {
-  return isWebhookType(type) || isCronType(type) || isManualTriggerType(type);
+  return isWebhookType(type) || isCronType(type) || isManualTriggerType(type) || isMcpTriggerType(type);
 }
 export function isCodeType(type: unknown): boolean {
   const t = normalizeNodeType(type);
@@ -410,6 +414,9 @@ const TRIGGER_TYPES = new Set([
   'synapseone.webhook',
   'synapseone.cron',
   'synapseone.manualTrigger',
+  'n8n-nodes-base.mcpTrigger',
+  'mcpTrigger',
+  'synapseone.mcpTrigger',
 ]);
 
 const MAX_CODE_BYTES = 50 * 1024;
@@ -2503,6 +2510,9 @@ export async function runWorkflow(
       case 'manualTrigger':
       case 'n8n-nodes-base.manualTrigger':
       case 'synapseone.manualTrigger':
+      case 'mcpTrigger':
+      case 'n8n-nodes-base.mcpTrigger':
+      case 'synapseone.mcpTrigger':
         output = await execTrigger(node, data);
         break;
       case 'noOp':

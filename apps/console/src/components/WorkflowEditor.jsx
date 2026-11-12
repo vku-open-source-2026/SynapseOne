@@ -1910,6 +1910,9 @@ function NodeForm({
     case 'cron':
     case 'n8n-nodes-base.cron':
       return <CronForm params={p} onPatch={onPatch} />;
+    case 'mcpTrigger':
+    case 'n8n-nodes-base.mcpTrigger':
+      return <McpTriggerForm params={p} onPatch={onPatch} />;
     default:
       return <p className="text-[11px] text-normal-text">No extra fields for this node, use Advanced JSON below if needed.</p>;
   }
@@ -2971,6 +2974,39 @@ function WebhookForm({ params, onPatch, headers }) {
             <input value={idem.ttlSeconds ?? ''} onChange={(e) => setIdem('ttlSeconds', e.target.value === '' ? undefined : Math.min(86400, Math.max(60, Number(e.target.value) || 60)))} type="number" min="60" max="86400" title="Dedupe TTL seconds (60–86400)" aria-label="Idempotency TTL seconds" className={rowInputCls()} />
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+function McpTriggerForm({ params, onPatch }) {
+  const schema = params?.inputSchema && typeof params.inputSchema === 'object'
+    ? JSON.stringify(params.inputSchema, null, 2)
+    : '{\n  "type": "object",\n  "properties": {},\n  "additionalProperties": true\n}';
+  return (
+    <div className="space-y-2">
+      <div>
+        <label className="block text-xs text-normal-text mb-1">MCP tool name</label>
+        <input value={params.toolName || ''} onChange={(e) => onPatch({ toolName: e.target.value || undefined })} placeholder="read_synapseone_docs" className={`${rowInputCls()} font-mono`} />
+      </div>
+      <div>
+        <label className="block text-xs text-normal-text mb-1">Description shown to the AI client</label>
+        <textarea value={params.description || ''} onChange={(e) => onPatch({ description: e.target.value || undefined })} rows={2} className={rowInputCls()} placeholder="Read SynapseOne documentation pages…" />
+      </div>
+      <div>
+        <label className="block text-xs text-normal-text mb-1">Input JSON Schema</label>
+        <textarea
+          value={schema}
+          onChange={(e) => {
+            try { onPatch({ inputSchema: JSON.parse(e.target.value) }); } catch { /* keep typing */ }
+          }}
+          rows={6}
+          spellCheck={false}
+          className={`${rowInputCls()} font-mono text-[11px]`}
+        />
+      </div>
+      <div className="rounded-xl bg-background p-2 text-[11px] text-normal-text">
+        Activate this workflow to expose it at <span className="font-mono">POST /mcp</span>. Clients authenticate with a SynapseOne Bearer JWT or <span className="font-mono">X-API-Key</span>.
       </div>
     </div>
   );

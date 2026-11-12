@@ -137,6 +137,7 @@ Migrations seed demo org `acme` and account `prod`; the memory fallback seeds
 - `GET/POST /v1/credentials`, `DELETE /v1/credentials/:id` (secrets never
   returned).
 - Public `ALL /webhook/:path` (no gateway auth; per-workflow auth/method).
+- `POST /mcp` MCP JSON-RPC server for active `mcpTrigger` workflows.
 - `GET /health`, `GET /metrics`.
 
 **Engine:** executes a DAG with a queue/fan-out model; expressions support
@@ -156,7 +157,10 @@ fan-out mechanism. Node families:
 **Triggers:** manual execute/test; public webhooks with `secret-header`,
 `hmac-sha256`, or `jwt` auth, per-workflow rate limit and optional idempotency
 header/TTL; cron scheduler tick (`WORKFLOW_CRON_TICK_MS`, default 15 s) runs
-active cron workflows. Activation gates cron + webhooks, not manual runs.
+active cron workflows; `mcpTrigger` exposes active workflows as MCP tools at
+`POST /mcp` (JSON-RPC `initialize`/`tools/list`/`tools/call`, gateway
+Bearer-JWT/X-API-Key auth, unique tool names, template `mcp-docs-reader`).
+Activation gates cron + webhooks + MCP, not manual runs.
 With `QUEUE_SERVICE_URL` set (default in Compose), triggers enqueue a job:
 platform worker (`WORKFLOW_WORKER_ENABLED`, concurrency 4), tenant custom
 runner, or hybrid shared queue. `WORKFLOW_EXECUTION_MODE=queue|inline|auto`

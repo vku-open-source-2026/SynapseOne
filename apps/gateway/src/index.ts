@@ -200,7 +200,10 @@ function authMiddleware(mode: RouteRule['auth']) {
     const h = String(Array.isArray(req.headers.authorization) ? req.headers.authorization[0] : (req.headers.authorization || ''));
     const hasBearer = h.startsWith('Bearer ');
     const apiKeyRaw = req.headers['x-api-key'] as string | string[] | undefined;
-    const apiKey = Array.isArray(apiKeyRaw) ? (apiKeyRaw[0] || '') : (apiKeyRaw || '');
+    let apiKey = Array.isArray(apiKeyRaw) ? (apiKeyRaw[0] || '') : (apiKeyRaw || '');
+    // MCP/CLI clients often only support an Authorization Bearer header.
+    // For `either` routes, allow `Bearer <api-key>` as an API-key fallback.
+    if (!apiKey && hasBearer && mode === 'either') apiKey = h.slice(7);
     if (mode === 'jwt' || mode === 'either') {
       if (hasBearer) {
         const token = h.slice(7);

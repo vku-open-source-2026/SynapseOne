@@ -562,7 +562,7 @@ export default function Workflows() {
                   </button>
                 </div>
                 <p className="text-[11px] text-normal-text mt-1">
-                  Triggers publish a SynapseQueue job; platform/custom workers consume it. <Link className="text-main-blue" to="/workflow-runners">Create a self-hosted runner</Link> to get a copy-paste command with its API key.
+                  Triggers publish a SynapseQueue job; platform/custom workers consume it. <Link className="text-main-blue" to="/runner-engine">Create a self-hosted runner</Link> to get a copy-paste command with its API key.
                 </p>
               </div>
               <Field label="Execute input (JSON)">

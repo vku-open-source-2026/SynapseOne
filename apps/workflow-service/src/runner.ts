@@ -511,7 +511,7 @@ if (require.main === module) {
   main().catch((e: any) => {
     errorLog(e?.message || e);
     if (/SYNAPSEONE_API_KEY|SYNAPSEONE_URL|WORKFLOW_RUNNER_ID/.test(String(e?.message || e))) {
-      errorLog('hint: copy the install command from Console → Workflow Runners; it includes the correct URL and API key.');
+      errorLog('hint: copy the install command from Console → Runner Engine; it includes the correct URL and API key.');
     }
     process.exit(1);
   });

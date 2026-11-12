@@ -621,7 +621,7 @@ export function graphWarnings(nodes, connections) {
 export function isKnownType(type) {
   if (NODE_TYPES.some((t) => t.type === type)) return true;
   return [
-    'webhook', 'cron', 'manualTrigger', 'httpRequest', 'code', 'set', 'if', 'noOp', 'synapseone.api',
+    'webhook', 'cron', 'manualTrigger', 'mcpTrigger', 'httpRequest', 'code', 'set', 'if', 'noOp', 'synapseone.api',
     'decision', 'decision.route', 'synapseflow.decision', 'synapseone.decision', 'n8n-nodes-base.decision',
     'ai.agent', 'synapseflow.aiAgent', 'synapseone.aiAgent', 'agent', 'n8n-nodes-base.aiAgent',
     'synapseflow.model', 'synapseone.model',
@@ -636,6 +636,8 @@ export const NODE_ICON_MAP = {
   cron: 'clock',
   'n8n-nodes-base.manualTrigger': 'play',
   manualTrigger: 'play',
+  'n8n-nodes-base.mcpTrigger': 'plug',
+  mcpTrigger: 'plug',
   'n8n-nodes-base.httpRequest': 'globe',
   httpRequest: 'globe',
   'n8n-nodes-base.code': 'code',
@@ -677,6 +679,7 @@ export const NODE_TYPES = [
   { type: 'n8n-nodes-base.webhook', label: 'Webhook', hint: 'Trigger via HTTP request, starts the run with the body', category: 'triggers', placeholder: 'Receives {"hello":"world"} → passes it downstream' },
   { type: 'n8n-nodes-base.cron', label: 'Schedule', hint: 'Trigger on a timer, fires with {scheduledAt}', category: 'triggers', placeholder: 'Every 24h → fetches and transforms' },
   { type: 'n8n-nodes-base.manualTrigger', label: 'Manual', hint: 'Trigger by hand, run from Console with any JSON input', category: 'triggers', placeholder: 'Click Execute with {"value": 21}' },
+  { type: 'n8n-nodes-base.mcpTrigger', label: 'MCP Tool', hint: 'Expose this workflow as an MCP tool for AI clients (Claude, Cursor, ...)', category: 'triggers', placeholder: 'toolName read_docs → call from an MCP client' },
   { type: 'synapseflow.aiAgent', label: 'AI Agent', hint: 'Autonomous agent with built-in tools + any workflow node wired into its Tools socket', category: 'ai', placeholder: 'Prompt: "Triage this ticket using the knowledge base"' },
   { type: 'synapseflow.decision', label: 'Decision Engine', hint: 'Multi-route classification with Decision-2.0-Eos-0.8B, one output port per route', category: 'ai', placeholder: 'Routes: billing / technical / account / sales' },
   { type: 'synapseflow.model', label: 'Model Core', hint: 'Model provider config for an AI Agent, wire into its Model socket', category: 'ai', placeholder: 'Synapse Inference · liquid/lfm-2.5-2.6b:free' },
@@ -716,6 +719,8 @@ const TYPE_VERSIONS = {
   'n8n-nodes-base.cron': 1,
   manualTrigger: 1,
   'n8n-nodes-base.manualTrigger': 1,
+  mcpTrigger: 1,
+  'n8n-nodes-base.mcpTrigger': 1,
   httpRequest: 4.2,
   'n8n-nodes-base.httpRequest': 4.2,
   code: 1,
@@ -773,6 +778,8 @@ export const EXAMPLE_PARAMS = {
   'n8n-nodes-base.cron': { rule: { interval: [{ field: 'hours', hoursInterval: 24 }] } },
   manualTrigger: {},
   'n8n-nodes-base.manualTrigger': {},
+  mcpTrigger: { toolName: 'read_docs', description: 'Read product documentation', inputSchema: { type: 'object', properties: { path: { type: 'string' } }, additionalProperties: false } },
+  'n8n-nodes-base.mcpTrigger': { toolName: 'read_docs', description: 'Read product documentation', inputSchema: { type: 'object', properties: { path: { type: 'string' } }, additionalProperties: false } },
   httpRequest: { url: 'https://api.example.com/health', method: 'GET' },
   'n8n-nodes-base.httpRequest': { url: 'https://api.example.com/health', method: 'GET' },
   code: { code: 'return { ...$input, doubled: ($input.value ?? 0) * 2, at: $now };' },

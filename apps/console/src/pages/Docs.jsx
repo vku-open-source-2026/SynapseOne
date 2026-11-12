@@ -1280,11 +1280,27 @@ curl -s -XPOST http://localhost:8080/webhook/transform \\
 # GitHub: Payload URL https://<host>/webhook/<path>,
 #   header x-hub-signature-256, store the secret as an hmac credential.`;
 
+const WORKFLOW_MCP = `# MCP server: active workflows with an mcpTrigger node become tools
+curl -s -XPOST http://localhost:8080/mcp \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}'
+
+# Discover tools, then call one with JSON arguments
+curl -s -XPOST http://localhost:8080/mcp \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+curl -s -XPOST http://localhost:8080/mcp \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_synapseone_docs","arguments":{"path":"docs/api.md"}}}'
+
+# MCP clients that only support headers can use: X-API-Key: <key>
+# Built-in template: mcp-docs-reader -> AI reads the public docs repository.`;
+
 const WORKFLOW_ENDPOINTS = [
-  ['GET', '/v1/templates · /v1/templates/:name', 'Built-in templates (webhook-to-log, cron-etl, ai-triage-ops, …)'],
+  ['GET', '/v1/templates · /v1/templates/:name', 'Built-in templates (webhook-to-log, cron-etl, mcp-docs-reader, …)'],
   ['GET · POST', '/v1/workflows', 'List or create from {name, template} or {name, definition}'],
   ['GET · PUT · DELETE', '/v1/workflows/:id', 'Read, update (bumps revision) or delete a workflow'],
-  ['POST', '/v1/workflows/:id/activate · /deactivate', 'Gate cron + webhook triggers; webhook paths must be unique'],
+  ['POST', '/v1/workflows/:id/activate · /deactivate', 'Gate cron, webhook and MCP triggers; webhook paths/tool names must be unique'],
   ['POST', '/v1/workflows/:id/execute', 'Manual run for any trigger type, active or not'],
   ['POST', '/v1/workflows/test-run', 'Validate and run an unsaved definition in the sandbox'],
   ['GET', '/v1/executions · /v1/executions/:id', 'History; ?includeData=true adds per-node input/output'],
@@ -1292,12 +1308,14 @@ const WORKFLOW_ENDPOINTS = [
   ['GET · POST · PUT', '/v1/human-tasks, /v1/human-tasks/:id/*', 'Durable human waits: claim, complete, reject, expire'],
   ['GET · POST · DELETE', '/v1/secrets, /v1/secrets/:name/*', 'Versioned secret vault with audited reads and rotation'],
   ['ANY', '/webhook/:path', 'Public inbound trigger with per-node auth, rate limit and idempotency'],
+  ['POST', '/mcp', 'MCP JSON-RPC server: active mcpTrigger workflows become AI tools'],
 ];
 
 const WORKFLOW_NODES = [
   ['webhook', 'Trigger on ANY /webhook/:path; path, httpMethod, auth, rateLimit, idempotency'],
   ['cron', 'Schedules from 10s: interval fields, 5-field cron, @hourly/@daily, timezone'],
   ['manualTrigger', 'Run from the Console, CLI or /execute with any JSON input'],
+  ['mcpTrigger', 'Expose the workflow as an MCP tool (toolName, description, inputSchema) at POST /mcp'],
   ['httpRequest', 'Public HTTP(S) with SSRF guard, credentials, retry and timeout'],
   ['code', 'Sandboxed JavaScript (≤50 KB, 5 s default) with $input/$json/$now'],
   ['set', 'Merge or assign values with {{ $json.x }} templating'],
@@ -1755,6 +1773,7 @@ function WorkflowDoc() {
 
       <DocSection title="Public webhooks" kicker="Triggers">
         <DocCode data={WORKFLOW_WEBHOOK} />
+        <DocCode data={WORKFLOW_MCP} />
       </DocSection>
 
       <DocSection title="API reference" kicker="Automation">

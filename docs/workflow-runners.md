@@ -1,4 +1,4 @@
-# Self-hosted workflow runners
+# Runner Engine (self-hosted connectors)
 
 SynapseFlow executes DAGs on **workers that consume a SynapseQueue queue**.
 You can use SynapseOne's built-in worker, deploy your own runner from the
@@ -54,7 +54,7 @@ A dedicated queue is also supported:
 
 ## 1. Create a runner and API key
 
-Console: **Workflow Runners → New runner**. Pick `custom` or `hybrid`, choose
+Console: **Runner Engine → New runner**. Pick the runner type (`workflow`, `inference`, `hybrid`) and queue, choose
 the key scopes (default `workflow:*,queue:*,*:read,base:query,base:vector-search,inference:*`),
 and create it. The dialog shows a `docker run` command that **already contains
 the API key** — copy it then; the key is not stored by workflow-service.
@@ -141,7 +141,7 @@ The runner's HTTP client (undici) is built for hostile networks:
   `SYNAPSEONE_HTTP_RETRY_BASE_MS` (default 300) tune retries.
 
 Run with Docker, Compose, Kubernetes or a systemd unit. The runner sends a
-heartbeat immediately on boot, so **Workflow Runners** switches to
+heartbeat immediately on boot, so **Runner Engine** switches to
 `connected` within ~2.5s. `GET /v1/workflow-runners/:id/connection` is the
 programmatic check.
 

@@ -314,7 +314,7 @@ export default function WorkflowRunners() {
   return (
     <>
       <PageTitle
-        title="Workflow Runners"
+        title="Runner Engine"
         sub="Cloudflare-style connectors for SynapseFlow — queue-backed execution on SynapseOne or your own infrastructure"
         right={(
           <>

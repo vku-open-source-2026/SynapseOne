@@ -167,6 +167,7 @@ function AppRoutes() {
           <Route path="/keys" element={<Guard><ConsoleLayout><Keys /></ConsoleLayout></Guard>} />
           <Route path="/service-accounts" element={<Guard><ConsoleLayout><ServiceAccounts /></ConsoleLayout></Guard>} />
           <Route path="/workflows" element={<Guard><ConsoleLayout><Workflows /></ConsoleLayout></Guard>} />
+          <Route path="/runner-engine" element={<Guard><ConsoleLayout><WorkflowRunners /></ConsoleLayout></Guard>} />
           <Route path="/workflow-runners" element={<Guard><ConsoleLayout><WorkflowRunners /></ConsoleLayout></Guard>} />
           <Route path="/base" element={<Guard><ConsoleLayout><SynapseBase /></ConsoleLayout></Guard>} />
           <Route path="/queue" element={<Guard><ConsoleLayout><SynapseQueue /></ConsoleLayout></Guard>} />

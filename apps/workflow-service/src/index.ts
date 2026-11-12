@@ -43,7 +43,7 @@ import {
 } from './queue';
 import type { WorkflowRunnerMode } from './queue';
 import { startPlatformWorker, platformWorkerId } from './worker';
-import { runWorkflow, HumanTaskPause, detectCycle, workflowCronIntervalMs, workflowCronNextRunAt, validateCronParams, validateSynapseOneParams, validateIntegrationParams, validateAgentToolIds, extractEmbeddingVector, isBlockedUrl as engineIsBlockedUrl, isAllowedSelfUrl, selfAllowlist, actorFor, isWebhookType, isCronType, isTriggerType, isCodeType, isHttpRequestType, isIfType, isSetType, isNoOpType, isAiAgentType, isDecisionType, isModelType, isIntegrationType, normalizeNodeType, edgeTargetPort, auxiliaryEdges } from './engine';
+import { runWorkflow, HumanTaskPause, detectCycle, workflowCronIntervalMs, workflowCronNextRunAt, validateCronParams, validateSynapseOneParams, validateIntegrationParams, validateAgentToolIds, extractEmbeddingVector, isBlockedUrl as engineIsBlockedUrl, isAllowedSelfUrl, selfAllowlist, actorFor, isWebhookType, isCronType, isTriggerType, isCodeType, isHttpRequestType, isIfType, isSetType, isNoOpType, isAiAgentType, isDecisionType, isModelType, isIntegrationType, isMcpTriggerType, normalizeNodeType, edgeTargetPort, auxiliaryEdges } from './engine';
 import type { CredentialResolver, RunPrincipal, SynapseOneCall, EngineNode, Connections } from './engine';
 
 /** May this credential be resolved for this run principal? (P0-4/#5)
@@ -960,6 +960,26 @@ function validateDefinition(definition: any, opts: { requireTrigger?: boolean } 
           }
         }
       }
+      if (isMcpTriggerType((n as any).type) && params && typeof params === 'object') {
+        const toolName = String((params as any).toolName || nm);
+        if (!/^[A-Za-z0-9_.-]{1,64}$/.test(toolName)) {
+          return `definition.nodes['${nm}'].mcpTrigger toolName must match [A-Za-z0-9_.-]{1,64}`;
+        }
+        if ((params as any).description !== undefined && String((params as any).description).length > 500) {
+          return `definition.nodes['${nm}'].mcpTrigger description ≤500 chars`;
+        }
+        const schema = (params as any).inputSchema;
+        if (schema !== undefined && schema !== null) {
+          if (typeof schema !== 'object' || Array.isArray(schema)) {
+            return `definition.nodes['${nm}'].mcpTrigger inputSchema must be a JSON Schema object`;
+          }
+          try {
+            if (Buffer.byteLength(JSON.stringify(schema), 'utf8') > 8 * 1024) {
+              return `definition.nodes['${nm}'].mcpTrigger inputSchema ≤8KB`;
+            }
+          } catch { return `definition.nodes['${nm}'].mcpTrigger inputSchema must be JSON-serializable`; }
+        }
+      }
       // P1-16: httpRequest credential reference shape (secret itself lives
       // in /v1/credentials and is resolved server-side at run time).
       if (isHttpRequestType((n as any).type) && params && typeof params === 'object') {
@@ -1856,6 +1876,164 @@ export function createApp(): express.Express {
     return handleInboundWebhook(req, res);
   }) as any);
 
+  // ---- MCP server (Model Context Protocol) ----
+  // Exposes active workflows with an `mcpTrigger` node as MCP tools. Clients
+  // authenticate through the gateway with a Bearer JWT or X-API-Key.
+  const MCP_PROTOCOL_VERSION = '2025-06-18';
+  const mcpGate = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (!INTERNAL_SECRET) return next();
+    const raw = (req.headers['x-synapseone-internal'] ?? req.headers['x-synapsedx-internal']) as string | string[] | undefined;
+    const got = Array.isArray(raw) ? (raw[0] || '') : (raw || '');
+    const a = Buffer.from(got);
+    const b = Buffer.from(INTERNAL_SECRET);
+    if (!got || a.length !== b.length || !timingSafeEqual(a, b)) {
+      return res.status(401).json({ error: 'unauthorized', message: 'MCP requires the SynapseOne gateway (internal credential missing)' });
+    }
+    return next();
+  };
+
+  async function activeMcpTools(principal: Principal | null): Promise<Array<{ workflow: StoredWorkflow; tool: NonNullable<ReturnType<typeof findMcpTrigger>> }>> {
+    if (!principal) return [];
+    const all = await listWorkflowRecs();
+    const out: Array<{ workflow: StoredWorkflow; tool: NonNullable<ReturnType<typeof findMcpTrigger>> }> = [];
+    for (const w of all) {
+      if (!w.active || !canAccessWorkflow(w, principal)) continue;
+      const tool = findMcpTrigger({ nodes: w.nodes });
+      if (tool) out.push({ workflow: w, tool });
+    }
+    return out;
+  }
+
+  const mcpToolsList = async (principal: Principal | null) => {
+    const tools = await activeMcpTools(principal);
+    return {
+      tools: tools.map(({ workflow, tool }) => ({
+        name: tool.toolName,
+        description: tool.description || `Run SynapseFlow workflow '${workflow.name}'`,
+        inputSchema: tool.inputSchema || { type: 'object', properties: {}, additionalProperties: true },
+        annotations: { title: workflow.name, readOnlyHint: true },
+      })),
+    };
+  };
+
+  const mcpToolCall = async (principal: Principal | null, name: string, args: any) => {
+    const tools = await activeMcpTools(principal);
+    const hit = tools.find((t) => t.tool.toolName === name);
+    if (!hit) throw Object.assign(new Error(`Unknown MCP tool '${name}'`), { rpcCode: -32602 });
+    const wf = hit.workflow;
+    if (!wf) throw Object.assign(new Error(`Workflow for tool '${name}' not found`), { rpcCode: -32602 });
+    const input = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
+    const executionId = randomUUID();
+    const startedAt = new Date().toISOString();
+    const r = await runWorkflow(
+      { nodes: wf.nodes as any, connections: wf.connections as any, name: wf.name, settings: wf.settings as any },
+      input,
+      {
+        triggeredBy: 'mcp',
+        timeoutMs: 60000,
+        principal,
+        credentialResolver: makeCredentialResolver(principal),
+        synapseoneCall,
+        humanTask: {
+          create: async (task) => {
+            const rec = await createHumanTaskRec({
+              id: randomUUID(), execution_id: executionId, workflow_id: wf.id, node_name: task.node,
+              title: task.title, description: task.description, assignee: task.assignee,
+              candidate_roles: task.candidateRoles, decision_schema: task.decisionSchema,
+              payload: task.payload, deadline: task.deadline,
+              org_id: principal?.org || wf.org_id || null,
+              account_id: principal?.account || wf.account_id || null,
+            });
+            return toPublicHumanTask(rec);
+          },
+        },
+      },
+    );
+    const finishedAt = new Date().toISOString();
+    recordRun('mcp', r.status, r.nodeRuns);
+    const exec = await createExecutionRec({
+      id: executionId, workflow_id: wf.id, workflow_name: wf.name, status: r.status,
+      input, output: r.output, node_runs: r.nodeRuns as any,
+      error: (r as any).error ?? null, triggered_by: 'mcp',
+      principal, actor: actorFor(wf.id, principal), startedAt, finishedAt,
+    });
+    if (r.status === 'paused') {
+      return {
+        content: [{ type: 'text', text: `Workflow paused for a human task (task ${exec.output?.humanTask?.id || 'created'}). Approve it in SynapseOne Console → Human Tasks.` }],
+        isError: true,
+      };
+    }
+    const safe = maskSecrets(r.output);
+    const text = safe && typeof safe === 'object' && typeof safe.content === 'string'
+      ? safe.content
+      : typeof safe === 'string' ? safe : JSON.stringify(safe, null, 2);
+    return {
+      content: [{ type: 'text', text: String(text ?? '').slice(0, 500000) }],
+      ...(safe && typeof safe === 'object' && !Array.isArray(safe) ? { structuredContent: safe } : {}),
+      ...(r.status === 'error' ? { isError: true } : {}),
+    };
+  };
+
+  app.post('/mcp', mcpGate, async (req, res) => {
+    const principal = principalFromHeaders(req);
+    const body = req.body;
+    const handle = async (msg: any): Promise<any | null> => {
+      const id = msg && Object.prototype.hasOwnProperty.call(msg, 'id') ? msg.id : undefined;
+      if (!msg || typeof msg !== 'object' || msg.jsonrpc !== '2.0' || typeof msg.method !== 'string') {
+        return id === undefined ? null : { jsonrpc: '2.0', id: id ?? null, error: { code: -32600, message: 'Invalid Request' } };
+      }
+      const method = msg.method;
+      if (method === 'notifications/initialized' || method.startsWith('notifications/')) return null;
+      if (method === 'initialize') {
+        return {
+          jsonrpc: '2.0', id,
+          result: {
+            protocolVersion: MCP_PROTOCOL_VERSION,
+            capabilities: { tools: { listChanged: true } },
+            serverInfo: { name: 'synapseone-synapseflow', version: VERSION },
+            instructions: 'Use tools/list to discover SynapseFlow workflows exposed as MCP tools. Authenticate with a SynapseOne Bearer JWT or X-API-Key.',
+          },
+        };
+      }
+      if (method === 'ping') return { jsonrpc: '2.0', id, result: {} };
+      if (!principal) {
+        return { jsonrpc: '2.0', id, error: { code: -32001, message: 'Authentication required: pass a SynapseOne Bearer JWT or X-API-Key.' } };
+      }
+      if (method === 'tools/list') {
+        return { jsonrpc: '2.0', id, result: await mcpToolsList(principal) };
+      }
+      if (method === 'tools/call') {
+        const params = msg.params && typeof msg.params === 'object' ? msg.params : {};
+        const name = String(params.name || '');
+        if (!name) return { jsonrpc: '2.0', id, error: { code: -32602, message: 'tools/call requires params.name' } };
+        try {
+          const result = await mcpToolCall(principal, name, params.arguments);
+          return { jsonrpc: '2.0', id, result };
+        } catch (e: any) {
+          return { jsonrpc: '2.0', id, error: { code: e?.rpcCode || -32603, message: String(e?.message || e).slice(0, 1000) } };
+        }
+      }
+      return { jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${method}` } };
+    };
+
+    try {
+      if (Array.isArray(body)) {
+        const out = [];
+        for (const msg of body.slice(0, 20)) {
+          const r = await handle(msg);
+          if (r) out.push(r);
+        }
+        if (!out.length) return res.status(202).end();
+        return res.json(out);
+      }
+      const r = await handle(body);
+      if (!r) return res.status(202).end();
+      return res.json(r);
+    } catch (e: any) {
+      return res.status(500).json({ jsonrpc: '2.0', id: body?.id ?? null, error: { code: -32603, message: String(e?.message || 'Internal error').slice(0, 500) } });
+    }
+  });
+
   // Defense-in-depth: workflow KHÔNG tin gateway mù quáng. Khi SYNAPSEONE_INTERNAL_SECRET
   // được set (cùng giá trị ở gateway), mọi /v1/* (trừ /health) phải mang header
   // x-synapseone-internal khớp — chặn truy cập trực tiếp :4002 vượt mặt gateway.
@@ -2278,6 +2456,21 @@ function tenantBinding(
           });
         }
       }
+      const mcp = findMcpTrigger({ nodes: cur.nodes });
+      if (mcp) {
+        const all = await listWorkflowRecs();
+        const clash = all.find((w) => {
+          if (w.id === id || !w.active) return false;
+          const other = findMcpTrigger({ nodes: w.nodes });
+          return other && other.toolName === mcp.toolName;
+        });
+        if (clash) {
+          return res.status(409).json({
+            error: 'mcp_tool_conflict',
+            message: `MCP tool '${mcp.toolName}' already serves active workflow '${clash.name}' (${clash.id}) — change the tool name or deactivate it first`,
+          });
+        }
+      }
     } catch { /* conflict scan is best-effort */ }
     const w = await updateWorkflowRec(id, { active: true });
     if (!w) return res.status(404).json({ error: 'not_found', message: 'workflow not found' });
@@ -2323,8 +2516,8 @@ function tenantBinding(
     // M10: test runs persist server-side — filterable so history views can
     // include or exclude them (triggeredBy=manual|webhook|cron|test).
     const triggeredBy = typeof q.triggeredBy === 'string' && q.triggeredBy.length <= 32 ? q.triggeredBy : undefined;
-    if (triggeredBy && !['manual', 'webhook', 'cron', 'test', 'human-task', 'workflow'].includes(triggeredBy)) {
-      return res.status(400).json({ error: 'invalid_query', message: 'triggeredBy must be manual|webhook|cron|test|human-task|workflow' });
+    if (triggeredBy && !['manual', 'webhook', 'cron', 'test', 'human-task', 'workflow', 'mcp'].includes(triggeredBy)) {
+      return res.status(400).json({ error: 'invalid_query', message: 'triggeredBy must be manual|webhook|cron|test|human-task|workflow|mcp' });
     }
     const includeData = q.includeData === 'true';
     const principal = principalFromHeaders(req);
@@ -3533,6 +3726,7 @@ export function listTemplates() {
     { name: 'etl-batch-warehouse', description: 'Manual/cron ETL: run a warehouse SQL transform into a target dataset (daily rollup template)' },
     { name: 'etl-stream-warehouse', description: 'Manual: ensure a SynapseStream topic consumer job that appends events to a warehouse dataset' },
     { name: 'etl-stream-microbatch', description: 'Manual: consume a SynapseStream micro-batch -> warehouse ingest -> ack (at-least-once)' },
+    { name: 'mcp-docs-reader', description: 'MCP tool: AI clients read SynapseOne docs through an mcpTrigger -> fetch -> format -> MCP response' },
   ];
 }
 
@@ -3565,6 +3759,28 @@ export function findWebhookTrigger(workflow: any): WebhookTrigger | null {
 /** First webhook trigger path of a workflow definition, or null. */
 export function findWebhookPath(workflow: any): string | null {
   return findWebhookTrigger(workflow)?.path || null;
+}
+
+export function mcpToolName(node: any): string {
+  return String(node?.parameters?.toolName || node?.name || '').trim();
+}
+
+export function findMcpTrigger(workflow: any): { toolName: string; description: string; inputSchema: any; node: any } | null {
+  try {
+    const nodes = workflow?.nodes;
+    if (!Array.isArray(nodes)) return null;
+    for (const n of nodes) {
+      if (!isMcpTriggerType((n as any)?.type)) continue;
+      const toolName = mcpToolName(n);
+      if (!/^[A-Za-z0-9_.-]{1,64}$/.test(toolName)) continue;
+      const description = String((n as any)?.parameters?.description || '').slice(0, 500);
+      const inputSchema = (n as any)?.parameters?.inputSchema && typeof (n as any).parameters.inputSchema === 'object'
+        ? (n as any).parameters.inputSchema
+        : { type: 'object', properties: {}, additionalProperties: true };
+      return { toolName, description, inputSchema, node: n };
+    }
+  } catch { /* ignore */ }
+  return null;
 }
 
 /** Decide routes are positional (main[0..n]); PostgreSQL JSONB does not
@@ -4243,6 +4459,49 @@ export function buildTemplate(name: string, workflowName?: string): any | null {
         Ingest: { main: [[{ node: 'Ack', type: 'main', index: 0 }]] },
         Ack: { main: [[{ node: 'Summary', type: 'main', index: 0 }]] },
       },
+    };
+  }
+  if (name === 'mcp-docs-reader') {
+    return {
+      name: wname,
+      nodes: [
+        {
+          id: wid(), name: 'MCP Trigger', type: 'mcpTrigger', typeVersion: 1, position: [200, 300],
+          parameters: {
+            toolName: 'read_synapseone_docs',
+            description: 'Read SynapseOne documentation pages. Pass a repository docs path such as docs/api.md or docs/README.md.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                path: { type: 'string', description: 'Docs path inside the SynapseOne repository (for example docs/api.md)' },
+              },
+              additionalProperties: false,
+            },
+          },
+        },
+        {
+          id: wid(), name: 'Build docs URL', type: 'code', typeVersion: 2, position: [420, 300],
+          parameters: {
+            code: "const raw = String($input.path || 'docs/README.md').replace(/^\\/+/, '');\nif (!raw || raw.includes('..')) throw new Error('invalid docs path');\nreturn { path: raw, url: `https://raw.githubusercontent.com/vku-open-source-2026/SynapseOne/main/${raw}` };",
+          },
+        },
+        {
+          id: wid(), name: 'Fetch docs', type: 'httpRequest', typeVersion: 4.2, position: [640, 300],
+          parameters: { url: '={{ $json.url }}', method: 'GET', timeoutMs: 30000, retry: { attempts: 2, delayMs: 500 } },
+        },
+        {
+          id: wid(), name: 'Format docs', type: 'code', typeVersion: 2, position: [860, 300],
+          parameters: {
+            code: "const body = $json.body;\nconst text = typeof body === 'string' ? body : JSON.stringify(body, null, 2);\nreturn { content: String(text || '').slice(0, 400000) };",
+          },
+        },
+      ],
+      connections: {
+        'MCP Trigger': { main: [[{ node: 'Build docs URL', type: 'main', index: 0 }]] },
+        'Build docs URL': { main: [[{ node: 'Fetch docs', type: 'main', index: 0 }]] },
+        'Fetch docs': { main: [[{ node: 'Format docs', type: 'main', index: 0 }]] },
+      },
+      settings: { timeoutMs: 60000 },
     };
   }
   return null;
