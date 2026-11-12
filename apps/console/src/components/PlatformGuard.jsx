@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 VKU.VIC
 import React, { useState } from 'react';
-import { Link, Navigate, useLocation } from 'react-router-dom';
+import { Link, Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../lib/auth.jsx';
 import { usePlatformAuth } from '../lib/platform-auth.jsx';
 import { Badge, Btn, Card, Err, Field, Input, PageTitle } from './ui.jsx';
 
 export default function PlatformGuard({ children }) {
-  const { auth } = useAuth();
+  const { auth, logout } = useAuth();
   const platform = usePlatformAuth();
   const loc = useLocation();
+  const nav = useNavigate();
   const [code, setCode] = useState('');
   const [localErr, setLocalErr] = useState(null);
 
@@ -25,7 +26,9 @@ export default function PlatformGuard({ children }) {
           <p className="text-sm text-normal-text">
             API-key sessions cannot open the platform console. Sign in with a password or SSO user, then enrol TOTP MFA.
           </p>
-          <Link to="/login" className="mt-4 inline-block text-sm text-main-blue hover:underline">Sign in as a user</Link>
+          <Btn className="mt-4" onClick={() => { logout(); nav('/login', { replace: true }); }}>
+            Sign out and sign in as a user
+          </Btn>
         </Card>
       </div>
     );
@@ -43,7 +46,7 @@ export default function PlatformGuard({ children }) {
 
   const error = localErr || platform.exchangeError;
   const errCode = error?.code;
-  const knownState = ['platform_admin_required', 'platform_admin_inactive', 'platform_mfa_required'].includes(errCode);
+  const knownState = ['platform_admin_required', 'platform_admin_inactive', 'platform_admin_org_required', 'platform_mfa_required', 'not_found'].includes(errCode);
 
   return (
     <div className="mx-auto max-w-xl px-4 pt-24">
@@ -64,7 +67,11 @@ export default function PlatformGuard({ children }) {
             TOTP MFA must be enabled on your account first. <Link to="/security" className="underline">Open Security</Link>.
           </p>
         )}
-        {errCode === 'platform_admin_required' || errCode === 'platform_admin_inactive' ? (
+        {errCode === 'not_found' ? (
+          <p className="mt-3 text-sm text-amber-600">Platform administration is disabled on this deployment.</p>
+        ) : errCode === 'platform_admin_org_required' ? (
+          <p className="mt-3 text-sm text-red-600">This account is not a member of the reserved platform organization.</p>
+        ) : errCode === 'platform_admin_required' || errCode === 'platform_admin_inactive' ? (
           <p className="mt-3 text-sm text-red-600">
             This account is not an active platform administrator.
           </p>

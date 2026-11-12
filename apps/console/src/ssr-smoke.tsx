@@ -20,6 +20,7 @@ import WorkflowEditor from './components/WorkflowEditor.jsx';
 const ROUTES = [
   '/',
   '/login',
+  '/register',
   '/about',
   '/oidc/callback',
   '/dashboard',
@@ -49,6 +50,7 @@ const ROUTES = [
   '/admin/usage',
   '/admin/audit',
   '/admin/access',
+  '/admin/not-a-route',
 ];
 
 const SESSIONS = {
@@ -81,6 +83,7 @@ const GUARDED = new Set([
   '/admin/usage',
   '/admin/audit',
   '/admin/access',
+  '/admin/not-a-route',
 ]);
 
 let failures = 0;

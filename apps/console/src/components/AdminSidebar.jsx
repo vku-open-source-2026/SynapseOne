@@ -18,6 +18,8 @@ const ITEMS = [
   { to: '/admin/access', label: 'Platform Admins', icon: faUserShield, owner: true },
 ];
 
+export { ITEMS as ADMIN_NAV_ITEMS };
+
 export default function AdminSidebar({ role }) {
   const { pathname } = useLocation();
   return (
@@ -30,7 +32,7 @@ export default function AdminSidebar({ role }) {
         {ITEMS.filter((it) => !it.owner || role === 'owner').map((it) => {
           const active = pathname === it.to || pathname.startsWith(it.to + '/');
           return (
-            <Link key={it.to} to={it.to} className={`flex items-center px-4 py-2 my-0.5 rounded-2xl text-sm transition-colors ${active ? 'text-main-blue bg-main-blue/10 font-medium' : 'hover:bg-background'}`}>
+            <Link key={it.to} to={it.to} aria-current={active ? 'page' : undefined} className={`flex items-center px-4 py-2 my-0.5 rounded-2xl text-sm transition-colors ${active ? 'text-main-blue bg-main-blue/10 font-medium' : 'hover:bg-background'}`}>
               <FontAwesomeIcon icon={it.icon} className="mr-3 w-4" />
               {it.label}
             </Link>

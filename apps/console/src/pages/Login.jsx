@@ -13,8 +13,8 @@ import SiteToggles from '../components/SiteToggles.jsx';
 import { useI18n } from '../lib/i18n-context.js';
 
 export default function Login() {
-  const [email, setEmail] = useState('demo@acme.local');
-  const [org, setOrg] = useState('acme');
+  const [email, setEmail] = useState('');
+  const [org, setOrg] = useState('');
   const [password, setPassword] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [mode, setMode] = useState('email');
@@ -136,10 +136,10 @@ export default function Login() {
           {mode === 'email' ? (
             <>
               <Field label={t.email}>
-                <Input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="demo@acme.local" autoComplete="username" />
+                <Input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" autoComplete="username" required />
               </Field>
               <Field label={t.org}>
-                <Input value={org} onChange={(e) => setOrg(e.target.value)} placeholder="acme" autoComplete="organization" />
+                <Input value={org} onChange={(e) => setOrg(e.target.value)} placeholder="your-org" autoComplete="organization" required />
               </Field>
               <Field label={t.password}>
                 <Input
@@ -185,6 +185,8 @@ export default function Login() {
         <p className="text-xs text-normal-text mt-4 text-center">
           {t.note}
           <br />
+          <Link to="/register" className="text-main-blue">Have an activation code? Activate your account</Link>
+          {' · '}
           <Link to="/about" className="text-main-blue">{t.about}</Link>
           {' · '}
           <Link to="/api-docs" className="text-main-blue">{m.nav.apiDocs}</Link>

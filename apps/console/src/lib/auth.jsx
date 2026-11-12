@@ -79,6 +79,12 @@ export function AuthProvider({ children }) {
   }, []);
 
   const loginWithKey = useCallback((apiKey) => setAuth({ apiKey }), []);
+
+  const acceptInvite = useCallback(async (token, password, displayName) => {
+    const r = await api.acceptInvite(token, password, displayName);
+    setAuth({ token: r.accessToken, refreshToken: r.refreshToken, user: r.user, email: r.user?.email });
+    return r;
+  }, []);
   // Server-side logout: revoke the refresh token so it can't be reused after
   // the browser session is gone (best-effort — local state clears regardless).
   const logout = useCallback(() => {
@@ -88,7 +94,7 @@ export function AuthProvider({ children }) {
   }, [auth?.refreshToken]);
 
   return (
-    <AuthCtx.Provider value={{ auth, headers, login, loginWithKey, loginWithOidc, completeMfa, logout, setAuth }}>
+    <AuthCtx.Provider value={{ auth, headers, login, loginWithKey, loginWithOidc, completeMfa, acceptInvite, logout, setAuth }}>
       {children}
     </AuthCtx.Provider>
   );

@@ -4,13 +4,24 @@
  * Dedicated platform-administrator session. The normal tenant session proves
  * identity; a fresh TOTP code is exchanged for a short-lived platform token
  * held in sessionStorage (not localStorage) and only used on /v1/platform/*.
+ *
+ * Step-up proofs are one-time, session-bound and action-bound. They are never
+ * cached or auto-attached: the action dialog passes the proof explicitly to the
+ * one request it authorizes.
  */
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { baseUrl, authStore } from './api.js';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import { api, baseUrl, authStore } from './api.js';
 import { useAuth } from './auth.jsx';
 
 const KEY = 'synapseone.admin.session';
-const STEP_KEY = 'synapseone.admin.stepup';
+const SESSION_INVALID = new Set([
+  'invalid_token',
+  'unauthorized',
+  'platform_session_required',
+  'platform_admin_required',
+  'platform_admin_inactive',
+  'platform_admin_org_required',
+]);
 
 export class PlatformError extends Error {
   constructor(status, path, body) {
@@ -37,52 +48,43 @@ function readSession() {
   }
 }
 
-function readStep() {
-  try {
-    const raw = sessionStorage.getItem(STEP_KEY);
-    if (!raw) return null;
-    const v = JSON.parse(raw);
-    if (!v?.token || !v?.expiresAt || v.expiresAt <= Date.now()) {
-      sessionStorage.removeItem(STEP_KEY);
-      return null;
-    }
-    return v;
-  } catch {
-    return null;
-  }
-}
-
 const PlatformAuthCtx = createContext(null);
 
 export function PlatformAuthProvider({ children }) {
-  const { auth } = useAuth();
+  const { auth, logout: logoutTenant } = useAuth();
   const [session, setSession] = useState(readSession);
-  const [step, setStep] = useState(readStep);
   const [exchangeError, setExchangeError] = useState(null);
   const [busy, setBusy] = useState(false);
-  const stepRef = useRef(step);
-  stepRef.current = step;
+  const tenantUserId = auth?.user?.id || null;
 
   useEffect(() => {
     if (session) sessionStorage.setItem(KEY, JSON.stringify(session));
     else sessionStorage.removeItem(KEY);
   }, [session]);
+
+  // A platform session belongs to exactly one tenant identity. A logout or a
+  // different user in the same tab must never inherit the old platform token.
   useEffect(() => {
-    if (step) sessionStorage.setItem(STEP_KEY, JSON.stringify(step));
-    else sessionStorage.removeItem(STEP_KEY);
-  }, [step]);
+    if (!session) return;
+    if (!tenantUserId || (session.user?.id && session.user.id !== tenantUserId)) {
+      setSession(null);
+      setExchangeError(null);
+    }
+  }, [tenantUserId, session]);
 
   const clear = useCallback(() => {
     setSession(null);
-    setStep(null);
   }, []);
 
   const request = useCallback(async (path, { method = 'GET', body, platformToken, stepUpToken } = {}) => {
     const token = platformToken || session?.token;
     if (!token) throw new PlatformError(401, path, { error: 'platform_session_required' });
+    if (session?.expiresAt && session.expiresAt <= Date.now()) {
+      clear();
+      throw new PlatformError(401, path, { error: 'platform_session_expired' });
+    }
     const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` };
-    const su = stepUpToken || stepRef.current?.token;
-    if (su) headers['x-platform-step-up'] = su;
+    if (stepUpToken) headers['x-platform-step-up'] = stepUpToken;
     let res;
     try {
       res = await fetch(`${baseUrl()}${path}`, {
@@ -96,41 +98,53 @@ export function PlatformAuthProvider({ children }) {
     const text = await res.text();
     let json = null;
     try { json = text ? JSON.parse(text) : null; } catch { json = text; }
-    if (res.status === 401) {
+    const code = json && typeof json === 'object' ? json.error : undefined;
+    if (res.status === 401 && SESSION_INVALID.has(code)) {
       clear();
+      setExchangeError(new PlatformError(res.status, path, json));
       throw new PlatformError(res.status, path, json);
     }
-    if (res.status === 403 && json && typeof json === 'object' && ['platform_admin_inactive', 'platform_admin_required'].includes(json.error)) {
+    if (res.status === 403 && SESSION_INVALID.has(code)) {
       clear();
+      setExchangeError(new PlatformError(res.status, path, json));
+      throw new PlatformError(res.status, path, json);
     }
     if (!res.ok) throw new PlatformError(res.status, path, json);
     return json;
-  }, [session?.token, clear]);
+  }, [session?.token, session?.expiresAt, clear]);
 
   const exchange = useCallback(async (code) => {
     setBusy(true);
     setExchangeError(null);
     try {
-      // The ordinary API client refreshes an expired tenant access token first.
       const live = authStore.get()?.token || auth?.token;
-      if (!live) throw new PlatformError(401, '/v1/platform/session', { error: 'login_required' });
-      const r = await fetch(`${baseUrl()}/v1/platform/session`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${live}` },
-        body: JSON.stringify(/^\d{6}$/.test(String(code || '').trim()) ? { code: String(code).trim() } : { recoveryCode: String(code || '').trim() }),
-      });
-      const text = await r.text();
-      let json = null;
-      try { json = text ? JSON.parse(text) : null; } catch { json = text; }
-      if (!r.ok) throw new PlatformError(r.status, '/v1/platform/session', json);
+      if (!live) {
+        logoutTenant();
+        throw new PlatformError(401, '/v1/platform/session', { error: 'login_required' });
+      }
+      const value = String(code || '').trim();
+      const body = /^\d{6}$/.test(value)
+        ? { code: value }
+        : value
+          ? { recoveryCode: value }
+          : {};
+      // Uses the console API client so an expired tenant access token is
+      // refreshed (single-flight) before the platform exchange.
+      let json;
+      try {
+        json = await api.call('POST', '/v1/platform/session', body, { token: live });
+      } catch (e) {
+        throw new PlatformError(e.status || 0, '/v1/platform/session', e.body || e.message);
+      }
       const next = {
         token: json.accessToken,
         expiresAt: Date.now() + Number(json.expiresIn || 900) * 1000,
         role: json.role,
         user: json.user,
+        mfaRequired: json.mfaRequired !== false,
+        stepUpRequired: json.stepUpRequired !== false,
       };
       setSession(next);
-      setStep(null);
       return next;
     } catch (e) {
       setExchangeError(e);
@@ -138,19 +152,22 @@ export function PlatformAuthProvider({ children }) {
     } finally {
       setBusy(false);
     }
-  }, [auth?.token]);
+  }, [auth?.token, logoutTenant]);
 
-  const stepUp = useCallback(async (code) => {
+  const stepUp = useCallback(async (code, action) => {
     setBusy(true);
     try {
       const value = String(code || '').trim();
-      const r = await request('/v1/platform/step-up', {
-        method: 'POST',
-        body: /^\d{6}$/.test(value) ? { code: value } : { recoveryCode: value },
-      });
-      const next = { token: r.stepUpToken, expiresAt: Date.now() + Number(r.expiresIn || 300) * 1000 };
-      setStep(next);
-      return next;
+      const body = {
+        action,
+        ...(/^\d{6}$/.test(value) ? { code: value } : { recoveryCode: value }),
+      };
+      const r = await request('/v1/platform/step-up', { method: 'POST', body });
+      return {
+        token: r.stepUpToken,
+        expiresAt: Date.now() + Number(r.expiresIn || 300) * 1000,
+        action: r.action || action,
+      };
     } finally {
       setBusy(false);
     }
@@ -165,15 +182,16 @@ export function PlatformAuthProvider({ children }) {
     session,
     role: session?.role || null,
     user: session?.user || null,
+    mfaRequired: session?.mfaRequired !== false,
+    stepUpRequired: session?.stepUpRequired !== false,
     exchangeError,
     busy,
     request,
     exchange,
     stepUp,
-    stepUpToken: step?.token || null,
     logout,
     clear,
-  }), [session, exchangeError, busy, request, exchange, stepUp, step?.token, logout, clear]);
+  }), [session, exchangeError, busy, request, exchange, stepUp, logout, clear]);
 
   return <PlatformAuthCtx.Provider value={value}>{children}</PlatformAuthCtx.Provider>;
 }

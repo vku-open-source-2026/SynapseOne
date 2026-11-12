@@ -4,7 +4,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { usePlatformAuth } from '../../lib/platform-auth.jsx';
 import AdminActionDialog from '../../components/AdminActionDialog.jsx';
-import { Badge, Btn, Card, Empty, Err, PageTitle, Skeleton, Table } from '../../components/ui.jsx';
+import { Badge, Btn, Card, Code, Empty, Err, Modal, PageTitle, Skeleton, Table } from '../../components/ui.jsx';
 
 export default function AdminUserDetail() {
   const { userId } = useParams();
@@ -13,6 +13,9 @@ export default function AdminUserDetail() {
   const [err, setErr] = useState(null);
   const [confirm, setConfirm] = useState(null);
   const [notice, setNotice] = useState(null);
+  const [invite, setInvite] = useState(null);
+
+  const canWrite = platform.role === 'owner' || platform.role === 'operator';
 
   const load = useCallback(async () => {
     setErr(null);
@@ -29,27 +32,59 @@ export default function AdminUserDetail() {
     const a = confirm;
     if (!a) return;
     const body = {};
-    if (a.kind === 'org-admin') body.isOrgAdmin = !a.current;
+    if (a.action === 'user:org-admin') body.isOrgAdmin = !data.user.is_org_admin;
     if (reason) body.reason = reason;
-    const path = a.kind === 'org-admin'
-      ? `/v1/platform/users/${encodeURIComponent(userId)}/org-admin`
-      : `/v1/platform/users/${encodeURIComponent(userId)}/${a.kind}`;
-    await platform.request(path, { method: a.kind === 'org-admin' ? 'PUT' : 'POST', body, stepUpToken });
-    setNotice('Action completed and recorded in the audit log.');
+    const out = await platform.request(
+      a.path || `/v1/platform/users/${encodeURIComponent(userId)}/${a.kind}`,
+      { method: a.method || 'POST', body, stepUpToken },
+    );
+    setNotice(`${a.label} completed and recorded in the audit log.`);
+    if (out?.inviteToken) setInvite({ email: data.user.email, token: out.inviteToken });
     await load();
   };
 
-  if (err) return <><PageTitle title="User" /><Err e={err} /><Link to="/admin/users" className="text-sm text-main-blue">Back to users</Link></>;
-  if (!data) return <Skeleton className="h-64 w-full" />;
+  if (err) {
+    return (
+      <>
+        <PageTitle title="User" right={<Link to="/admin/users" className="text-sm text-main-blue hover:underline">Back</Link>} />
+        <Err e={err} />
+      </>
+    );
+  }
+  if (!data) {
+    return (
+      <>
+        <PageTitle title="User detail" right={<Link to="/admin/users" className="text-sm text-main-blue hover:underline">Back</Link>} />
+        <Skeleton className="h-64 w-full" />
+      </>
+    );
+  }
 
   const u = data.user || {};
   const mfa = data.mfa || {};
   const actions = [
-    { kind: 'org-admin', label: u.is_org_admin ? 'Revoke org admin' : 'Grant org admin', current: u.is_org_admin, danger: u.is_org_admin },
-    { kind: 'reset-mfa', label: 'Reset MFA', danger: true },
-    { kind: 'revoke-sessions', label: 'Revoke sessions', danger: true },
-    { kind: u.active ? 'disable' : 'enable', label: u.active ? 'Disable user' : 'Enable user', danger: u.active },
-    { kind: 'unlock', label: 'Unlock sign-in', danger: false },
+    {
+      kind: 'org-admin', action: 'user:org-admin', method: 'PUT',
+      label: u.is_org_admin ? 'Revoke org admin' : 'Grant org admin',
+      danger: !!u.is_org_admin, requireReason: true,
+    },
+    ...(mfa.enabled ? [{
+      kind: 'reset-mfa', action: 'user:reset-mfa', label: 'Reset MFA', danger: true,
+    }] : []),
+    {
+      kind: 'revoke-sessions', action: 'user:revoke-sessions', label: 'Revoke sessions', danger: true,
+    },
+    {
+      kind: u.active ? 'disable' : 'enable', action: 'user:disable',
+      label: u.active ? 'Disable user' : 'Enable user', danger: !!u.active,
+      requireStepUp: !!u.active,
+    },
+    ...(data.lockedForSeconds > 0 ? [{
+      kind: 'unlock', action: 'user:disable', label: 'Unlock sign-in', danger: false, requireStepUp: false,
+    }] : []),
+    ...(!u.passwordSet ? [{
+      kind: 'invite', action: 'user:invite', label: 'Issue activation code', danger: false,
+    }] : []),
   ];
 
   return (
@@ -59,7 +94,14 @@ export default function AdminUserDetail() {
         sub={`${data.organization?.slug || '–'} · ${u.display_name || 'No display name'}`}
         right={<Link to="/admin/users" className="text-sm text-main-blue hover:underline">Back</Link>}
       />
-      {notice && <div className="mb-4 px-4 py-2.5 rounded-2xl bg-emerald-500/10 text-emerald-700 text-sm">{notice}</div>}
+      <div role="status" aria-live="polite">
+        {notice && <div className="mb-4 px-4 py-2.5 rounded-2xl bg-emerald-500/10 text-emerald-700 text-sm">{notice}</div>}
+      </div>
+      {!canWrite && (
+        <div className="mb-4 px-4 py-2.5 rounded-2xl bg-amber-500/10 text-amber-700 text-sm">
+          Auditor role: this page is read-only.
+        </div>
+      )}
 
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
         <Card>
@@ -69,7 +111,11 @@ export default function AdminUserDetail() {
             <div className="flex justify-between gap-2"><dt className="text-normal-text">Organization</dt><dd>{data.organization?.slug}</dd></div>
             <div className="flex justify-between gap-2"><dt className="text-normal-text">Status</dt><dd><Badge tone={u.active ? 'green' : 'gray'}>{u.active ? 'active' : 'inactive'}</Badge></dd></div>
             <div className="flex justify-between gap-2"><dt className="text-normal-text">Org admin</dt><dd><Badge tone={u.is_org_admin ? 'blue' : 'gray'}>{u.is_org_admin ? 'yes' : 'no'}</Badge></dd></div>
+            <div className="flex justify-between gap-2"><dt className="text-normal-text">Password</dt><dd><Badge tone={u.passwordSet ? 'green' : 'amber'}>{u.passwordSet ? 'set' : 'activation pending'}</Badge></dd></div>
             <div className="flex justify-between gap-2"><dt className="text-normal-text">MFA</dt><dd><Badge tone={mfa.enabled ? 'green' : 'amber'}>{mfa.enabled ? `${mfa.recoveryCodesRemaining} recovery codes` : 'not enabled'}</Badge></dd></div>
+            {data.lockedForSeconds > 0 && (
+              <div className="flex justify-between gap-2"><dt className="text-normal-text">Sign-in lock</dt><dd><Badge tone="red">{data.lockedForSeconds}s</Badge></dd></div>
+            )}
           </dl>
         </Card>
         <Card>
@@ -79,50 +125,73 @@ export default function AdminUserDetail() {
           ) : <Empty text="No roles assigned" />}
         </Card>
         <Card>
-          <h3 className="font-semibold text-main-text mb-3">Actions</h3>
-          <div className="flex flex-wrap gap-2">
-            {actions.map((a) => (
-              <Btn key={a.kind} kind={a.danger ? 'danger' : 'secondary'} onClick={() => setConfirm(a)}>{a.label}</Btn>
-            ))}
-          </div>
-          <p className="text-xs text-normal-text mt-3">Destructive actions require a fresh authenticator code. Every action is audited.</p>
+          <h3 className="font-semibold text-main-text mb-3">Administrative actions</h3>
+          {canWrite ? (
+            <div className="flex flex-wrap gap-2">
+              {actions.map((a) => (
+                <Btn key={a.kind} kind={a.danger ? 'danger' : 'secondary'} onClick={() => setConfirm(a)}>{a.label}</Btn>
+              ))}
+            </div>
+          ) : <Empty text="Read-only for the auditor role" />}
+          <p className="text-xs text-normal-text mt-3">High-risk actions require a fresh authenticator code. Every action is audited.</p>
         </Card>
       </div>
 
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 mt-6">
         <Card>
-          <h3 className="font-semibold text-main-text mb-3">Effective policy statements</h3>
+          <h3 className="font-semibold text-main-text mb-3">Policy documents</h3>
           {data.policies?.length ? (
-            <Table head={['#', 'Statements']}>
-              {data.policies.map((p) => <tr key={p.index} className="border-t border-slate-100"><td className="py-2 pr-4">{p.index + 1}</td><td className="py-2 pr-4">{p.Statement}</td></tr>)}
-            </Table>
+            <div className="space-y-3">
+              {data.policies.map((p) => (
+                <div key={p.index}>
+                  <p className="text-xs font-medium text-main-text mb-1">Policy {p.index + 1}</p>
+                  <Code data={p.document || {}} />
+                </div>
+              ))}
+            </div>
           ) : <Empty text="No policies via roles" />}
         </Card>
         <Card>
-          <h3 className="font-semibold text-main-text mb-3">Sessions</h3>
+          <h3 className="font-semibold text-main-text mb-3">Refresh sessions</h3>
           {data.sessions?.length ? (
-            <Table head={['Session', 'Created', 'Expires']}>
+            <Table head={['Session', 'Created', 'Expires', 'State']}>
               {data.sessions.map((s) => (
                 <tr key={s.id} className="border-t border-slate-100">
                   <td className="py-2 pr-4 text-xs font-mono text-normal-text">{s.id.slice(0, 8)}…</td>
                   <td className="py-2 pr-4 text-xs text-normal-text">{s.created_at ? new Date(s.created_at).toLocaleString() : '–'}</td>
                   <td className="py-2 pr-4 text-xs text-normal-text">{s.expires_at ? new Date(s.expires_at).toLocaleString() : '–'}</td>
+                  <td className="py-2 pr-4"><Badge tone={s.revoked_at ? 'gray' : 'green'}>{s.revoked_at ? 'revoked' : 'active'}</Badge></td>
                 </tr>
               ))}
             </Table>
-          ) : <Empty text="No active sessions" />}
+          ) : <Empty text="No refresh sessions" />}
         </Card>
       </div>
 
       <AdminActionDialog
         open={!!confirm}
         title={confirm ? `${confirm.label}?` : ''}
-        message={confirm ? `This affects ${u.email}. A fresh TOTP code is required.` : ''}
+        message={confirm ? `This affects ${u.email}.` : ''}
+        action={confirm?.action}
         confirmLabel={confirm?.label || 'Confirm'}
-        requireReason={confirm?.kind === 'org-admin'}
+        requireReason={confirm?.requireReason}
+        requireStepUp={confirm?.requireStepUp !== false}
+        danger={confirm?.danger !== false}
         onClose={() => setConfirm(null)}
         onConfirm={run}
       />
+
+      {invite && (
+        <Modal title="One-time activation code" onClose={() => setInvite(null)}>
+          <p className="text-sm text-normal-text">
+            Send this code to <strong>{invite.email}</strong> through a trusted channel. It expires in 7 days and
+            can be used once at <code>/register</code> to set a password.
+          </p>
+          <div className="mt-3 rounded-2xl bg-background p-3 break-all font-mono text-xs">{invite.token}</div>
+          <Btn className="mt-4" onClick={() => { navigator.clipboard?.writeText(invite.token); }}>Copy code</Btn>
+          <Btn kind="secondary" className="mt-4 ml-2" onClick={() => setInvite(null)}>Close</Btn>
+        </Modal>
+      )}
     </>
   );
 }

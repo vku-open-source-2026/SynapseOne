@@ -20,6 +20,7 @@ import ErrorBoundary from './components/ErrorBoundary.jsx';
 import { ScopeProvider } from './components/Scope.jsx';
 import { PageSkeleton, RouteProgress, ScrollToTop } from './components/loading.jsx';
 import Login from './pages/Login.jsx';
+import Register from './pages/Register.jsx';
 import OidcCallback from './pages/OidcCallback.jsx';
 import Landing from './pages/Landing.jsx';
 import About from './pages/About.jsx';
@@ -169,6 +170,7 @@ function AppRoutes() {
           <Route path="/welcome" element={<Navigate to="/" replace />} />
           <Route path="/about" element={<About />} />
           <Route path="/login" element={<Login />} />
+          <Route path="/register" element={<Register />} />
           <Route path="/oidc/callback" element={<OidcCallback />} />
           <Route path="/api-docs" element={<DocsLayout><ApiDocs /></DocsLayout>} />
           <Route path="/docs" element={<DocsLayout><Docs /></DocsLayout>} />
@@ -203,10 +205,21 @@ function AppRoutes() {
           <Route path="/admin/usage" element={<PlatformGuard><AdminLayout><AdminUsage /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/audit" element={<PlatformGuard><AdminLayout><AdminAudit /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/access" element={<PlatformGuard><AdminLayout><AdminPlatformAdmins /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/*" element={<PlatformGuard><AdminLayout><AdminNotFound /></AdminLayout></PlatformGuard>} />
           <Route path="*" element={<Landing />} />
         </Routes>
       </Suspense>
     </ResettingBoundary>
+  );
+}
+
+function AdminNotFound() {
+  return (
+    <div className="max-w-xl">
+      <h1 className="text-2xl font-semibold text-main-text">Admin page not found</h1>
+      <p className="text-sm text-normal-text mt-2">The requested platform administration route does not exist.</p>
+      <a href="/admin/overview" className="inline-block mt-4 text-sm text-main-blue hover:underline">Back to Platform Overview</a>
+    </div>
   );
 }
 

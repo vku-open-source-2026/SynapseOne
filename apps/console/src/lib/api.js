@@ -149,6 +149,11 @@ export const api = {
     ...(typeof password === 'string' && password.length ? { password } : {}),
   }),
   verifyMfa: (mfaToken, code, recoveryCode) => post('/v1/auth/mfa/verify', code ? { mfaToken, code } : { mfaToken, recoveryCode }),
+  acceptInvite: (token, password, displayName) => post('/v1/auth/invite/accept', {
+    token,
+    password,
+    ...(displayName ? { displayName } : {}),
+  }),
   mfaStatus: (auth) => get('/v1/auth/mfa', auth),
   mfaSetup: (auth) => post('/v1/auth/mfa/totp/setup', {}, auth),
   mfaEnable: (code, auth) => post('/v1/auth/mfa/totp/enable', { code }, auth),

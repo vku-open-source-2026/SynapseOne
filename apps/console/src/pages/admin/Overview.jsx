@@ -26,30 +26,39 @@ export default function AdminOverview() {
   const [ready, setReady] = useState(null);
   const [err, setErr] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [healthLoading, setHealthLoading] = useState(true);
+  const [updatedAt, setUpdatedAt] = useState(null);
+  const [recentErr, setRecentErr] = useState(null);
 
   const load = useCallback(async () => {
     setErr(null);
     setLoading(true);
     const w = windowFor(range);
-    try {
-      const [o, u, a] = await Promise.all([
-        platform.request(`/v1/platform/overview?from=${encodeURIComponent(w.from)}&to=${encodeURIComponent(w.to)}`),
-        platform.request(`/v1/platform/usage/summary?from=${encodeURIComponent(w.from)}&to=${encodeURIComponent(w.to)}`),
-        platform.request('/v1/platform/audit?limit=6'),
-      ]);
-      setOverview(o);
-      setUsage(u);
-      setRecent(Array.isArray(a) ? a : []);
-    } catch (e) {
-      setErr(e);
-    } finally {
-      setLoading(false);
+    const [o, u, a] = await Promise.allSettled([
+      platform.request(`/v1/platform/overview?from=${encodeURIComponent(w.from)}&to=${encodeURIComponent(w.to)}`),
+      platform.request(`/v1/platform/usage/summary?from=${encodeURIComponent(w.from)}&to=${encodeURIComponent(w.to)}`),
+      platform.request('/v1/platform/audit?limit=6'),
+    ]);
+    if (o.status === 'fulfilled') setOverview(o.value);
+    if (u.status === 'fulfilled') setUsage(u.value);
+    if (a.status === 'fulfilled') {
+      setRecent(Array.isArray(a.value) ? a.value : []);
+      setRecentErr(null);
+    } else {
+      setRecentErr(a.reason);
     }
+    const firstError = [o, u, a].find((r) => r.status === 'rejected')?.reason;
+    setErr(firstError || null);
+    setUpdatedAt(new Date());
+    setLoading(false);
+    setHealthLoading(true);
     try {
       const r = await fetch(`${baseUrl()}/ready`);
       setReady(await r.json());
     } catch {
       setReady(null);
+    } finally {
+      setHealthLoading(false);
     }
   }, [platform, range]);
 
@@ -88,6 +97,8 @@ export default function AdminOverview() {
           { label: 'Active users', value: tenancy.activeUsers },
           { label: 'Org admins', value: tenancy.orgAdmins },
           { label: 'MFA enabled', value: tenancy.mfaEnabledUsers },
+          { label: 'API keys', value: tenancy.activeApiKeys },
+          { label: 'Service accounts', value: tenancy.serviceAccounts },
           { label: 'Requests', value: totals.requests },
           { label: 'Error rate', value: totals.errorRate == null ? '–' : `${totals.errorRate}%` },
           { label: 'p95 latency', value: totals.p95Ms == null ? '–' : `${totals.p95Ms} ms` },
@@ -103,20 +114,28 @@ export default function AdminOverview() {
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 mt-6">
         <Card className="xl:col-span-2">
           <div className="flex items-center justify-between mb-3">
-            <h3 className="font-semibold text-main-text">Request activity</h3>
+            <div>
+              <h3 className="font-semibold text-main-text">Request activity</h3>
+              {updatedAt && <p className="text-[11px] text-normal-text">Updated {updatedAt.toLocaleTimeString()}</p>}
+            </div>
             <Badge tone={totals.errorRate > 5 ? 'red' : totals.errorRate > 1 ? 'amber' : 'green'}>{totals.requests || 0} requests</Badge>
           </div>
           {loading ? <Skeleton className="h-40 w-full" /> : series.length ? (
-            <div className="h-44 flex items-end gap-[2px]" aria-label="Request activity chart">
-              {series.map((s) => (
-                <div
-                  key={s.ts}
-                  title={`${new Date(s.ts).toLocaleString()} · ${s.requests} requests · ${s.errors} errors`}
-                  className="flex-1 min-w-[2px] rounded-t bg-gradient-to-t from-main-blue to-second-blue"
-                  style={{ height: `${Math.max(2, (Number(s.requests) || 0) / max * 100)}%` }}
-                />
-              ))}
-            </div>
+            <>
+              <div className="h-44 flex items-end gap-[2px]" aria-label="Request and error chart">
+                {series.map((s) => {
+                  const h = Math.max(2, (Number(s.requests) || 0) / max * 100);
+                  const e = Math.min(100, (Number(s.errors) || 0) / max * 100);
+                  return (
+                    <div key={s.ts} className="flex-1 min-w-[2px] relative" title={`${new Date(s.ts).toLocaleString()} · ${s.requests} requests · ${s.errors} errors`}>
+                      <div className="w-full rounded-t bg-gradient-to-t from-main-blue to-second-blue" style={{ height: `${h}%`, minHeight: 2 }} />
+                      {e > 0 && <div className="absolute bottom-0 left-0 right-0 bg-red-500/80 rounded-t" style={{ height: `${Math.max(1, e)}%` }} />}
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="flex gap-4 mt-2 text-[11px] text-normal-text"><span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-sm bg-main-blue" /> requests</span><span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-sm bg-red-500" /> errors</span></div>
+            </>
           ) : <Empty text="No usage events in this range" />}
         </Card>
 
@@ -125,8 +144,8 @@ export default function AdminOverview() {
             <h3 className="font-semibold text-main-text">Service health</h3>
             <Badge tone={ready?.status === 'ready' ? 'green' : 'amber'}>{ready?.status || 'unknown'}</Badge>
           </div>
-          <p className="text-xs text-normal-text mb-3">{healthy}/{upstreams.length || '–'} upstreams healthy</p>
-          <ul className="space-y-2 text-xs">
+          <p className="text-xs text-normal-text mb-3">{healthLoading ? 'Probing…' : `${healthy}/${upstreams.length || '–'} upstreams healthy`}</p>
+          {healthLoading ? <Skeleton className="h-24 w-full" /> : <ul className="space-y-2 text-xs">
             {upstreams.slice(0, 8).map((u) => (
               <li key={u.name} className="flex items-center gap-2">
                 <span className={`w-2 h-2 rounded-full ${u.ok ? 'bg-emerald-500' : 'bg-red-500'}`} />
@@ -134,7 +153,7 @@ export default function AdminOverview() {
                 <span className="ml-auto text-normal-text">{u.ok ? `${u.ms} ms` : 'down'}</span>
               </li>
             ))}
-          </ul>
+          </ul>}
           <Link to="/admin/health" className="mt-4 inline-block text-xs text-main-blue hover:underline">Open Service Health →</Link>
         </Card>
       </div>
@@ -156,7 +175,7 @@ export default function AdminOverview() {
             <h3 className="font-semibold text-main-text">Recent platform activity</h3>
             <Badge tone="blue">{recent.length}</Badge>
           </div>
-          {recent.length ? (
+          {recentErr ? <Err e={recentErr} /> : loading ? <Skeleton className="h-24 w-full" /> : recent.length ? (
             <ul className="space-y-2 text-xs">
               {recent.map((a) => (
                 <li key={a.id} className="flex items-center gap-2 min-w-0">

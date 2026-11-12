@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 VKU.VIC
 import React, { useCallback, useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { usePlatformAuth } from '../../lib/platform-auth.jsx';
 import { Badge, Btn, Card, Empty, Err, Field, Input, PageTitle, Table, TableSkeleton } from '../../components/ui.jsx';
 
@@ -11,13 +11,15 @@ export default function AdminUsers() {
   const platform = usePlatformAuth();
   const [q, setQ] = useState('');
   const [query, setQuery] = useState('');
-  const [orgId, setOrgId] = useState('');
+  const [params] = useSearchParams();
+  const [orgId, setOrgId] = useState(params.get('orgId') || '');
   const [active, setActive] = useState('');
   const [isOrgAdmin, setIsOrgAdmin] = useState('');
   const [orgs, setOrgs] = useState([]);
   const [offset, setOffset] = useState(0);
   const [data, setData] = useState({ items: [], total: 0 });
   const [loaded, setLoaded] = useState(false);
+  const [loading, setLoading] = useState(false);
   const [err, setErr] = useState(null);
 
   useEffect(() => {
@@ -26,6 +28,7 @@ export default function AdminUsers() {
 
   const load = useCallback(async () => {
     setErr(null);
+    setLoading(true);
     const p = new URLSearchParams({ q: query, limit: String(PAGE), offset: String(offset) });
     if (orgId) p.set('orgId', orgId);
     if (active) p.set('active', active);
@@ -36,6 +39,7 @@ export default function AdminUsers() {
     } catch (e) {
       setErr(e);
     } finally {
+      setLoading(false);
       setLoaded(true);
     }
   }, [platform, query, orgId, active, isOrgAdmin, offset]);
@@ -46,6 +50,7 @@ export default function AdminUsers() {
     e.preventDefault();
     setOffset(0);
     setQuery(q.trim());
+    if (q.trim() === query) load();
   };
   const clear = () => {
     setQ(''); setQuery(''); setOrgId(''); setActive(''); setIsOrgAdmin(''); setOffset(0);
@@ -55,7 +60,11 @@ export default function AdminUsers() {
 
   return (
     <>
-      <PageTitle title="Users & Access" sub="Search users across organizations and review access state" />
+      <PageTitle
+        title="Users & Access"
+        sub="Search users across organizations and review access state"
+        right={<Btn kind="secondary" onClick={load} loading={loading}>Refresh</Btn>}
+      />
       <Err e={err} />
       <Card className="mb-4">
         <form onSubmit={search} className="grid grid-cols-1 md:grid-cols-5 gap-2 items-end">
@@ -94,6 +103,8 @@ export default function AdminUsers() {
               </tr>
             ))}
           </Table>
+        ) : err ? (
+          <div className="py-6 text-center"><Btn kind="secondary" onClick={load}>Retry</Btn></div>
         ) : <Empty text="No users match these filters" />}
         {data.total > PAGE && (
           <div className="flex items-center justify-between mt-4 text-xs text-normal-text">
