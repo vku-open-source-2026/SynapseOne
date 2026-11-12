@@ -22,7 +22,7 @@ import {
   startUsageTelemetry,
 } from './usage';
 import { scopeAllows } from './scopes';
-import { authzMiddleware, registerAuthzMetrics, authzMode, type ActionOverride } from './authz';
+import { authzMiddleware, registerAuthzMetrics, authzMode, actionFor, type ActionOverride } from './authz';
 
 dotenv.config();
 
@@ -382,7 +382,7 @@ export function propagatePrincipal(req: express.Request): void {
     if (p.org) h['x-synapseone-org'] = String(p.org);
     if (p.account) h['x-synapseone-account'] = String(p.account);
     if (Array.isArray(p.scopes) && p.scopes.length) h['x-synapseone-scopes'] = p.scopes.join(',');
-    h['x-synapseone-kind'] = 'user';
+    h['x-synapseone-kind'] = String(p.kind || 'user');
   } else if (p?.type === 'apikey') {
     h['x-synapseone-kind'] = 'apikey';
     if ((p as any).org) h['x-synapseone-org'] = String((p as any).org);
@@ -407,6 +407,12 @@ export function propagatePrincipal(req: express.Request): void {
 export function createApp(): express.Express {
   if (process.env.NODE_ENV === 'production' && !isVerifyApiKeyEnabled()) {
     throw new Error('[gateway] GATEWAY_VERIFY_APIKEY=false is forbidden in production (auth bypass). Set true.');
+  }
+  if (process.env.NODE_ENV === 'production' && process.env.AUTHZ_MODE_REQUIRED === 'true' && authzMode() === 'off') {
+    throw new Error('[gateway] AUTHZ_MODE=off is forbidden when AUTHZ_MODE_REQUIRED=true. Set audit or enforce.');
+  }
+  if (process.env.NODE_ENV === 'production' && authzMode() === 'off') {
+    console.warn('[gateway][security] AUTHZ_MODE=off — central policy enforcement is disabled. Set audit/enforce before exposing multi-tenant administration.');
   }
   const app = express();
   app.disable('x-powered-by');
@@ -673,6 +679,7 @@ export function createApp(): express.Express {
     if (req.originalUrl.split('?')[0] === '/v1/auth/verify') return next();
     return edgeLimit(120)(req, res, next);
   }) as any);
+  app.use('/v1/platform/' as any, edgeLimit(120) as any);
   app.use(((req: express.Request, res: express.Response, next: express.NextFunction) => {
     const urlPath = req.path; // pathname, không query
     if (urlPath === '/' || urlPath === '/health' || urlPath === '/metrics' || urlPath === '/ready') return next();
@@ -690,10 +697,25 @@ export function createApp(): express.Express {
     return authMiddleware(route.auth)(req, res, (err?: any) => {
       if (err) return next(err);
       // Per-route authorization (#23): the credential must carry a scope that
-      // covers this service+action. User JWTs hold `*`; API keys and delegated
-      // tokens are narrow, so a read-only key cannot perform writes.
+      // covers this service+action. Derive the service from the route table
+      // (not a parallel prefix list) so every route, including RPC-style POSTs
+      // with action overrides, is enforced consistently.
       const principal = (req as any).principal;
-      if (principal && route.auth !== 'none' && !scopeAllows(principal.scopes || [], req.path, req.method)) {
+      const isPlatformPath = req.path === '/v1/platform' || req.path.startsWith('/v1/platform/');
+      const isPlatformSession = req.path === '/v1/platform/session';
+      if (isPlatformPath && !isPlatformSession && principal?.kind !== 'platform-admin') {
+        (req as any).synapseoneError = 'platform_admin_required';
+        return res.status(403).json({ error: 'platform_admin_required', message: 'a platform administrator token is required' });
+      }
+      if (!isPlatformPath && principal?.kind === 'platform-admin') {
+        (req as any).synapseoneError = 'platform_token_tenant_forbidden';
+        return res.status(403).json({ error: 'platform_token_tenant_forbidden', message: 'platform tokens cannot call tenant APIs' });
+      }
+      const scopeAction = route.service ? actionFor(route as any, req.method, req.path) : null;
+      if (principal && route.auth !== 'none' && !scopeAllows(principal.scopes || [], req.path, req.method, {
+        service: route.service,
+        action: scopeAction || undefined,
+      })) {
         (req as any).synapseoneError = 'scope_denied';
         return res.status(403).json({
           error: 'scope_denied',

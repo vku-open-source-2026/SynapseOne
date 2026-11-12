@@ -76,6 +76,20 @@ routes:
     auth: either
     service: iam
 
+  # Platform Super Admin control plane. Only JWT credentials are accepted
+  # (API keys/service accounts are rejected at the gateway); normal user JWTs
+  # are allowed only on /session to exchange for a short-lived platform token.
+  - path: /v1/platform
+    target: ${IAM_SERVICE_URL:http://iam:4001}
+    auth: jwt
+    service: platform
+    timeoutMs: 30000
+    actions:
+      - { method: POST, path: /v1/platform/session, action: platform:Read }
+      - { method: POST, path: /v1/platform/step-up, action: platform:Write }
+      - { method: POST, path: /v1/platform/admins, action: platform:Admin }
+      - { method: DELETE, path: /v1/platform/admins/*, action: platform:Admin }
+
   - path: /v1/workflow-runners
     target: ${WORKFLOW_SERVICE_URL:http://workflow:4002}
     auth: either

@@ -25,9 +25,11 @@ export const organizations = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     slug: text('slug').notNull(),
     displayName: text('display_name').notNull(),
+    /** tenant = customer organization; platform = reserved staff organization. */
+    kind: text('kind').notNull().default('tenant'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [uniqueIndex('organizations_slug_key').on(t.slug)],
+  (t) => [uniqueIndex('organizations_slug_key').on(t.slug), index('idx_organizations_kind').on(t.kind)],
 );
 
 export const accounts = pgTable(
@@ -70,6 +72,8 @@ export const users = pgTable(
     uniqueIndex('idx_users_external_sub').on(t.externalSub).where(sql`${t.externalSub} is not null`),
     uniqueIndex('idx_users_org_email_lower').on(t.orgId, sql`lower(${t.email})`),
     index('idx_users_org').on(t.orgId),
+    index('idx_users_email_lower').on(sql`lower(${t.email})`),
+    index('idx_users_created_at').on(t.createdAt.desc()),
   ],
 );
 
@@ -266,12 +270,15 @@ export const auditLog = pgTable(
     action: text('action').notNull(),
     resource: text('resource').notNull().default(''),
     decision: boolean('decision').notNull(),
+    /** Tenant attribution column (indexed) for platform/tenant audit queries. */
+    orgId: uuid('org_id'),
     context: jsonb('context').$type<Record<string, any>>().notNull().default(sql`'{}'::jsonb`),
   },
   (t) => [
     index('idx_audit_actor').on(t.actorId, t.createdAt.desc()),
     index('idx_audit_time').on(t.createdAt.desc()),
     index('idx_audit_action').on(t.action, t.decision),
+    index('idx_audit_org_time').on(t.orgId, t.createdAt.desc()),
   ],
 );
 
@@ -323,3 +330,18 @@ export const userMfa = pgTable('user_mfa', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   enabledAt: timestamp('enabled_at', { withTimezone: true }),
 });
+
+/** Human-operated platform administrators (cross-tenant control plane).
+ *  This is deliberately separate from users.is_org_admin (tenant-scoped). */
+export const platformAdmins = pgTable(
+  'platform_admins',
+  {
+    userId: uuid('user_id').primaryKey().references(() => users.id, { onDelete: 'cascade' }),
+    role: text('role').notNull().default('auditor'),
+    grantedBy: uuid('granted_by').references(() => users.id, { onDelete: 'set null' }),
+    grantedAt: timestamp('granted_at', { withTimezone: true }).notNull().defaultNow(),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    reason: text('reason').notNull().default(''),
+  },
+  (t) => [index('idx_platform_admins_role').on(t.role), index('idx_platform_admins_revoked').on(t.revokedAt)],
+);

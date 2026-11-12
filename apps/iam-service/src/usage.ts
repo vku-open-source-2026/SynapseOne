@@ -73,7 +73,8 @@ export interface UsageEventRow {
 }
 
 export interface UsageFilter {
-  orgId: string;
+  /** Required by tenant routes; omitted only by the platform control plane. */
+  orgId?: string;
   from: Date;
   to: Date;
   feature?: string;
@@ -264,10 +265,10 @@ function bucketSecondsFor(from: Date, to: Date): number {
 
 function dbConditions(f: UsageFilter): SQL | undefined {
   const conds: SQL[] = [
-    eq(usageEvents.orgId, f.orgId),
     gte(usageEvents.createdAt, f.from),
     lte(usageEvents.createdAt, f.to),
   ];
+  if (f.orgId) conds.push(eq(usageEvents.orgId, f.orgId));
   if (f.feature) conds.push(eq(usageEvents.feature, f.feature));
   if (f.accountId) conds.push(eq(usageEvents.accountId, f.accountId));
   if (f.method) conds.push(eq(usageEvents.method, f.method));
@@ -435,7 +436,7 @@ export async function listUsageEvents(
   }
 
   const filtered = (__mem.usage as UsageEventRow[])
-    .filter((e) => e.orgId === f.orgId && memoryMatch(f, e))
+    .filter((e) => (!f.orgId || e.orgId === f.orgId) && memoryMatch(f, e))
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   return {
     total: filtered.length,
@@ -653,7 +654,7 @@ export async function usageSummary(f: UsageFilter): Promise<UsageSummary> {
 
   // ---- in-memory fallback (dev/test) ----
   const events = (__mem.usage as UsageEventRow[]).filter(
-    (e) => e.orgId === f.orgId && memoryMatch(f, e),
+    (e) => (!f.orgId || e.orgId === f.orgId) && memoryMatch(f, e),
   );
   const requests = events.length;
   const success = events.filter((e) => e.status < 400).length;

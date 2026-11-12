@@ -57,11 +57,15 @@ export interface AccessClaims {
   account?: string; // account id
   scopes?: string[];
   kind?: string;
+  /** Platform administrator role (only kind=platform-admin). */
+  role?: 'owner' | 'operator' | 'auditor';
   /** Delegated token: the service identity that acted for the user. */
   act?: { sub: string; kind?: string };
   /** Delegation marker + audience (Tier-2 service). */
   delegated?: boolean;
   aud?: string;
+  amr?: string[];
+  auth_time?: number;
 }
 
 export function signAccess(
@@ -111,6 +115,69 @@ export function signDelegated(input: {
 export function verifyAccess(token: string): AccessClaims {
   // Accept legacy issuer during the rebrand window so existing sessions survive.
   return jwt.verify(token, JWT_SECRET, { issuer: ['synapseone-iam', 'synapsedx-iam'], algorithms: ['HS256'] }) as AccessClaims;
+}
+
+export const PLATFORM_AUDIENCE = 'synapseone-platform-admin';
+export const PLATFORM_STEP_UP_AUDIENCE = 'synapseone-platform-step-up';
+
+/** Issue a short-lived token for the dedicated platform control plane. It has
+ *  no org/account claims and a distinct audience so it cannot be used as a
+ *  normal tenant token. */
+export function signPlatformAccess(input: {
+  userId: string;
+  role: 'owner' | 'operator' | 'auditor';
+  ttlSeconds?: number;
+}): { token: string; expiresIn: number } {
+  const expiresIn = Math.min(Math.max(Math.floor(input.ttlSeconds ?? 900), 60), 3600);
+  const scopes = input.role === 'owner'
+    ? ['platform:read', 'platform:write', 'platform:admin']
+    : input.role === 'operator'
+      ? ['platform:read', 'platform:write']
+      : ['platform:read'];
+  const token = jwt.sign({
+    sub: input.userId,
+    kind: 'platform-admin',
+    role: input.role,
+    scopes,
+    aud: PLATFORM_AUDIENCE,
+    iss: 'synapseone-iam',
+    auth_time: Math.floor(Date.now() / 1000),
+  }, JWT_SECRET, { expiresIn });
+  return { token, expiresIn };
+}
+
+export function verifyPlatformAccess(token: string): AccessClaims {
+  const claims = verifyAccess(token);
+  if (claims.kind !== 'platform-admin' || claims.aud !== PLATFORM_AUDIENCE) {
+    throw new Error('not a platform administrator token');
+  }
+  return claims;
+}
+
+/** Short-lived proof of a fresh TOTP challenge for one destructive action. */
+export function signPlatformStepUp(input: { userId: string; role: 'owner' | 'operator' | 'auditor' }): { token: string; expiresIn: number } {
+  const expiresIn = Math.min(Math.max(Number(process.env.PLATFORM_STEP_UP_TTL_SECONDS || 300), 60), 900);
+  const token = jwt.sign({
+    sub: input.userId,
+    typ: 'platform_step_up',
+    role: input.role,
+    aud: PLATFORM_STEP_UP_AUDIENCE,
+    iss: 'synapseone-iam',
+  }, JWT_SECRET, { expiresIn });
+  return { token, expiresIn };
+}
+
+export function verifyPlatformStepUp(token: string, userId: string): boolean {
+  try {
+    const claims: any = jwt.verify(token, JWT_SECRET, {
+      issuer: ['synapseone-iam', 'synapsedx-iam'],
+      audience: PLATFORM_STEP_UP_AUDIENCE,
+      algorithms: ['HS256'],
+    });
+    return claims?.typ === 'platform_step_up' && claims?.sub === userId;
+  } catch {
+    return false;
+  }
 }
 
 export function newRefreshToken(): { value: string; hash: string } {
