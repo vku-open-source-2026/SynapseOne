@@ -2461,6 +2461,7 @@ function tenantBinding(
         const all = await listWorkflowRecs();
         const clash = all.find((w) => {
           if (w.id === id || !w.active) return false;
+          if (!canAccessWorkflow(w, principalFromHeaders(req))) return false;
           const other = findMcpTrigger({ nodes: w.nodes });
           return other && other.toolName === mcp.toolName;
         });
