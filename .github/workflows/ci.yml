@@ -112,7 +112,10 @@ jobs:
           echo E2E_OK
       - run: bash tests/e2e/api-check.sh
       - run: pip install ./sdks/sdk-python -q && SYNAPSEONE_BASE_URL=http://localhost:8080 python tests/e2e/sdk-check.py
-      - run: npm install --workspaces --no-audit --no-fund -q && npm run build --workspaces --if-present -q && SYNAPSEONE_BASE_URL=http://localhost:8080 node tests/e2e/sdk-check.js
+      - name: Install and build JS SDK
+        run: npm install --workspace=sdks/sdk-js --no-audit --no-fund -q && npm run build --workspace=sdks/sdk-js -q
+      - name: JS SDK e2e
+        run: SYNAPSEONE_BASE_URL=http://localhost:8080 node tests/e2e/sdk-check.js
       - run: SYNAPSEONE_BASE_URL=http://localhost:8080 node tests/e2e/services-check.js
       - run: SYNAPSEONE_BASE_URL=http://localhost:8080 WORKFLOW_HEALTH_URL=http://localhost:4002/health node tests/e2e/workflow-runner-e2e.mjs
       - run: SYNAPSEONE_BASE_URL=http://localhost:8080 node tests/e2e/mcp-docs-e2e.mjs

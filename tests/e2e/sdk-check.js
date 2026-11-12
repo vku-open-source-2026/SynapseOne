@@ -8,10 +8,10 @@ const { SynapseOneClient } = require('../../sdks/sdk-js/dist/index.js');
 
 async function main() {
   const c = new SynapseOneClient({ baseUrl: process.env.SYNAPSEONE_BASE_URL || 'http://127.0.0.1:18110' });
-  // Audit reads are org-admin only. api-check.sh has already created
-  // e2e@acme.local as the first (admin) user of acme; a fresh member identity
-  // would correctly receive 403 from /v1/audit.
-  const login = await c.login('e2e@acme.local');
+  // Audit reads are org-admin only. The e2e-compose workflow first signs in as
+  // ci@acme.local (step 7), making it the bootstrap org admin. e2e@acme.local
+  // is created later by api-check.sh and is only a member.
+  const login = await c.login('ci@acme.local');
   c.setToken(login.accessToken);
   console.log('SDK_ME', (await c.me()).user.email);
   console.log('SDK_VERIFY', (await c.verify()).valid);
