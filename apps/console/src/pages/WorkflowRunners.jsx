@@ -183,6 +183,7 @@ export default function WorkflowRunners() {
     setBusy(true);
     setErr(null);
     let keyId = null;
+    let runnerId = null;
     try {
       const key = await api.createKey(scope.accountId, `workflow-runner-${name.trim()}`.slice(0, 100), headers, { scopes: scopeList });
       keyId = key.id;
@@ -195,6 +196,7 @@ export default function WorkflowRunners() {
         scopes: scopeList,
         metadata: { concurrency },
       }, headers);
+      runnerId = reg.runner.id;
       const cmd = await api.workflowRunnerCommand(reg.runner.id, key.apiKey, headers);
       if (reg.options) applyOptions(reg.options);
       setCreated({ ...reg, command: cmd.command, apiKey: key.apiKey });
@@ -202,6 +204,7 @@ export default function WorkflowRunners() {
       setCheck({ connected: false, status: 'waiting', instanceCount: 0 });
       load(true);
     } catch (e) {
+      if (runnerId) api.deleteWorkflowRunner(runnerId, headers).catch(() => undefined);
       if (keyId) api.revokeKey(keyId, headers).catch(() => undefined);
       setErr(e);
     } finally {
