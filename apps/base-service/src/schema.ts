@@ -60,6 +60,32 @@ export const baseDocuments = pgTable(
   ],
 );
 
+
+/** Transactional outbox for committed document changes. Rows are written in
+ *  the same Postgres transaction as the document mutation. */
+export const baseOutbox = pgTable(
+  'synapseone_base_outbox',
+  {
+    eventId: text('event_id').primaryKey(),
+    orgId: text('org_id'),
+    accountId: text('account_id'),
+    collectionId: text('collection_id').notNull(),
+    collectionName: text('collection_name').notNull().default(''),
+    documentId: text('document_id').notNull(),
+    operation: text('operation').notNull(),
+    version: integer('version').notNull().default(1),
+    occurredAt: timestamp('occurred_at', { withTimezone: true }).notNull().defaultNow(),
+    payload: jsonb('payload').$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+    publishedAt: timestamp('published_at', { withTimezone: true }),
+    attempts: integer('attempts').notNull().default(0),
+    lastError: text('last_error'),
+  },
+  (t) => [
+    index('idx_base_outbox_unpublished').on(t.publishedAt, t.occurredAt),
+    index('idx_base_outbox_collection').on(t.collectionId, t.occurredAt),
+  ],
+);
+
 export const baseVectors = pgTable(
   'synapseone_base_vectors',
   {

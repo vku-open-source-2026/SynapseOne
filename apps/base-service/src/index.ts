@@ -22,6 +22,7 @@ import {
   createCollectionRec, findCollectionRec, getCollectionRec, listCollectionRecs, updateCollectionRec, deleteCollectionRec,
   createDocumentRec, getDocumentRec, listDocumentRecs, listDocumentRecsPage, listAllDocumentRecs, countDocumentRecs, setDocumentRec, deleteDocumentRec, incrementDocumentRec,
   documentStatsRec, ensureTables, useDb, queryDocumentRecs, vectorSearchRec, listDocumentRecsMatching, StoreError, StoredCollection,
+  listOutboxChanges, listUnpublishedOutbox, markOutboxPublished, recordOutboxFailure, enqueueBackfill, outboxStats,
 } from './store';
 import {
   normalizeMapping, hasMapping, objectToData, dataToObject, normalizeDocumentData, validateDocumentData,
@@ -186,6 +187,89 @@ function parseDataBody(
   return normalizeDocumentData(b.data, mapping, MAX_DOCUMENT_BYTES);
 }
 
+
+const OUTBOX_TOPIC = process.env.BASE_OUTBOX_STREAM_TOPIC || 'base-changes';
+let relayTimer: NodeJS.Timeout | null = null;
+let relayBusy = false;
+
+function tenantForEvent(payload: any): string {
+  if (payload?.organization_id) return `org:${payload.organization_id}`;
+  if (payload?.account_id) return `account:${payload.account_id}`;
+  return 'platform';
+}
+
+async function streamOutboxCall(method: string, path: string, tenant: string, body?: unknown, allowConflict = false): Promise<any> {
+  const base = String(process.env.STREAM_SERVICE_URL || '').replace(/\/$/, '');
+  if (!base) throw new Error('STREAM_SERVICE_URL is not configured');
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    'x-synapseone-tenant': tenant,
+  };
+  if (process.env.SYNAPSEONE_INTERNAL_SECRET) headers['x-synapseone-internal'] = process.env.SYNAPSEONE_INTERNAL_SECRET;
+  const response = await fetch(`${base}${path}`, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await response.text();
+  let parsed: any = null;
+  try { parsed = text ? JSON.parse(text) : null; } catch { /* text */ }
+  if (!response.ok && !(allowConflict && response.status === 409)) {
+    throw new Error(`SynapseStream ${method} ${path} -> ${response.status}: ${String(parsed?.message || parsed?.error || text).slice(0, 300)}`);
+  }
+  return parsed;
+}
+
+/** Publish one outbox batch. At-least-once: rows stay unpublished until Stream
+ *  has acknowledged the whole batch. */
+export async function relayOutboxOnce(limit = 100): Promise<number> {
+  if (relayBusy) return 0;
+  relayBusy = true;
+  try {
+    const rows = await listUnpublishedOutbox(limit);
+    if (!rows.length) return 0;
+    const byTenant = new Map<string, typeof rows>();
+    for (const row of rows) {
+      const tenant = tenantForEvent(row.payload);
+      const group = byTenant.get(tenant) || [];
+      group.push(row);
+      byTenant.set(tenant, group);
+    }
+    let published = 0;
+    for (const [tenant, group] of byTenant) {
+      try {
+        await streamOutboxCall('PUT', `/v1/stream/topics/${encodeURIComponent(OUTBOX_TOPIC)}`, tenant, {}, true);
+        await streamOutboxCall('POST', `/v1/stream/topics/${encodeURIComponent(OUTBOX_TOPIC)}/events:batch`, tenant, {
+          events: group.map((row) => ({
+            payload: row.payload,
+            key: row.payload.collection_id,
+            headers: { source: 'synapsebase', schema_version: 1 },
+          })),
+        });
+        await markOutboxPublished(group.map((row) => row.eventId));
+        published += group.length;
+      } catch (error) {
+        for (const row of group) await recordOutboxFailure(row.eventId, error).catch(() => undefined);
+      }
+    }
+    return published;
+  } finally {
+    relayBusy = false;
+  }
+}
+
+export function startOutboxRelay(): void {
+  if (relayTimer) return;
+  if (!process.env.STREAM_SERVICE_URL) {
+    console.warn('[base][outbox] STREAM_SERVICE_URL not set — outbox relay disabled');
+    return;
+  }
+  const interval = Math.min(Math.max(Number(process.env.BASE_OUTBOX_RELAY_MS) || 1000, 100), 60000);
+  relayTimer = setInterval(() => { void relayOutboxOnce().catch((e) => console.error('[base][outbox] relay failed:', e?.message || e)); }, interval);
+  relayTimer.unref?.();
+  void relayOutboxOnce().catch(() => undefined);
+}
+
 export function createApp(): express.Express {
   if (IS_PROD) {
     if (!process.env.SYNAPSEONE_INTERNAL_SECRET) {
@@ -265,6 +349,12 @@ export function createApp(): express.Express {
         '# TYPE synapseone_base_collections_total gauge',
         `synapseone_base_collections_total ${collections.length}`,
       );
+      const outbox = await outboxStats();
+      lines.push(
+        '# HELP synapseone_base_outbox_pending Unpublished change events.',
+        '# TYPE synapseone_base_outbox_pending gauge',
+        `synapseone_base_outbox_pending ${outbox.pending}`,
+      );
     } catch { /* scrape never fails on db blips */ }
     res.type('text/plain').send(`${lines.join('\n')}\n`);
   });
@@ -287,6 +377,36 @@ export function createApp(): express.Express {
     if (!ok) return res.status(401).json({ error: 'unauthorized', message: 'Missing or invalid internal credential' });
     next();
   }) as any);
+
+
+  app.use('/internal/' as any, ((req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (!INTERNAL_SECRET) {
+      if (IS_PROD) return res.status(500).json({ error: 'misconfigured', message: 'internal secret required in production' });
+      return next();
+    }
+    const raw = (req.headers['x-synapseone-internal'] ?? req.headers['x-synapsedx-internal']) as string | string[] | undefined;
+    const got = Array.isArray(raw) ? (raw[0] || '') : (raw || '');
+    const a = Buffer.from(got); const b = Buffer.from(INTERNAL_SECRET);
+    if (!(got && a.length === b.length && timingSafeEqual(a, b))) {
+      return res.status(401).json({ error: 'unauthorized', message: 'Missing or invalid internal credential' });
+    }
+    next();
+  }) as any);
+
+  app.post('/internal/base/collections/:collection/backfill', async (req, res) => {
+    const loaded = await loadCollection(req, res);
+    if (!loaded) return;
+    const limit = Math.min(Math.max(Number((req.body || {}).limit) || 500, 1), 1000);
+    const afterId = (req.body || {}).afterId ? String((req.body || {}).afterId) : undefined;
+    const docs = await listDocumentRecs(loaded.collection.id, { scanLimit: limit, afterId });
+    const enqueued = await enqueueBackfill(loaded.collection.id, docs);
+    res.json({
+      enqueued,
+      scanned: docs.length,
+      nextAfter: docs.length ? docs[docs.length - 1].id : afterId || null,
+      hasMore: docs.length === limit,
+    });
+  });
 
   // Async wrapper (Express 4 doesn't catch async throws).
   for (const m of ['get', 'post', 'put', 'delete', 'patch'] as const) {
@@ -938,12 +1058,30 @@ export function createApp(): express.Express {
     }
     const as = req.query.as === undefined ? 'data' : String(req.query.as);
     if (as !== 'data' && as !== 'object') return res.status(400).json({ error: 'invalid_view', message: "as must be 'data' or 'object'" });
-    const docs = await listDocumentRecs(loaded.collection.id, { since, scanLimit: rawLimit });
-    const changes = docs.map((d) => ({ ...toApiDocument(d, as as 'data' | 'object', loaded.collection.mapping), deleted: false }));
+    const after = req.query.after === undefined ? undefined : String(req.query.after);
+    const outbox = await listOutboxChanges(loaded.collection.id, { since, afterId: after, limit: rawLimit });
+    const changes = outbox.events.map((e) => {
+      const base: Record<string, unknown> = {
+        id: e.document_id,
+        collection: loaded.collection.name,
+        version: e.version,
+        createdAt: e.occurred_at,
+        updatedAt: e.occurred_at,
+        operation: e.operation,
+        deleted: e.operation === 'delete',
+        eventId: e.event_id,
+      };
+      if (e.data !== undefined) {
+        base.data = e.data;
+        if (as === 'object') base.object = dataToObject(e.data as Record<string, unknown>, loaded.collection.mapping);
+      }
+      return base;
+    });
     res.json({
       changes,
-      nextSince: changes.length ? changes[changes.length - 1].updatedAt : since,
-      hasMore: docs.length === rawLimit,
+      nextSince: outbox.nextSince,
+      nextAfter: outbox.nextAfter,
+      hasMore: outbox.events.length === rawLimit,
     });
   });
 
@@ -1005,5 +1143,6 @@ if (require.main === module) {
     .catch(() => {})
     .finally(() => {
       app.listen(PORT, () => console.log(`[base] SynapseBase listening on :${PORT} (db=${useDb() ? 'postgres' : 'memory'})`));
+      startOutboxRelay();
     });
 }

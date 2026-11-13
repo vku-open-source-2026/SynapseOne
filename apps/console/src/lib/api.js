@@ -387,6 +387,20 @@ export const api = {
     post(`/v1/stream/topics/${encodeURIComponent(name)}/groups/${encodeURIComponent(group)}/read`, body, a),
   streamGroupAck: (name, group, body, a) =>
     post(`/v1/stream/topics/${encodeURIComponent(name)}/groups/${encodeURIComponent(group)}/ack`, body, a),
+  // ---- Synapse Warehouse (OLAP + ETL) ----
+  warehouseDatasets: (a) => get('/v1/warehouse/datasets', a),
+  warehouseDataset: (id, a) => get(`/v1/warehouse/datasets/${encodeURIComponent(id)}`, a),
+  warehouseCreateDataset: (body, a) => post('/v1/warehouse/datasets', body, a),
+  warehouseDeleteDataset: (id, a) => del(`/v1/warehouse/datasets/${encodeURIComponent(id)}`, a),
+  warehouseIngest: (id, rows, a) => post(`/v1/warehouse/datasets/${encodeURIComponent(id)}/rows`, { rows }, a),
+  warehouseQuery: (sql, limit, a) => post('/v1/warehouse/query', { sql, limit }, a),
+  warehouseTemplates: (a) => get('/v1/warehouse/templates', a),
+  warehouseJobs: (a) => get('/v1/warehouse/jobs', a),
+  warehouseCreateJob: (body, a) => post('/v1/warehouse/jobs', body, a),
+  warehouseRunJob: (id, a) => post(`/v1/warehouse/jobs/${encodeURIComponent(id)}/run`, {}, a),
+  warehousePauseJob: (id, a) => post(`/v1/warehouse/jobs/${encodeURIComponent(id)}/pause`, {}, a),
+  warehouseResumeJob: (id, a) => post(`/v1/warehouse/jobs/${encodeURIComponent(id)}/resume`, {}, a),
+  warehouseDeleteJob: (id, a) => del(`/v1/warehouse/jobs/${encodeURIComponent(id)}`, a),
   // ---- Synapse Faststore (cache / KV) ----
   faststoreStats: (a) => get('/v1/faststore/stats', a),
   faststoreKeys: (params, a) => {

@@ -40,6 +40,7 @@ const WorkflowRunners = React.lazy(() => import('./pages/WorkflowRunners.jsx'));
 const SynapseBase = React.lazy(() => import('./pages/SynapseBase.jsx'));
 const SynapseQueue = React.lazy(() => import('./pages/SynapseQueue.jsx'));
 const SynapseStream = React.lazy(() => import('./pages/SynapseStream.jsx'));
+const SynapseWarehouse = React.lazy(() => import('./pages/SynapseWarehouse.jsx'));
 const SynapseFaststore = React.lazy(() => import('./pages/SynapseFaststore.jsx'));
 const SynapseOCS = React.lazy(() => import('./pages/SynapseOCS.jsx'));
 const SynapseInference = React.lazy(() => import('./pages/SynapseInference.jsx'));
@@ -188,6 +189,7 @@ function AppRoutes() {
           <Route path="/base" element={<Guard><ConsoleLayout><SynapseBase /></ConsoleLayout></Guard>} />
           <Route path="/queue" element={<Guard><ConsoleLayout><SynapseQueue /></ConsoleLayout></Guard>} />
           <Route path="/stream" element={<Guard><ConsoleLayout><SynapseStream /></ConsoleLayout></Guard>} />
+          <Route path="/warehouse" element={<Guard><ConsoleLayout><SynapseWarehouse /></ConsoleLayout></Guard>} />
           <Route path="/faststore" element={<Guard><ConsoleLayout><SynapseFaststore /></ConsoleLayout></Guard>} />
           <Route path="/ocs" element={<Guard><ConsoleLayout><SynapseOCS /></ConsoleLayout></Guard>} />
           <Route path="/inference" element={<Guard><ConsoleLayout><SynapseInference /></ConsoleLayout></Guard>} />

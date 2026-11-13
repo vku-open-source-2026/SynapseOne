@@ -24,6 +24,7 @@ const FORBIDDEN_SQL = new RegExp(
       'read_ndjson', 'read_ndjson_auto', 'sqlite_scan', 'postgres_scan',
       'mysql_scan', 'iceberg_scan', 'delta_scan', 'parquet_scan', 'csv_scan',
       'json_scan', 'ndjson_scan', 'avro_scan', 'glob', 'getenv',
+      'query_table', 'query', 'duckdb_', 'sniff_csv', 'parquet_metadata', 'parquet_schema',
     ].join('|') +
     String.raw`)\b`,
   'i',
@@ -92,6 +93,29 @@ export function normalizeColumns(input: unknown): WarehouseColumn[] {
   return columns;
 }
 
+/** Blank SQL string/identifier literals so keyword checks do not reject data
+ *  values such as `WHERE operation = 'delete'`. Quotes are preserved only as
+ *  spaces; a mismatched quote is left for DuckDB to reject. */
+function maskLiterals(sql: string): string {
+  let out = '';
+  for (let i = 0; i < sql.length; i++) {
+    const ch = sql[i];
+    if (ch !== "'" && ch !== '"') { out += ch; continue; }
+    const quote = ch;
+    out += ' ';
+    i++;
+    while (i < sql.length) {
+      if (sql[i] === quote) {
+        if (sql[i + 1] === quote) { out += ' '; i += 2; continue; }
+        out += ' '; break;
+      }
+      out += ' ';
+      i++;
+    }
+  }
+  return out;
+}
+
 /** Return a safe single-statement SELECT/WITH query, or throw a stable error. */
 export function assertReadOnlySql(raw: unknown): string {
   if (typeof raw !== 'string') throw new Error('sql must be a string');
@@ -99,19 +123,26 @@ export function assertReadOnlySql(raw: unknown): string {
   if (!sql) throw new Error('sql is required');
   if (sql.length > 100_000) throw new Error('sql exceeds 100KB');
   const withoutTrailing = sql.replace(/;+\s*$/, '');
-  if (withoutTrailing.includes(';')) throw new Error('only one SQL statement is allowed');
+  const masked = maskLiterals(withoutTrailing);
+  if (masked.includes(';')) throw new Error('only one SQL statement is allowed');
   if (withoutTrailing.includes('--') || withoutTrailing.includes('/*')) {
     throw new Error('SQL comments are not allowed');
   }
-  if (!/^(select|with)\b/i.test(withoutTrailing)) {
+  if (!/^(select|with)\b/i.test(masked)) {
     throw new Error('only read-only SELECT/WITH queries are allowed');
   }
-  const forbidden = withoutTrailing.match(FORBIDDEN_SQL);
+  const forbidden = masked.match(FORBIDDEN_SQL);
   if (forbidden) {
     throw new Error(`SQL contains a forbidden keyword: ${forbidden[1]}`);
   }
-  if (/\bread_[a-z0-9_]*\s*\(/i.test(withoutTrailing)) {
+  if (/\bread_[a-z0-9_]*\s*\(/i.test(masked)) {
     throw new Error('file-reading functions are not allowed');
+  }
+  // Underscore-prefixed tables are service internals (dataset/job metadata and
+  // usage rollups). Dataset ids cannot start with '_', so this cannot hide a
+  // user-created table.
+  if (/\b(?:from|join)\s+"?_[a-z0-9_]+"?/i.test(masked)) {
+    throw new Error('internal warehouse tables are not queryable');
   }
   return withoutTrailing;
 }

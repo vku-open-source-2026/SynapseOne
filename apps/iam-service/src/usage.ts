@@ -470,7 +470,7 @@ function fillSeries(
   return out;
 }
 
-export async function usageSummary(f: UsageFilter): Promise<UsageSummary> {
+export async function usageSummaryRaw(f: UsageFilter): Promise<UsageSummary> {
   const bucketSeconds = bucketSecondsFor(f.from, f.to);
 
   if (useDb()) {
@@ -798,4 +798,415 @@ export async function purgeUsage(olderThanDays: number, batch = 1000): Promise<n
     (e) => new Date(e.createdAt).getTime() >= cutoff.getTime(),
   );
   return before - __mem.usage.length;
+}
+
+// ---- Warehouse-backed hybrid summary -------------------------------------
+// Raw Postgres rows remain the source of truth for the live tail; completed
+// hours live in DuckDB as hourly rollups. The wrapper below merges both so the
+// dashboard response keeps the same shape and stays exact at range boundaries.
+
+import {
+  fetchWarehouseUsage,
+  warehouseWatermark,
+  USAGE_LATENCY_BOUNDS,
+  USAGE_LATENCY_BUCKETS,
+  type WarehouseUsageResponse,
+} from './usage-rollup';
+
+const HOUR_MS = 3600_000;
+const MAX_RAW_PART_ROWS = 100_000;
+const MAX_RAW_HEAD_MS = 48 * HOUR_MS;
+
+interface UsagePart {
+  summary: UsageSummary;
+  latency: number[];
+  featureLatency: Map<string, number[]>;
+  userIds: Set<string>;
+  accountIds: Set<string>;
+  raw: boolean;
+}
+
+function emptyHistogram(): number[] {
+  return new Array(USAGE_LATENCY_BUCKETS).fill(0);
+}
+
+function addHistogram(target: number[], source: number[]): void {
+  for (let i = 0; i < target.length; i++) target[i] += Number(source[i] || 0);
+}
+
+function percentileFromHistogram(counts: number[]): number {
+  const total = counts.reduce((sum, n) => sum + Number(n || 0), 0);
+  if (!total) return 0;
+  const target = Math.max(0, Math.ceil(total * 0.95) - 1);
+  let cumulative = 0;
+  for (let i = 0; i < counts.length; i++) {
+    cumulative += Number(counts[i] || 0);
+    if (cumulative > target) {
+      return i < USAGE_LATENCY_BOUNDS.length ? USAGE_LATENCY_BOUNDS[i] : USAGE_LATENCY_BOUNDS[USAGE_LATENCY_BOUNDS.length - 1];
+    }
+  }
+  return USAGE_LATENCY_BOUNDS[USAGE_LATENCY_BOUNDS.length - 1];
+}
+
+function maxIso(a: string | null, b: string | null): string | null {
+  if (!a) return b;
+  if (!b) return a;
+  return a > b ? a : b;
+}
+
+function normalizeHistogram(value: unknown): number[] {
+  const hist = emptyHistogram();
+  if (Array.isArray(value)) {
+    for (let i = 0; i < hist.length; i++) hist[i] = Number(value[i] || 0) || 0;
+  }
+  return hist;
+}
+
+function shouldUseWarehouse(f: UsageFilter): boolean {
+  if (!process.env.WAREHOUSE_SERVICE_URL || !f.orgId) return false;
+  if (f.q || f.actor || f.status !== undefined) return false;
+  return bucketSecondsFor(f.from, f.to) >= 3600;
+}
+
+function ceilHour(ms: number): number {
+  return Math.ceil(ms / HOUR_MS) * HOUR_MS;
+}
+
+function floorHour(ms: number): number {
+  return Math.floor(ms / HOUR_MS) * HOUR_MS;
+}
+
+function warehousePart(wh: WarehouseUsageResponse): UsagePart {
+  const totalLatency = normalizeHistogram(wh.totals.latency);
+  const requests = Number(wh.totals.requests) || 0;
+  const clientErrors = Number(wh.totals.clientErrors) || 0;
+  const serverErrors = Number(wh.totals.serverErrors) || 0;
+  const features = (wh.features || []).map((feature) => {
+    const featureRequests = Number(feature.requests) || 0;
+    return {
+      feature: feature.feature,
+      requests: featureRequests,
+      success: Number(feature.success) || 0,
+      clientErrors: Number(feature.clientErrors) || 0,
+      serverErrors: Number(feature.serverErrors) || 0,
+      errorRate: featureRequests ? round2((((Number(feature.clientErrors) || 0) + (Number(feature.serverErrors) || 0)) * 100) / featureRequests) : 0,
+      avgMs: featureRequests ? round2((Number(feature.durationSum) || 0) / featureRequests) : 0,
+      p95Ms: percentileFromHistogram(normalizeHistogram(feature.latency)),
+      lastRequestAt: feature.lastRequestAt || null,
+      share: requests ? round2((featureRequests * 100) / requests) : 0,
+    };
+  });
+  const featureLatency = new Map<string, number[]>();
+  for (const feature of wh.features || []) featureLatency.set(feature.feature, normalizeHistogram(feature.latency));
+  const summary: UsageSummary = {
+    from: wh.from,
+    to: wh.to,
+    bucketSeconds: bucketSecondsFor(new Date(wh.from), new Date(wh.to)),
+    totals: {
+      requests,
+      success: Number(wh.totals.success) || 0,
+      clientErrors,
+      serverErrors,
+      errorRate: requests ? round2(((clientErrors + serverErrors) * 100) / requests) : 0,
+      avgMs: requests ? round2((Number(wh.totals.durationSum) || 0) / requests) : 0,
+      p95Ms: percentileFromHistogram(totalLatency),
+      uniqueUsers: (wh.totals.userIds || []).length,
+      uniqueAccounts: (wh.totals.accountIds || []).length,
+      lastRequestAt: wh.totals.lastRequestAt || null,
+      promptTokens: Number(wh.totals.promptTokens) || 0,
+      completionTokens: Number(wh.totals.completionTokens) || 0,
+      totalTokens: Number(wh.totals.totalTokens) || 0,
+    },
+    features,
+    series: (wh.series || []).map((point) => ({
+      ts: point.ts,
+      requests: Number(point.requests) || 0,
+      errors: Number(point.errors) || 0,
+      avgMs: Number(point.requests) ? round2((Number(point.durationSum) || 0) / Number(point.requests)) : 0,
+    })),
+    statusClasses: wh.statusClasses || [],
+    authKinds: wh.authKinds || [],
+    topRoutes: (wh.topRoutes || []).map((route) => ({
+      feature: route.feature,
+      route: route.route,
+      method: route.method,
+      requests: Number(route.requests) || 0,
+      errors: Number(route.errors) || 0,
+      avgMs: Number(route.requests) ? round2((Number(route.durationSum) || 0) / Number(route.requests)) : 0,
+    })),
+    models: wh.models || [],
+  };
+  return {
+    summary,
+    latency: totalLatency,
+    featureLatency,
+    userIds: new Set((wh.totals.userIds || []).filter(Boolean)),
+    accountIds: new Set((wh.totals.accountIds || []).filter(Boolean)),
+    raw: false,
+  };
+}
+
+async function rawExtras(f: UsageFilter): Promise<{
+  latency: number[];
+  featureLatency: Map<string, number[]>;
+  userIds: Set<string>;
+  accountIds: Set<string>;
+}> {
+  const latency = emptyHistogram();
+  const featureLatency = new Map<string, number[]>();
+  const userIds = new Set<string>();
+  const accountIds = new Set<string>();
+
+  const add = (feature: string, duration: number, userId: string | null, accountId: string | null) => {
+    let idx = USAGE_LATENCY_BOUNDS.findIndex((bound) => duration <= bound);
+    if (idx < 0) idx = USAGE_LATENCY_BOUNDS.length;
+    latency[idx]++;
+    const key = feature || 'other';
+    const hist = featureLatency.get(key) || emptyHistogram();
+    hist[idx]++;
+    featureLatency.set(key, hist);
+    if (userId) userIds.add(String(userId));
+    if (accountId) accountIds.add(String(accountId));
+  };
+
+  if (useDb()) {
+    await ensureTables();
+    const rows = await getDb()!
+      .select({
+        feature: usageEvents.feature,
+        durationMs: usageEvents.durationMs,
+        userId: usageEvents.userId,
+        accountId: usageEvents.accountId,
+      })
+      .from(usageEvents)
+      .where(dbConditions(f))
+      .limit(MAX_RAW_PART_ROWS + 1);
+    if (rows.length > MAX_RAW_PART_ROWS) {
+      throw new Error('usage tail too large for warehouse merge');
+    }
+    for (const row of rows) add(row.feature, Number(row.durationMs) || 0, row.userId ?? null, row.accountId ?? null);
+    return { latency, featureLatency, userIds, accountIds };
+  }
+
+  for (const event of __mem.usage as UsageEventRow[]) {
+    if (f.orgId && event.orgId !== f.orgId) continue;
+    if (!memoryMatch(f, event)) continue;
+    add(event.feature, Number(event.durationMs) || 0, event.userId ?? null, event.accountId ?? null);
+  }
+  return { latency, featureLatency, userIds, accountIds };
+}
+
+async function rawPart(f: UsageFilter): Promise<UsagePart> {
+  const summary = await usageSummaryRaw(f);
+  const extras = await rawExtras(f);
+  return { summary, ...extras, raw: true };
+}
+
+function mergeUsageParts(parts: UsagePart[], f: UsageFilter): UsageSummary {
+  const bucketSeconds = bucketSecondsFor(f.from, f.to);
+  const targetMs = bucketSeconds * 1000;
+  const points = new Map<number, { requests: number; errors: number; avgSum: number }>();
+  const latency = emptyHistogram();
+  const userIds = new Set<string>();
+  const accountIds = new Set<string>();
+  let requests = 0;
+  let success = 0;
+  let clientErrors = 0;
+  let serverErrors = 0;
+  let durationSum = 0;
+  let promptTokens = 0;
+  let completionTokens = 0;
+  let totalTokens = 0;
+  let lastRequestAt: string | null = null;
+
+  const featureMap = new Map<string, {
+    requests: number; success: number; clientErrors: number; serverErrors: number;
+    durationSum: number; latency: number[]; lastRequestAt: string | null;
+  }>();
+  const statusMap = new Map<string, number>();
+  const authMap = new Map<string, number>();
+  const routeMap = new Map<string, { feature: string; route: string; method: string; requests: number; errors: number; durationSum: number }>();
+  const modelMap = new Map<string, { requests: number; promptTokens: number; completionTokens: number; totalTokens: number }>();
+
+  for (const part of parts) {
+    const s = part.summary;
+    requests += s.totals.requests;
+    success += s.totals.success;
+    clientErrors += s.totals.clientErrors;
+    serverErrors += s.totals.serverErrors;
+    durationSum += s.totals.avgMs * s.totals.requests;
+    promptTokens += s.totals.promptTokens;
+    completionTokens += s.totals.completionTokens;
+    totalTokens += s.totals.totalTokens;
+    lastRequestAt = maxIso(lastRequestAt, s.totals.lastRequestAt);
+    addHistogram(latency, part.latency);
+    for (const id of part.userIds) userIds.add(id);
+    for (const id of part.accountIds) accountIds.add(id);
+
+    for (const feature of s.features) {
+      const hit = featureMap.get(feature.feature) || {
+        requests: 0, success: 0, clientErrors: 0, serverErrors: 0,
+        durationSum: 0, latency: emptyHistogram(), lastRequestAt: null,
+      };
+      hit.requests += feature.requests;
+      hit.success += feature.success;
+      hit.clientErrors += feature.clientErrors;
+      hit.serverErrors += feature.serverErrors;
+      hit.durationSum += feature.avgMs * feature.requests;
+      hit.lastRequestAt = maxIso(hit.lastRequestAt, feature.lastRequestAt);
+      addHistogram(hit.latency, part.featureLatency.get(feature.feature) || emptyHistogram());
+      featureMap.set(feature.feature, hit);
+    }
+
+    for (const point of s.series) {
+      const when = new Date(point.ts).getTime();
+      if (!Number.isFinite(when)) continue;
+      const bucket = Math.floor(when / targetMs) * targetMs;
+      const hit = points.get(bucket) || { requests: 0, errors: 0, avgSum: 0 };
+      hit.requests += point.requests;
+      hit.errors += point.errors;
+      hit.avgSum += (Number(point.avgMs) || 0) * point.requests;
+      points.set(bucket, hit);
+    }
+
+    for (const statusClass of s.statusClasses) {
+      statusMap.set(statusClass.class, (statusMap.get(statusClass.class) || 0) + (Number(statusClass.count) || 0));
+    }
+    for (const auth of s.authKinds) {
+      authMap.set(auth.kind, (authMap.get(auth.kind) || 0) + (Number(auth.requests) || 0));
+    }
+    for (const route of s.topRoutes) {
+      const key = `${route.feature}\u0000${route.method}\u0000${route.route}`;
+      const hit = routeMap.get(key) || {
+        feature: route.feature, route: route.route, method: route.method, requests: 0, errors: 0, durationSum: 0,
+      };
+      hit.requests += Number(route.requests) || 0;
+      hit.errors += Number(route.errors) || 0;
+      hit.durationSum += (Number(route.avgMs) || 0) * (Number(route.requests) || 0);
+      routeMap.set(key, hit);
+    }
+    for (const model of s.models) {
+      const hit = modelMap.get(model.model) || { requests: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+      hit.requests += Number(model.requests) || 0;
+      hit.promptTokens += Number(model.promptTokens) || 0;
+      hit.completionTokens += Number(model.completionTokens) || 0;
+      hit.totalTokens += Number(model.totalTokens) || 0;
+      modelMap.set(model.model, hit);
+    }
+  }
+
+  const features: UsageFeatureStat[] = [...featureMap.entries()]
+    .map(([feature, hit]) => ({
+      feature,
+      requests: hit.requests,
+      success: hit.success,
+      clientErrors: hit.clientErrors,
+      serverErrors: hit.serverErrors,
+      errorRate: hit.requests ? round2(((hit.clientErrors + hit.serverErrors) * 100) / hit.requests) : 0,
+      avgMs: hit.requests ? round2(hit.durationSum / hit.requests) : 0,
+      p95Ms: percentileFromHistogram(hit.latency),
+      lastRequestAt: hit.lastRequestAt,
+      share: requests ? round2((hit.requests * 100) / requests) : 0,
+    }))
+    .sort((a, b) => b.requests - a.requests);
+
+  return {
+    from: f.from.toISOString(),
+    to: f.to.toISOString(),
+    bucketSeconds,
+    totals: {
+      requests,
+      success,
+      clientErrors,
+      serverErrors,
+      errorRate: requests ? round2(((clientErrors + serverErrors) * 100) / requests) : 0,
+      avgMs: requests ? round2(durationSum / requests) : 0,
+      p95Ms: percentileFromHistogram(latency),
+      uniqueUsers: userIds.size,
+      uniqueAccounts: accountIds.size,
+      lastRequestAt,
+      promptTokens,
+      completionTokens,
+      totalTokens,
+    },
+    features,
+    series: fillSeries(f.from, f.to, bucketSeconds, points),
+    statusClasses: [...statusMap.entries()]
+      .sort((a, b) => Number(a[0].replace('xx', '')) - Number(b[0].replace('xx', '')))
+      .map(([cls, count]) => ({ class: cls, count })),
+    authKinds: [...authMap.entries()]
+      .map(([kind, count]) => ({ kind, requests: count }))
+      .sort((a, b) => b.requests - a.requests),
+    topRoutes: [...routeMap.values()]
+      .map((route) => ({
+        feature: route.feature,
+        route: route.route,
+        method: route.method,
+        requests: route.requests,
+        errors: route.errors,
+        avgMs: route.requests ? round2(route.durationSum / route.requests) : 0,
+      }))
+      .sort((a, b) => b.requests - a.requests)
+      .slice(0, 10),
+    models: [...modelMap.entries()]
+      .map(([model, hit]) => ({ model, ...hit }))
+      .sort((a, b) => b.totalTokens - a.totalTokens)
+      .slice(0, 20),
+  };
+}
+
+/**
+ * Usage summary with a warehouse fast path:
+ *   raw head (partial hour) + hourly rollups + raw live tail
+ * Falls back to the Postgres-only query for narrow ranges, ad-hoc searches,
+ * exact-status filters, or when the warehouse is unavailable.
+ */
+export async function usageSummary(f: UsageFilter): Promise<UsageSummary> {
+  if (!shouldUseWarehouse(f)) return usageSummaryRaw(f);
+  try {
+    const watermark = await warehouseWatermark(f.orgId!);
+    const coveredUntil = watermark.coveredUntil ? new Date(watermark.coveredUntil).getTime() : null;
+    const rangeStart = f.from.getTime();
+    const rangeEnd = f.to.getTime();
+    if (coveredUntil === null || coveredUntil <= rangeStart) return usageSummaryRaw(f);
+
+    const coverageStart = watermark.coveredFrom || watermark.minBucket;
+    const firstCovered = coverageStart ? Math.max(rangeStart, new Date(coverageStart).getTime()) : rangeStart;
+    if (firstCovered >= rangeEnd) return usageSummaryRaw(f);
+
+    const warehouseStart = ceilHour(firstCovered);
+    if (warehouseStart - rangeStart > MAX_RAW_HEAD_MS) return usageSummaryRaw(f);
+    // Warehouse buckets are whole hours. Leave the final partial hour to the
+    // raw tail so a custom `to` that is not hour-aligned stays exact.
+    const warehouseEnd = floorHour(Math.min(rangeEnd, coveredUntil));
+    // A range that ends inside the first partial hour has no complete bucket:
+    // use the exact Postgres path instead of splitting overlapping head/tail.
+    if (warehouseEnd <= warehouseStart) return usageSummaryRaw(f);
+    const parts: UsagePart[] = [];
+
+    if (warehouseStart > rangeStart) {
+      const headEndMs = warehouseStart - 1;
+      if (headEndMs >= rangeStart) {
+        parts.push(await rawPart({ ...f, from: f.from, to: new Date(headEndMs) }));
+      }
+    }
+
+    const wh = await fetchWarehouseUsage({
+      ...f,
+      from: new Date(warehouseStart),
+      to: new Date(warehouseEnd),
+    });
+    if (wh && wh.coverageEnd) parts.push(warehousePart(wh));
+
+    if (warehouseEnd < rangeEnd) {
+      parts.push(await rawPart({ ...f, from: new Date(warehouseEnd), to: f.to }));
+    }
+
+    if (!parts.length) return usageSummaryRaw(f);
+    if (parts.length === 1 && parts[0].raw) return parts[0].summary;
+    return mergeUsageParts(parts, f);
+  } catch (error: any) {
+    console.warn(`[iam][usage] warehouse summary fallback: ${error?.message || error}`);
+    return usageSummaryRaw(f);
+  }
 }

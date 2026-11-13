@@ -627,20 +627,29 @@ Endpoints: `POST .../geo/features`, `GET .../geo/features?bbox=`,
 
 ## Change feed
 
-`GET /v1/base/collections/:collection/changes?since=<ISO-8601>&limit=100&as=data|object`
+`GET /v1/base/collections/:collection/changes?since=<ISO-8601>&after=<event-id>&limit=100&as=data|object`
 
 ```json
 {
   "changes": [
-    {"id": "park-1", "version": 4, "createdAt": "...", "updatedAt": "...", "data": {...}, "deleted": false}
+    {"id": "park-1", "version": 4, "createdAt": "...", "updatedAt": "...", "operation": "update", "eventId": "…", "data": {...}, "deleted": false},
+    {"id": "park-2", "version": 3, "operation": "delete", "eventId": "…", "deleted": true}
   ],
   "nextSince": "2026-10-21T09:00:00.000Z",
+  "nextAfter": "event-id",
   "hasMore": false
 }
 ```
 
-- Poll with the last `nextSince` value; it is the `updatedAt` of the last returned
-  document (or `since` when nothing changed).
+- The feed reads the transactional outbox, not the current document table.
+  Create, update and delete are emitted; deletes are tombstones.
+- Poll with `nextSince` + `nextAfter` so multiple events with the same timestamp
+  are not skipped.
+- Backfill an existing collection with
+  `POST /internal/base/collections/:collection/backfill`
+  (`x-synapseone-internal`, 500 docs/page, deterministic event ids).
+- `BASE_OUTBOX_STREAM_TOPIC` (default `base-changes`) enables the relay to
+  SynapseStream when `STREAM_SERVICE_URL` is configured.
 - `limit` 1..1000 (default 100).
 - Only upserts/updates are emitted. **Deletes are not emitted** — `deleted` is
   always `false`; consumers must handle removals separately.

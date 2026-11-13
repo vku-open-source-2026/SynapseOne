@@ -20,6 +20,7 @@ import {
   faStream,
   faCloud,
   faServer,
+  faWarehouse,
 } from '@fortawesome/free-solid-svg-icons';
 import { useI18n } from '../lib/i18n-context.js';
 
@@ -83,6 +84,18 @@ export const PLATFORM_SERVICES = [
     shadowColor: 'rgba(244, 63, 94, 0.28)',
     match: (p) => p.startsWith('/stream'),
     keywords: ['stream', 'streaming', 'kafka', 'events', 'consumer group', 'replay', 'telemetry', 'topic', 'log'],
+  },
+  {
+    to: '/warehouse',
+    label: 'Synapse Warehouse',
+    category: 'OLAP & ETL',
+    desc: 'DuckDB datasets, read-only SQL studio, batch & stream ETL jobs',
+    icon: faWarehouse,
+    iconColor: 'from-lime-500 to-emerald-600',
+    bgGradient: 'linear-gradient(135deg, #84cc16 0%, #059669 100%)',
+    shadowColor: 'rgba(16, 185, 129, 0.28)',
+    match: (p) => p.startsWith('/warehouse'),
+    keywords: ['warehouse', 'olap', 'duckdb', 'sql', 'dataset', 'etl', 'analytics', 'batch', 'stream', 'aggregate', 'rollup'],
   },
   {
     to: '/ocs',

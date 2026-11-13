@@ -50,6 +50,7 @@ import {
 import { decideForPrincipal, managedPolicyList, MANAGED_POLICIES, type PrincipalInput } from './authz';
 import { secretsEqual, hashCandidates, withTransaction } from './db';
 import { ingestUsageEvents, listUsageEvents, purgeUsage, usageSummary, type UsageFilter } from './usage';
+import { startUsageRollup } from './usage-rollup';
 import { assertOidcConfig, isPublicHttpsUrl, createOidcState, exchangeCode, authorizationEndpoint, oidcSettings, OidcError } from './oidc';
 import {
   hashPassword, verifyPassword, passwordPolicyError, newOneTimeToken,
@@ -975,6 +976,8 @@ async function auditMutation(req: express.Request, action: string, resource: str
     setInterval(sweep, 60 * 60 * 1000).unref?.();
     setTimeout(sweep, 45_000).unref?.();
   }
+  // Hourly usage rollups → Synapse Warehouse (no-op without WAREHOUSE_SERVICE_URL).
+  startUsageRollup();
   const PUBLIC_PREFIXES = ['/v1/auth/'];
   const PUBLIC_EXACT = new Set(['/v1/auth']);
   app.use(((async (req: express.Request, res: express.Response, next: express.NextFunction) => {

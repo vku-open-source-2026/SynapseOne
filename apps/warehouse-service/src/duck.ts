@@ -28,7 +28,7 @@ import {
   tableName,
 } from './sql';
 
-type Conn = any;
+export type Conn = any;
 
 interface TenantDb {
   instance: any;
@@ -62,7 +62,7 @@ function normalizeValue(value: any): any {
   return value;
 }
 
-async function readAll(conn: Conn, sql: string, params?: any[]): Promise<{
+export async function readAll(conn: Conn, sql: string, params?: any[]): Promise<{
   columns: string[];
   types: string[];
   rows: Record<string, any>[];
@@ -199,6 +199,13 @@ export class WarehouseStore {
       created_at VARCHAR NOT NULL,
       updated_at VARCHAR NOT NULL
     )`);
+    await conn.run(`CREATE TABLE IF NOT EXISTS _ingest_events (
+      event_id VARCHAR NOT NULL,
+      dataset_id VARCHAR NOT NULL,
+      job_id VARCHAR,
+      applied_at VARCHAR NOT NULL,
+      PRIMARY KEY (event_id, dataset_id)
+    )`);
     await conn.run(`CREATE TABLE IF NOT EXISTS _jobs (
       id VARCHAR PRIMARY KEY,
       name VARCHAR NOT NULL,
@@ -313,53 +320,87 @@ export class WarehouseStore {
     });
   }
 
-  async insertRows(tenant: string, dataset: DatasetMeta, rows: unknown[]): Promise<number> {
+  private async insertRowsOnConn(conn: Conn, dataset: DatasetMeta, rows: unknown[]): Promise<number> {
     if (!Array.isArray(rows) || rows.length < 1 || rows.length > 5000) {
       throw new WarehouseError(400, 'invalid_rows', 'rows must be an array of 1..5000 objects');
     }
     const columns = dataset.columns;
-    return this.run(tenant, async (conn) => {
-      const tuples: string[] = [];
-      const values: any[] = [];
-      for (const raw of rows) {
-        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-          throw new WarehouseError(400, 'invalid_rows', 'every row must be a JSON object');
-        }
-        const row = raw as Record<string, unknown>;
-        const placeholders: string[] = [];
-        for (const column of columns) {
-          const cast = column.type === 'json'
-            ? '?::JSON'
-            : column.type === 'timestamp'
-              ? '?::TIMESTAMP'
-              : '?';
-          placeholders.push(cast);
-          let value = row[column.name];
-          if (value === undefined) value = null;
-          if (value !== null) {
-            if (column.type === 'json') value = typeof value === 'string' ? value : JSON.stringify(value);
-            else if (column.type === 'timestamp') value = value instanceof Date ? value.toISOString() : String(value);
-            else if (column.type === 'boolean') value = Boolean(value);
-            else if (column.type === 'number') {
-              const numeric = Number(value);
-              if (!Number.isFinite(numeric)) {
-                throw new WarehouseError(400, 'invalid_rows', `column '${column.name}' must be numeric`);
-              }
-              value = numeric;
-            } else if (typeof value === 'object') {
-              value = JSON.stringify(value);
-            }
-          }
-          values.push(value);
-        }
-        tuples.push(`(${placeholders.join(', ')})`);
+    const tuples: string[] = [];
+    const values: any[] = [];
+    for (const raw of rows) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        throw new WarehouseError(400, 'invalid_rows', 'every row must be a JSON object');
       }
-      await conn.run(
-        `INSERT INTO ${quoteIdent(tableName(dataset.id))} VALUES ${tuples.join(', ')}`,
-        values,
-      );
-      await conn.run('UPDATE _datasets SET updated_at = ? WHERE id = ?', [nowIso(), dataset.id]);
-      return rows.length;
+      const row = raw as Record<string, unknown>;
+      const placeholders: string[] = [];
+      for (const column of columns) {
+        const cast = column.type === 'json'
+          ? '?::JSON'
+          : column.type === 'timestamp'
+            ? '?::TIMESTAMP'
+            : '?';
+        placeholders.push(cast);
+        let value = row[column.name];
+        if (value === undefined) value = null;
+        if (value !== null) {
+          if (column.type === 'json') value = typeof value === 'string' ? value : JSON.stringify(value);
+          else if (column.type === 'timestamp') value = value instanceof Date ? value.toISOString() : String(value);
+          else if (column.type === 'boolean') value = Boolean(value);
+          else if (column.type === 'number') {
+            const numeric = Number(value);
+            if (!Number.isFinite(numeric)) {
+              throw new WarehouseError(400, 'invalid_rows', `column '${column.name}' must be numeric`);
+            }
+            value = numeric;
+          } else if (typeof value === 'object') {
+            value = JSON.stringify(value);
+          }
+        }
+        values.push(value);
+      }
+      tuples.push(`(${placeholders.join(', ')})`);
+    }
+    await conn.run(
+      `INSERT INTO ${quoteIdent(tableName(dataset.id))} VALUES ${tuples.join(', ')}`,
+      values,
+    );
+    await conn.run('UPDATE _datasets SET updated_at = ? WHERE id = ?', [nowIso(), dataset.id]);
+    return rows.length;
+  }
+
+  async insertRows(tenant: string, dataset: DatasetMeta, rows: unknown[]): Promise<number> {
+    return this.run(tenant, (conn) => this.insertRowsOnConn(conn, dataset, rows));
+  }
+
+  /** Durable stream materialization: rows + event-id marker commit together.
+   *  A crash before ack leaves the marker, so redelivery is a no-op. */
+  async ingestStreamEvents(
+    tenant: string,
+    dataset: DatasetMeta,
+    jobId: string,
+    events: Array<{ eventId: string; rows: Array<Record<string, unknown>> }>,
+  ): Promise<{ inserted: number; duplicates: number }> {
+    if (!events.length) return { inserted: 0, duplicates: 0 };
+    return this.run(tenant, async (conn) => {
+      let inserted = 0;
+      let duplicates = 0;
+      await conn.run('BEGIN');
+      try {
+        for (const event of events) {
+          const existing = await readAll(conn, 'SELECT event_id FROM _ingest_events WHERE event_id = ? AND dataset_id = ?', [event.eventId, dataset.id]);
+          if (existing.rows.length) { duplicates += 1; continue; }
+          if (event.rows.length) inserted += await this.insertRowsOnConn(conn, dataset, event.rows);
+          await conn.run(
+            'INSERT INTO _ingest_events (event_id, dataset_id, job_id, applied_at) VALUES (?, ?, ?, ?)',
+            [event.eventId, dataset.id, jobId, nowIso()],
+          );
+        }
+        await conn.run('COMMIT');
+      } catch (error) {
+        await conn.run('ROLLBACK').catch(() => undefined);
+        throw error;
+      }
+      return { inserted, duplicates };
     });
   }
 
@@ -369,10 +410,18 @@ export class WarehouseStore {
     const started = Date.now();
     return this.run(tenant, async (conn) => {
       let result: { columns: string[]; types: string[]; rows: Record<string, any>[] };
+      const timeoutMs = Math.min(Math.max(Number(process.env.WAREHOUSE_QUERY_TIMEOUT_MS) || 15000, 1000), 120000);
+      const timer = setTimeout(() => { try { conn.interrupt?.(); } catch { /* best effort */ } }, timeoutMs);
       try {
         result = await readAll(conn, limitedSql(sql, bounded));
       } catch (error) {
-        throw new WarehouseError(400, 'query_failed', String((error as Error)?.message || error).slice(0, 500));
+        const message = String((error as Error)?.message || error).slice(0, 500);
+        if (/interrupt|cancel/i.test(message)) {
+          throw new WarehouseError(408, 'query_timeout', `query exceeded ${timeoutMs}ms`);
+        }
+        throw new WarehouseError(400, 'query_failed', message);
+      } finally {
+        clearTimeout(timer);
       }
       const truncated = result.rows.length > bounded;
       const rows = truncated ? result.rows.slice(0, bounded) : result.rows;
@@ -562,6 +611,27 @@ export class WarehouseStore {
         if (error instanceof WarehouseError) throw error;
         throw new WarehouseError(400, 'etl_failed', String((error as Error)?.message || error).slice(0, 500));
       }
+    });
+  }
+
+  /** Tenant-scoped operational snapshot for the pipeline status API. */
+  async pipelineStatus(tenant: string): Promise<any> {
+    return this.run(tenant, async (conn) => {
+      const datasets = await readAll(conn, 'SELECT count(*) AS n FROM _datasets');
+      const jobs = await readAll(conn, `SELECT status, count(*) AS n FROM _jobs GROUP BY status`);
+      const last = await readAll(conn, `SELECT max(last_run_at) AS last_run, max(updated_at) AS updated, max(last_error) AS last_error FROM _jobs`);
+      const applied = await readAll(conn, 'SELECT count(*) AS n FROM _ingest_events');
+      const rows = jobs.rows as Array<{ status: string; n: number }>;
+      return {
+        datasets: Number(datasets.rows[0]?.n) || 0,
+        jobs: Number(rows.reduce((sum, row) => sum + Number(row.n || 0), 0)),
+        running: Number(rows.find((row) => row.status === 'running')?.n || 0),
+        paused: Number(rows.find((row) => row.status === 'paused')?.n || 0),
+        appliedEvents: Number(applied.rows[0]?.n) || 0,
+        lastRunAt: last.rows[0]?.last_run ? String(last.rows[0].last_run) : null,
+        updatedAt: last.rows[0]?.updated ? String(last.rows[0].updated) : null,
+        lastError: last.rows[0]?.last_error ? String(last.rows[0].last_error) : null,
+      };
     });
   }
 

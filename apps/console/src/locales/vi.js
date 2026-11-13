@@ -331,6 +331,7 @@ export const vi = {
     base: { category: 'CSDL tài liệu', desc: 'Tài liệu JSON, ánh xạ đối tượng ↔ dữ liệu và truy vấn' },
     queue: { category: 'Hàng đợi tin nhắn', desc: 'Hàng đợi giao ít nhất một lần, lease và dead letter' },
     stream: { category: 'Luồng sự kiện', desc: 'Nhật ký sự kiện phân tán, consumer group và phát lại theo thời gian' },
+    warehouse: { category: 'OLAP & ETL', desc: 'Dataset DuckDB, SQL studio chỉ đọc, batch ETL và stream ETL' },
     ocs: { category: 'Lưu trữ đối tượng', desc: 'Bucket, object, URL ký sẵn, tải lên nhiều phần và hạn mức tenant' },
     faststore: { category: 'Cache & KV', desc: 'Cache trên Redis, bộ đếm, hash và khóa phân tán' },
     lds: { category: 'Dữ liệu liên kết', desc: 'Nguồn dữ liệu NGSI-LD, schema thực thể và giấy phép dữ liệu mở' },

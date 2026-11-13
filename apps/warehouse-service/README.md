@@ -13,6 +13,9 @@ Tenant-scoped OLAP service behind the gateway's `/v1/warehouse` route.
 - **Stream ETL:** `POST /v1/warehouse/etl/stream` ensures a consumer-group job
   over SynapseStream. The worker reads a micro-batch, maps event payloads to
   dataset columns, appends rows and acks only after a successful write.
+  `_ingest_events(event_id, dataset_id)` is written in the same DuckDB
+  transaction, so redelivery after a crash is a no-op. Change-log datasets keep
+  create/update/delete rows; current state is a query over the latest version.
 
 ## API
 
@@ -24,6 +27,7 @@ Tenant-scoped OLAP service behind the gateway's `/v1/warehouse` route.
 | POST | `/v1/warehouse/datasets/:id/rows` |
 | POST | `/v1/warehouse/query` |
 | GET | `/v1/warehouse/templates` |
+| GET | `/v1/warehouse/pipeline/status` |
 | GET/POST | `/v1/warehouse/jobs` |
 | GET/DELETE | `/v1/warehouse/jobs/:id` |
 | POST | `/v1/warehouse/jobs/:id/run` (batch) |
@@ -31,6 +35,31 @@ Tenant-scoped OLAP service behind the gateway's `/v1/warehouse` route.
 | POST | `/v1/warehouse/jobs/:id/resume` |
 | POST | `/v1/warehouse/etl/batch` |
 | POST | `/v1/warehouse/etl/stream` |
+
+Internal (no gateway route; IAM only, shared secret required):
+
+| Method | Path |
+| --- | --- |
+| POST | `/internal/usage/rollup` |
+| POST | `/internal/usage/summary` |
+| GET | `/internal/usage/watermark` |
+
+## Usage-analytics rollups
+
+The dashboard does not scan raw request telemetry on every load. IAM writes
+gateway events to Postgres and periodically pushes completed hours here:
+
+- `_usage_hourly` — hour × feature × route × method × status class × auth kind
+  × account × model, with request/success/error counters, token sums, duration
+  sum and a fixed latency histogram for p95.
+- `_usage_hourly_user` — hour × feature × method × status class × account ×
+  user, used for distinct active users/accounts.
+- `_usage_rollup_state` — exclusive coverage watermark per tenant. Empty hours
+  still advance the watermark.
+
+IAM merges warehouse history with the still-unaggregated Postgres tail, so
+dashboard totals remain exact at range boundaries. Exact-status, actor and
+free-text (`q`) filters intentionally stay on the Postgres path.
 
 ## Env
 
@@ -40,7 +69,7 @@ Tenant-scoped OLAP service behind the gateway's `/v1/warehouse` route.
 | `WAREHOUSE_DATA_DIR` | `/data/warehouse` | DuckDB file directory (volume) |
 | `WAREHOUSE_THREADS` | `2` | DuckDB intra-op threads |
 | `STREAM_SERVICE_URL` | `http://stream:4009` | SynapseStream base URL |
-| `SYNAPSEONE_INTERNAL_SECRET` | — | Required in production |
+| `SYNAPSEONE_INTERNAL_SECRET` | — | Required in production (also guards `/internal/*`) |
 | `CORS_ORIGIN` | — | Allowed console origin |
 
 ## Tests

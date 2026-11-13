@@ -11,7 +11,7 @@ import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Server } from 'http';
 import http from 'node:http';
-import { createApp } from './index';
+import { createApp, relayOutboxOnce } from './index';
 import { __clearBaseMem } from './store';
 import { __auditEvents, __clearAudit, __flushAudit } from './audit';
 
@@ -258,8 +258,59 @@ test('batch writes and change feed', async () => {
   const changes = await call('GET', `/v1/base/collections/users/changes?since=${encodeURIComponent(since)}`);
   assert.equal(changes.status, 200);
   assert.ok(changes.json.changes.some((c: any) => c.id === 'b' && c.data.n === 5));
+  const tombstone = changes.json.changes.find((c: any) => c.id === 'a' && c.operation === 'delete');
+  assert.ok(tombstone);
+  assert.equal(tombstone.deleted, true);
+  assert.ok(tombstone.eventId);
+  assert.ok(changes.json.nextAfter);
   const invalid = await call('GET', '/v1/base/collections/users/changes?since=nope');
   assert.equal(invalid.status, 400);
+});
+
+test('a rolled-back document write emits no outbox event', async () => {
+  await createCollection();
+  const first = await call('POST', '/v1/base/collections/users/documents', { id: 'dup', data: { n: 1 } });
+  assert.equal(first.status, 201);
+  const since = new Date(Date.now() - 60_000).toISOString();
+  const before = await call('GET', `/v1/base/collections/users/changes?since=${encodeURIComponent(since)}`);
+  const failed = await call('POST', '/v1/base/collections/users/documents', { id: 'dup', data: { n: 2 } });
+  assert.equal(failed.status, 409);
+  const after = await call('GET', `/v1/base/collections/users/changes?since=${encodeURIComponent(since)}`);
+  assert.equal(after.json.changes.length, before.json.changes.length);
+  assert.equal(after.json.changes.filter((c: any) => c.id === 'dup').length, 1);
+});
+
+test('outbox relay publishes once even when called twice', async () => {
+  const received: any[] = [];
+  const stream = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      res.setHeader('content-type', 'application/json');
+      if (req.method === 'POST') received.push(JSON.parse(raw || '{}'));
+      res.statusCode = 201;
+      res.end(JSON.stringify({ ok: true, events: [] }));
+    });
+  });
+  await new Promise<void>((resolve) => stream.listen(0, '127.0.0.1', () => resolve()));
+  const addr = stream.address();
+  process.env.STREAM_SERVICE_URL = `http://127.0.0.1:${typeof addr === 'object' && addr ? addr.port : 0}`;
+  process.env.BASE_OUTBOX_STREAM_TOPIC = 'base-changes';
+  try {
+    await createCollection();
+    await call('POST', '/v1/base/collections/users/documents', { id: 'relay-1', data: { n: 1 } });
+    const first = await relayOutboxOnce();
+    assert.equal(first, 1);
+    assert.equal(received.length, 1);
+    assert.equal(received[0].events[0].payload.document_id, 'relay-1');
+    assert.equal(received[0].events[0].payload.event_id.startsWith('backfill:'), false);
+    const second = await relayOutboxOnce();
+    assert.equal(second, 0);
+  } finally {
+    delete process.env.STREAM_SERVICE_URL;
+    delete process.env.BASE_OUTBOX_STREAM_TOPIC;
+    await new Promise<void>((resolve) => stream.close(() => resolve()));
+  }
 });
 
 test('anonymous callers are rejected', async () => {

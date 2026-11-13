@@ -331,6 +331,7 @@ export const en = {
     base: { category: 'Document Database', desc: 'JSON documents with object ↔ data mapping & queries' },
     queue: { category: 'Message Queue', desc: 'At-least-once message queues, leases & dead letters' },
     stream: { category: 'Event Streaming', desc: 'Distributed event stream log, consumer groups & time-series replay' },
+    warehouse: { category: 'OLAP & ETL', desc: 'DuckDB datasets, read-only SQL studio, batch & stream ETL jobs' },
     ocs: { category: 'Object Cloud Storage', desc: 'Buckets, objects, signed URLs, multipart upload & tenant quotas' },
     faststore: { category: 'Cache & KV Store', desc: 'Redis-backed cache, counters, hashes & distributed locks' },
     lds: { category: 'Linked Data', desc: 'NGSI-LD datasources, entity schemas & open-data licenses' },

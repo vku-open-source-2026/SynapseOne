@@ -669,11 +669,13 @@ export function createApp(): express.Express {
     const inferenceUrl = process.env.INFERENCE_SERVICE_URL;
     const ocsUrl = process.env.OCS_SERVICE_URL || process.env.STORAGE_SERVICE_URL;
     const notificationsUrl = process.env.NOTIFICATIONS_SERVICE_URL;
+    const warehouseUrl = process.env.WAREHOUSE_SERVICE_URL;
     const probeList = [
       probe('iam', iamUrl), probe('workflow', wfUrl), probe('ai', aiUrl), probe('lds', ldsUrl),
       probe('base', baseUrl), probe('faststore', faststoreUrl), probe('queue', queueUrl),
     ];
     if (streamUrl) probeList.push(probe('stream', streamUrl));
+    if (warehouseUrl) probeList.push(probe('warehouse', warehouseUrl));
     // Inference is a routed dependency; probe it whenever its URL is configured.
     if (inferenceUrl) probeList.push(probe('inference', inferenceUrl));
     if (ocsUrl) probeList.push(probe('ocs', ocsUrl));
