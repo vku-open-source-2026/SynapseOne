@@ -50,6 +50,7 @@ import {
 import { decideForPrincipal, managedPolicyList, MANAGED_POLICIES, type PrincipalInput } from './authz';
 import { secretsEqual, hashCandidates } from './db';
 import { ingestUsageEvents, listUsageEvents, purgeUsage, usageSummary, type UsageFilter } from './usage';
+import { startUsageRollup } from './usage-rollup';
 import { assertOidcConfig, isPublicHttpsUrl, signState, exchangeCode, authorizationEndpoint, oidcSettings, OidcError } from './oidc';
 import {
   hashPassword, verifyPassword, passwordPolicyError, newOneTimeToken,
@@ -382,6 +383,26 @@ async function requirePlatformStepUp(
   return true;
 }
 
+/** Retry a privileged audit insert, then fail closed. Used by platform and
+ *  tenant administrative mutations so a lost audit row is never silent. */
+async function writeAuditStrict(entry: Parameters<typeof logAudit>[0]): Promise<void> {
+  let lastError: any;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await logAudit(entry);
+      return;
+    } catch (e: any) {
+      lastError = e;
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 25 * (attempt + 1)));
+    }
+  }
+  console.error('[iam][audit] privileged audit write failed:', entry.action, lastError?.message || lastError);
+  throw Object.assign(new Error('privileged audit write failed'), {
+    status: 503,
+    code: 'audit_write_failed',
+  });
+}
+
 /** Privileged platform actions must never silently succeed without their
  *  audit row. Retry transient DB failures, then fail closed with 503. */
 async function auditPlatformAction(
@@ -405,21 +426,7 @@ async function auditPlatformAction(
       ...extra,
     },
   };
-  let lastError: any;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      await logAudit(entry);
-      return;
-    } catch (e: any) {
-      lastError = e;
-      if (attempt < 2) await new Promise((r) => setTimeout(r, 25 * (attempt + 1)));
-    }
-  }
-  console.error('[iam][audit] platform action audit write failed:', action, lastError?.message || lastError);
-  throw Object.assign(new Error('platform audit write failed'), {
-    status: 503,
-    code: 'audit_write_failed',
-  });
+  await writeAuditStrict(entry);
 }
 
 /** Denied platform-plane attempts are security events too. A denied request
@@ -902,14 +909,14 @@ async function auditMutation(req: express.Request, action: string, resource: str
     resolveCallerOrg(req, TRUST_STAMPED),
     resolveCallerUser(req, TRUST_STAMPED),
   ]);
-  await logAudit({
+  await writeAuditStrict({
     actor_type: user ? 'user' : 'service',
     actor_id: user || '',
     action,
     resource,
     decision: true,
     context: { ...(org ? { org } : {}), ...(user ? { callerUser: user } : {}), ...extra },
-  }).catch(() => undefined);
+  });
 }
 
   // Audit retention (opt-in): hourly purge of rows older than N days.
@@ -947,6 +954,8 @@ async function auditMutation(req: express.Request, action: string, resource: str
     setInterval(sweep, 60 * 60 * 1000).unref?.();
     setTimeout(sweep, 45_000).unref?.();
   }
+  // Hourly usage rollups → Synapse Warehouse (no-op without WAREHOUSE_SERVICE_URL).
+  startUsageRollup();
   const PUBLIC_PREFIXES = ['/v1/auth/'];
   const PUBLIC_EXACT = new Set(['/v1/auth']);
   app.use(((req: express.Request, res: express.Response, next: express.NextFunction) => {
@@ -3700,10 +3709,10 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (user.active === false) await setUserActive(user.id, true);
     const admin = await grantPlatformAdmin({ userId: user.id, role: 'owner', grantedBy: user.id, reason: 'initial bootstrap' });
     const inviteToken = await issueInvite((await getUserById(user.id)) || user);
-    await logAudit({
+    await writeAuditStrict({
       actor_type: 'platform-bootstrap', actor_id: 'bootstrap', action: 'platform:bootstrap', resource: 'platform',
       decision: true, org_id: org.id, context: { platformAdmin: true, targetUserId: user.id, email: user.email },
-    }).catch(() => undefined);
+    });
     noStore(res);
     res.status(201).json({ organization: org, user: publicUser(user), admin, inviteToken });
   });
@@ -3732,11 +3741,11 @@ async function auditMutation(req: express.Request, action: string, resource: str
     } else {
       result.revoked = await revokeAllRefresh(user.id);
     }
-    await logAudit({
+    await writeAuditStrict({
       actor_type: 'platform-recovery', actor_id: 'recovery', action: `platform:recovery:${parsed.data.action}`,
       resource: `user:${user.id}`, decision: true, org_id: user.org_id,
       context: { platformAdmin: true, targetUserId: user.id, action: parsed.data.action },
-    }).catch(() => undefined);
+    });
     noStore(res);
     res.json(result);
   });
