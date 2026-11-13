@@ -161,7 +161,9 @@ export default function Login() {
                 <Input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" autoComplete="username" required />
               </Field>
               <Field label={t.org}>
-                <Input value={org} onChange={(e) => setOrg(e.target.value)} placeholder="your-org" autoComplete="organization" required />
+                {/* Not `required`: the submit handler explains the missing org in the
+                    selected locale instead of the browser's generic tooltip. */}
+                <Input value={org} onChange={(e) => setOrg(e.target.value)} placeholder="your-org" autoComplete="organization" />
               </Field>
               <Field label={t.password}>
                 <Input
