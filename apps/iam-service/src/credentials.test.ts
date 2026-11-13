@@ -12,6 +12,7 @@ import type { Server } from 'node:http';
 import jwt from 'jsonwebtoken';
 import { createApp } from './index';
 import { getJwtSecret, verifyAccess } from './tokens';
+import { setUserActive } from './db';
 
 // Lifecycle tokens are opt-in; these tests assert the dev/mailer-less flow.
 process.env.IAM_EXPOSE_LIFECYCLE_TOKENS = 'true';
@@ -72,6 +73,19 @@ describe('first-party credential lifecycle', () => {
     assert.equal(verify.data.emailVerified, true);
     const reused = await call('POST', '/v1/auth/email/verify', { token: reg.emailVerificationToken });
     assert.equal(reused.status, 400);
+  });
+
+  it('rejects existing access tokens after the account is disabled', async () => {
+    const reg = await register('cred-disabled', 'disabled@cred.local');
+    const before = await call('GET', '/v1/orgs', undefined, reg.accessToken);
+    assert.equal(before.status, 200);
+    await setUserActive(reg.user.id, false);
+    const after = await call('GET', '/v1/orgs', undefined, reg.accessToken);
+    assert.equal(after.status, 401);
+    assert.equal(after.data.error, 'account_deactivated');
+    const me = await call('GET', '/v1/auth/me', undefined, reg.accessToken);
+    assert.equal(me.status, 401);
+    assert.equal(me.data.error, 'account_deactivated');
   });
 
   it('never returns password material on auth or user endpoints', async () => {

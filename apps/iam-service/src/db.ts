@@ -8,6 +8,7 @@
  * Drizzle migrations.
  */
 import path from 'path';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { Pool } from 'pg';
 import { randomUUID, createHash, createHmac, timingSafeEqual } from 'crypto';
 import { and, asc, desc, eq, ilike, inArray, isNull, lt, or, sql } from 'drizzle-orm';
@@ -37,7 +38,26 @@ if (DATABASE_URL) {
   pool = new Pool({ connectionString: DATABASE_URL });
   pool.on('error', (e) => console.error('[iam][db] pool error', e.message));
 }
-const db: NodePgDatabase<typeof schema> | null = pool ? drizzle(pool, { schema }) : null;
+const baseDb: NodePgDatabase<typeof schema> | null = pool ? drizzle(pool, { schema }) : null;
+/** Request-scoped transaction context. A Proxy keeps every existing helper on
+ *  the same connection inside withTransaction(), including audit inserts, so a
+ *  failed mandatory audit rolls the privileged mutation back. */
+const txStore = new AsyncLocalStorage<{ tx: any }>();
+const db: NodePgDatabase<typeof schema> | null = baseDb
+  ? new Proxy(baseDb, {
+      get(target, prop, receiver) {
+        const tx = txStore.getStore()?.tx;
+        const src = tx || target;
+        const value = Reflect.get(src, prop, src);
+        return typeof value === 'function' ? value.bind(src) : value;
+      },
+    }) as NodePgDatabase<typeof schema>
+  : null;
+
+export async function withTransaction<T>(fn: () => Promise<T>): Promise<T> {
+  if (!baseDb) return fn();
+  return baseDb.transaction(async (tx) => txStore.run({ tx }, fn));
+}
 
 let ensured = false;
 export async function ensureTables(): Promise<void> {
