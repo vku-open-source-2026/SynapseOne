@@ -217,17 +217,18 @@ user and all authorization. Details: `docs/architecture.md`, `docs/iam-model.md`
 
 ```
 apps/console               Admin UI (React + Vite + Tailwind)
-apps/gateway               API gateway (proxy, JWT/API-key, principal headers, /metrics)
+apps/gateway               API gateway (Rust/Axum; proxy, JWT/API-key, principal headers, /metrics)
 apps/iam-service           IAM + tokens + authorize/simulator + real OIDC code flow
 apps/workflow-service      Workflow engine (local built-in DAG runner, sandboxed code, triggers)
-apps/lds-service           SynapseLDS — NGSI-LD datasources, registry, licensed exports
-apps/base-service          SynapseBase — documents, mapping, queries, change feed
-apps/faststore-service     Synapse Faststore — cache/KV, data structures, locks
-apps/queue-service         SynapseQueue — publish/consume, leases, retries, DLQ
-apps/stream-service        SynapseStream — topics, consumer groups, acks
-apps/warehouse-service     Synapse Warehouse — OLAP datasets, SQL, batch/stream ETL
-apps/ocs-service       SynapseOCS — objects, multipart, presign, quotas
-apps/notifications-service SynapseNotifications — outbox, templates, preferences
+apps/lds-service           SynapseLDS — NGSI-LD datasources, registry, licensed exports (Rust)
+apps/base-service          SynapseBase — documents, mapping, queries, change feed (Rust)
+apps/faststore-service     Synapse Faststore — cache/KV, data structures, locks (Rust)
+apps/queue-service         SynapseQueue — publish/consume, leases, retries, DLQ (Rust)
+apps/stream-service        SynapseStream — topics, consumer groups, acks (Rust)
+apps/warehouse-service     Synapse Warehouse — OLAP datasets, SQL, batch/stream ETL (Rust)
+apps/ocs-service           SynapseOCS — objects, multipart, presign, quotas (Rust)
+apps/notifications-service SynapseNotifications — outbox, templates, preferences (Rust)
+apps/ai-service            SynapseOne AI assistant — LLM routing + call generation (Rust)
 sdks/sdk-js                @synapseone/sdk (TypeScript, zero runtime deps)
 sdks/sdk-python            synapseone-sdk (Python, requests only)
 sdks/sdk-go                synapseone-sdk-go (Go, stdlib only)

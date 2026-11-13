@@ -30,15 +30,14 @@ Skip: `node_modules/`, `apps/*/dist/`, `.pytest_cache/`, `.ruff_cache/`,
 ## Stack
 
 - Node 20 + TypeScript + Express for the remaining platform services (IAM,
-  Workflow, Warehouse). `pg` for SQL; Drizzle is used only for schema
-  definitions and migrations. Platform-service tests run as `node --test` on
-  compiled JS.
+  Workflow). `pg` for SQL; Drizzle is used only for schema definitions and
+  migrations. Platform-service tests run as `node --test` on compiled JS.
 - Rust 1.82+ (Axum + Tokio) for `apps/ai-service`, `apps/stream-service`,
   `apps/lds-service`, `apps/notifications-service`, `apps/faststore-service`,
-  `apps/queue-service`, `apps/ocs-service`, `apps/base-service` and
-  `apps/gateway`. Each has `Cargo.toml`, `Cargo.lock`, a Rust `Dockerfile` and
-  a `--healthcheck` mode. Their TypeScript sources remain as the behavioural
-  reference; the Rust binary is what ships.
+  `apps/queue-service`, `apps/ocs-service`, `apps/base-service`,
+  `apps/warehouse-service` and `apps/gateway`. Each has `Cargo.toml`,
+  `Cargo.lock`, a Rust `Dockerfile` and a `--healthcheck` mode. Their TypeScript
+  sources remain as the behavioural reference; the Rust binary is what ships.
 
 - React 18 + Vite + Tailwind Console (plain JSX, not TypeScript).
 - Python 3.11 FastAPI inference service (local embeddings/decision model +

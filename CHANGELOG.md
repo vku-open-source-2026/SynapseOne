@@ -6,10 +6,10 @@ Format based on Keep a Changelog; versioning follows SemVer.
 ## [Unreleased]
 
 ### Changed
-- Faststore, Queue, OCS, Base and the Tier-1 gateway now ship as Rust/Axum
-  services. They keep the existing HTTP contracts, tenant/auth/audit semantics,
-  Redis key namespaces and Lua scripts, Drizzle-compatible schema bootstrap and
-  use `--healthcheck` instead of Node.js.
+- Faststore, Queue, OCS, Warehouse, Base and the Tier-1 gateway now ship as
+  Rust/Axum services. They keep the existing HTTP contracts, tenant/auth/audit
+  semantics, Redis key namespaces and Lua scripts, Drizzle-compatible schema
+  bootstrap and use `--healthcheck` instead of Node.js.
 
 ### Added
 - **Platform Super Admin** (`/admin`, `/v1/platform/*`): dedicated cross-tenant
