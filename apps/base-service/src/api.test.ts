@@ -313,6 +313,20 @@ test('outbox relay publishes once even when called twice', async () => {
   }
 });
 
+test('backfill is idempotent and produces replayable events', async () => {
+  await createCollection();
+  await call('POST', '/v1/base/collections/users/documents', { id: 'snap-1', data: { n: 1 } });
+  const first = await call('POST', '/internal/base/collections/users/backfill', { limit: 100 });
+  assert.equal(first.status, 200, JSON.stringify(first.json));
+  assert.equal(first.json.enqueued, 1);
+  const second = await call('POST', '/internal/base/collections/users/backfill', { limit: 100 });
+  assert.equal(second.status, 200);
+  assert.equal(second.json.enqueued, 0);
+  const changes = await call('GET', `/v1/base/collections/users/changes?since=${encodeURIComponent('1970-01-01T00:00:00.000Z')}&limit=100`);
+  const backfilled = changes.json.changes.filter((c: any) => c.id === 'snap-1' && c.eventId.startsWith('backfill:'));
+  assert.equal(backfilled.length, 1);
+});
+
 test('anonymous callers are rejected', async () => {
   const r = await call('GET', '/v1/base/collections', undefined, { 'x-synapseone-anon': '1' } as any);
   assert.equal(r.status, 401);
