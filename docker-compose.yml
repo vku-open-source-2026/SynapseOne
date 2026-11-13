@@ -446,7 +446,7 @@ services:
     ports:
       - "${FASTSTORE_SERVICE_HOST_PORT:-127.0.0.1:4006}:4006"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:4006/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "/usr/local/bin/synapseone-faststore", "--healthcheck"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -474,7 +474,7 @@ services:
     ports:
       - "${QUEUE_SERVICE_HOST_PORT:-127.0.0.1:4007}:4007"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:4007/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "/usr/local/bin/synapseone-queue", "--healthcheck"]
       interval: 15s
       timeout: 5s
       retries: 5
