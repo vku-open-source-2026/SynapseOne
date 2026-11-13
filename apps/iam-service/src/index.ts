@@ -201,11 +201,13 @@ async function resolveCallerUser(req: express.Request, trustStamped: boolean): P
 
 /** A user JWT must still map to an active account. Disabling or deleting a
  *  user must invalidate existing access tokens before their natural expiry. */
-async function claimsUserActive(claims: any): Promise<boolean> {
-  if (!claims || claims.kind === 'service-account') return true;
-  if (!claims.sub) return false;
+async function claimsUserStatus(claims: any): Promise<'ok' | 'inactive' | 'revoked'> {
+  if (!claims || claims.kind === 'service-account') return 'ok';
+  if (!claims.sub) return 'revoked';
   const user = await getUserById(String(claims.sub));
-  return !!user && user.active !== false;
+  if (!user || user.active === false) return 'inactive';
+  // Credential epoch: logout-all/disable/MFA-reset bumps users.auth_version.
+  return Number(claims.ver || 0) === Number(user.auth_version || 0) ? 'ok' : 'revoked';
 }
 
 /** May the caller act for `accountId`? Role-based account membership first,
@@ -562,8 +564,8 @@ export function exposesLifecycleTokens(): boolean {
 }
 
 /** Issue an access+refresh pair for a user (login/register/refresh). */
-async function issueSession(user: { id: string; email: string; org_id: string }): Promise<{ accessToken: string; expiresIn: number; refreshToken: string; user: unknown }> {
-  const { token, expiresIn } = signAccess({ sub: user.id, email: user.email, org: user.org_id });
+async function issueSession(user: { id: string; email: string; org_id: string; auth_version?: number }): Promise<{ accessToken: string; expiresIn: number; refreshToken: string; user: unknown }> {
+  const { token, expiresIn } = signAccess({ sub: user.id, email: user.email, org: user.org_id, ver: Number(user.auth_version) || 0 });
   const rt = newRefreshToken();
   await storeRefresh(user.id, rt.hash, refreshExpiry());
   return { accessToken: token, expiresIn, refreshToken: rt.value, user: publicUser(user as User) };
@@ -609,6 +611,14 @@ async function requireUserCaller(req: express.Request, res: express.Response): P
   const user = await getUserById(claims.sub);
   if (!user) {
     res.status(404).json({ error: 'user_not_found' });
+    return null;
+  }
+  if (user.active === false) {
+    res.status(401).json({ error: 'account_deactivated', message: 'This account has been deactivated.' });
+    return null;
+  }
+  if (Number(claims.ver || 0) !== Number(user.auth_version || 0)) {
+    res.status(401).json({ error: 'token_revoked', message: 'This session was revoked. Sign in again.' });
     return null;
   }
   return user;
@@ -997,8 +1007,11 @@ async function auditMutation(req: express.Request, action: string, resource: str
       if (h.startsWith('Bearer ')) {
         try {
           const claims = verifyAccess(h.slice(7));
-          if (!(await claimsUserActive(claims))) {
-            return res.status(401).json({ error: 'account_deactivated', message: 'This account has been deactivated.' });
+          const state = await claimsUserStatus(claims);
+          if (state !== 'ok') {
+            return res.status(401).json(state === 'revoked'
+              ? { error: 'token_revoked', message: 'This session was revoked. Sign in again.' }
+              : { error: 'account_deactivated', message: 'This account has been deactivated.' });
           }
           return next();
         } catch { /* fall through */ }
@@ -1018,8 +1031,11 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (h.startsWith('Bearer ')) {
       try {
         const claims = verifyAccess(h.slice(7));
-        if (!(await claimsUserActive(claims))) {
-          return res.status(401).json({ error: 'account_deactivated', message: 'This account has been deactivated.' });
+        const state = await claimsUserStatus(claims);
+        if (state !== 'ok') {
+          return res.status(401).json(state === 'revoked'
+            ? { error: 'token_revoked', message: 'This session was revoked. Sign in again.' }
+            : { error: 'account_deactivated', message: 'This account has been deactivated.' });
         }
         return next();
       } catch { /* fall through to apikey */ }
@@ -1190,7 +1206,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
             if (left > 0) return sendLocked(res, left);
             return sendMfaChallenge(res, user.id, 'oidc');
           }
-          const { token, expiresIn } = signAccess({ sub: user.id, email: user.email, org: user.org_id });
+          const { token, expiresIn } = signAccess({ sub: user.id, email: user.email, org: user.org_id, ver: Number(user.auth_version) || 0 });
           const rt = newRefreshToken();
           await storeRefresh(user.id, rt.hash, refreshExpiry());
           await logAudit({
@@ -1231,7 +1247,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       const user = await bootstrapOrgAdmin(resolved.user);
       if (user.active === false) return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated.' });
       if (await mfaEnabled(user.id)) return sendMfaChallenge(res, user.id, 'oidc');
-      const { token, expiresIn } = signAccess({ sub: user.id, email: user.email, org: user.org_id });
+      const { token, expiresIn } = signAccess({ sub: user.id, email: user.email, org: user.org_id, ver: Number(user.auth_version) || 0 });
       const rt = newRefreshToken();
       await storeRefresh(user.id, rt.hash, refreshExpiry());
       noStore(res);
@@ -2082,6 +2098,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
 
     const { token, expiresIn } = signDelegated({
       userId: user.id,
+      ver: Number(user.auth_version) || 0,
       org: user.org_id,
       account: account.id,
       scopes,
@@ -2136,7 +2153,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
     const rt = newRefreshToken();
     await storeRefresh(rec.user_id, rt.hash, refreshExpiry());
     const user = await getUserById(rec.user_id).catch(() => null);
-    const { token, expiresIn } = signAccess(user ? { sub: user.id, email: user.email, org: user.org_id } : { sub: rec.user_id });
+    const { token, expiresIn } = signAccess(user ? { sub: user.id, email: user.email, org: user.org_id, ver: Number(user.auth_version) || 0 } : { sub: rec.user_id });
     noStore(res);
     res.json({ accessToken: token, expiresIn, refreshToken: rt.value });
   });
@@ -2169,6 +2186,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
       const user = await getUserById(decoded.sub);
       if (!user) return res.status(404).json({ error: 'user_not_found' });
       if (user.active === false) return res.status(401).json({ error: 'account_deactivated', message: 'This account has been deactivated.' });
+      if (Number(decoded.ver || 0) !== Number(user.auth_version || 0)) {
+        return res.status(401).json({ error: 'token_revoked', message: 'This session was revoked. Sign in again.' });
+      }
       res.json({ user: publicUser(user), kind: decoded.kind || 'user' });
     } catch (e: any) {
       return res.status(401).json({ error: 'invalid_token', message: e.message });
@@ -2179,7 +2199,16 @@ async function auditMutation(req: express.Request, action: string, resource: str
     const apiKey = firstHeader(req.headers['x-api-key'] as any);
     if (h.startsWith('Bearer ')) {
       try {
-        const decoded = verifyAccess(h.slice(7));
+        const decoded: any = verifyAccess(h.slice(7));
+        if (decoded.kind !== 'service-account') {
+          const user = await getUserById(String(decoded.sub || ''));
+          if (!user || user.active === false) {
+            return res.status(401).json({ valid: false, error: 'account_deactivated', message: 'This account has been deactivated.' });
+          }
+          if (Number(decoded.ver || 0) !== Number(user.auth_version || 0)) {
+            return res.status(401).json({ valid: false, error: 'token_revoked', message: 'This session was revoked. Sign in again.' });
+          }
+        }
         return res.json({ valid: true, type: 'jwt', claims: decoded });
       } catch (e: any) {
         return res.status(401).json({ valid: false, message: e.message });
@@ -2215,10 +2244,14 @@ async function auditMutation(req: express.Request, action: string, resource: str
           message: 'organization creation is managed by a platform administrator',
         });
       }
-      const created = await createOrganization(sanitizeName(b.slug, 64), sanitizeName(b.displayName));
-      await auditMutation(req, 'iam:org:create', `org:${created.id}`, { slug: created.slug });
+      const created = await withTransaction(async () => {
+        const org = await createOrganization(sanitizeName(b.slug, 64), sanitizeName(b.displayName));
+        await auditMutation(req, 'iam:org:create', `org:${org.id}`, { slug: org.slug });
+        return org;
+      });
       res.status(201).json(created);
     } catch (e: any) {
+      if (e?.code === 'audit_write_failed' || e?.status === 503) throw e;
       if (e?.code === 'reserved_org_slug' || e?.status === 403) {
         return res.status(403).json({ error: 'reserved_org_slug', message: 'This organization slug is reserved for platform administration.' });
       }
@@ -2252,10 +2285,14 @@ async function auditMutation(req: express.Request, action: string, resource: str
         return res.status(403).json({ error: 'forbidden', message: 'organization belongs to another tenant' });
       }
       if (!(await requireSensitiveMutation(req, res, TRUST_STAMPED, req.params.orgId, 'iam:account:create'))) return;
-      const created = await createAccount(req.params.orgId, b.slug, sanitizeName(b.displayName));
-      await auditMutation(req, 'iam:account:create', `account:${created.id}`, { org: req.params.orgId, slug: created.slug });
+      const created = await withTransaction(async () => {
+        const account = await createAccount(req.params.orgId, b.slug, sanitizeName(b.displayName));
+        await auditMutation(req, 'iam:account:create', `account:${account.id}`, { org: req.params.orgId, slug: account.slug });
+        return account;
+      });
       res.status(201).json(created);
     } catch (e: any) {
+      if (e?.code === 'audit_write_failed' || e?.status === 503) throw e;
       if (e?.code === '23505' || e?.status === 409) {
         return res.status(409).json({ error: 'conflict', message: 'account slug exists' });
       }
@@ -2280,10 +2317,13 @@ async function auditMutation(req: express.Request, action: string, resource: str
       return res.status(403).json({ error: 'forbidden', message: 'organization belongs to another tenant' });
     }
     if (!(await requireSensitiveMutation(req, res, TRUST_STAMPED, req.params.orgId, 'iam:user:create'))) return;
-    const created = await upsertUser(req.params.orgId, email, displayName ? sanitizeName(displayName) : undefined);
-    const inviteToken = await issueInvite(created);
-    await auditMutation(req, 'iam:user:create', `user:${created.id}`, { org: req.params.orgId, email, inviteIssued: !!inviteToken });
-    res.status(201).json({ ...publicUser(created), inviteToken });
+    const result = await withTransaction(async () => {
+      const created = await upsertUser(req.params.orgId, email, displayName ? sanitizeName(displayName) : undefined);
+      const inviteToken = await issueInvite(created);
+      await auditMutation(req, 'iam:user:create', `user:${created.id}`, { org: req.params.orgId, email, inviteIssued: !!inviteToken });
+      return { created, inviteToken };
+    });
+    res.status(201).json({ ...publicUser(result.created), inviteToken: result.inviteToken });
   });
 
   app.get('/v1/orgs/:orgId/users', async (req, res) => {
@@ -2314,8 +2354,11 @@ async function auditMutation(req: express.Request, action: string, resource: str
     }
     const orgId = await orgForAccount(req.params.accountId);
     if (!orgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, orgId, 'iam:role:create'))) return;
-    const created = await createRole(req.params.accountId, slug, sanitizeName(description || ''));
-    await auditMutation(req, 'iam:role:create', `role:${created.id}`, { account: req.params.accountId, slug });
+    const created = await withTransaction(async () => {
+      const role = await createRole(req.params.accountId, slug, sanitizeName(description || ''));
+      await auditMutation(req, 'iam:role:create', `role:${role.id}`, { account: req.params.accountId, slug });
+      return role;
+    });
     res.status(201).json(created);
   });
 
@@ -2349,9 +2392,13 @@ async function auditMutation(req: express.Request, action: string, resource: str
     }
     const orgId = await orgForAccount(role.account_id);
     if (!orgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, orgId, 'iam:role:delete'))) return;
-    const ok = await deleteRole(req.params.roleId);
+    const ok = await withTransaction(async () => {
+      const deleted = await deleteRole(req.params.roleId);
+      if (!deleted) return false;
+      await auditMutation(req, 'iam:role:delete', `role:${req.params.roleId}`, { account: role.account_id });
+      return true;
+    });
     if (!ok) return res.status(404).json({ error: 'role_not_found' });
-    await auditMutation(req, 'iam:role:delete', `role:${req.params.roleId}`, { account: role.account_id });
     res.json({ ok: true });
   });
 
@@ -2380,8 +2427,11 @@ async function auditMutation(req: express.Request, action: string, resource: str
     const orgId = await orgForAccount(req.params.accountId);
     if (!orgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, orgId, 'iam:policy:create'))) return;
     const desc = description || (managed ? `${managed} (managed): ${MANAGED_POLICIES[managed].description}` : '');
-    const created = await createPolicy(req.params.accountId, slug, sanitizeName(desc), document);
-    await auditMutation(req, 'iam:policy:create', `policy:${created.id}`, { account: req.params.accountId, slug, ...(managed ? { managed } : {}) });
+    const created = await withTransaction(async () => {
+      const policy = await createPolicy(req.params.accountId, slug, sanitizeName(desc), document);
+      await auditMutation(req, 'iam:policy:create', `policy:${policy.id}`, { account: req.params.accountId, slug, ...(managed ? { managed } : {}) });
+      return policy;
+    });
     res.status(201).json(created);
   });
 
@@ -2404,9 +2454,13 @@ async function auditMutation(req: express.Request, action: string, resource: str
     }
     const orgId = await orgForAccount(pol.account_id);
     if (!orgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, orgId, 'iam:policy:delete'))) return;
-    const ok = await deletePolicy(req.params.policyId);
+    const ok = await withTransaction(async () => {
+      const deleted = await deletePolicy(req.params.policyId);
+      if (!deleted) return false;
+      await auditMutation(req, 'iam:policy:delete', `policy:${req.params.policyId}`, { account: pol.account_id });
+      return true;
+    });
     if (!ok) return res.status(404).json({ error: 'policy_not_found' });
-    await auditMutation(req, 'iam:policy:delete', `policy:${req.params.policyId}`, { account: pol.account_id });
     res.json({ ok: true });
   });
 
@@ -2428,8 +2482,10 @@ async function auditMutation(req: express.Request, action: string, resource: str
     }
     const orgId = await orgForAccount(role.account_id);
     if (!orgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, orgId, 'iam:policy:attach'))) return;
-    await attachPolicy(req.params.roleId, req.body.policyId);
-    await auditMutation(req, 'iam:policy:attach', `role:${req.params.roleId}`, { policyId: req.body.policyId, account: role.account_id });
+    await withTransaction(async () => {
+      await attachPolicy(req.params.roleId, req.body.policyId);
+      await auditMutation(req, 'iam:policy:attach', `role:${req.params.roleId}`, { policyId: req.body.policyId, account: role.account_id });
+    });
     res.json({ ok: true });
   });
   app.delete('/v1/roles/:roleId/policies/:policyId', async (req, res) => {
@@ -2444,8 +2500,10 @@ async function auditMutation(req: express.Request, action: string, resource: str
     }
     const orgId = await orgForAccount(role.account_id);
     if (!orgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, orgId, 'iam:policy:detach'))) return;
-    await detachPolicy(req.params.roleId, req.params.policyId);
-    await auditMutation(req, 'iam:policy:detach', `role:${req.params.roleId}`, { policyId: req.params.policyId, account: role.account_id });
+    await withTransaction(async () => {
+      await detachPolicy(req.params.roleId, req.params.policyId);
+      await auditMutation(req, 'iam:policy:detach', `role:${req.params.roleId}`, { policyId: req.params.policyId, account: role.account_id });
+    });
     res.json({ ok: true });
   });
   app.post('/v1/users/:userId/assign', async (req, res) => {
@@ -2466,8 +2524,10 @@ async function auditMutation(req: express.Request, action: string, resource: str
       return res.status(403).json({ error: 'forbidden', message: 'user belongs to another tenant' });
     }
     if (!(await requireSensitiveMutation(req, res, TRUST_STAMPED, user.org_id, 'iam:role:assign'))) return;
-    await assignRole(req.params.userId, req.body.roleId);
-    await auditMutation(req, 'iam:role:assign', `user:${req.params.userId}`, { roleId: req.body.roleId, org: user.org_id });
+    await withTransaction(async () => {
+      await assignRole(req.params.userId, req.body.roleId);
+      await auditMutation(req, 'iam:role:assign', `user:${req.params.userId}`, { roleId: req.body.roleId, org: user.org_id });
+    });
     res.json({ ok: true });
   });
   app.delete('/v1/users/:userId/roles/:roleId', async (req, res) => {
@@ -2481,8 +2541,10 @@ async function auditMutation(req: express.Request, action: string, resource: str
       return res.status(403).json({ error: 'forbidden', message: 'user belongs to another tenant' });
     }
     if (!(await requireSensitiveMutation(req, res, TRUST_STAMPED, user.org_id, 'iam:role:unassign'))) return;
-    await unassignRole(req.params.userId, req.params.roleId);
-    await auditMutation(req, 'iam:role:unassign', `user:${req.params.userId}`, { roleId: req.params.roleId, org: user.org_id });
+    await withTransaction(async () => {
+      await unassignRole(req.params.userId, req.params.roleId);
+      await auditMutation(req, 'iam:role:unassign', `user:${req.params.userId}`, { roleId: req.params.roleId, org: user.org_id });
+    });
     res.json({ ok: true });
   });
 
@@ -2733,13 +2795,13 @@ async function auditMutation(req: express.Request, action: string, resource: str
       if (userId !== callerUserId && !(await callerIsOrgAdmin(req, TRUST_STAMPED, ownerTarget.org_id))) {
         return res.status(403).json({ error: 'key_owner_forbidden', message: 'only an organization administrator can create a key for another user' });
       }    }
-    const k = await createApiKeyRecord(req.params.accountId, userId || null, keyName, keyScopes, exp);
-    await logAudit({
-      actor_type: 'user', actor_id: (await resolveCallerUser(req, TRUST_STAMPED)) || '',
-      action: 'iam:key:create', resource: `account:${req.params.accountId}`,
-      decision: true,
-      context: { org: keyOrgId, account: req.params.accountId, keyId: k.id, scopes: keyScopes, ownerUserId: userId || null },
-    }).catch(() => undefined);
+    const k = await withTransaction(async () => {
+      const key = await createApiKeyRecord(req.params.accountId, userId || null, keyName, keyScopes, exp);
+      await auditMutation(req, 'iam:key:create', `account:${req.params.accountId}`, {
+        org: keyOrgId, account: req.params.accountId, keyId: key.id, scopes: keyScopes, ownerUserId: userId || null,
+      });
+      return key;
+    });
     res.status(201).json({ id: k.id, apiKey: k.value, prefix: k.prefix, warning: 'Save this apiKey now — it is shown only once.' });
   });
 
@@ -2774,9 +2836,13 @@ async function auditMutation(req: express.Request, action: string, resource: str
     }
     const keyOrgId = await orgForAccount(rec.account_id);
     if (!keyOrgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, keyOrgId, 'iam:key:revoke'))) return;
-    const ok = await revokeApiKey(req.params.id);
+    const ok = await withTransaction(async () => {
+      const revoked = await revokeApiKey(req.params.id);
+      if (!revoked) return false;
+      await auditMutation(req, 'iam:key:revoke', `key:${req.params.id}`, { account: rec.account_id });
+      return true;
+    });
     if (!ok) return res.status(404).json({ error: 'key_not_found' });
-    await auditMutation(req, 'iam:key:revoke', `key:${req.params.id}`, { account: rec.account_id });
     res.json({ ok: true });
   });
 
@@ -2822,8 +2888,11 @@ async function auditMutation(req: express.Request, action: string, resource: str
     }
     const saOrgId = await orgForAccount(req.params.accountId);
     if (!saOrgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, saOrgId, 'iam:service-account:create'))) return;
-    const created = await createServiceAccount(req.params.accountId, slug, sanitizeName(description || ''));
-    await auditMutation(req, 'iam:service-account:create', `service-account:${created.id}`, { account: req.params.accountId, slug });
+    const created = await withTransaction(async () => {
+      const sa = await createServiceAccount(req.params.accountId, slug, sanitizeName(description || ''));
+      await auditMutation(req, 'iam:service-account:create', `service-account:${sa.id}`, { account: req.params.accountId, slug });
+      return sa;
+    });
     res.status(201).json(created);
   });
 
@@ -2925,8 +2994,10 @@ async function auditMutation(req: express.Request, action: string, resource: str
     }
     const saOrgId = await orgForAccount(sa.account_id);
     if (!saOrgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, saOrgId, 'iam:service-account:role:assign'))) return;
-    await assignRoleToServiceAccount(sa.id, roleId);
-    await auditMutation(req, 'iam:service-account:role:assign', `service-account:${sa.id}`, { roleId, account: sa.account_id });
+    await withTransaction(async () => {
+      await assignRoleToServiceAccount(sa.id, roleId);
+      await auditMutation(req, 'iam:service-account:role:assign', `service-account:${sa.id}`, { roleId, account: sa.account_id });
+    });
     res.json({ ok: true });
   });
   app.delete('/v1/service-accounts/:id/roles/:roleId', async (req, res) => {
@@ -2935,9 +3006,13 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!sa) return;
     const saOrgId = await orgForAccount(sa.account_id);
     if (!saOrgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, saOrgId, 'iam:service-account:role:unassign'))) return;
-    const ok = await unassignRoleFromServiceAccount(sa.id, req.params.roleId);
+    const ok = await withTransaction(async () => {
+      const removed = await unassignRoleFromServiceAccount(sa.id, req.params.roleId);
+      if (!removed) return false;
+      await auditMutation(req, 'iam:service-account:role:unassign', `service-account:${sa.id}`, { roleId: req.params.roleId, account: sa.account_id });
+      return true;
+    });
     if (!ok) return res.status(404).json({ error: 'assignment_not_found' });
-    await auditMutation(req, 'iam:service-account:role:unassign', `service-account:${sa.id}`, { roleId: req.params.roleId, account: sa.account_id });
     res.json({ ok: true });
   });
 
@@ -2960,13 +3035,16 @@ async function auditMutation(req: express.Request, action: string, resource: str
       if (admins.length <= 1) return res.status(409).json({ error: 'last_admin', message: 'an organization needs at least one active administrator' });
     }
     const reason = typeof (req.body || {}).reason === 'string' ? String((req.body || {}).reason).slice(0, 500) : '';
-    const updated = await setOrgAdmin(user.id, flag);
-    await auditMutation(req, 'iam:user:org-admin', `user:${user.id}`, {
-      org: user.org_id,
-      targetUserId: user.id,
-      oldValue: !!user.is_org_admin,
-      newValue: flag,
-      ...(reason ? { reason } : {}),
+    const updated = await withTransaction(async () => {
+      const u = await setOrgAdmin(user.id, flag);
+      await auditMutation(req, 'iam:user:org-admin', `user:${user.id}`, {
+        org: user.org_id,
+        targetUserId: user.id,
+        oldValue: !!user.is_org_admin,
+        newValue: flag,
+        ...(reason ? { reason } : {}),
+      });
+      return u;
     });
     res.json(updated ? publicUser(updated) : { ok: true });
   });
@@ -2976,17 +3054,25 @@ async function auditMutation(req: express.Request, action: string, resource: str
   app.delete('/v1/users/:userId/mfa', mfaLimiter, async (req, res) => {
     const user = await orgAdminTarget(req, res, TRUST_STAMPED);
     if (!user) return;
-    const removed = await removeMfa(user.id);
-    await clearLoginFailures(user.id);
-    await auditMutation(req, 'iam:mfa:reset', `user:${user.id}`, { org: user.org_id, removed });
+    const removed = await withTransaction(async () => {
+      const had = await removeMfa(user.id);
+      await clearLoginFailures(user.id);
+      // A stolen session must not survive a second-factor reset.
+      await revokeAllRefresh(user.id);
+      await revokeApiKeysForUser(user.id);
+      await auditMutation(req, 'iam:mfa:reset', `user:${user.id}`, { org: user.org_id, removed: had });
+      return had;
+    });
     res.json({ ok: true, removed });
   });
 
   app.post('/v1/users/:userId/unlock', mfaLimiter, async (req, res) => {
     const user = await orgAdminTarget(req, res, TRUST_STAMPED);
     if (!user) return;
-    await clearLoginFailures(user.id);
-    await auditMutation(req, 'iam:user:unlock', `user:${user.id}`, { org: user.org_id });
+    await withTransaction(async () => {
+      await clearLoginFailures(user.id);
+      await auditMutation(req, 'iam:user:unlock', `user:${user.id}`, { org: user.org_id });
+    });
     res.json({ ok: true });
   });
 
@@ -3247,7 +3333,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
         });
       }
     }
-    const session = signPlatformAccess({ userId: user.id, role: admin.role });
+    const session = signPlatformAccess({ userId: user.id, role: admin.role, ver: Number(user.auth_version) || 0 });
     await auditPlatformAction(req, user.id, 'platform:session:exchange', user.org_id, { role: admin.role });
     noStore(res);
     return res.json({

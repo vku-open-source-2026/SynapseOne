@@ -11,7 +11,8 @@ import { Btn, Card, Code, Empty, Err, Field, Input, Modal, PageTitle, Spinner, T
 import { ScopeBar, useScope } from '../components/Scope.jsx';
 
 export default function ServiceAccounts() {
-  const { headers } = useAuth();
+  const { headers, auth } = useAuth();
+  const canAdmin = !!auth?.user?.is_org_admin;
   const scope = useScope();
   const [rows, setRows] = useState([]);
   const [err, setErr] = useState(null);
@@ -74,7 +75,7 @@ export default function ServiceAccounts() {
 
   return (
     <>
-      <PageTitle title="Service Accounts" sub="Machine identity (kind=service-account JWTs)" right={<Btn onClick={() => setOpen(true)}>+ New</Btn>} />
+      <PageTitle title="Service Accounts" sub="Machine identity (kind=service-account JWTs)" right={canAdmin ? <Btn onClick={() => setOpen(true)}>+ New</Btn> : undefined} />
       <Err e={err} />
       <ScopeBar scope={scope} />
       <Card>

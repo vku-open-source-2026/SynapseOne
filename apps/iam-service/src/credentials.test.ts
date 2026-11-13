@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import jwt from 'jsonwebtoken';
 import { createApp } from './index';
-import { getJwtSecret, verifyAccess } from './tokens';
+import { getJwtSecret, verifyAccess, revokeAllRefresh } from './tokens';
 import { setUserActive } from './db';
 
 // Lifecycle tokens are opt-in; these tests assert the dev/mailer-less flow.
@@ -86,6 +86,19 @@ describe('first-party credential lifecycle', () => {
     const me = await call('GET', '/v1/auth/me', undefined, reg.accessToken);
     assert.equal(me.status, 401);
     assert.equal(me.data.error, 'account_deactivated');
+  });
+
+  it('rejects access tokens after a session revocation epoch bump', async () => {
+    const reg = await register('cred-revoke', 'revoke@cred.local');
+    const before = await call('GET', '/v1/orgs', undefined, reg.accessToken);
+    assert.equal(before.status, 200);
+    await revokeAllRefresh(reg.user.id);
+    const after = await call('GET', '/v1/orgs', undefined, reg.accessToken);
+    assert.equal(after.status, 401);
+    assert.equal(after.data.error, 'token_revoked');
+    const verify = await call('GET', '/v1/auth/verify', undefined, reg.accessToken);
+    assert.equal(verify.status, 401);
+    assert.equal(verify.data.error, 'token_revoked');
   });
 
   it('never returns password material on auth or user endpoints', async () => {

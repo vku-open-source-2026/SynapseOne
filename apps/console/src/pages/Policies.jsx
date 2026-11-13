@@ -23,7 +23,8 @@ const SAMPLE = JSON.stringify(
 );
 
 export default function Policies() {
-  const { headers } = useAuth();
+  const { headers, auth } = useAuth();
+  const canAdmin = !!auth?.user?.is_org_admin;
   const scope = useScope();
   const [rows, setRows] = useState([]);
   const [err, setErr] = useState(null);
@@ -104,7 +105,7 @@ export default function Policies() {
 
   return (
     <>
-      <PageTitle title="Policies" sub="AWS-style JSON: Allow/Deny + Action/Resource + Condition" right={<Btn onClick={() => setOpen(true)}>+ New</Btn>} />
+      <PageTitle title="Policies" sub="AWS-style JSON: Allow/Deny + Action/Resource + Condition" right={canAdmin ? <Btn onClick={() => setOpen(true)}>+ New</Btn> : undefined} />
       <Err e={err} />
       <ScopeBar scope={scope} />
       <Card>

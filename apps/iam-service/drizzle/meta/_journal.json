@@ -64,6 +64,13 @@
       "when": 1796000400000,
       "tag": "0008_shocking_grandmaster",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1794556896312,
+      "tag": "0009_milky_naoko",
+      "breakpoints": true
     }
   ]
 }

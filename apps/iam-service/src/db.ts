@@ -18,7 +18,7 @@ import * as schema from './schema';
 
 export interface Organization { id: string; slug: string; display_name: string; kind?: string; created_at?: string }
 export interface Account { id: string; org_id: string; slug: string; display_name: string }
-export interface User { id: string; org_id: string; email: string; display_name?: string; external_sub?: string; password_hash?: string; email_verified?: boolean; active?: boolean; is_org_admin?: boolean }
+export interface User { id: string; org_id: string; email: string; display_name?: string; external_sub?: string; password_hash?: string; email_verified?: boolean; active?: boolean; is_org_admin?: boolean; auth_version?: number }
 export interface Role { id: string; account_id: string; slug: string; description?: string }
 export interface PolicyDoc { Version?: string; Statement: Array<{ Effect: 'Allow'|'Deny'; Action: string|string[]; Resource: string|string[]; Condition?: any }> }
 export interface Policy { id: string; account_id: string; slug: string; description?: string; document: PolicyDoc }
@@ -143,7 +143,7 @@ function orgRow(r: { id: string; slug: string; displayName: string; kind?: strin
 function accountRow(r: { id: string; orgId: string; slug: string; displayName: string }): Account {
   return { id: r.id, org_id: r.orgId, slug: r.slug, display_name: r.displayName };
 }
-function userRow(r: { id: string; orgId: string; email: string; displayName: string | null; externalSub: string | null; passwordHash?: string | null; emailVerified?: boolean | null; active?: boolean | null; isOrgAdmin?: boolean | null }): User {
+function userRow(r: { id: string; orgId: string; email: string; displayName: string | null; externalSub: string | null; passwordHash?: string | null; emailVerified?: boolean | null; active?: boolean | null; isOrgAdmin?: boolean | null; authVersion?: number | null }): User {
   return {
     id: r.id,
     org_id: r.orgId,
@@ -154,6 +154,7 @@ function userRow(r: { id: string; orgId: string; email: string; displayName: str
     email_verified: !!r.emailVerified,
     active: r.active !== false,
     is_org_admin: !!r.isOrgAdmin,
+    auth_version: Number(r.authVersion) || 0,
   };
 }
 /** Strip credential material before a user row is serialized to a client. */
@@ -517,6 +518,7 @@ export async function listUsers(orgId: string): Promise<User[]> {
       externalSub: schema.users.externalSub,
       active: schema.users.active,
       isOrgAdmin: schema.users.isOrgAdmin,
+      authVersion: schema.users.authVersion,
     }).from(schema.users).where(eq(schema.users.orgId, orgId)).orderBy(asc(schema.users.email));
     return rows.map(userRow).map(publicUser);
   }
@@ -536,6 +538,7 @@ export async function getUserById(id: string): Promise<User | null> {
       emailVerified: schema.users.emailVerified,
       active: schema.users.active,
       isOrgAdmin: schema.users.isOrgAdmin,
+      authVersion: schema.users.authVersion,
     }).from(schema.users).where(eq(schema.users.id, id)).limit(1);
     return rows[0] ? userRow(rows[0]) : null;
   }
@@ -557,6 +560,7 @@ export async function findUserByOrgEmail(orgId: string, email: string): Promise<
       emailVerified: schema.users.emailVerified,
       active: schema.users.active,
       isOrgAdmin: schema.users.isOrgAdmin,
+      authVersion: schema.users.authVersion,
     }).from(schema.users).where(and(
       eq(schema.users.orgId, orgId),
       eq(schema.users.email, email),
@@ -962,6 +966,23 @@ export async function updateUserProfile(userId: string, patch: { displayName?: s
   if (patch.displayName !== undefined) user.display_name = patch.displayName;
   if (patch.externalSub !== undefined) user.external_sub = patch.externalSub || undefined;
   return true;
+}
+
+/** Bump the per-user credential epoch. Every access JWT carries the epoch it
+ *  was issued with; a mismatch is rejected by IAM and the gateway. */
+export async function bumpAuthVersion(userId: string): Promise<number> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(schema.users)
+      .set({ authVersion: sql`${schema.users.authVersion} + 1` })
+      .where(eq(schema.users.id, userId))
+      .returning({ version: schema.users.authVersion });
+    return Number(rows[0]?.version) || 0;
+  }
+  const user = mem.users.get(userId);
+  if (!user) return 0;
+  user.auth_version = (Number(user.auth_version) || 0) + 1;
+  return user.auth_version;
 }
 
 export async function setUserActive(userId: string, active: boolean): Promise<boolean> {
@@ -1431,6 +1452,7 @@ export async function listPlatformUsers(opts: {
       orgSlug: schema.organizations.slug,
       active: schema.users.active,
       isOrgAdmin: schema.users.isOrgAdmin,
+      authVersion: schema.users.authVersion,
       createdAt: schema.users.createdAt,
     }).from(schema.users).innerJoin(schema.organizations, eq(schema.organizations.id, schema.users.orgId))
       .where(where).orderBy(asc(schema.users.email)).limit(limit).offset(offset);

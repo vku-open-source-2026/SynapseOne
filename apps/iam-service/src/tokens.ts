@@ -8,7 +8,7 @@
 import jwt from 'jsonwebtoken';
 import { randomBytes, randomUUID } from 'crypto';
 import { and, desc, eq, gt, isNull, or, sql } from 'drizzle-orm';
-import { ensureTables, getDb, useDb, __mem, hashSecret, hashCandidates } from './db';
+import { ensureTables, getDb, useDb, __mem, hashSecret, hashCandidates, bumpAuthVersion } from './db';
 import { apiKeys, refreshTokens } from './schema';
 
 /** Fail fast on weak/default JWT secrets in production; warn loudly in dev. */
@@ -71,6 +71,8 @@ export interface AccessClaims {
   aud?: string;
   amr?: string[];
   auth_time?: number;
+  /** Credential epoch (users.auth_version) captured when the token was issued. */
+  ver?: number;
 }
 
 export function signAccess(
@@ -102,6 +104,7 @@ export function signDelegated(input: {
   actorKind?: string;
   audience?: string;
   ttlSeconds?: number;
+  ver?: number;
 }): { token: string; expiresIn: number } {
   return signAccess(
     {
@@ -110,6 +113,7 @@ export function signDelegated(input: {
       account: input.account,
       scopes: input.scopes,
       kind: 'delegated',
+      ver: input.ver,
       delegated: true,
       act: { sub: input.actor, kind: input.actorKind || 'service-account' },
     },
@@ -132,6 +136,7 @@ export function signPlatformAccess(input: {
   userId: string;
   role: 'owner' | 'operator' | 'auditor';
   ttlSeconds?: number;
+  ver?: number;
 }): { token: string; expiresIn: number; jti: string } {
   const expiresIn = Math.min(Math.max(Math.floor(input.ttlSeconds ?? 900), 60), 3600);
   const scopes = input.role === 'owner'
@@ -145,6 +150,7 @@ export function signPlatformAccess(input: {
     kind: 'platform-admin',
     role: input.role,
     scopes,
+    ver: input.ver,
     aud: PLATFORM_AUDIENCE,
     iss: 'synapseone-iam',
     auth_time: Math.floor(Date.now() / 1000),
@@ -333,6 +339,8 @@ export async function findRefreshOwner(value: string): Promise<{ user_id: string
 
 /** Thu hồi TẤT CẢ refresh token của user (mất thiết bị). Trả về số token bị thu hồi. */
 export async function revokeAllRefresh(userId: string): Promise<number> {
+  // Every access token issued before this revocation becomes unusable.
+  await bumpAuthVersion(userId);
   if (useDb()) {
     const db = getDb()!;
     await ensureTables();

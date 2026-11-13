@@ -9,6 +9,7 @@ import cors from 'cors';
 import morgan from 'morgan';
 import { createProxyMiddleware } from 'http-proxy-middleware';
 import jwt from 'jsonwebtoken';
+import { createHash } from 'crypto';
 import fs from 'fs';
 import yaml from 'js-yaml';
 import client from 'prom-client';
@@ -173,8 +174,55 @@ function loadRoutes(): RouteRule[] {
   ];
 }
 
+const SESSION_CACHE = new Map<string, { exp: number; status: number; error?: string }>();
+function jwtCacheTtlMs(): number {
+  const n = Number(process.env.GATEWAY_SESSION_CACHE_MS ?? 2000);
+  return Number.isFinite(n) ? Math.min(Math.max(Math.floor(n), 0), 30_000) : 2000;
+}
+
+/** Ask IAM (the authority for users.auth_version + active state) whether this
+ *  exact access token is still valid. Positive and negative results are cached
+ *  for a very short window to avoid an IAM round-trip per request. IAM/network
+ *  failures fail closed for routes that require authentication. */
+export function clearSessionCache(): void { SESSION_CACHE.clear(); }
+export async function validateJwtSession(token: string, decoded: any, iamBase = IAM_SERVICE_URL): Promise<{ status: number; error: string } | null> {
+  if (!decoded || decoded.kind === 'service-account' || decoded.kind === 'platform-step-up') return null;
+  if (!decoded.sub) return { status: 401, error: 'invalid_token' };
+  const ttl = jwtCacheTtlMs();
+  const key = createHash('sha256').update(token).digest('hex');
+  const now = Date.now();
+  const hit = SESSION_CACHE.get(key);
+  if (hit && hit.exp > now) return hit.status === 200 ? null : { status: hit.status, error: hit.error || 'token_revoked' };
+  if (SESSION_CACHE.size > 20_000) SESSION_CACHE.clear();
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 2500);
+  try {
+    const r = await fetch(`${iamBase.replace(/\/$/, '')}/v1/auth/verify`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${token}` },
+      signal: ctl.signal,
+    });
+    clearTimeout(timer);
+    if (r.ok) {
+      if (ttl > 0) SESSION_CACHE.set(key, { exp: Date.now() + ttl, status: 200 });
+      return null;
+    }
+    if (r.status === 401) {
+      if (ttl > 0) SESSION_CACHE.set(key, { exp: Date.now() + ttl, status: 401, error: 'token_revoked' });
+      return { status: 401, error: 'token_revoked' };
+    }
+    // IAM errors are never treated as "still valid".
+    if (ttl > 0) SESSION_CACHE.set(key, { exp: Date.now() + 500, status: 503, error: 'iam_unavailable' });
+    return { status: 503, error: 'iam_unavailable' };
+  } catch {
+    clearTimeout(timer);
+    if (ttl > 0) SESSION_CACHE.set(key, { exp: Date.now() + 500, status: 503, error: 'iam_unavailable' });
+    return { status: 503, error: 'iam_unavailable' };
+  }
+}
+
 function authMiddleware(mode: RouteRule['auth']) {
-  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  return (async (req: express.Request, res: express.Response, next: express.NextFunction) => {
     if (mode === 'none') {
       // Public routes are anonymous, BUT a valid Bearer JWT or API key is
       // honoured as optional auth: public read-only MCP tools and LDS
@@ -188,6 +236,10 @@ function authMiddleware(mode: RouteRule['auth']) {
           if (decoded.kind === 'platform-step-up') {
             (req as any).synapseoneError = 'invalid_token';
             return res.status(401).json({ error: 'invalid_token', message: 'step-up token is not an access token' });
+          }
+          if (await validateJwtSession(bearer, decoded)) {
+            // Optional auth: a revoked token falls back to anonymous, never tenant access.
+            return next();
           }
           (req as any).principal = {
             type: 'jwt',
@@ -238,6 +290,11 @@ function authMiddleware(mode: RouteRule['auth']) {
           if (decoded.kind === 'platform-step-up') {
             (req as any).synapseoneError = 'invalid_token';
             return res.status(401).json({ error: 'invalid_token', message: 'step-up token is not an access token' });
+          }
+          const rejected = await validateJwtSession(token, decoded);
+          if (rejected) {
+            (req as any).synapseoneError = rejected.error;
+            return res.status(rejected.status).json({ error: rejected.error, message: rejected.error === 'iam_unavailable' ? 'IAM session check unavailable' : 'This session was revoked. Sign in again.' });
           }
           (req as any).principal = {
             type: 'jwt',
@@ -297,7 +354,7 @@ function authMiddleware(mode: RouteRule['auth']) {
     }
     (req as any).synapseoneError = 'unauthorized';
     return res.status(401).json({ error: 'unauthorized', message: 'Provide Bearer JWT and/or X-API-Key' });
-  };
+  }) as any;
 }
 
 export async function verifyApiKeyUpstream(

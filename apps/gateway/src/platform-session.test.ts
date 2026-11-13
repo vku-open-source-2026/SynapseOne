@@ -26,6 +26,10 @@ describe('platform session exchange boundary', () => {
         res.writeHead(200, { 'content-type': 'application/json' });
         return res.end('{"status":"ok","version":"test"}');
       }
+      if (req.url === '/v1/auth/verify') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        return res.end('{"valid":true,"type":"jwt"}');
+      }
       if (req.url === '/v1/platform/session') {
         sessionHits += 1;
         res.writeHead(200, { 'content-type': 'application/json' });

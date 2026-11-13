@@ -11,7 +11,8 @@ import { Btn, Card, Empty, Err, Field, InlineLoader, Input, Modal, PageTitle, Ta
 import { ScopeBar, useScope } from '../components/Scope.jsx';
 
 export default function Roles() {
-  const { headers } = useAuth();
+  const { headers, auth } = useAuth();
+  const canAdmin = !!auth?.user?.is_org_admin;
   const scope = useScope();
   const [rows, setRows] = useState([]);
   const [err, setErr] = useState(null);
@@ -161,7 +162,7 @@ export default function Roles() {
 
   return (
     <>
-      <PageTitle title="Roles" sub="Assigned to users, policies attached (like AWS IAM roles)" right={<Btn onClick={() => setOpen(true)}>+ New</Btn>} />
+      <PageTitle title="Roles" sub="Assigned to users, policies attached (like AWS IAM roles)" right={canAdmin ? <Btn onClick={() => setOpen(true)}>+ New</Btn> : undefined} />
       <Err e={err} />
       <ScopeBar scope={scope} />
       {scope.accountId && rows.length > 0 && policies.length > 0 && (

@@ -11,7 +11,8 @@ import { Btn, Card, Empty, Err, Field, Input, Modal, PageTitle, Table, TableSkel
 import { ScopeBar, useScope } from '../components/Scope.jsx';
 
 export default function Accounts() {
-  const { headers } = useAuth();
+  const { headers, auth } = useAuth();
+  const canAdmin = !!auth?.user?.is_org_admin;
   const scope = useScope();
   const [rows, setRows] = useState([]);
   const [err, setErr] = useState(null);
@@ -62,7 +63,7 @@ export default function Accounts() {
 
   return (
     <>
-      <PageTitle title="Accounts" sub="Environments in an org: prod, staging… (like AWS Accounts)" right={<Btn onClick={() => setOpen(true)}>+ New</Btn>} />
+      <PageTitle title="Accounts" sub="Environments in an org: prod, staging… (like AWS Accounts)" right={canAdmin ? <Btn onClick={() => setOpen(true)}>+ New</Btn> : undefined} />
       <Err e={err} />
       <ScopeBar scope={scope} showAccount={false} />
       <Card>

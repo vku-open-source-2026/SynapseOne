@@ -59,6 +59,8 @@ export const users = pgTable(
     passwordHash: text('password_hash'),
     emailVerified: boolean('email_verified').notNull().default(false),
     active: boolean('active').notNull().default(true),
+    /** Incremented on every session/credential revocation; access JWTs carry it. */
+    authVersion: integer('auth_version').notNull().default(0),
     passwordUpdatedAt: timestamp('password_updated_at', { withTimezone: true }),
     /** Org administrator (AWS "root"-like): full access inside its own org. */
     isOrgAdmin: boolean('is_org_admin').notNull().default(false),

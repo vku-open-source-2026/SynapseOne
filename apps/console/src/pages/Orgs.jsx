@@ -10,7 +10,8 @@ import { api } from '../lib/api.js';
 import { Badge, Btn, Card, Empty, Err, Field, Input, Modal, PageTitle, Table, TableSkeleton } from '../components/ui.jsx';
 
 export default function Orgs() {
-  const { headers } = useAuth();
+  const { headers, auth } = useAuth();
+  const canAdmin = !!auth?.user?.is_org_admin;
   const [orgs, setOrgs] = useState([]);
   const [err, setErr] = useState(null);
   const [loaded, setLoaded] = useState(false);
@@ -45,7 +46,7 @@ export default function Orgs() {
 
   return (
     <>
-      <PageTitle title="Organizations" sub="Root tenants, like AWS Organizations" right={<Btn onClick={() => setOpen(true)}>+ New</Btn>} />
+      <PageTitle title="Organizations" sub="Root tenants, like AWS Organizations" right={canAdmin ? <Btn onClick={() => setOpen(true)}>+ New</Btn> : undefined} />
       <Err e={err} />
       <Card>
         {!loaded ? (
