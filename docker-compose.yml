@@ -613,7 +613,7 @@ services:
     ports:
       - "${STORAGE_HOST_PORT:-127.0.0.1:4010}:4010"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:4010/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "/usr/local/bin/synapseone-ocs", "--healthcheck"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -753,7 +753,7 @@ services:
     ports:
       - "${GATEWAY_HOST_PORT:-8080}:8080"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "/usr/local/bin/synapseone-gateway", "--healthcheck"]
       interval: 15s
       timeout: 5s
       retries: 5
