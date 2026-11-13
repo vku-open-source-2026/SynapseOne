@@ -11,10 +11,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions: { contents: write, packages: write }
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with: { node-version: 24, registry-url: https://registry.npmjs.org }
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with: { python-version: "3.11" }
       - run: npm install --workspaces
       - run: npm run build --workspaces --if-present
@@ -29,7 +29,7 @@ jobs:
           python -m build sdks/sdk-python --outdir release-assets
           sha256sum release-assets/* > release-assets/SHA256SUMS
           ls -l release-assets
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           files: release-assets/*
@@ -39,10 +39,10 @@ jobs:
     needs: release
     permissions: { packages: write, id-token: write, contents: read }
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
       - uses: sigstore/cosign-installer@v3
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -105,8 +105,8 @@ jobs:
       contents: read
       id-token: write # npm Trusted Publishing (OIDC, no token secret)
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with: { node-version: 24, registry-url: https://registry.npmjs.org }
       - run: npm install --workspace=sdks/sdk-js && npm run build --workspace=sdks/sdk-js
       - run: cp LICENSE sdks/sdk-js/LICENSE
@@ -126,8 +126,8 @@ jobs:
       contents: read
       id-token: write # npm Trusted Publishing (OIDC, no token secret)
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with: { node-version: 24, registry-url: https://registry.npmjs.org }
       - run: cp LICENSE tools/cli/LICENSE 2>/dev/null || true
       # Idempotent: skip when this exact version already exists (re-runs stay green).
@@ -148,8 +148,8 @@ jobs:
       contents: read
       id-token: write # PyPI Trusted Publishing (OIDC, no token secret)
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: { python-version: "3.11" }
       - run: pip install build
       - run: cp LICENSE sdks/sdk-python/LICENSE
