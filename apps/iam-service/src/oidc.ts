@@ -65,10 +65,17 @@ export function assertOidcConfig(env: NodeJS.ProcessEnv = process.env): void {
   }
   const issuer = rawIssuer.replace(/\/*$/, '/');
   if (!isPublicHttpsUrl(issuer)) {
-    throw new Error(
-      `[iam] OIDC_ISSUER must be a public HTTPS URL in production (got '${issuer}'). `
-      + "Browsers cannot resolve an internal Docker host; configure e.g. https://auth.example.com/application/o/synapseone/.",
-    );
+    // Explicit operator override for deployments where Authentik/Keycloak is
+    // not exposed publicly yet (the browser path is handled by the reverse
+    // proxy later). Never enable this on a shared/public issuer without TLS.
+    const allowInternal = String(env.IAM_ALLOW_INTERNAL_OIDC_ISSUER || '').toLowerCase() === 'true';
+    if (!allowInternal) {
+      throw new Error(
+        `[iam] OIDC_ISSUER must be a public HTTPS URL in production (got '${issuer}'). `
+        + "Browsers cannot resolve an internal Docker host; configure e.g. https://auth.example.com/application/o/synapseone/.",
+      );
+    }
+    console.warn(`[iam] OIDC_ISSUER is not a public HTTPS URL ('${issuer}'); IAM_ALLOW_INTERNAL_OIDC_ISSUER=true is set.`);
   }
   const clientId = String(env.OIDC_CLIENT_ID || '').trim();
   if (!clientId || clientId.includes('change_me')) {

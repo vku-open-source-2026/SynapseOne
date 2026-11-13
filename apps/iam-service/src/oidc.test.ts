@@ -367,6 +367,13 @@ describe('OIDC production configuration (#21)', () => {
       () => assertOidcConfig({ ...base, OIDC_ISSUER: 'http://authentik-server:9000/application/o/synapseone/' }),
       /public HTTPS/,
     );
+    // Explicit operator escape hatch for a private IdP that is not publicly
+    // exposed yet; boot is allowed but the issuer remains internal.
+    assert.doesNotThrow(() => assertOidcConfig({
+      ...base,
+      OIDC_ISSUER: 'http://authentik-server:9000/application/o/synapseone/',
+      IAM_ALLOW_INTERNAL_OIDC_ISSUER: 'true',
+    }));
     assert.throws(() => assertOidcConfig({ ...base, OIDC_ISSUER: '' }), /public HTTPS/);
     assert.throws(() => assertOidcConfig({ ...base, OIDC_CLIENT_ID: '' }), /OIDC_CLIENT_ID/);
     assert.throws(() => assertOidcConfig({ ...base, OIDC_CLIENT_SECRET: 'change_me_oidc_secret' }), /OIDC_CLIENT_SECRET/);
