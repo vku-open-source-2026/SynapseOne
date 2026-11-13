@@ -50,6 +50,7 @@ import {
 import { decideForPrincipal, managedPolicyList, MANAGED_POLICIES, type PrincipalInput } from './authz';
 import { secretsEqual, hashCandidates } from './db';
 import { ingestUsageEvents, listUsageEvents, purgeUsage, usageSummary, type UsageFilter } from './usage';
+import { startUsageRollup } from './usage-rollup';
 import { assertOidcConfig, isPublicHttpsUrl, signState, exchangeCode, authorizationEndpoint, oidcSettings, OidcError } from './oidc';
 import {
   hashPassword, verifyPassword, passwordPolicyError, newOneTimeToken,
@@ -382,6 +383,8 @@ async function requirePlatformStepUp(
   return true;
 }
 
+/** Privileged platform actions must never silently succeed without their
+ *  audit row. Retry transient DB failures, then fail closed with 503. */
 async function auditPlatformAction(
   req: express.Request,
   actorId: string,
@@ -389,7 +392,7 @@ async function auditPlatformAction(
   targetOrgId?: string | null,
   extra: Record<string, unknown> = {},
 ): Promise<void> {
-  await logAudit({
+  const entry = {
     actor_type: 'platform-admin',
     actor_id: actorId,
     action,
@@ -402,10 +405,26 @@ async function auditPlatformAction(
       requestId: firstHeader(req.headers['x-request-id'] as any) || '',
       ...extra,
     },
-  }).catch(() => undefined);
+  };
+  let lastError: any;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await logAudit(entry);
+      return;
+    } catch (e: any) {
+      lastError = e;
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 25 * (attempt + 1)));
+    }
+  }
+  console.error('[iam][audit] platform action audit write failed:', action, lastError?.message || lastError);
+  throw Object.assign(new Error('platform audit write failed'), {
+    status: 503,
+    code: 'audit_write_failed',
+  });
 }
 
-/** Denied platform-plane attempts are security events too. */
+/** Denied platform-plane attempts are security events too. A denied request
+ *  remains denied even if the audit sink is degraded; log loudly for alerting. */
 async function auditPlatformDenied(
   req: express.Request,
   actorId: string,
@@ -413,19 +432,23 @@ async function auditPlatformDenied(
   action: string,
   reason: string,
 ): Promise<void> {
-  await logAudit({
-    actor_type: 'user',
-    actor_id: actorId || '',
-    action,
-    resource: String(req.path || ''),
-    decision: false,
-    org_id: targetOrgId || null,
-    context: {
-      platformAdmin: false,
-      reason,
-      requestId: firstHeader(req.headers['x-request-id'] as any) || '',
-    },
-  }).catch(() => undefined);
+  try {
+    await logAudit({
+      actor_type: 'user',
+      actor_id: actorId || '',
+      action,
+      resource: String(req.path || ''),
+      decision: false,
+      org_id: targetOrgId || null,
+      context: {
+        platformAdmin: false,
+        reason,
+        requestId: firstHeader(req.headers['x-request-id'] as any) || '',
+      },
+    });
+  } catch (e: any) {
+    console.error('[iam][audit] denied-action audit write failed:', action, reason, e?.message || e);
+  }
 }
 
 /** Issue a one-time activation code for a passwordless invited account. */
@@ -925,6 +948,8 @@ async function auditMutation(req: express.Request, action: string, resource: str
     setInterval(sweep, 60 * 60 * 1000).unref?.();
     setTimeout(sweep, 45_000).unref?.();
   }
+  // Hourly usage rollups → Synapse Warehouse (no-op without WAREHOUSE_SERVICE_URL).
+  startUsageRollup();
   const PUBLIC_PREFIXES = ['/v1/auth/'];
   const PUBLIC_EXACT = new Set(['/v1/auth']);
   app.use(((req: express.Request, res: express.Response, next: express.NextFunction) => {
@@ -3729,6 +3754,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
     }
     if (err?.status === 413 || err?.type === 'entity.too.large') {
       return res.status(413).json({ error: 'payload_too_large', message: 'Request body exceeds the size limit' });
+    }
+    if (err?.code === 'audit_write_failed') {
+      return res.status(503).json({ error: 'audit_write_failed', message: 'The administrative audit record could not be persisted; the request was not acknowledged.' });
     }
     if (err?.code === '23505' || err?.status === 409) {
       return res.status(409).json({ error: 'conflict', message: 'duplicate slug' });
