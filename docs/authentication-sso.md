@@ -153,8 +153,20 @@ Create a **confidential** OAuth2/OpenID provider in Authentik:
 | Scopes | `openid email profile` |
 | Subject mode | stable user identifier (do not use email as `sub`) |
 
-Attach the provider to the `synapseone` application. The discovery document
-must advertise:
+Attach the provider to the `synapseone` application **and assign the default
+`openid`, `email`, and `profile` scope mappings to the provider**. A provider
+created through the API/shell without these mappings returns an ID token with
+no `email`/`name` claims, and IAM correctly fails the login with
+`oidc_no_email`. In the Authentik UI this is *Provider → Advanced protocol
+settings → Scopes*; via the shell:
+
+```python
+from authentik.providers.oauth2.models import OAuth2Provider, ScopeMapping
+p = OAuth2Provider.objects.get(client_id="synapseone-platform")
+p.property_mappings.set(ScopeMapping.objects.filter(scope_name__in=["openid", "email", "profile"]))
+```
+
+The discovery document must advertise:
 
 ```json
 {

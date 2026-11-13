@@ -406,6 +406,28 @@ describe('oidc config', () => {
       else process.env.OIDC_ISSUER = saved;
     }
   });
+
+  it('keeps the SSO entry point usable for a local http issuer in dev only', async () => {
+    const savedIssuer = process.env.OIDC_ISSUER;
+    const savedNodeEnv = process.env.NODE_ENV;
+    try {
+      process.env.OIDC_ISSUER = 'http://127.0.0.1:9000/application/o/synapseone/';
+      process.env.NODE_ENV = 'development';
+      const dev = await call('GET', '/v1/auth/oidc/config');
+      assert.equal(dev.status, 200);
+      assert.equal(dev.data.issuerPublic, false);
+      assert.equal(dev.data.ssoAvailable, true);
+      process.env.NODE_ENV = 'production';
+      const prod = await call('GET', '/v1/auth/oidc/config');
+      assert.equal(prod.status, 200);
+      assert.equal(prod.data.ssoAvailable, false);
+    } finally {
+      if (savedIssuer === undefined) delete process.env.OIDC_ISSUER;
+      else process.env.OIDC_ISSUER = savedIssuer;
+      if (savedNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = savedNodeEnv;
+    }
+  });
 });
 
 

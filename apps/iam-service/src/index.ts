@@ -1088,8 +1088,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
       provider: cfg.provider,
       codeExchange: true,
       // Whether a browser can actually reach the configured IdP (public HTTPS).
+      // Local development may use an http://localhost IdP; production must not.
       issuerPublic: isPublicHttpsUrl(cfg.issuer),
-      ssoAvailable: isPublicHttpsUrl(cfg.issuer),
+      ssoAvailable: isPublicHttpsUrl(cfg.issuer) || process.env.NODE_ENV !== 'production',
       demoCallback: isDemoCallbackEnabled(),
       note: 'Federated OIDC upstream. IAM keeps the shadow user + org/account/role/policy authorization.',
     });
