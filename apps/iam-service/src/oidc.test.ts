@@ -285,7 +285,8 @@ describe('oidc authorization code flow (stub IdP)', () => {
       assert.equal(bad.status, 400);
       // Expired: same payload shape, 11-minute-old timestamp, valid HMAC.
       const forged = Buffer.from(JSON.stringify({ org: 'ssoorg', t: Date.now() - 11 * 60 * 1000, n: 'x' })).toString('base64url');
-      const sig = createHmac('sha256', getJwtSecret()).update(forged).digest('hex');
+      // Match stateSecret(): OIDC_STATE_SECRET (when configured) overrides the JWT key.
+      const sig = createHmac('sha256', process.env.OIDC_STATE_SECRET || getJwtSecret()).update(forged).digest('hex');
       const exp = await call('POST', '/v1/auth/oidc/callback', { code: 'x', state: `${forged}.${sig}` });
       assert.equal(exp.status, 400);
       assert.equal(exp.data.error, 'oidc_state_expired');
