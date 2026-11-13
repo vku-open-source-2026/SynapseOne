@@ -12,6 +12,7 @@ import { appDashboardUrl, appLoginUrl, isCanonicalAppHost } from '../lib/site.js
 import { useI18n } from '../lib/i18n-context.js';
 import SiteToggles from './SiteToggles.jsx';
 import StableLabel from './StableLabel.jsx';
+import BrandSymbol from './BrandSymbol.jsx';
 
 export default function PublicHeader() {
   const [open, setOpen] = useState(false);
@@ -34,9 +35,10 @@ export default function PublicHeader() {
       <div className="flex items-center justify-between px-4 mx-auto max-w-6xl h-16">
         <Link
           to="/"
-          className="text-xl font-semibold bg-gradient-to-b from-main-start to-main-end bg-clip-text text-transparent"
+          className="flex items-center gap-2 text-xl font-semibold text-s1-fg"
         >
-          synapseone
+          <BrandSymbol className="h-8 w-8 shrink-0" />
+          <span className="bg-gradient-to-b from-main-start to-main-end bg-clip-text text-transparent">synapseone</span>
         </Link>
         <nav className="hidden md:flex items-center gap-1 text-sm">
           {LINKS.map((l) => (

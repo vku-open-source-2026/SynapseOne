@@ -23,6 +23,7 @@ import {
   faLock,
 } from '@fortawesome/free-solid-svg-icons';
 import { useI18n } from '../lib/i18n-context.js';
+import BrandSymbol from './BrandSymbol.jsx';
 
 const CORE_ITEMS = [
   { to: '/dashboard', key: 'dashboard', icon: faHouse, match: (p) => p.startsWith('/dashboard') },
@@ -51,8 +52,9 @@ export default function Sidebar() {
       aria-label="Core Navigation"
       className="fixed left-3 xl:left-5 top-0 h-screen w-64 xl:w-72 hidden lg:flex flex-col items-center z-30"
     >
-      <Link to="/">
-        <p className="my-6 mt-8 ml-2 whitespace-nowrap text-xl xl:text-2xl font-semibold bg-gradient-to-b from-main-start to-main-end bg-clip-text text-transparent">
+      <Link to="/" className="my-6 mt-8 ml-2 flex items-center gap-2">
+        <BrandSymbol className="h-8 w-8 shrink-0" />
+        <p className="whitespace-nowrap text-xl xl:text-2xl font-semibold bg-gradient-to-b from-main-start to-main-end bg-clip-text text-transparent">
           {m.console.title}
         </p>
       </Link>
