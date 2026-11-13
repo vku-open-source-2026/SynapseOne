@@ -10,6 +10,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../lib/auth.jsx';
 import { useI18n } from '../lib/i18n-context.js';
+import { landingPath } from '../lib/auth-routing.js';
 import { Btn, Err, Field, Input, Spinner } from '../components/ui.jsx';
 
 const OIDC_STATE_KEY = 'synapseone.oidc.state';
@@ -49,7 +50,7 @@ export default function OidcCallback() {
       return;
     }
     loginWithOidc(code, state).then(
-      () => nav('/dashboard', { replace: true }),
+      (result) => nav(landingPath(result?.currentContext), { replace: true }),
       (ex) => {
         if (ex?.status === 401 && ex.body?.error === 'mfa_required' && ex.body.mfaToken) {
           setMfa({ token: ex.body.mfaToken });
@@ -68,8 +69,8 @@ export default function OidcCallback() {
     setBusy(true);
     try {
       const code = mfaCode.trim();
-      await completeMfa(mfa.token, useRecovery ? undefined : code, useRecovery ? code : undefined);
-      nav('/dashboard', { replace: true });
+      const result = await completeMfa(mfa.token, useRecovery ? undefined : code, useRecovery ? code : undefined);
+      nav(landingPath(result?.currentContext), { replace: true });
     } catch (ex) {
       setErr(ex);
     } finally {

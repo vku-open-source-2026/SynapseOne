@@ -186,7 +186,7 @@ function jwtCacheTtlMs(): number {
  *  failures fail closed for routes that require authentication. */
 export function clearSessionCache(): void { SESSION_CACHE.clear(); }
 export async function validateJwtSession(token: string, decoded: any, iamBase = IAM_SERVICE_URL): Promise<{ status: number; error: string } | null> {
-  if (!decoded || decoded.kind === 'service-account' || decoded.kind === 'platform-step-up') return null;
+  if (!decoded || decoded.kind === 'platform-step-up') return null;
   if (!decoded.sub) return { status: 401, error: 'invalid_token' };
   const ttl = jwtCacheTtlMs();
   const key = createHash('sha256').update(token).digest('hex');
@@ -210,6 +210,12 @@ export async function validateJwtSession(token: string, decoded: any, iamBase = 
     if (r.status === 401) {
       if (ttl > 0) SESSION_CACHE.set(key, { exp: Date.now() + ttl, status: 401, error: 'token_revoked' });
       return { status: 401, error: 'token_revoked' };
+    }
+    if (r.status === 403) {
+      let error = 'org_suspended';
+      try { const body: any = await r.json(); if (body?.error) error = String(body.error); } catch { /* default */ }
+      if (ttl > 0) SESSION_CACHE.set(key, { exp: Date.now() + ttl, status: 403, error });
+      return { status: 403, error };
     }
     // IAM errors are never treated as "still valid".
     if (ttl > 0) SESSION_CACHE.set(key, { exp: Date.now() + 500, status: 503, error: 'iam_unavailable' });
@@ -294,7 +300,7 @@ function authMiddleware(mode: RouteRule['auth']) {
           const rejected = await validateJwtSession(token, decoded);
           if (rejected) {
             (req as any).synapseoneError = rejected.error;
-            return res.status(rejected.status).json({ error: rejected.error, message: rejected.error === 'iam_unavailable' ? 'IAM session check unavailable' : 'This session was revoked. Sign in again.' });
+            return res.status(rejected.status).json({ error: rejected.error, message: rejected.error === 'iam_unavailable' ? 'IAM session check unavailable' : rejected.error === 'org_suspended' ? 'This organization is suspended.' : 'This session was revoked. Sign in again.' });
           }
           (req as any).principal = {
             type: 'jwt',

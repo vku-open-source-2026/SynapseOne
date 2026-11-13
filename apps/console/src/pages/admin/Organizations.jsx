@@ -3,7 +3,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { usePlatformAuth } from '../../lib/platform-auth.jsx';
-import { Btn, Card, Empty, Err, Field, Input, Modal, PageTitle, Table, TableSkeleton } from '../../components/ui.jsx';
+import { Badge, Btn, Card, Empty, Err, Field, Input, Modal, PageTitle, Table, TableSkeleton } from '../../components/ui.jsx';
 
 const PAGE = 25;
 
@@ -110,13 +110,14 @@ export default function AdminOrganizations() {
         {!loaded ? <TableSkeleton rows={6} cols={6} /> : err ? (
           <div className="py-6 text-center"><Btn kind="secondary" onClick={load}>Retry</Btn></div>
         ) : data.items.length ? (
-          <Table head={['Organization', 'Accounts', 'Users', 'Active', 'Org admins', 'Created']}>
+          <Table head={['Organization', 'Status', 'Accounts', 'Users', 'Active', 'Org admins', 'Created']}>
             {data.items.map((o) => (
               <tr key={o.id} className="border-t border-slate-100">
                 <td className="py-2 pr-4">
                   <Link to={`/admin/orgs/${o.id}`} className="font-medium text-main-blue hover:underline">{o.slug}</Link>
                   <p className="text-xs text-normal-text">{o.display_name}</p>
                 </td>
+                <td className="py-2 pr-4"><Badge tone={o.status === 'suspended' ? 'red' : 'green'}>{o.status || 'active'}</Badge></td>
                 <td className="py-2 pr-4 tabular-nums">{o.counts?.accounts ?? 0}</td>
                 <td className="py-2 pr-4 tabular-nums">{o.counts?.users ?? 0}</td>
                 <td className="py-2 pr-4 tabular-nums">{o.counts?.activeUsers ?? 0}</td>

@@ -20,6 +20,7 @@ import {
 } from '@fortawesome/free-solid-svg-icons';
 import { useAuth } from '../lib/auth.jsx';
 import { api } from '../lib/api.js';
+import ContextSwitcher from './ContextSwitcher.jsx';
 import { useScope } from './Scope.jsx';
 import { PLATFORM_SERVICES } from './ServicesSidebar.jsx';
 import SiteToggles from './SiteToggles.jsx';
@@ -148,6 +149,8 @@ export default function Topbar({ servicesOpen = true, onToggleServices }) {
               </span>
             </button>
           )}
+
+          {auth?.contexts?.filter((c) => c.type === 'platform').length > 0 && <ContextSwitcher />}
 
           {/* User Pill */}
           <div className="relative">

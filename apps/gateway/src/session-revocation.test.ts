@@ -44,8 +44,11 @@ describe('gateway JWT session revocation check', () => {
     assert.deepEqual(r, { status: 503, error: 'iam_unavailable' });
   });
 
-  it('does not introspect machine service-account tokens', async () => {
+  it('introspects machine service-account tokens for revocation and suspended orgs', async () => {
     assert.equal(await validateJwtSession('tok-sa', { kind: 'service-account', sub: 'sa1' }, base), null);
-    assert.equal(calls, 0);
+    assert.equal(calls, 1);
+    mode = 'revoked';
+    const revoked = await validateJwtSession('tok-sa-2', { kind: 'service-account', sub: 'sa1' }, base);
+    assert.deepEqual(revoked, { status: 401, error: 'token_revoked' });
   });
 });

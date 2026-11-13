@@ -71,6 +71,13 @@
       "when": 1796000500000,
       "tag": "0009_milky_naoko",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1796000600000,
+      "tag": "0010_wonderful_alex_wilder",
+      "breakpoints": true
     }
   ]
 }

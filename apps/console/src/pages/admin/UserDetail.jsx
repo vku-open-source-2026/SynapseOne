@@ -62,6 +62,7 @@ export default function AdminUserDetail() {
 
   const u = data.user || {};
   const mfa = data.mfa || {};
+  const active = u.active !== false;
   const actions = [
     {
       kind: 'org-admin', action: 'user:org-admin', method: 'PUT',
@@ -75,12 +76,11 @@ export default function AdminUserDetail() {
       kind: 'revoke-sessions', action: 'user:revoke-sessions', label: 'Revoke sessions', danger: true,
     },
     {
-      kind: u.active ? 'disable' : 'enable', action: 'user:disable',
-      label: u.active ? 'Disable user' : 'Enable user', danger: !!u.active,
-      requireStepUp: !!u.active,
+      kind: active ? 'disable' : 'enable', action: active ? 'user:disable' : 'user:enable',
+      label: active ? 'Disable user' : 'Enable user', danger: active,
     },
     ...(data.lockedForSeconds > 0 ? [{
-      kind: 'unlock', action: 'user:disable', label: 'Unlock sign-in', danger: false, requireStepUp: false,
+      kind: 'unlock', action: 'user:unlock', label: 'Unlock sign-in', danger: false,
     }] : []),
     ...(!u.passwordSet ? [{
       kind: 'invite', action: 'user:invite', label: 'Issue activation code', danger: false,
@@ -109,7 +109,7 @@ export default function AdminUserDetail() {
           <dl className="space-y-2 text-sm">
             <div className="flex justify-between gap-2"><dt className="text-normal-text">User ID</dt><dd className="font-mono text-xs text-main-text truncate">{u.id}</dd></div>
             <div className="flex justify-between gap-2"><dt className="text-normal-text">Organization</dt><dd>{data.organization?.slug}</dd></div>
-            <div className="flex justify-between gap-2"><dt className="text-normal-text">Status</dt><dd><Badge tone={u.active ? 'green' : 'gray'}>{u.active ? 'active' : 'inactive'}</Badge></dd></div>
+            <div className="flex justify-between gap-2"><dt className="text-normal-text">Status</dt><dd><Badge tone={active ? 'green' : 'gray'}>{active ? 'active' : 'inactive'}</Badge></dd></div>
             <div className="flex justify-between gap-2"><dt className="text-normal-text">Org admin</dt><dd><Badge tone={u.is_org_admin ? 'blue' : 'gray'}>{u.is_org_admin ? 'yes' : 'no'}</Badge></dd></div>
             <div className="flex justify-between gap-2"><dt className="text-normal-text">Password</dt><dd><Badge tone={u.passwordSet ? 'green' : 'amber'}>{u.passwordSet ? 'set' : 'activation pending'}</Badge></dd></div>
             <div className="flex justify-between gap-2"><dt className="text-normal-text">MFA</dt><dd><Badge tone={mfa.enabled ? 'green' : 'amber'}>{mfa.enabled ? `${mfa.recoveryCodesRemaining} recovery codes` : 'not enabled'}</Badge></dd></div>

@@ -16,7 +16,7 @@ import { drizzle, type NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import * as schema from './schema';
 
-export interface Organization { id: string; slug: string; display_name: string; kind?: string; created_at?: string }
+export interface Organization { id: string; slug: string; display_name: string; kind?: string; status?: string; suspended_at?: string; suspended_by?: string; suspend_reason?: string; created_at?: string }
 export interface Account { id: string; org_id: string; slug: string; display_name: string }
 export interface User { id: string; org_id: string; email: string; display_name?: string; external_sub?: string; password_hash?: string; email_verified?: boolean; active?: boolean; is_org_admin?: boolean; auth_version?: number }
 export interface Role { id: string; account_id: string; slug: string; description?: string }
@@ -151,8 +151,15 @@ function iso(v: Date | string | null | undefined): string | undefined {
   return Number.isNaN(d.getTime()) ? String(v) : d.toISOString();
 }
 
-function orgRow(r: { id: string; slug: string; displayName: string; kind?: string | null; createdAt?: Date | null }): Organization {
-  return { id: r.id, slug: r.slug, display_name: r.displayName, kind: r.kind ?? 'tenant', ...(r.createdAt ? { created_at: iso(r.createdAt) } : {}) };
+function orgRow(r: { id: string; slug: string; displayName: string; kind?: string | null; status?: string | null; suspendedAt?: Date | null; suspendedBy?: string | null; suspendReason?: string | null; createdAt?: Date | null }): Organization {
+  return {
+    id: r.id, slug: r.slug, display_name: r.displayName, kind: r.kind ?? 'tenant',
+    status: r.status ?? 'active',
+    ...(r.suspendedAt ? { suspended_at: iso(r.suspendedAt) } : {}),
+    ...(r.suspendedBy ? { suspended_by: r.suspendedBy } : {}),
+    ...(r.suspendReason ? { suspend_reason: r.suspendReason } : {}),
+    ...(r.createdAt ? { created_at: iso(r.createdAt) } : {}),
+  };
 }
 function accountRow(r: { id: string; orgId: string; slug: string; displayName: string }): Account {
   return { id: r.id, org_id: r.orgId, slug: r.slug, display_name: r.displayName };
@@ -174,7 +181,9 @@ function userRow(r: { id: string; orgId: string; email: string; displayName: str
 /** Strip credential material before a user row is serialized to a client. */
 export function publicUser(user: User): Omit<User, 'password_hash'> {
   const { password_hash: _ignored, ...rest } = user;
-  return rest;
+  // Normalize defaults so the in-memory backend and Postgres return the same
+  // shape. A missing `active` means active; a missing `is_org_admin` means not.
+  return { ...rest, active: user.active !== false, is_org_admin: !!user.is_org_admin };
 }
 function roleRow(r: { id: string; accountId: string; slug: string; description: string | null }): Role {
   return { id: r.id, account_id: r.accountId, slug: r.slug, description: r.description ?? '' };
@@ -232,7 +241,7 @@ export async function createOrganization(slug: string, display_name: string, kin
     return orgRow(rows[0]);
   }
   if (mem.orgsBySlug.has(slug)) throw Object.assign(new Error('org exists'), { status: 409 });
-  const o: Organization = { id: randomUUID(), slug, display_name, kind };
+  const o: Organization = { id: randomUUID(), slug, display_name, kind, status: 'active' };
   mem.orgs.set(o.id, o); mem.orgsBySlug.set(slug, o);
   return o;
 }
@@ -289,6 +298,10 @@ export async function listOrganizations(): Promise<Organization[]> {
       slug: schema.organizations.slug,
       displayName: schema.organizations.displayName,
       kind: schema.organizations.kind,
+      status: schema.organizations.status,
+      suspendedAt: schema.organizations.suspendedAt,
+      suspendedBy: schema.organizations.suspendedBy,
+      suspendReason: schema.organizations.suspendReason,
       createdAt: schema.organizations.createdAt,
     }).from(schema.organizations).orderBy(asc(schema.organizations.createdAt));
     return rows.map(orgRow);
@@ -304,6 +317,10 @@ export async function getOrgBySlug(slug: string): Promise<Organization | null> {
       slug: schema.organizations.slug,
       displayName: schema.organizations.displayName,
       kind: schema.organizations.kind,
+      status: schema.organizations.status,
+      suspendedAt: schema.organizations.suspendedAt,
+      suspendedBy: schema.organizations.suspendedBy,
+      suspendReason: schema.organizations.suspendReason,
     }).from(schema.organizations).where(eq(schema.organizations.slug, slug)).limit(1);
     return rows[0] ? orgRow(rows[0]) : null;
   }
@@ -318,6 +335,10 @@ export async function getOrgById(id: string): Promise<Organization | null> {
       slug: schema.organizations.slug,
       displayName: schema.organizations.displayName,
       kind: schema.organizations.kind,
+      status: schema.organizations.status,
+      suspendedAt: schema.organizations.suspendedAt,
+      suspendedBy: schema.organizations.suspendedBy,
+      suspendReason: schema.organizations.suspendReason,
     }).from(schema.organizations).where(eq(schema.organizations.id, id)).limit(1);
     return rows[0] ? orgRow(rows[0]) : null;
   }
@@ -898,7 +919,7 @@ export async function purgeAudit(olderThanDays: number, batch = 1000): Promise<n
   return removed;
 }
 
-export interface ServiceAccount { id: string; account_id: string; slug: string; description?: string }
+export interface ServiceAccount { id: string; account_id: string; slug: string; description?: string; revoked_at?: string | null }
 
 export async function createServiceAccount(accountId: string, slug: string, description = ''): Promise<ServiceAccount> {
   if (db) {
@@ -910,8 +931,9 @@ export async function createServiceAccount(accountId: string, slug: string, desc
         accountId: schema.serviceAccounts.accountId,
         slug: schema.serviceAccounts.slug,
         description: schema.serviceAccounts.description,
+        revokedAt: schema.serviceAccounts.revokedAt,
       });
-    return { id: rows[0].id, account_id: rows[0].accountId, slug: rows[0].slug, description: rows[0].description ?? '' };
+    return { id: rows[0].id, account_id: rows[0].accountId, slug: rows[0].slug, description: rows[0].description ?? '', revoked_at: rows[0].revokedAt ? iso(rows[0].revokedAt) : null };
   }
   const dup = [...__mem.serviceAccounts.values()].find((s: any) => s.account_id === accountId && s.slug === slug);
   if (dup) throw Object.assign(new Error('service account exists'), { status: 409 });
@@ -928,10 +950,13 @@ export async function listServiceAccounts(accountId: string): Promise<ServiceAcc
       accountId: schema.serviceAccounts.accountId,
       slug: schema.serviceAccounts.slug,
       description: schema.serviceAccounts.description,
+      revokedAt: schema.serviceAccounts.revokedAt,
     }).from(schema.serviceAccounts).where(eq(schema.serviceAccounts.accountId, accountId)).orderBy(asc(schema.serviceAccounts.slug));
-    return rows.map((r) => ({ id: r.id, account_id: r.accountId, slug: r.slug, description: r.description ?? '' }));
+    return rows.map((r) => ({ id: r.id, account_id: r.accountId, slug: r.slug, description: r.description ?? '', revoked_at: r.revokedAt ? iso(r.revokedAt) : null }));
   }
-  return [...__mem.serviceAccounts.values()].filter((s: any) => s.account_id === accountId);
+  return [...__mem.serviceAccounts.values()]
+    .filter((s: any) => s.account_id === accountId)
+    .map((s: any) => ({ ...s, revoked_at: s.revoked_at || null }));
 }
 
 export async function getServiceAccount(id: string): Promise<ServiceAccount | null> {
@@ -942,12 +967,14 @@ export async function getServiceAccount(id: string): Promise<ServiceAccount | nu
       accountId: schema.serviceAccounts.accountId,
       slug: schema.serviceAccounts.slug,
       description: schema.serviceAccounts.description,
+      revokedAt: schema.serviceAccounts.revokedAt,
     }).from(schema.serviceAccounts).where(eq(schema.serviceAccounts.id, id)).limit(1);
     return rows[0]
-      ? { id: rows[0].id, account_id: rows[0].accountId, slug: rows[0].slug, description: rows[0].description ?? '' }
+      ? { id: rows[0].id, account_id: rows[0].accountId, slug: rows[0].slug, description: rows[0].description ?? '', revoked_at: rows[0].revokedAt ? iso(rows[0].revokedAt) : null }
       : null;
   }
-  return (__mem.serviceAccounts.get(id) as ServiceAccount) || null;
+  const sa: any = __mem.serviceAccounts.get(id);
+  return sa ? { ...sa, revoked_at: sa.revoked_at || null } : null;
 }
 
 /** Set/replace a user's password hash (never returns the hash to callers). */
@@ -1353,6 +1380,10 @@ export async function listPlatformOrganizations(opts: {
       slug: schema.organizations.slug,
       displayName: schema.organizations.displayName,
       kind: schema.organizations.kind,
+      status: schema.organizations.status,
+      suspendedAt: schema.organizations.suspendedAt,
+      suspendedBy: schema.organizations.suspendedBy,
+      suspendReason: schema.organizations.suspendReason,
       createdAt: schema.organizations.createdAt,
     }).from(schema.organizations).where(where)
       .orderBy(desc(schema.organizations.createdAt)).limit(limit).offset(offset);
@@ -1427,6 +1458,208 @@ export async function getPlatformOrganization(orgId: string): Promise<{
       orgAdmins: users.filter((u) => u.is_org_admin).length,
     },
   };
+}
+
+
+/** Reversible organization lifecycle. Returns the updated row or null. */
+export async function setOrganizationStatus(
+  orgId: string,
+  status: 'active' | 'suspended',
+  actorId: string,
+  reason = '',
+): Promise<Organization | null> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(schema.organizations).set({
+      status,
+      suspendedAt: status === 'suspended' ? new Date() : null,
+      suspendedBy: status === 'suspended' ? actorId : null,
+      suspendReason: status === 'suspended' ? reason.slice(0, 500) : null,
+    }).where(and(eq(schema.organizations.id, orgId), eq(schema.organizations.kind, 'tenant'))).returning({
+      id: schema.organizations.id,
+      slug: schema.organizations.slug,
+      displayName: schema.organizations.displayName,
+      kind: schema.organizations.kind,
+      status: schema.organizations.status,
+      suspendedAt: schema.organizations.suspendedAt,
+      suspendedBy: schema.organizations.suspendedBy,
+      suspendReason: schema.organizations.suspendReason,
+      createdAt: schema.organizations.createdAt,
+    });
+    return rows[0] ? orgRow(rows[0]) : null;
+  }
+  const org = mem.orgs.get(orgId);
+  if (!org || (org.kind || 'tenant') !== 'tenant') return null;
+  org.status = status;
+  org.suspended_at = status === 'suspended' ? new Date().toISOString() : undefined;
+  org.suspended_by = status === 'suspended' ? actorId : undefined;
+  org.suspend_reason = status === 'suspended' ? reason.slice(0, 500) : undefined;
+  return org;
+}
+
+/** All user rows for one email across organizations (context switcher). */
+export async function listUserRowsByEmail(email: string): Promise<Array<User & { org_slug: string; org_name: string; org_kind: string; org_status: string }>> {
+  const normalized = email.trim().toLowerCase();
+  if (db) {
+    await ensureTables();
+    const rows = await db.select({
+      id: schema.users.id,
+      orgId: schema.users.orgId,
+      email: schema.users.email,
+      displayName: schema.users.displayName,
+      externalSub: schema.users.externalSub,
+      active: schema.users.active,
+      isOrgAdmin: schema.users.isOrgAdmin,
+      authVersion: schema.users.authVersion,
+      orgSlug: schema.organizations.slug,
+      orgName: schema.organizations.displayName,
+      orgKind: schema.organizations.kind,
+      orgStatus: schema.organizations.status,
+    }).from(schema.users)
+      .innerJoin(schema.organizations, eq(schema.organizations.id, schema.users.orgId))
+      .where(sql`lower(${schema.users.email}) = ${normalized}`)
+      .orderBy(asc(schema.organizations.slug));
+    return rows.map((r) => ({
+      ...userRow(r),
+      org_slug: r.orgSlug,
+      org_name: r.orgName,
+      org_kind: r.orgKind,
+      org_status: r.orgStatus,
+    }));
+  }
+  const out: any[] = [];
+  for (const u of mem.users.values()) {
+    if (u.email.toLowerCase() !== normalized) continue;
+    const org = mem.orgs.get(u.org_id);
+    if (!org) continue;
+    out.push({ ...u, org_slug: org.slug, org_name: org.display_name, org_kind: org.kind || 'tenant', org_status: org.status || 'active' });
+  }
+  return out.sort((a, b) => a.org_slug.localeCompare(b.org_slug));
+}
+
+/** Platform control-plane view of all administrative resources in one org. */
+export async function getPlatformOrganizationResources(orgId: string): Promise<any | null> {
+  const org = await getOrgById(orgId);
+  if (!org || (org.kind || 'tenant') !== 'tenant') return null;
+  const accounts = await listAccounts(orgId);
+  const users = await listUsers(orgId);
+  const accountIds = accounts.map((a) => a.id);
+  const roles: any[] = [];
+  const policies: any[] = [];
+  const keys: any[] = [];
+  const serviceAccounts: any[] = [];
+  if (db) {
+    await ensureTables();
+    if (accountIds.length) {
+      const roleRows = await db.select().from(schema.roles).where(inArray(schema.roles.accountId, accountIds)).orderBy(asc(schema.roles.slug));
+      roles.push(...roleRows.map((r: any) => ({ id: r.id, account_id: r.accountId, slug: r.slug, description: r.description || '' })));
+      const policyRows = await db.select().from(schema.policies).where(inArray(schema.policies.accountId, accountIds)).orderBy(asc(schema.policies.slug));
+      policies.push(...policyRows.map((r: any) => ({ id: r.id, account_id: r.accountId, slug: r.slug, description: r.description || '', document: r.document })));
+      const keyRows = await db.select({
+        id: schema.apiKeys.id, accountId: schema.apiKeys.accountId, name: schema.apiKeys.name,
+        prefix: schema.apiKeys.keyPrefix, scopes: schema.apiKeys.scopes, userId: schema.apiKeys.userId,
+        expiresAt: schema.apiKeys.expiresAt, revokedAt: schema.apiKeys.revokedAt, lastUsedAt: schema.apiKeys.lastUsedAt,
+      }).from(schema.apiKeys).where(inArray(schema.apiKeys.accountId, accountIds)).orderBy(desc(schema.apiKeys.createdAt));
+      keys.push(...keyRows.map((r: any) => ({
+        id: r.id, account_id: r.accountId, name: r.name, prefix: r.prefix, scopes: r.scopes || [],
+        user_id: r.userId, expires_at: iso(r.expiresAt), revoked_at: iso(r.revokedAt), last_used_at: iso(r.lastUsedAt),
+      })));
+      const saRows = await db.select().from(schema.serviceAccounts).where(inArray(schema.serviceAccounts.accountId, accountIds)).orderBy(asc(schema.serviceAccounts.slug));
+      serviceAccounts.push(...saRows.map((r: any) => ({ id: r.id, account_id: r.accountId, slug: r.slug, description: r.description || '', revoked_at: iso(r.revokedAt) })));
+    }
+  } else {
+    for (const a of accounts) {
+      roles.push(...[...mem.roles.values()].filter((r) => r.account_id === a.id));
+      policies.push(...[...mem.policies.values()].filter((p) => p.account_id === a.id));
+      keys.push(...[...mem.apiKeys.values()]
+        .filter((k: any) => k.account_id === a.id)
+        .map((k: any) => ({
+          id: k.id,
+          account_id: k.account_id,
+          name: k.name,
+          prefix: k.key_prefix,
+          scopes: k.scopes || [],
+          user_id: k.user_id || null,
+          expires_at: k.expires_at || null,
+          revoked_at: k.revoked_at || null,
+          last_used_at: k.last_used_at || null,
+        })));
+      serviceAccounts.push(...[...__mem.serviceAccounts.values()]
+        .filter((s: any) => s.account_id === a.id)
+        .map((s: any) => ({ ...s, revoked_at: s.revoked_at || null })));
+    }
+  }
+  const accountSlug = new Map(accounts.map((a) => [a.id, a.slug]));
+  for (const r of [...roles, ...policies, ...keys, ...serviceAccounts]) r.account_slug = accountSlug.get(r.account_id) || '';
+  return {
+    organization: org,
+    accounts,
+    users,
+    admins: users.filter((u) => u.is_org_admin),
+    roles,
+    policies,
+    keys,
+    serviceAccounts,
+    counts: {
+      accounts: accounts.length, users: users.length,
+      activeUsers: users.filter((u) => u.active !== false).length,
+      orgAdmins: users.filter((u) => u.is_org_admin).length,
+    },
+  };
+}
+
+/** Revoke a service account without deleting its audit history. */
+export async function revokeServiceAccount(id: string): Promise<boolean> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(schema.serviceAccounts)
+      .set({ revokedAt: new Date() })
+      .where(and(eq(schema.serviceAccounts.id, id), isNull(schema.serviceAccounts.revokedAt)))
+      .returning({ id: schema.serviceAccounts.id });
+    return rows.length > 0;
+  }
+  const sa: any = __mem.serviceAccounts.get(id);
+  if (!sa || sa.revoked_at) return false;
+  sa.revoked_at = new Date().toISOString();
+  return true;
+}
+
+
+export interface PlatformAccountRow {
+  id: string; org_id: string; org_slug: string; org_name: string; slug: string; display_name: string; created_at?: string;
+}
+
+export async function listPlatformAccounts(opts: { q?: string; orgId?: string; limit?: number; offset?: number } = {}): Promise<{ items: PlatformAccountRow[]; total: number }> {
+  const limit = Math.min(Math.max(Math.floor(Number(opts.limit) || 50), 1), 200);
+  const offset = Math.min(Math.max(Math.floor(Number(opts.offset) || 0), 0), 100_000);
+  const q = String(opts.q || '').trim().slice(0, 200);
+  if (db) {
+    await ensureTables();
+    const conds = [eq(schema.organizations.kind, 'tenant')];
+    if (opts.orgId) conds.push(eq(schema.accounts.orgId, opts.orgId));
+    if (q) conds.push(or(ilike(schema.accounts.slug, `%${q}%`), ilike(schema.accounts.displayName, `%${q}%`))!);
+    const where = and(...conds);
+    const total = await db.select({ n: sql<number>`count(*)::int` }).from(schema.accounts)
+      .innerJoin(schema.organizations, eq(schema.organizations.id, schema.accounts.orgId)).where(where);
+    const rows = await db.select({
+      id: schema.accounts.id, orgId: schema.accounts.orgId, orgSlug: schema.organizations.slug,
+      orgName: schema.organizations.displayName, slug: schema.accounts.slug,
+      displayName: schema.accounts.displayName, createdAt: schema.accounts.createdAt,
+    }).from(schema.accounts).innerJoin(schema.organizations, eq(schema.organizations.id, schema.accounts.orgId))
+      .where(where).orderBy(asc(schema.organizations.slug), asc(schema.accounts.slug)).limit(limit).offset(offset);
+    return {
+      items: rows.map((r) => ({ id: r.id, org_id: r.orgId, org_slug: r.orgSlug, org_name: r.orgName, slug: r.slug, display_name: r.displayName, created_at: iso(r.createdAt) })),
+      total: Number(total[0]?.n) || 0,
+    };
+  }
+  const rows = [...mem.accounts.values()]
+    .filter((a) => (mem.orgs.get(a.org_id)?.kind || 'tenant') === 'tenant')
+    .map((a) => {
+      const org = mem.orgs.get(a.org_id);
+      return { id: a.id, org_id: a.org_id, org_slug: org?.slug || '', org_name: org?.display_name || '', slug: a.slug, display_name: a.display_name };
+    })
+    .filter((a) => (!opts.orgId || a.org_id === opts.orgId) && (!q || a.slug.includes(q) || a.display_name.toLowerCase().includes(q.toLowerCase())));
+  return { items: rows.slice(offset, offset + limit), total: rows.length };
 }
 
 export interface PlatformUserRow {

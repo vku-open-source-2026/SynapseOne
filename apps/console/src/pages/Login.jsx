@@ -5,16 +5,18 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
 import React, { useEffect, useState } from 'react';
-import { Link, Navigate, useNavigate } from 'react-router-dom';
+import { Link, Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../lib/auth.jsx';
 import { api, baseUrl } from '../lib/api.js';
 import { Btn, Err, Field, Input } from '../components/ui.jsx';
 import SiteToggles from '../components/SiteToggles.jsx';
 import { useI18n } from '../lib/i18n-context.js';
+import { landingPath } from '../lib/auth-routing.js';
 
 export default function Login() {
+  const location = useLocation();
   const [email, setEmail] = useState('');
-  const [org, setOrg] = useState('');
+  const [org, setOrg] = useState(location.state?.prefillOrg || '');
   const [password, setPassword] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [mode, setMode] = useState('email');
@@ -38,7 +40,7 @@ export default function Login() {
     return () => { alive = false; };
   }, []);
 
-  if (auth) return <Navigate to="/dashboard" replace />;
+  if (auth) return <Navigate to={landingPath(auth.currentContext)} replace />;
 
   const orgSlug = org.trim().toLowerCase();
   const ssoAvailable = sso ? (sso.ssoAvailable ?? sso.issuerPublic) !== false : null;
@@ -77,13 +79,14 @@ export default function Login() {
           return;
         }
         setOrgError('');
-        await login(email, orgSlug, password);
+        const result = await login(email, orgSlug, password);
+        nav(landingPath(result?.currentContext, location.state?.from), { replace: true });
       }
       else {
         if (!apiKey) throw new Error(t.enterKey);
         loginWithKey(apiKey);
+        nav('/dashboard', { replace: true });
       }
-      nav('/dashboard', { replace: true });
     } catch (ex) {
       if (ex?.status === 401 && ex.body?.error === 'mfa_required' && ex.body.mfaToken) {
         setMfa({ token: ex.body.mfaToken });
@@ -101,8 +104,8 @@ export default function Login() {
     setBusy(true);
     try {
       const code = mfaCode.trim();
-      await completeMfa(mfa.token, useRecovery ? undefined : code, useRecovery ? code : undefined);
-      nav('/dashboard', { replace: true });
+      const result = await completeMfa(mfa.token, useRecovery ? undefined : code, useRecovery ? code : undefined);
+      nav(landingPath(result?.currentContext, location.state?.from), { replace: true });
     } catch (ex) {
       if (ex?.body?.error === 'invalid_mfa_token') setMfa(null);
       setErr(ex);

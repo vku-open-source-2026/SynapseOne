@@ -181,10 +181,13 @@ impl AuthService {
                             }
                             if let Some(rejected) = self.validate_jwt_session(bearer, &claims).await
                             {
-                                let message = if rejected.error == "iam_unavailable" {
-                                    "IAM session check unavailable"
-                                } else {
-                                    "This session was revoked. Sign in again."
+                                let message = match rejected.error.as_str() {
+                                    "iam_unavailable" => "IAM session check unavailable",
+                                    "org_suspended" => "This organization is suspended.",
+                                    "service_account_revoked" => {
+                                        "This service account was revoked."
+                                    }
+                                    _ => "This session was revoked. Sign in again.",
                                 };
                                 return Err(AuthFailure::new(
                                     StatusCode::from_u16(rejected.status)
@@ -306,7 +309,9 @@ impl AuthService {
         decoded: &Value,
     ) -> Option<SessionRejection> {
         let kind = decoded.get("kind").and_then(Value::as_str).unwrap_or("");
-        if kind == "service-account" || kind == "platform-step-up" {
+        // Service-account tokens are introspected too: revocation and org
+        // suspension must take effect while the short-lived JWT is still valid.
+        if kind == "platform-step-up" {
             return None;
         }
         if claim_text(decoded, "sub")
@@ -359,6 +364,23 @@ impl AuthService {
                     status: 401,
                     error: "token_revoked".into(),
                 })
+            }
+            Ok(response) if response.status() == StatusCode::FORBIDDEN => {
+                // IAM uses 403 for organization suspension and service-account
+                // revocation. Preserve the machine-readable error and fail
+                // closed instead of treating it as an IAM outage.
+                let error = response
+                    .json::<Value>()
+                    .await
+                    .ok()
+                    .and_then(|body| {
+                        body.get("error")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| "org_suspended".into());
+                self.put_session(&key, ttl, 403, &error);
+                Some(SessionRejection { status: 403, error })
             }
             _ => {
                 if !ttl.is_zero() {

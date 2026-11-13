@@ -11,7 +11,8 @@ import { useAuth } from '../lib/auth.jsx';
 
 export default function AdminLayout({ children }) {
   const { role, logout } = usePlatformAuth();
-  const { logout: logoutTenant } = useAuth();
+  const { logout: logoutTenant, auth } = useAuth();
+  const tenantContexts = (auth?.contexts || []).filter((c) => c.type === 'tenant');
   const { pathname } = useLocation();
   const signOut = () => { logout(); logoutTenant(); };
   const items = ADMIN_NAV_ITEMS.filter((it) => !it.owner || role === 'owner');
@@ -24,7 +25,7 @@ export default function AdminLayout({ children }) {
           <Link to="/admin/overview" className="font-semibold text-main-blue">SynapseOne Admin</Link>
           <div className="flex items-center gap-1">
             <SiteToggles />
-            <Link to="/dashboard" className="text-xs text-normal-text px-2">Tenant</Link>
+            {tenantContexts.length > 0 && <Link to="/dashboard" className="text-xs text-normal-text px-2">Tenant</Link>}
             <button type="button" onClick={signOut} className="text-xs text-red-500 px-2">Sign out</button>
           </div>
         </div>

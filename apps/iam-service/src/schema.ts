@@ -27,6 +27,11 @@ export const organizations = pgTable(
     displayName: text('display_name').notNull(),
     /** tenant = customer organization; platform = reserved staff organization. */
     kind: text('kind').notNull().default('tenant'),
+    /** active | suspended. Platform org is always active. */
+    status: text('status').notNull().default('active'),
+    suspendedAt: timestamp('suspended_at', { withTimezone: true }),
+    suspendedBy: text('suspended_by'),
+    suspendReason: text('suspend_reason'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [uniqueIndex('organizations_slug_key').on(t.slug), index('idx_organizations_kind').on(t.kind)],
@@ -176,6 +181,7 @@ export const serviceAccounts = pgTable(
     accountId: uuid('account_id').notNull().references(() => accounts.id, { onDelete: 'cascade' }),
     slug: text('slug').notNull(),
     description: text('description').default(''),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [

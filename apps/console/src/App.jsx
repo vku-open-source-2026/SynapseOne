@@ -52,6 +52,7 @@ const ApiDocs = React.lazy(() => import('./pages/ApiDocs.jsx'));
 const Docs = React.lazy(() => import('./pages/Docs.jsx'));
 const AdminOverview = React.lazy(() => import('./pages/admin/Overview.jsx'));
 const AdminOrganizations = React.lazy(() => import('./pages/admin/Organizations.jsx'));
+const AdminAccounts = React.lazy(() => import('./pages/admin/Accounts.jsx'));
 const AdminOrganizationDetail = React.lazy(() => import('./pages/admin/OrganizationDetail.jsx'));
 const AdminUsers = React.lazy(() => import('./pages/admin/Users.jsx'));
 const AdminUserDetail = React.lazy(() => import('./pages/admin/UserDetail.jsx'));
@@ -200,6 +201,7 @@ function AppRoutes() {
           <Route path="/admin" element={<Navigate to="/admin/overview" replace />} />
           <Route path="/admin/overview" element={<PlatformGuard><AdminLayout><AdminOverview /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/orgs" element={<PlatformGuard><AdminLayout><AdminOrganizations /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/accounts" element={<PlatformGuard><AdminLayout><AdminAccounts /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/orgs/:orgId" element={<PlatformGuard><AdminLayout><AdminOrganizationDetail /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/users" element={<PlatformGuard><AdminLayout><AdminUsers /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/users/:userId" element={<PlatformGuard><AdminLayout><AdminUserDetail /></AdminLayout></PlatformGuard>} />

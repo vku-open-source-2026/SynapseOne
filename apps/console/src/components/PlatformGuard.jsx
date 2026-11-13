@@ -18,6 +18,22 @@ export default function PlatformGuard({ children }) {
 
   if (platform.session) return children;
 
+  const contextsLoaded = Array.isArray(auth.contexts) && auth.contexts.length > 0;
+  const hasPlatformContext = (auth.contexts || []).some((c) => c.type === 'platform');
+  if (contextsLoaded && !hasPlatformContext) {
+    return (
+      <div className="mx-auto max-w-xl px-4 pt-24">
+        <PageTitle title="Platform administration" sub="Platform Administrator required" />
+        <Card>
+          <p className="text-sm text-normal-text">
+            This account is not an active Platform Administrator. Use the tenant console for organization resources.
+          </p>
+          <Link to="/dashboard"><Btn className="mt-4">Return to tenant console</Btn></Link>
+        </Card>
+      </div>
+    );
+  }
+
   if (auth.apiKey) {
     return (
       <div className="mx-auto max-w-xl px-4 pt-24">

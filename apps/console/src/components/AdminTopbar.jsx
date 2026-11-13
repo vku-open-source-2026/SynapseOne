@@ -8,18 +8,21 @@ import { useAuth } from '../lib/auth.jsx';
 import { usePlatformAuth } from '../lib/platform-auth.jsx';
 import { Badge } from './ui.jsx';
 import SiteToggles from './SiteToggles.jsx';
+import ContextSwitcher from './ContextSwitcher.jsx';
 
 export default function AdminTopbar() {
   const { auth, logout } = useAuth();
   const platform = usePlatformAuth();
   const email = platform.user?.email || auth?.email || 'platform administrator';
+  const tenantContexts = (auth?.contexts || []).filter((c) => c.type === 'tenant');
   return (
     <div className="hidden lg:flex fixed top-0 left-0 right-0 h-16 z-20 px-4 lg:px-6 items-center justify-end console-topbar-band border-b border-slate-200">
       <div className="flex items-center gap-3 pr-2 lg:pr-8">
         <SiteToggles />
+        {tenantContexts.length > 0 && <ContextSwitcher />}
         <Badge tone="blue"><FontAwesomeIcon icon={faShieldHalved} className="mr-1" /> {platform.role || 'platform'}</Badge>
         <span className="text-xs text-normal-text max-w-64 truncate" title={email}>{email}</span>
-        <Link to="/dashboard" className="text-xs text-main-blue hover:underline">Tenant console</Link>
+        {tenantContexts.length > 0 && <Link to="/dashboard" className="text-xs text-main-blue hover:underline">Tenant console</Link>}
         <button
           type="button"
           onClick={() => { platform.logout(); logout(); }}

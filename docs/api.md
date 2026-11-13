@@ -61,6 +61,8 @@ tenant. Platform calls without a tenant fail with `400 tenant_required`.
 - `POST /v1/auth/logout-all {refreshToken}` → `{ok, revoked}` (revokes all of your own sessions)
 - `GET /v1/auth/verify` (Bearer or X-API-Key) → `{valid, ...}`
 - `GET /v1/auth/me` (Bearer) → `{user, kind}` (`user.is_org_admin` tells whether the caller administers its org)
+- `GET /v1/auth/contexts` (Bearer) → `{current, contexts}` — tenant/platform contexts this email may enter; suspended organizations are omitted
+- `POST /v1/auth/contexts/switch {orgId}` (Bearer) → tenant token set after server-side membership revalidation. Platform context is never minted here; it returns `409 platform_context_login_required` and requires the platform-org login + MFA.
 - `GET /v1/auth/sessions` (user Bearer) → `[{id, created_at, expires_at}]` — your active sessions (one per live refresh token), newest first
 - `DELETE /v1/auth/sessions/:id` (user Bearer) → `{ok}` — revoke one session (its refresh token stops working); other users' ids → `404`
 - `GET /v1/auth/oidc/config` → `{issuer, clientId, redirectUri, codeExchange, ...}`
@@ -860,21 +862,37 @@ Tenant JWTs, API keys and service-account tokens are rejected.
 | GET | `/v1/platform/overview?from&to` | Cross-tenant counts, usage totals and audit signals. |
 | GET | `/v1/platform/orgs?q&limit&offset` | Tenant organizations with counts. |
 | POST | `/v1/platform/orgs` | Create an organization and its first org admin. |
+| GET | `/v1/platform/accounts?q&orgId&limit&offset` | Cross-tenant account list. |
 | GET | `/v1/platform/orgs/:orgId` | Organization detail, accounts and admins. |
+| GET | `/v1/platform/orgs/:orgId/resources` | Accounts, users, roles, policies, API-key metadata and service accounts for one organization. |
+| GET | `/v1/platform/orgs/:orgId/audit?limit&offset` | Organization-scoped audit trail. |
 | POST | `/v1/platform/orgs/:orgId/accounts` | Create a tenant account (step-up `org:account:create`). |
+| POST | `/v1/platform/orgs/:orgId/suspend` | Suspend a tenant organization (step-up `org:suspend`); revokes refresh sessions and API keys. |
+| POST | `/v1/platform/orgs/:orgId/reactivate` | Reactivate a suspended organization (step-up `org:reactivate`). |
+| POST | `/v1/platform/orgs/:orgId/roles` | Create a role in an organization account (step-up `org:role:create`). |
+| POST | `/v1/platform/orgs/:orgId/policies` | Create a policy in an organization account (step-up `org:policy:create`). |
+| POST | `/v1/platform/orgs/:orgId/keys/:keyId/revoke` | Revoke a tenant API key (step-up `org:key:revoke`). |
+| POST | `/v1/platform/orgs/:orgId/service-accounts/:id/revoke` | Revoke a tenant service account (step-up `org:service-account:revoke`). |
 | GET | `/v1/platform/users?q&orgId&active&isOrgAdmin&limit&offset` | Cross-tenant users. |
 | GET | `/v1/platform/users/:userId` | User, roles, policies, MFA and sessions. |
 | PUT | `/v1/platform/users/:userId/org-admin` | Grant/revoke org admin (step-up). |
 | POST | `/v1/platform/users/:userId/reset-mfa` | Reset MFA and revoke sessions/API keys (step-up). |
 | POST | `/v1/platform/users/:userId/invite` | Re-issue a one-time activation code for a passwordless tenant user (step-up). |
-| POST | `/v1/platform/users/:userId/unlock` | Clear a sign-in lockout. |
+| POST | `/v1/platform/users/:userId/unlock` | Clear a sign-in lockout (step-up `user:unlock`). |
 | POST | `/v1/platform/users/:userId/revoke-sessions` | Revoke refresh sessions (step-up). |
 | POST | `/v1/platform/users/:userId/disable` | Deactivate a user (step-up). |
-| POST | `/v1/platform/users/:userId/enable` | Reactivate a user. |
+| POST | `/v1/platform/users/:userId/enable` | Reactivate a user (step-up `user:enable`). |
 | GET | `/v1/platform/usage/summary` | Platform-wide usage summary (optional `orgId`). |
 | GET | `/v1/platform/usage/events` | Platform-wide request log (optional `orgId`). |
 | GET | `/v1/platform/audit` | Platform-wide audit (optional `orgId`). |
 | GET/POST/DELETE | `/v1/platform/admins[/:userId]` | Owner-only platform administrator management. |
+
+Tenant organizations carry `status=active|suspended`. Suspension is reversible,
+requires a reason plus step-up, revokes refresh sessions/API keys and bumps each
+user's credential epoch; `/v1/auth/login`, `/v1/auth/refresh`,
+`/v1/auth/verify`, API-key verification and the gateway all fail closed while
+suspended. The reserved platform organization cannot be suspended
+(`403 platform_org_protected`). Reactivation requires a fresh tenant sign-in.
 
 Internal bootstrap/recovery endpoints (`/internal/platform/bootstrap`,
 `/internal/platform/recovery`) are reachable only over the service network and

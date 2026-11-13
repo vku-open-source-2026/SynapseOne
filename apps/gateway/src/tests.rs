@@ -143,6 +143,7 @@ fn step_up_claims() -> Value {
 enum VerifyMode {
     Ok,
     Revoked,
+    Suspended,
     Down,
 }
 
@@ -290,6 +291,11 @@ async fn mock_verify(State(state): State<Arc<MockIamState>>) -> Response {
         VerifyMode::Revoked => (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "valid": false, "error": "token_revoked" })),
+        )
+            .into_response(),
+        VerifyMode::Suspended => (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "valid": false, "error": "org_suspended" })),
         )
             .into_response(),
         VerifyMode::Down => StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1540,7 +1546,9 @@ async fn jwt_auth_gate_and_principal_stamping() {
         "second request uses the session cache"
     );
 
-    // Service accounts are machine credentials and skip session introspection.
+    // Service accounts are machine credentials but still introspected so a
+    // revoked service account or suspended organization cannot keep using an
+    // unexpired token.
     let service_account = sign(json!({
         "sub": "sa1", "kind": "service-account", "org": "org-1",
         "scopes": ["*"], "iss": TEST_ISSUER, "exp": now_ts() + 300
@@ -1552,7 +1560,7 @@ async fn jwt_auth_gate_and_principal_stamping() {
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
-    assert_eq!(mock.verify_hits(), 1);
+    assert_eq!(mock.verify_hits(), 2, "service account is introspected");
 
     // Revoked sessions fail closed.
     mock.set_verify(VerifyMode::Revoked);
@@ -1872,6 +1880,7 @@ async fn session_revocation_cache_and_fail_closed() {
         "IAM outage is cached briefly"
     );
 
+    mock.set_verify(VerifyMode::Ok);
     let hits = mock.verify_hits();
     assert!(service
         .validate_jwt_session(
@@ -1880,7 +1889,30 @@ async fn session_revocation_cache_and_fail_closed() {
         )
         .await
         .is_none());
-    assert_eq!(mock.verify_hits(), hits);
+    assert_eq!(mock.verify_hits(), hits + 1);
+
+    // A suspended organization (or revoked service account) is a 403, not an
+    // IAM outage, and must never be cached as a valid session.
+    mock.set_verify(VerifyMode::Suspended);
+    let rejected = service
+        .validate_jwt_session(
+            "tok-sa-suspended",
+            &json!({ "kind": "service-account", "sub": "sa1" })
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status, 403);
+    assert_eq!(rejected.error, "org_suspended");
+    let suspended_hits = mock.verify_hits();
+    let rejected = service
+        .validate_jwt_session(
+            "tok-sa-suspended",
+            &json!({ "kind": "service-account", "sub": "sa1" })
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.error, "org_suspended");
+    assert_eq!(mock.verify_hits(), suspended_hits, "403 result is cached");
     let rejected = service
         .validate_jwt_session("tok-nosub", &json!({ "kind": "user" }))
         .await

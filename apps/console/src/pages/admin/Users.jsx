@@ -96,7 +96,7 @@ export default function AdminUsers() {
               <tr key={u.id} className="border-t border-slate-100">
                 <td className="py-2 pr-4"><Link to={`/admin/users/${u.id}`} className="font-medium text-main-blue hover:underline">{u.email}</Link><p className="text-xs text-normal-text">{u.display_name || '–'}</p></td>
                 <td className="py-2 pr-4 text-sm">{u.org_slug || '–'}</td>
-                <td className="py-2 pr-4"><Badge tone={u.active ? 'green' : 'gray'}>{u.active ? 'active' : 'inactive'}</Badge></td>
+                <td className="py-2 pr-4"><Badge tone={u.active !== false ? 'green' : 'gray'}>{u.active !== false ? 'active' : 'inactive'}</Badge></td>
                 <td className="py-2 pr-4"><Badge tone={u.is_org_admin ? 'blue' : 'gray'}>{u.is_org_admin ? 'admin' : 'member'}</Badge></td>
                 <td className="py-2 pr-4"><Badge tone={u.mfa_enabled ? 'green' : 'amber'}>{u.mfa_enabled ? 'on' : 'off'}</Badge></td>
                 <td className="py-2 pr-4 text-xs text-normal-text">{u.created_at ? new Date(u.created_at).toLocaleDateString() : '–'}</td>

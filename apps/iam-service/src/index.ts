@@ -26,7 +26,8 @@ import {
   setOrgAdmin, orgHasAdmin, assignRoleToServiceAccount, unassignRoleFromServiceAccount, rolesForServiceAccount,
   getPlatformAdmin, listPlatformAdmins, grantPlatformAdmin, revokePlatformAdmin, countActivePlatformOwners,
   registerPlatformStepUp, consumePlatformStepUp,
-  listPlatformOrganizations, getPlatformOrganization, listPlatformUsers, getPlatformOverviewCounts, platformAuditStats,
+  listPlatformOrganizations, getPlatformOrganization, getPlatformOrganizationResources, listPlatformUsers, getPlatformOverviewCounts, platformAuditStats,
+  setOrganizationStatus, listUserRowsByEmail, revokeServiceAccount, listPlatformAccounts,
   type PlatformAdmin, type User,
 } from './db';
 import {
@@ -202,13 +203,26 @@ async function resolveCallerUser(req: express.Request, trustStamped: boolean): P
 
 /** A user JWT must still map to an active account. Disabling or deleting a
  *  user must invalidate existing access tokens before their natural expiry. */
-async function claimsUserStatus(claims: any): Promise<'ok' | 'inactive' | 'revoked'> {
-  if (!claims || claims.kind === 'service-account') return 'ok';
+async function claimsUserStatus(claims: any): Promise<'ok' | 'inactive' | 'revoked' | 'org_suspended'> {
+  if (!claims) return 'revoked';
+  if (claims.kind === 'service-account') {
+    const sa = await getServiceAccount(String(claims.sub || ''));
+    if (!sa || sa.revoked_at) return 'revoked';
+    const account = claims.account ? await getAccountById(String(claims.account)) : null;
+    const org = account ? await getOrgById(account.org_id) : null;
+    return org && org.status === 'suspended' ? 'org_suspended' : 'ok';
+  }
   if (!claims.sub) return 'revoked';
   const user = await getUserById(String(claims.sub));
   if (!user || user.active === false) return 'inactive';
+  const org = await getOrgById(user.org_id);
+  if (org && org.status === 'suspended') return 'org_suspended';
   // Credential epoch: logout-all/disable/MFA-reset bumps users.auth_version.
   return Number(claims.ver || 0) === Number(user.auth_version || 0) ? 'ok' : 'revoked';
+}
+
+function orgSuspendedResponse(res: express.Response): express.Response {
+  return res.status(403).json({ error: 'org_suspended', message: 'This organization is suspended. Contact a platform administrator.' });
 }
 
 /** May the caller act for `accountId`? Role-based account membership first,
@@ -302,11 +316,19 @@ const PLATFORM_ROLE_RANK: Record<string, number> = { auditor: 1, operator: 2, ow
 const PLATFORM_STEP_UP_ACTIONS = new Set([
   'org:create',
   'org:account:create',
+  'org:suspend',
+  'org:reactivate',
+  'org:role:create',
+  'org:policy:create',
+  'org:key:revoke',
+  'org:service-account:revoke',
   'user:org-admin',
   'user:reset-mfa',
   'user:invite',
   'user:revoke-sessions',
   'user:disable',
+  'user:enable',
+  'user:unlock',
   'admin:grant',
   'admin:revoke',
 ]);
@@ -616,6 +638,11 @@ async function requireUserCaller(req: express.Request, res: express.Response): P
   }
   if (user.active === false) {
     res.status(401).json({ error: 'account_deactivated', message: 'This account has been deactivated.' });
+    return null;
+  }
+  const callerOrg = await getOrgById(user.org_id);
+  if (callerOrg && callerOrg.status === 'suspended') {
+    orgSuspendedResponse(res);
     return null;
   }
   if (Number(claims.ver || 0) !== Number(user.auth_version || 0)) {
@@ -1015,6 +1042,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
           const claims = verifyAccess(h.slice(7));
           const state = await claimsUserStatus(claims);
           if (state !== 'ok') {
+            if (state === 'org_suspended') return orgSuspendedResponse(res);
             return res.status(401).json(state === 'revoked'
               ? { error: 'token_revoked', message: 'This session was revoked. Sign in again.' }
               : { error: 'account_deactivated', message: 'This account has been deactivated.' });
@@ -1039,6 +1067,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
         const claims = verifyAccess(h.slice(7));
         const state = await claimsUserStatus(claims);
         if (state !== 'ok') {
+          if (state === 'org_suspended') return orgSuspendedResponse(res);
           return res.status(401).json(state === 'revoked'
             ? { error: 'token_revoked', message: 'This session was revoked. Sign in again.' }
             : { error: 'account_deactivated', message: 'This account has been deactivated.' });
@@ -1205,6 +1234,8 @@ async function auditMutation(req: express.Request, action: string, resource: str
           }
           const user = await bootstrapOrgAdmin(resolved.user);
           if (user.active === false) return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated.' });
+          const oidcOrg = await getOrgById(user.org_id);
+          if (oidcOrg && oidcOrg.status === 'suspended') return orgSuspendedResponse(res);
           // Do not silently bypass local MFA assurance. Users with an enrolled
           // TOTP factor must complete it even when the upstream IdP signed them in.
           if (await mfaEnabled(user.id)) {
@@ -1252,6 +1283,8 @@ async function auditMutation(req: express.Request, action: string, resource: str
       }
       const user = await bootstrapOrgAdmin(resolved.user);
       if (user.active === false) return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated.' });
+      const demoOrg = await getOrgById(user.org_id);
+      if (demoOrg && demoOrg.status === 'suspended') return orgSuspendedResponse(res);
       if (await mfaEnabled(user.id)) return sendMfaChallenge(res, user.id, 'oidc');
       const { token, expiresIn } = signAccess({ sub: user.id, email: user.email, org: user.org_id, ver: Number(user.auth_version) || 0 });
       const rt = newRefreshToken();
@@ -1281,6 +1314,11 @@ async function auditMutation(req: express.Request, action: string, resource: str
     }
     if (write && !token.scopes.includes('scim:write')) {
       res.status(403).json({ schemas: ['urn:ietf:params:scim:api:messages:2.0:Error'], detail: 'scim:write scope required', status: '403' });
+      return null;
+    }
+    const scimOrg = await getOrgById(token.orgId);
+    if (!scimOrg || scimOrg.status === 'suspended') {
+      res.status(403).json({ schemas: ['urn:ietf:params:scim:api:messages:2.0:Error'], detail: 'organization is suspended', status: '403' });
       return null;
     }
     return token;
@@ -1638,6 +1676,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       if (user && user.active === false) {
         return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated by an administrator.' });
       }
+      if (user && org && org.status === 'suspended') return orgSuspendedResponse(res);
       if (!user || !ok) {
         const lockedFor = user ? await recordLoginFailure(user.id) : 0;
         await logAudit({
@@ -1670,6 +1709,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       return res.status(403).json({ error: 'reserved_org_slug', message: 'This organization slug is reserved for platform administration.' });
     }
     const org = existingOrg || (await createOrganization(slug, slug));
+    if (org.status === 'suspended') return orgSuspendedResponse(res);
     const user = await bootstrapOrgAdmin(await upsertUser(org.id, email, email));
     if (user.active === false) {
       return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated by an administrator.' });
@@ -1702,6 +1742,8 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (user.active === false) {
       return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated by an administrator.' });
     }
+    const mfaOrg = await getOrgById(user.org_id);
+    if (mfaOrg && mfaOrg.status === 'suspended') return orgSuspendedResponse(res);
     const left = await lockRemaining(user.id);
     if (left > 0) return sendLocked(res, left);
     const result = await checkSecondFactor(user.id, { code, recoveryCode });
@@ -2159,7 +2201,10 @@ async function auditMutation(req: express.Request, action: string, resource: str
     const rt = newRefreshToken();
     await storeRefresh(rec.user_id, rt.hash, refreshExpiry());
     const user = await getUserById(rec.user_id).catch(() => null);
-    const { token, expiresIn } = signAccess(user ? { sub: user.id, email: user.email, org: user.org_id, ver: Number(user.auth_version) || 0 } : { sub: rec.user_id });
+    if (!user || user.active === false) return res.status(401).json({ error: 'account_deactivated' });
+    const org = await getOrgById(user.org_id);
+    if (org && org.status === 'suspended') return orgSuspendedResponse(res);
+    const { token, expiresIn } = signAccess({ sub: user.id, email: user.email, org: user.org_id, ver: Number(user.auth_version) || 0 });
     noStore(res);
     res.json({ accessToken: token, expiresIn, refreshToken: rt.value });
   });
@@ -2195,10 +2240,87 @@ async function auditMutation(req: express.Request, action: string, resource: str
       if (Number(decoded.ver || 0) !== Number(user.auth_version || 0)) {
         return res.status(401).json({ error: 'token_revoked', message: 'This session was revoked. Sign in again.' });
       }
+      const meOrg = await getOrgById(user.org_id);
+      if (meOrg && meOrg.status === 'suspended') return orgSuspendedResponse(res);
       res.json({ user: publicUser(user), kind: decoded.kind || 'user' });
     } catch (e: any) {
       return res.status(401).json({ error: 'invalid_token', message: e.message });
     }
+  });
+
+
+  /** Authorized contexts for the signed-in email. Read-only metadata; no
+   *  tokens are minted here. Platform context still requires its own MFA
+   *  exchange, and tenant switches revalidate membership server-side. */
+  app.get('/v1/auth/contexts', async (req, res) => {
+    const h = firstHeader(req.headers.authorization as any);
+    if (!h.startsWith('Bearer ')) return res.status(401).json({ error: 'unauthorized' });
+    let claims: any;
+    try { claims = verifyAccess(h.slice(7)); } catch { return res.status(401).json({ error: 'invalid_token' }); }
+    if (claims.kind && claims.kind !== 'user') return res.status(403).json({ error: 'user_session_required' });
+    const user = await getUserById(String(claims.sub));
+    if (!user || user.active === false) return res.status(401).json({ error: 'account_deactivated' });
+    if (Number(claims.ver || 0) !== Number(user.auth_version || 0)) {
+      return res.status(401).json({ error: 'token_revoked', message: 'This session was revoked. Sign in again.' });
+    }
+    const currentOrg = await getOrgById(user.org_id);
+    if (!currentOrg) return res.status(404).json({ error: 'org_not_found' });
+    if (currentOrg.status === 'suspended') return orgSuspendedResponse(res);
+    const rows = await listUserRowsByEmail(user.email);
+    const contexts: any[] = [];
+    for (const row of rows) {
+      if (row.active === false) continue;
+      const org = await getOrgById(row.org_id);
+      if (!org || org.status === 'suspended') continue;
+      if (org.kind === 'platform') {
+        const admin = await getPlatformAdmin(row.id);
+        if (!admin || admin.revoked_at) continue;
+        contexts.push({
+          id: `platform:${org.id}`, type: 'platform', orgId: org.id, slug: org.slug,
+          name: org.display_name, role: admin.role, userId: row.id,
+        });
+      } else {
+        contexts.push({
+          id: `tenant:${org.id}`, type: 'tenant', orgId: org.id, slug: org.slug,
+          name: org.display_name, role: row.is_org_admin ? 'org_admin' : 'member', userId: row.id,
+        });
+      }
+    }
+    contexts.sort((a, b) => (a.type === b.type ? a.slug.localeCompare(b.slug) : a.type === 'platform' ? -1 : 1));
+    const current = contexts.find((c) => c.orgId === user.org_id && c.userId === user.id) || null;
+    res.json({ current, contexts });
+  });
+
+  app.post('/v1/auth/contexts/switch', mfaLimiter, async (req, res) => {
+    const h = firstHeader(req.headers.authorization as any);
+    if (!h.startsWith('Bearer ')) return res.status(401).json({ error: 'unauthorized' });
+    let claims: any;
+    try { claims = verifyAccess(h.slice(7)); } catch { return res.status(401).json({ error: 'invalid_token' }); }
+    if (claims.kind && claims.kind !== 'user') return res.status(403).json({ error: 'user_session_required' });
+    const currentUser = await getUserById(String(claims.sub));
+    if (!currentUser || currentUser.active === false) return res.status(401).json({ error: 'account_deactivated' });
+    if (Number(claims.ver || 0) !== Number(currentUser.auth_version || 0)) return res.status(401).json({ error: 'token_revoked' });
+    const parsed = z.object({ orgId: z.string().uuid() }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: 'orgId (uuid) required' });
+    const targetOrg = await getOrgById(parsed.data.orgId);
+    if (!targetOrg || targetOrg.status === 'suspended') return res.status(404).json({ error: 'org_not_found' });
+    if (targetOrg.kind === 'platform') {
+      return res.status(409).json({
+        error: 'platform_context_login_required',
+        message: 'Sign in with the platform organization and complete MFA to enter Platform Administration.',
+        orgSlug: targetOrg.slug,
+      });
+    }
+    const rows = await listUserRowsByEmail(currentUser.email);
+    const target = rows.find((u) => u.org_id === targetOrg.id && u.active !== false);
+    if (!target) return res.status(403).json({ error: 'context_not_authorized', message: 'No membership for this organization.' });
+    const session = await issueSession(target);
+    await logAudit({
+      actor_type: 'user', actor_id: target.id, action: 'iam:auth:context-switch', resource: `org:${targetOrg.id}`,
+      decision: true, context: { fromOrg: currentUser.org_id, toOrg: targetOrg.id },
+    }).catch(() => undefined);
+    noStore(res);
+    res.json({ ...session, context: { id: `tenant:${targetOrg.id}`, type: 'tenant', orgId: targetOrg.id, slug: targetOrg.slug, name: targetOrg.display_name, role: target.is_org_admin ? 'org_admin' : 'member' } });
   });
 
   app.get('/v1/auth/verify', async (req, res) => {    const h = firstHeader(req.headers.authorization as any);
@@ -2213,6 +2335,18 @@ async function auditMutation(req: express.Request, action: string, resource: str
           }
           if (Number(decoded.ver || 0) !== Number(user.auth_version || 0)) {
             return res.status(401).json({ valid: false, error: 'token_revoked', message: 'This session was revoked. Sign in again.' });
+          }
+          const verifyOrg = await getOrgById(user.org_id);
+          if (verifyOrg && verifyOrg.status === 'suspended') {
+            return res.status(403).json({ valid: false, error: 'org_suspended', message: 'This organization is suspended.' });
+          }
+        } else if (decoded.kind === 'service-account') {
+          const sa = await getServiceAccount(String(decoded.sub || ''));
+          const account = decoded.account ? await getAccountById(String(decoded.account)) : null;
+          const org = account ? await getOrgById(account.org_id) : null;
+          if (!sa || sa.revoked_at) return res.status(403).json({ valid: false, error: 'service_account_revoked' });
+          if (!account || !org || org.status === 'suspended') {
+            return res.status(403).json({ valid: false, error: 'org_suspended', message: 'This organization is suspended.' });
           }
         }
         return res.json({ valid: true, type: 'jwt', claims: decoded });
@@ -2830,6 +2964,10 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!rec) return res.status(401).json({ valid: false });
     // Include the owning org: the gateway uses this for usage attribution (#28).
     const acc = rec.account_id ? await getAccountById(rec.account_id) : null;
+    const keyOrg = acc ? await getOrgById(acc.org_id) : null;
+    if (!acc || !keyOrg || keyOrg.status === 'suspended') {
+      return res.status(403).json({ valid: false, error: 'org_suspended' });
+    }
     res.json({ valid: true, ...rec, ...(acc?.org_id ? { org_id: acc.org_id } : {}) });
   });
 
@@ -2956,6 +3094,10 @@ async function auditMutation(req: express.Request, action: string, resource: str
     }
     const sa = await getServiceAccount(req.params.id);
     if (!sa) return res.status(404).json({ error: 'service_account_not_found' });
+    const saAccount = await getAccountById(sa.account_id);
+    const saOrg = saAccount ? await getOrgById(saAccount.org_id) : null;
+    if (sa.revoked_at) return res.status(403).json({ error: 'service_account_revoked' });
+    if (!saOrg || saOrg.status === 'suspended') return orgSuspendedResponse(res);
     if (!(await canActForAccount(req, TRUST_STAMPED, sa.account_id))) {
       return res.status(403).json({ error: 'forbidden', message: 'service account belongs to another tenant' });
     }
@@ -3524,6 +3666,178 @@ async function auditMutation(req: express.Request, action: string, resource: str
     res.json(out);
   });
 
+
+  app.get('/v1/platform/orgs/:orgId/resources', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'auditor');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id' });
+    const out = await getPlatformOrganizationResources(req.params.orgId);
+    if (!out) return res.status(404).json({ error: 'org_not_found' });
+    noStore(res);
+    res.json(out);
+  });
+
+  app.get('/v1/platform/orgs/:orgId/audit', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'auditor');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id' });
+    const org = await getOrgById(req.params.orgId);
+    if (!org || (org.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'org_not_found' });
+    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+    const offset = Math.min(Math.max(Number(req.query.offset) || 0, 0), 100_000);
+    noStore(res);
+    res.json(await queryAudit({ orgId: org.id, limit, offset }));
+  });
+
+  app.post('/v1/platform/orgs/:orgId/suspend', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id' });
+    const org = await getOrgById(req.params.orgId);
+    if (!org) return res.status(404).json({ error: 'org_not_found' });
+    if ((org.kind || 'tenant') === 'platform' || org.slug === (process.env.PLATFORM_ORG_SLUG || 'synapseone-platform')) {
+      return res.status(403).json({ error: 'platform_org_protected', message: 'The platform organization cannot be suspended.' });
+    }
+    if ((org.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'org_not_found' });
+    const reason = typeof (req.body || {}).reason === 'string' ? String((req.body || {}).reason).trim().slice(0, 500) : '';
+    if (reason.length < 3) return res.status(400).json({ error: 'reason_required', message: 'A suspension reason is required.' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'org:suspend'))) return;
+    const result = await withTransaction(async () => {
+      const users = await listUsers(org.id);
+      let revoked = 0;
+      for (const u of users) {
+        revoked += await revokeAllRefresh(u.id);
+        await revokeApiKeysForUser(u.id);
+      }
+      const accounts = await listAccounts(org.id);
+      for (const account of accounts) {
+        for (const key of await listApiKeys(account.id)) {
+          if (!key.revoked_at) await revokeApiKey(key.id);
+        }
+      }
+      const updated = await setOrganizationStatus(org.id, 'suspended', ctx.user.id, reason);
+      await auditPlatformAction(req, ctx.user.id, 'platform:org:suspend', org.id, { slug: org.slug, reason, users: users.length, revoked });
+      return { organization: updated, revoked };
+    });
+    res.json({ ok: true, ...result });
+  });
+
+  app.post('/v1/platform/orgs/:orgId/reactivate', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id' });
+    const org = await getOrgById(req.params.orgId);
+    if (!org || (org.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'org_not_found' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'org:reactivate'))) return;
+    const updated = await withTransaction(async () => {
+      const row = await setOrganizationStatus(org.id, 'active', ctx.user.id, '');
+      await auditPlatformAction(req, ctx.user.id, 'platform:org:reactivate', org.id, { slug: org.slug });
+      return row;
+    });
+    res.json({ ok: true, organization: updated });
+  });
+
+  app.post('/v1/platform/orgs/:orgId/roles', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id' });
+    const org = await getOrgById(req.params.orgId);
+    if (!org || (org.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'org_not_found' });
+    const parsed = z.object({
+      accountId: z.string().uuid(),
+      slug: z.string().trim().regex(/^[a-z0-9-]{1,64}$/),
+      description: z.string().trim().max(500).nullish(),
+    }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    const account = await getAccountById(parsed.data.accountId);
+    if (!account || account.org_id !== org.id) return res.status(403).json({ error: 'cross_org', message: 'account is outside the organization' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'org:role:create'))) return;
+    const created = await withTransaction(async () => {
+      const role = await createRole(account.id, parsed.data.slug, sanitizeName(parsed.data.description || ''));
+      await auditPlatformAction(req, ctx.user.id, 'platform:org:role:create', org.id, { accountId: account.id, roleId: role.id, slug: role.slug });
+      return role;
+    });
+    res.status(201).json(created);
+  });
+
+  app.post('/v1/platform/orgs/:orgId/policies', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id' });
+    const org = await getOrgById(req.params.orgId);
+    if (!org || (org.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'org_not_found' });
+    const parsed = z.object({
+      accountId: z.string().uuid(),
+      slug: z.string().trim().regex(/^[a-z0-9-]{1,64}$/),
+      description: z.string().trim().max(500).nullish(),
+      document: z.any(),
+    }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    const docErr = validatePolicyDocument(parsed.data.document);
+    if (docErr) return res.status(400).json({ error: 'invalid_document', message: docErr });
+    const account = await getAccountById(parsed.data.accountId);
+    if (!account || account.org_id !== org.id) return res.status(403).json({ error: 'cross_org', message: 'account is outside the organization' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'org:policy:create'))) return;
+    const created = await withTransaction(async () => {
+      const policy = await createPolicy(account.id, parsed.data.slug, sanitizeName(parsed.data.description || ''), parsed.data.document);
+      await auditPlatformAction(req, ctx.user.id, 'platform:org:policy:create', org.id, { accountId: account.id, policyId: policy.id, slug: policy.slug });
+      return policy;
+    });
+    res.status(201).json(created);
+  });
+
+  app.post('/v1/platform/orgs/:orgId/keys/:keyId/revoke', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId) || !isUuid(req.params.keyId)) return res.status(400).json({ error: 'invalid_id' });
+    const key = await findApiKeyById(req.params.keyId);
+    if (!key) return res.status(404).json({ error: 'key_not_found' });
+    const account = await getAccountById(key.account_id);
+    if (!account || account.org_id !== req.params.orgId) return res.status(404).json({ error: 'key_not_found' });
+    if (key.revoked_at) return res.status(409).json({ error: 'key_already_revoked' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'org:key:revoke'))) return;
+    const ok = await withTransaction(async () => {
+      const revoked = await revokeApiKey(req.params.keyId);
+      await auditPlatformAction(req, ctx.user.id, 'platform:org:key:revoke', req.params.orgId, { keyId: req.params.keyId, accountId: account.id });
+      return revoked;
+    });
+    if (!ok) return res.status(409).json({ error: 'key_already_revoked' });
+    res.json({ ok: true });
+  });
+
+  app.post('/v1/platform/orgs/:orgId/service-accounts/:id/revoke', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId) || !isUuid(req.params.id)) return res.status(400).json({ error: 'invalid_id' });
+    const sa = await getServiceAccount(req.params.id);
+    if (!sa) return res.status(404).json({ error: 'service_account_not_found' });
+    const account = await getAccountById(sa.account_id);
+    if (!account || account.org_id !== req.params.orgId) return res.status(404).json({ error: 'service_account_not_found' });
+    if (sa.revoked_at) return res.status(409).json({ error: 'service_account_already_revoked' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'org:service-account:revoke'))) return;
+    const ok = await withTransaction(async () => {
+      const revoked = await revokeServiceAccount(sa.id);
+      await auditPlatformAction(req, ctx.user.id, 'platform:org:service-account:revoke', req.params.orgId, { serviceAccountId: sa.id, accountId: account.id });
+      return revoked;
+    });
+    if (!ok) return res.status(409).json({ error: 'service_account_already_revoked' });
+    res.json({ ok: true });
+  });
+
+  app.get('/v1/platform/accounts', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'auditor');
+    if (!ctx) return;
+    const limit = req.query.limit === undefined ? 50 : Number(req.query.limit);
+    const offset = req.query.offset === undefined ? 0 : Number(req.query.offset);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) return res.status(400).json({ error: 'invalid_limit' });
+    if (!Number.isInteger(offset) || offset < 0 || offset > 100_000) return res.status(400).json({ error: 'invalid_offset' });
+    const orgId = req.query.orgId === undefined ? undefined : String(req.query.orgId);
+    if (orgId && !isUuid(orgId)) return res.status(400).json({ error: 'invalid_orgId' });
+    const out = await listPlatformAccounts({ q: String(req.query.q || ''), ...(orgId ? { orgId } : {}), limit, offset });
+    noStore(res);
+    res.json({ ...out, limit, offset });
+  });
+
   app.get('/v1/platform/users', async (req, res) => {
     const ctx = await currentPlatformAdmin(req, res, 'auditor');
     if (!ctx) return;
@@ -3641,6 +3955,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!target) return res.status(404).json({ error: 'user_not_found' });
     const targetOrg = await getOrgById(target.org_id);
     if (!targetOrg || (targetOrg.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'user_not_found' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'user:unlock'))) return;
     await withTransaction(async () => {
       await clearLoginFailures(target.id);
       await auditPlatformAction(req, ctx.user.id, 'platform:user:unlock', target.org_id, { targetUserId: target.id });
@@ -3693,6 +4008,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!target) return res.status(404).json({ error: 'user_not_found' });
     const targetOrg = await getOrgById(target.org_id);
     if (!targetOrg || (targetOrg.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'user_not_found' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'user:enable'))) return;
     await withTransaction(async () => {
       await setUserActive(target.id, true);
       await auditPlatformAction(req, ctx.user.id, 'platform:user:enable', target.org_id, { targetUserId: target.id });

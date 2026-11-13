@@ -23,23 +23,34 @@ and from the internal `SYNAPSEONE_INTERNAL_SECRET` platform caller.
 - Destructive actions require a second, short-lived step-up token
   (`x-platform-step-up`, TTL 5 minutes). A proof is **single-use**, bound to the
   issuing platform session (`sid`) and to one action such as `org:create`,
-  `user:reset-mfa` or `admin:grant`.
+  `org:suspend`, `org:role:create`, `user:reset-mfa`, `user:enable` or
+  `admin:grant`.
 - The reserved platform slug cannot be created as a tenant. `bootstrap` refuses
   to reuse a tenant organization with that slug, and `currentPlatformAdmin`
   verifies the administrator's organization is `kind=platform`.
 - Invited accounts (first tenant admin, additional platform admins, tenant
   users) are activated with a one-time code; email+org alone cannot claim an
   existing membership. Codes expire after 7 days by default.
-- The MVP is metadata-first: no tenant document, object or secret content is
-  exposed through the six dashboard modules.
+- A user with rows in several organizations can list those contexts. Tenant →
+  tenant switching issues a fresh session only after the server revalidates the
+  same-email membership; tenant → platform never mints a session and requires
+  the platform-org login plus MFA. There is no impersonation path.
+- Tenant organizations support `active`/`suspended` lifecycle. Suspension
+  requires a reason and step-up, revokes sessions and API keys, and is enforced
+  by IAM and the gateway. The reserved platform organization is protected from
+  suspension; reactivation also requires step-up and a fresh tenant sign-in.
+- The control plane is metadata-first: no tenant document, object or secret
+  content is exposed through the dashboard modules.
 
 ## Modules
 
 | Module | Main API |
 |---|---|
 | Overview | `GET /v1/platform/overview`, `/v1/platform/usage/summary` |
-| Organizations | `GET/POST /v1/platform/orgs`, `GET /v1/platform/orgs/:id` |
+| Organizations | `GET/POST /v1/platform/orgs`, `GET /v1/platform/orgs/:id`, `/resources`, `/audit`, suspend/reactivate |
+| Accounts | `GET /v1/platform/accounts` |
 | Users & Access | `GET /v1/platform/users`, `GET /v1/platform/users/:id`, user action routes |
+| Organization detail | Overview, Accounts, Members, Administrators, Roles, Policies, API Keys, Service Accounts, Audit tabs under `/admin/orgs/:id` |
 | Service Health | gateway `GET /ready` |
 | Usage | `GET /v1/platform/usage/summary`, `/v1/platform/usage/events` |
 | Audit & Security | `GET /v1/platform/audit` |
@@ -134,8 +145,12 @@ email in the platform organization.
    Console login form supports first-party password sign-in; OIDC is also
    available when configured.
 2. Open `/security` and enable TOTP MFA (10 recovery codes are shown once).
-3. Open `/admin`; enter a fresh authenticator code.
-4. The Overview page loads platform-wide metadata.
+3. After sign-in, platform administrators are routed to `/admin/overview`
+   automatically. Enter a fresh authenticator code for the separate platform
+   session.
+4. The Overview page loads platform-wide metadata. Platform-only accounts do
+   not see tenant navigation; dual-role accounts can switch to a tenant context
+   they genuinely belong to.
 
 A fully provisioned local account with passwords/TOTP stored outside Git is
 documented in [`platform-superadmin-login.md`](platform-superadmin-login.md).
@@ -191,6 +206,9 @@ IAM migrations add:
   `idx_users_created_at`.
 - `0008_shocking_grandmaster.sql`: `platform_step_ups` (one-time `jti`,
   user/session/action binding, expiry, used_at).
+- `0010_wonderful_alex_wilder.sql`: `organizations.status`,
+  `suspended_at`, `suspended_by`, `suspend_reason`; `service_accounts.revoked_at`.
+  Additive and backwards-compatible (existing rows default to `active`).
 
 The migrations are additive and idempotent. Backfill existing audit rows with:
 

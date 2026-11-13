@@ -56,35 +56,68 @@ export function AuthProvider({ children }) {
     [auth],
   );
 
+  const persistSession = useCallback(async (r) => {
+    let contexts = [];
+    let current = null;
+    try {
+      const ctx = await api.authContexts({ token: r.accessToken });
+      contexts = Array.isArray(ctx?.contexts) ? ctx.contexts : [];
+      current = ctx?.current || null;
+    } catch { /* older deployment or transient failure */ }
+    const next = { token: r.accessToken, refreshToken: r.refreshToken, user: r.user, email: r.user?.email, contexts, currentContext: current };
+    setAuth(next);
+    return { ...r, contexts, currentContext: current };
+  }, []);
+
   const login = useCallback(async (email, orgSlug, password) => {
     const r = await api.login(email, orgSlug || 'acme', password);
-    setAuth({ token: r.accessToken, refreshToken: r.refreshToken, user: r.user, email: r.user?.email });
-    return r;
-  }, []);
+    return persistSession(r);
+  }, [persistSession]);
 
   // SSO: exchange an IdP authorization `code` (+ signed `state`) for platform
   // tokens. The code is single-use and short-lived — safe to POST from the
   // callback page, and never lands in history (unlike tokens in URLs).
   const loginWithOidc = useCallback(async (code, state) => {
     const r = await api.oidcCallback(code, state);
-    setAuth({ token: r.accessToken, refreshToken: r.refreshToken, user: r.user, email: r.user?.email });
-    return r;
-  }, []);
+    return persistSession(r);
+  }, [persistSession]);
 
   // Second sign-in step when the account has MFA (login threw 401 mfa_required).
   const completeMfa = useCallback(async (mfaToken, code, recoveryCode) => {
     const r = await api.verifyMfa(mfaToken, code, recoveryCode);
-    setAuth({ token: r.accessToken, refreshToken: r.refreshToken, user: r.user, email: r.user?.email });
-    return r;
-  }, []);
+    return persistSession(r);
+  }, [persistSession]);
 
   const loginWithKey = useCallback((apiKey) => setAuth({ apiKey }), []);
 
   const acceptInvite = useCallback(async (token, password, displayName) => {
     const r = await api.acceptInvite(token, password, displayName);
-    setAuth({ token: r.accessToken, refreshToken: r.refreshToken, user: r.user, email: r.user?.email });
-    return r;
-  }, []);
+    return persistSession(r);
+  }, [persistSession]);
+  // Revalidate context metadata after reload/token rotation. The backend is
+  // authoritative; localStorage contexts are only a UI hint.
+  useEffect(() => {
+    if (!auth?.token) return;
+    let alive = true;
+    api.authContexts({ token: auth.token })
+      .then((ctx) => {
+        if (!alive) return;
+        const contexts = Array.isArray(ctx?.contexts) ? ctx.contexts : [];
+        const current = ctx?.current || null;
+        const before = JSON.stringify({ c: auth.contexts || [], u: auth.currentContext || null });
+        const after = JSON.stringify({ c: contexts, u: current });
+        if (before !== after) setAuth((prev) => prev ? { ...prev, contexts, currentContext: current } : prev);
+      })
+      .catch(() => undefined);
+    return () => { alive = false; };
+  }, [auth?.token]);
+
+  const switchContext = useCallback(async (orgId) => {
+    if (!auth?.token) throw new Error('Not signed in');
+    const r = await api.switchContext(orgId, { token: auth.token });
+    return persistSession(r);
+  }, [auth?.token, persistSession]);
+
   // Server-side logout: revoke the refresh token so it can't be reused after
   // the browser session is gone (best-effort — local state clears regardless).
   const logout = useCallback(() => {
@@ -94,7 +127,7 @@ export function AuthProvider({ children }) {
   }, [auth?.refreshToken]);
 
   return (
-    <AuthCtx.Provider value={{ auth, headers, login, loginWithKey, loginWithOidc, completeMfa, acceptInvite, logout, setAuth }}>
+    <AuthCtx.Provider value={{ auth, headers, login, loginWithKey, loginWithOidc, completeMfa, acceptInvite, switchContext, logout, setAuth }}>
       {children}
     </AuthCtx.Provider>
   );
