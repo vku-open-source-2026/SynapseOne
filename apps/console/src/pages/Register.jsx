@@ -12,8 +12,11 @@ export default function Register() {
   const [form, setForm] = useState({ token: '', password: '', confirm: '', displayName: '' });
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [activating, setActivating] = useState(false);
 
-  if (auth) return <Navigate to="/dashboard" replace />;
+  // Once activation succeeds, the new auth state must not race the explicit
+  // /security redirect back to the dashboard (MFA setup prompt).
+  if (auth && !activating) return <Navigate to="/dashboard" replace />;
 
   const submit = async (e) => {
     e.preventDefault();
@@ -27,10 +30,12 @@ export default function Register() {
       return;
     }
     setBusy(true);
+    setActivating(true);
     try {
       await acceptInvite(form.token.trim(), form.password, form.displayName.trim() || undefined);
       nav('/security', { replace: true });
     } catch (ex) {
+      setActivating(false);
       setErr(ex);
     } finally {
       setBusy(false);

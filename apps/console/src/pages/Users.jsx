@@ -20,6 +20,7 @@ export default function Users() {
   const [busy, setBusy] = useState(false);
   const [email, setEmail] = useState('');
   const [displayName, setDisplayName] = useState('');
+  const [invite, setInvite] = useState(null);
   const [roles, setRoles] = useState([]);
   const [assignUser, setAssignUser] = useState('');
   const [assignRole, setAssignRole] = useState('');
@@ -51,10 +52,13 @@ export default function Users() {
     setBusy(true);
     setErr(null);
     try {
-      await api.createUser(scope.orgId, email, displayName || undefined, headers);
+      const created = await api.createUser(scope.orgId, email, displayName || undefined, headers);
       setOpen(false);
       setEmail('');
       setDisplayName('');
+      if (created?.inviteToken) {
+        setInvite({ email: created.email || email, token: created.inviteToken });
+      }
       api.users(scope.orgId, headers).then((v) => setRows(Array.isArray(v) ? v : [])).catch(setErr);
     } catch (ex) {
       setErr(ex);
@@ -130,6 +134,19 @@ export default function Users() {
           <Empty text={scope.orgId ? 'No users yet' : 'Pick an organization to see its users'} />
         )}
       </Card>
+      {invite && (
+        <Modal title="User invited" onClose={() => setInvite(null)}>
+          <p className="text-sm text-normal-text">
+            Send this one-time activation code to <strong>{invite.email}</strong> through a trusted channel.
+          </p>
+          <p className="text-xs text-normal-text mt-3">Activation code (expires in 7 days):</p>
+          <div className="mt-2 rounded-2xl bg-background p-3 break-all font-mono text-xs">{invite.token}</div>
+          <div className="flex gap-2 mt-3">
+            <Btn onClick={() => navigator.clipboard?.writeText(invite.token)}>Copy code</Btn>
+            <Btn kind="secondary" onClick={() => setInvite(null)}>Close</Btn>
+          </div>
+        </Modal>
+      )}
       {open && (
         <Modal title="New user" onClose={() => setOpen(false)}>
           <form onSubmit={create}>
