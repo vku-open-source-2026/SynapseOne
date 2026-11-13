@@ -1,6 +1,6 @@
 # OLTP → OLAP Data Platform — Master Plan
 
-Status: **IMPLEMENTED, VERIFIED IN ISOLATED + PRODUCTION CANARY**
+Status: **CORE PIPELINE COMPLETE; residual items listed below**
 Owner: SynapseOne Tier-1
 Baseline commit: `38a87d2`
 Last updated: 2026-11-13
@@ -220,7 +220,9 @@ Guarantees:
 | 2026-11-13 | Flow B E2E | Base create/update/delete → outbox → Stream → DuckDB, duplicate + restart |
 | 2026-11-13 | Flow A exactness | Production completed-hour warehouse 2,564 = Postgres 2,564 |
 | 2026-11-13 | Production canary | platform tenant: 3 events, 3 rows, duplicate stayed 3; cleaned up |
-| 2026-11-13 | Release | `96e902c` + `960947c`, images `0.9.2-data` |
+| 2026-11-13 | Release | `2736cc8`, images `0.9.2-data` |
+| 2026-11-13 | CI/CD | CD `43408832389`, Security `43408832398` success |
+| 2026-11-13 | Production auth regression | 18/18 browser checks after data release |
 
 ## Deployed State
 
@@ -231,3 +233,17 @@ Guarantees:
 - `/ready` includes warehouse (12/12).
 - Production canary dataset/job/collection deleted after verification.
 
+
+
+## Residual / Explicitly Not Claimed
+
+- Base `documents:batch` keeps its existing per-operation result semantics
+  (partial success is reported per item); it is not an all-or-nothing batch.
+- Change-feed rows with identical millisecond timestamps are ordered by the
+  opaque event id; consumers must use `version` for current-state projection.
+- The historical backfill endpoint is verified in memory; a production
+  full-collection backfill was intentionally not run.
+- Warehouse SDK methods compile and pass language tests, but no live SDK
+  warehouse call was run against production.
+- Usage backfill is intentionally limited to 24h on the production canary;
+  increase `USAGE_ROLLUP_BACKFILL_HOURS` only after monitoring.
