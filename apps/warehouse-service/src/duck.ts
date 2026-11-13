@@ -315,6 +315,7 @@ export class WarehouseStore {
       if (!existing.rows.length) return false;
       await conn.run(`DROP TABLE IF EXISTS ${quoteIdent(tableName(id))}`);
       await conn.run('DELETE FROM _jobs WHERE target_dataset_id = ?', [id]);
+      await conn.run('DELETE FROM _ingest_events WHERE dataset_id = ?', [id]);
       await conn.run('DELETE FROM _datasets WHERE id = ?', [id]);
       return true;
     });
@@ -620,7 +621,7 @@ export class WarehouseStore {
       const datasets = await readAll(conn, 'SELECT count(*) AS n FROM _datasets');
       const jobs = await readAll(conn, `SELECT status, count(*) AS n FROM _jobs GROUP BY status`);
       const last = await readAll(conn, `SELECT max(last_run_at) AS last_run, max(updated_at) AS updated, max(last_error) AS last_error FROM _jobs`);
-      const applied = await readAll(conn, 'SELECT count(*) AS n FROM _ingest_events');
+      const applied = await readAll(conn, 'SELECT count(*) AS n FROM _ingest_events e JOIN _datasets d ON d.id = e.dataset_id');
       const rows = jobs.rows as Array<{ status: string; n: number }>;
       return {
         datasets: Number(datasets.rows[0]?.n) || 0,
