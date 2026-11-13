@@ -13,8 +13,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
 ```
 
-> The crate is prepared for crates.io publication. Until the first release,
-> use the path dependency shown in `openinfra/datacollector/backend-rs`.
+> The crate is published on crates.io as `synapseone` (`cargo add synapseone`).
 
 ## Quick start
 
