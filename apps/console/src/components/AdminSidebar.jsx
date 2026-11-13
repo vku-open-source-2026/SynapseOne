@@ -24,7 +24,7 @@ export default function AdminSidebar({ role }) {
   const { pathname } = useLocation();
   return (
     <aside aria-label="Platform administration navigation" className="fixed left-3 xl:left-5 top-0 h-screen w-64 xl:w-72 hidden lg:flex flex-col items-center z-30">
-      <Link to="/admin/overview" className="my-6 mt-8 ml-2 whitespace-nowrap text-xl xl:text-2xl font-semibold bg-gradient-to-b from-main-start to-main-end bg-clip-text text-transparent">
+      <Link to="/admin/overview" className="my-6 mt-8 ml-2 whitespace-nowrap text-xl xl:text-2xl font-semibold bg-gradient-to-b from-[#0A72C4] to-[#4FACFE] bg-clip-text text-transparent">
         SynapseOne Admin
       </Link>
       <nav className="w-full bg-white rounded-3xl py-4 px-3 flex flex-col text-normal-text shadow-md max-h-[82vh] overflow-y-auto s1-thin-scroll">

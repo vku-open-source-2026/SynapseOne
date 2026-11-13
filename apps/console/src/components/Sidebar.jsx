@@ -54,7 +54,7 @@ export default function Sidebar() {
     >
       <Link to="/" className="my-6 mt-8 ml-2 flex items-center gap-2">
         <BrandSymbol className="h-8 w-8 shrink-0" />
-        <p className="whitespace-nowrap text-xl xl:text-2xl font-semibold bg-gradient-to-b from-main-start to-main-end bg-clip-text text-transparent">
+        <p className="whitespace-nowrap text-xl xl:text-2xl font-semibold bg-gradient-to-b from-[#0A72C4] to-[#4FACFE] bg-clip-text text-transparent">
           {m.console.title}
         </p>
       </Link>

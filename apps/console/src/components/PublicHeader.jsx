@@ -38,7 +38,7 @@ export default function PublicHeader() {
           className="flex items-center gap-2 text-xl font-semibold text-s1-fg"
         >
           <BrandSymbol className="h-8 w-8 shrink-0" />
-          <span className="bg-gradient-to-b from-main-start to-main-end bg-clip-text text-transparent">synapseone</span>
+          <span className="bg-gradient-to-b from-[#0A72C4] to-[#4FACFE] bg-clip-text text-transparent">synapseone</span>
         </Link>
         <nav className="hidden md:flex items-center gap-1 text-sm">
           {LINKS.map((l) => (
