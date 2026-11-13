@@ -86,7 +86,7 @@ jobs:
           ok=0
           for attempt in 1 2; do
             echo "docker compose up — attempt ${attempt}"
-            if docker compose up -d --build postgres redis s3 s3-init iam workflow queue inference ocs gateway; then
+            if docker compose up -d --build postgres valkey s3 s3-init iam workflow queue inference ocs gateway; then
               ok=1
               break
             fi
