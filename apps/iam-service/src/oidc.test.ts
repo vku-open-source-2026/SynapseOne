@@ -15,6 +15,8 @@ import jwt from 'jsonwebtoken';
 import { createApp } from './index';
 import { __clearOidcCache, assertOidcConfig, isPublicHttpsUrl } from './oidc';
 import { getJwtSecret } from './tokens';
+import { createOrganization, upsertUser, ensureTables } from './db';
+import { beginTotpEnrolment, enableTotp } from './mfa';
 
 let base = '';
 let server: Server | null = null;
@@ -77,7 +79,7 @@ interface Stub {
 /** Minimal OIDC provider: discovery + JWKS + token endpoint signing `alg`. */
 async function startStubIdp(
   alg: 'RS256' | 'HS256',
-  opts: { noEmail?: boolean; wrongIssuer?: boolean; unknownKid?: boolean; email?: string; sub?: string } = {},
+  opts: { noEmail?: boolean; wrongIssuer?: boolean; unknownKid?: boolean; wrongNonce?: boolean; email?: string; sub?: string } = {},
 ): Promise<Stub> {
   const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
   const privPem = privateKey.export({ format: 'pem', type: 'pkcs8' }) as string;
@@ -85,11 +87,17 @@ async function startStubIdp(
   pubJwk.kid = 'stub-k1';
   pubJwk.alg = 'RS256';
   pubJwk.use = 'sig';
+  let lastNonce = '';
   const srv = http.createServer((req, res) => {
     const send = (code: number, obj: any) => {
       res.writeHead(code, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(obj));
     };
+    if (String(req.url || '').startsWith('/authorize')) {
+      const u = new URL(String(req.url), 'http://stub.local');
+      lastNonce = u.searchParams.get('nonce') || '';
+      return send(200, { ok: true });
+    }
     if (req.url === '/.well-known/openid-configuration') {
       const iss = `http://127.0.0.1:${(srv.address() as any).port}/`;
       return send(200, {
@@ -114,7 +122,7 @@ async function startStubIdp(
             : { algorithm: 'HS256', expiresIn: 300 };
         // jsonwebtoken v9: sign(payload, secretOrPrivateKey, options)
         const key = alg === 'RS256' ? privPem : 'weak-shared-secret';
-        const claims: any = { iss, aud: 'test-client', sub: opts.sub || 'stub-sub-1', name: 'Stub User' };
+        const claims: any = { iss, aud: 'test-client', sub: opts.sub || 'stub-sub-1', name: 'Stub User', nonce: opts.wrongNonce ? 'wrong-nonce' : lastNonce };
         if (!opts.noEmail) claims.email = opts.email || 'SSO@Example.COM';
         const idToken = (jwt as any).sign(claims, key, signOpts);
         send(200, { id_token: idToken, token_type: 'Bearer', expires_in: 300 });
@@ -128,6 +136,15 @@ async function startStubIdp(
   return { url, close: () => new Promise<void>((resolve) => srv.close(() => resolve())) };
 }
 
+async function begin(stub: Stub, org: string) {
+  const start = await call('GET', `/v1/auth/oidc/start?org=${encodeURIComponent(org)}`);
+  assert.equal(start.status, 200, JSON.stringify(start.data));
+  // Simulate the browser hitting the IdP authorize endpoint so the stub can
+  // carry the nonce into the ID token (real IdPs echo it from the request).
+  await fetch(String(start.data.authorizeUrl));
+  return start;
+}
+
 describe('oidc authorization code flow (stub IdP)', () => {
   it('/start returns a signed state bound to the org', async () => {
     const stub = await startStubIdp('RS256');
@@ -137,6 +154,10 @@ describe('oidc authorization code flow (stub IdP)', () => {
       assert.equal(r.status, 200);
       assert.ok(r.data.authorizeUrl.includes('/authorize'));
       assert.ok(r.data.authorizeUrl.includes(encodeURIComponent('test-client')));
+      const u = new URL(r.data.authorizeUrl);
+      assert.equal(u.searchParams.get('code_challenge_method'), 'S256');
+      assert.ok(u.searchParams.get('code_challenge'));
+      assert.ok(u.searchParams.get('nonce'));
       const parts = String(r.data.state).split('.');
       assert.equal(parts.length, 2); // payload.hmac (unsigned legacy states are rejected)
     } finally {
@@ -148,7 +169,7 @@ describe('oidc authorization code flow (stub IdP)', () => {
     const stub = await startStubIdp('RS256');
     try {
       setIdp(stub.url);
-      const start = await call('GET', '/v1/auth/oidc/start?org=ssoorg');
+      const start = await begin(stub, 'ssoorg');
       const cb = await call('POST', '/v1/auth/oidc/callback', { code: 'opaque-code', state: start.data.state });
       assert.equal(cb.status, 200);
       assert.ok(cb.data.accessToken);
@@ -168,7 +189,7 @@ describe('oidc authorization code flow (stub IdP)', () => {
     const stubA = await startStubIdp('RS256');
     try {
       setIdp(stubA.url);
-      const startA = await call('GET', '/v1/auth/oidc/start?org=joinsorg');
+      const startA = await begin(stubA, 'joinsorg');
       const cbA = await call('POST', '/v1/auth/oidc/callback', { code: 'opaque-code', state: startA.data.state });
       assert.equal(cbA.status, 200); // first login founds the org
     } finally {
@@ -177,7 +198,7 @@ describe('oidc authorization code flow (stub IdP)', () => {
     const stubB = await startStubIdp('RS256', { email: 'intruder@example.com', sub: 'stub-sub-2' });
     try {
       setIdp(stubB.url);
-      const startB = await call('GET', '/v1/auth/oidc/start?org=joinsorg');
+      const startB = await begin(stubB, 'joinsorg');
       const cbB = await call('POST', '/v1/auth/oidc/callback', { code: 'opaque-code', state: startB.data.state });
       assert.equal(cbB.status, 403);
       assert.equal(cbB.data.error, 'org_membership_required');
@@ -193,10 +214,9 @@ describe('oidc authorization code flow (stub IdP)', () => {
       try {
         setIdp(stub.url);
         const blocked = await call('GET', '/v1/auth/oidc/start?org=otherorg');
-        const r = await call('POST', '/v1/auth/oidc/callback', { code: 'opaque-code', state: blocked.data.state });
-        assert.equal(r.status, 403);
-        assert.equal(r.data.error, 'org_not_allowed');
-        const allowed = await call('GET', '/v1/auth/oidc/start?org=allowedorg');
+        assert.equal(blocked.status, 403);
+        assert.equal(blocked.data.error, 'org_not_allowed');
+        const allowed = await begin(stub, 'allowedorg');
         const ok = await call('POST', '/v1/auth/oidc/callback', { code: 'opaque-code', state: allowed.data.state });
         assert.equal(ok.status, 200);
       } finally {
@@ -204,6 +224,42 @@ describe('oidc authorization code flow (stub IdP)', () => {
       }
     } finally {
       delete process.env.OIDC_ALLOWED_ORGS;
+    }
+  });
+
+  it('does not bypass local MFA for an OIDC user with an enrolled factor', async () => {
+    const stub = await startStubIdp('RS256', { email: 'mfa-sso@example.com', sub: 'mfa-sso-sub' });
+    try {
+      setIdp(stub.url);
+      await ensureTables();
+      const org = await createOrganization(`mfaoidc${Date.now()}`, 'MFA OIDC', 'tenant');
+      const user = await upsertUser(org.id, 'mfa-sso@example.com', 'MFA SSO');
+      const start = await beginTotpEnrolment(user.id);
+      assert.ok(start);
+      const codes = await enableTotp(user.id);
+      const callback = await begin(stub, org.slug);
+      const cb = await call('POST', '/v1/auth/oidc/callback', { code: 'opaque-code', state: callback.data.state });
+      assert.equal(cb.status, 401);
+      assert.equal(cb.data.error, 'mfa_required');
+      assert.ok(cb.data.mfaToken);
+      assert.equal(cb.data.accessToken, undefined);
+      const verify = await call('POST', '/v1/auth/mfa/verify', { mfaToken: cb.data.mfaToken, recoveryCode: codes[0] });
+      assert.equal(verify.status, 200);
+      assert.ok(verify.data.accessToken);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it('requires an explicit organization at /start', async () => {
+    const stub = await startStubIdp('RS256');
+    try {
+      setIdp(stub.url);
+      const r = await call('GET', '/v1/auth/oidc/start');
+      assert.equal(r.status, 400);
+      assert.equal(r.data.error, 'oidc_org_required');
+    } finally {
+      await stub.close();
     }
   });
 
@@ -238,11 +294,24 @@ describe('oidc authorization code flow (stub IdP)', () => {
     }
   });
 
+  it('ID token nonce mismatch is rejected', async () => {
+    const stub = await startStubIdp('RS256', { wrongNonce: true });
+    try {
+      setIdp(stub.url);
+      const start = await begin(stub, 'ssoorg');
+      const r = await call('POST', '/v1/auth/oidc/callback', { code: 'x', state: start.data.state });
+      assert.equal(r.status, 502);
+      assert.equal(r.data.error, 'oidc_bad_nonce');
+    } finally {
+      await stub.close();
+    }
+  });
+
   it('symmetric (HS256) IdP tokens are refused', async () => {
     const stub = await startStubIdp('HS256');
     try {
       setIdp(stub.url);
-      const start = await call('GET', '/v1/auth/oidc/start?org=ssoorg');
+      const start = await begin(stub, 'ssoorg');
       const r = await call('POST', '/v1/auth/oidc/callback', { code: 'x', state: start.data.state });
       assert.equal(r.status, 502);
       assert.equal(r.data.error, 'oidc_bad_id_token');
@@ -282,7 +351,7 @@ describe('oidc authorization code flow (stub IdP)', () => {
     const stub = await startStubIdp('RS256', { unknownKid: true });
     try {
       setIdp(stub.url);
-      const start = await call('GET', '/v1/auth/oidc/start?org=ssoorg');
+      const start = await begin(stub, 'ssoorg');
       const r = await call('POST', '/v1/auth/oidc/callback', { code: 'x', state: start.data.state });
       assert.equal(r.status, 502);
       assert.equal(r.data.error, 'oidc_unknown_kid');
@@ -295,7 +364,7 @@ describe('oidc authorization code flow (stub IdP)', () => {
     const stub = await startStubIdp('RS256', { noEmail: true });
     try {
       setIdp(stub.url);
-      const start = await call('GET', '/v1/auth/oidc/start?org=ssoorg');
+      const start = await begin(stub, 'ssoorg');
       const r = await call('POST', '/v1/auth/oidc/callback', { code: 'x', state: start.data.state });
       assert.equal(r.status, 502);
       assert.equal(r.data.error, 'oidc_no_email');

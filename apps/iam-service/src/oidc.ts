@@ -8,7 +8,7 @@
  * signature verification via JWKS + node:crypto JWK import + jsonwebtoken.
  */
 import jwt from 'jsonwebtoken';
-import { createHmac, randomBytes, createPublicKey, timingSafeEqual } from 'crypto';
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, createPublicKey, timingSafeEqual } from 'crypto';
 import { getJwtSecret } from './tokens';
 
 export interface OidcSettings {
@@ -146,14 +146,48 @@ function stateSecret(): string {
   return process.env.OIDC_STATE_SECRET || getJwtSecret();
 }
 
-/** state = base64url({org,t,n}).hmac — HMAC key is OIDC_STATE_SECRET (fallback JWT secret). */
-export function signState(org: string): string {
-  const payload = b64u({ org, t: Date.now(), n: randomBytes(16).toString('hex') });
-  const sig = createHmac('sha256', stateSecret()).update(payload).digest('hex');
-  return `${payload}.${sig}`;
+function stateKey(): Buffer {
+  return createHash('sha256').update(stateSecret()).digest();
 }
 
-export function verifyState(state: string): { org: string } {
+/** Encrypt the PKCE verifier inside the signed state. The browser can read
+ *  the state string but cannot recover the verifier without the server key. */
+function sealVerifier(verifier: string): string {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', stateKey(), iv);
+  const enc = Buffer.concat([cipher.update(verifier, 'utf8'), cipher.final()]);
+  return [iv, cipher.getAuthTag(), enc].map((b) => b.toString('base64url')).join('.');
+}
+
+function openVerifier(sealed: string): string {
+  const [ivRaw, tagRaw, encRaw] = String(sealed || '').split('.');
+  if (!ivRaw || !tagRaw || !encRaw) throw new OidcError('oidc_bad_state', 'Invalid OIDC state (PKCE).', 400);
+  try {
+    const decipher = createDecipheriv('aes-256-gcm', stateKey(), Buffer.from(ivRaw, 'base64url'));
+    decipher.setAuthTag(Buffer.from(tagRaw, 'base64url'));
+    return Buffer.concat([decipher.update(Buffer.from(encRaw, 'base64url')), decipher.final()]).toString('utf8');
+  } catch {
+    throw new OidcError('oidc_bad_state', 'Invalid OIDC state (PKCE decrypt).', 400);
+  }
+}
+
+/** Create signed state carrying org + nonce + encrypted PKCE verifier. */
+export function createOidcState(org: string): { state: string; nonce: string; codeChallenge: string } {
+  const nonce = randomBytes(16).toString('hex');
+  const verifier = randomBytes(32).toString('base64url');
+  const codeChallenge = createHash('sha256').update(verifier).digest('base64url');
+  const payload = b64u({
+    org,
+    t: Date.now(),
+    n: randomBytes(16).toString('hex'),
+    nonce,
+    v: sealVerifier(verifier),
+  });
+  const sig = createHmac('sha256', stateSecret()).update(payload).digest('hex');
+  return { state: `${payload}.${sig}`, nonce, codeChallenge };
+}
+
+export function verifyState(state: string): { org: string; nonce: string; verifier: string } {
   const parts = String(state || '').split('.');
   if (parts.length !== 2 || !parts[0] || !parts[1]) {
     throw new OidcError('oidc_bad_state', 'Invalid OIDC state (format).', 400);
@@ -180,7 +214,14 @@ export function verifyState(state: string): { org: string } {
   if (typeof payload.t !== 'number' || Date.now() - payload.t > STATE_TTL_MS || payload.t > Date.now() + 60_000) {
     throw new OidcError('oidc_state_expired', 'OIDC state expired — restart login.', 400);
   }
-  return { org: payload.org };
+  if (typeof payload.nonce !== 'string' || !/^[a-f0-9]{16,128}$/.test(payload.nonce)) {
+    throw new OidcError('oidc_bad_state', 'Invalid OIDC state (nonce).', 400);
+  }
+  const verifier = openVerifier(payload.v);
+  if (!/^[A-Za-z0-9_-]{43,128}$/.test(verifier)) {
+    throw new OidcError('oidc_bad_state', 'Invalid OIDC state (verifier).', 400);
+  }
+  return { org: payload.org, nonce: payload.nonce, verifier };
 }
 
 // ---------- discovery + JWKS (short-TTL caches) ----------
@@ -273,7 +314,7 @@ export interface VerifiedIdentity {
   displayName: string;
 }
 
-async function verifyIdToken(idToken: string, doc: any, clientId: string, issuer: string): Promise<any> {
+async function verifyIdToken(idToken: string, doc: any, clientId: string, issuer: string, expectedNonce: string): Promise<any> {
   const parts = idToken.split('.');
   if (parts.length !== 3) throw new OidcError('oidc_bad_id_token', 'Malformed ID token.', 502);
   let header: any;
@@ -296,17 +337,27 @@ async function verifyIdToken(idToken: string, doc: any, clientId: string, issuer
   } catch {
     throw new OidcError('oidc_bad_jwk', 'IdP JWK could not be imported.', 502);
   }
+  let claims: any;
   try {
-    return jwt.verify(idToken, pem, { algorithms: [header.alg], issuer, audience: clientId });
+    claims = jwt.verify(idToken, pem, { algorithms: [header.alg], issuer, audience: clientId, clockTolerance: 60 });
   } catch (e: any) {
     throw new OidcError('oidc_bad_id_token', `ID token verification failed: ${e?.message || e}`, 502);
   }
+  const gotNonce = Buffer.from(typeof claims?.nonce === 'string' ? claims.nonce : '');
+  const wantNonce = Buffer.from(expectedNonce);
+  if (gotNonce.length !== wantNonce.length || !timingSafeEqual(gotNonce, wantNonce)) {
+    throw new OidcError('oidc_bad_nonce', 'ID token nonce mismatch.', 502);
+  }
+  if (claims?.azp && claims.azp !== clientId) {
+    throw new OidcError('oidc_bad_azp', 'ID token authorized party mismatch.', 502);
+  }
+  return claims;
 }
 
 // ---------- full exchange ----------
 
 export async function exchangeCode(code: string, state: string): Promise<VerifiedIdentity> {
-  const { org } = verifyState(state);
+  const { org, nonce, verifier } = verifyState(state);
   if (!code || typeof code !== 'string' || code.length > 4096) {
     throw new OidcError('oidc_code_required', 'Authorization `code` is required.', 400);
   }
@@ -325,6 +376,7 @@ export async function exchangeCode(code: string, state: string): Promise<Verifie
     redirect_uri: cfg.redirectUri,
     client_id: cfg.clientId,
     client_secret: cfg.clientSecret,
+    code_verifier: verifier,
   });
   const tok: any = await fetchJson(
     doc.token_endpoint,
@@ -334,7 +386,7 @@ export async function exchangeCode(code: string, state: string): Promise<Verifie
   if (!tok || typeof tok.id_token !== 'string') {
     throw new OidcError('oidc_token_failed', 'IdP did not return an ID token.', 502);
   }
-  const claims: any = await verifyIdToken(tok.id_token, doc, cfg.clientId, cfg.issuer);
+  const claims: any = await verifyIdToken(tok.id_token, doc, cfg.clientId, cfg.issuer, nonce);
   const email = String(claims.email || '').trim().toLowerCase();
   if (!email || email.length > 320 || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
     throw new OidcError('oidc_no_email', 'IdP did not release an email claim (check client scopes).', 502);

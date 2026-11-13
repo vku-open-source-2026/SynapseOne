@@ -4,7 +4,7 @@
  * Copyright 2026 SynapseOne Contributors
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Link, Navigate, useNavigate } from 'react-router-dom';
 import { useAuth } from '../lib/auth.jsx';
 import { api, baseUrl } from '../lib/api.js';
@@ -23,21 +23,40 @@ export default function Login() {
   const [mfa, setMfa] = useState(null); // { token } after 401 mfa_required
   const [mfaCode, setMfaCode] = useState('');
   const [useRecovery, setUseRecovery] = useState(false);
+  const [sso, setSso] = useState(null);
   const { auth, login, loginWithKey, completeMfa } = useAuth();
   const nav = useNavigate();
   const { m } = useI18n();
   const t = m.login;
 
+  useEffect(() => {
+    let alive = true;
+    api.oidcConfig()
+      .then((cfg) => { if (alive) setSso(cfg); })
+      .catch(() => { if (alive) setSso(null); });
+    return () => { alive = false; };
+  }, []);
+
   if (auth) return <Navigate to="/dashboard" replace />;
+
+  const orgSlug = org.trim().toLowerCase();
+  const ssoAvailable = sso ? (sso.ssoAvailable ?? sso.issuerPublic) !== false : null;
 
   const submitSso = async () => {
     setErr(null);
+    if (!orgSlug) {
+      setErr(new Error(t.orgRequired));
+      return;
+    }
     setBusy(true);
     try {
-      const start = await api.oidcStart(org || 'acme');
-      if (!start || typeof start.authorizeUrl !== 'string' || !start.authorizeUrl) {
+      const start = await api.oidcStart(orgSlug);
+      if (!start || typeof start.authorizeUrl !== 'string' || !start.authorizeUrl || !start.state) {
         throw new Error(t.ssoMissing);
       }
+      // Bind the signed state to this browser tab; the callback refuses a
+      // state that was not issued by this tab (login CSRF protection).
+      try { sessionStorage.setItem('synapseone.oidc.state', String(start.state)); } catch { /* storage blocked */ }
       window.location.href = start.authorizeUrl;
     } catch (ex) {
       setErr(ex);
@@ -49,7 +68,10 @@ export default function Login() {
     setErr(null);
     setBusy(true);
     try {
-      if (mode === 'email') await login(email, org || 'acme', password);
+      if (mode === 'email') {
+        if (!orgSlug) throw new Error(t.orgRequired);
+        await login(email, orgSlug, password);
+      }
       else {
         if (!apiKey) throw new Error(t.enterKey);
         loginWithKey(apiKey);
@@ -176,12 +198,16 @@ export default function Login() {
         <button
           type="button"
           onClick={submitSso}
-          disabled={busy}
-          className="w-full py-2.5 rounded-2xl text-sm font-medium bg-background text-main-text disabled:opacity-60 disabled:cursor-wait inline-flex items-center justify-center gap-2"
+          disabled={busy || ssoAvailable === false}
+          className="w-full py-2.5 rounded-2xl text-sm font-medium bg-background text-main-text disabled:opacity-60 disabled:cursor-not-allowed inline-flex items-center justify-center gap-2"
+          title={ssoAvailable === false ? t.ssoUnavailable : undefined}
         >
           {busy && <span className="sdx-spinner h-4 w-4 border-2" />}
-          {busy ? t.redirecting : t.sso}
+          {busy ? t.redirecting : ssoAvailable === false ? t.ssoUnavailable : t.sso}
         </button>
+        {ssoAvailable === false && (
+          <p className="text-xs text-amber-600 mt-2">{t.ssoUnavailableHint}</p>
+        )}
         <p className="text-xs text-normal-text mt-4 text-center">
           {t.note}
           <br />

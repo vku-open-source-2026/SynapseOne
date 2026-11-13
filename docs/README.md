@@ -20,6 +20,7 @@
 | [ai-assistant.md](ai-assistant.md) | AI testing assistant (agent design, models, limits, chatbot) |
 | [monitoring.md](monitoring.md) | Prometheus (run, targets, alerts, useful queries) |
 | [production.md](production.md) | Production checklist (secrets, TLS, backups, image pinning) |
+| [authentication-sso.md](authentication-sso.md) | Public SSO/OIDC: activation, security invariants, verification, error reference |
 | [sdk-js.md](sdk-js.md) | JavaScript/TypeScript SDK — install, auth, full API reference |
 | [sdk-python.md](sdk-python.md) | Python SDK — install, auth, full API reference |
 | [sdk-go.md](sdk-go.md) | Go SDK — install, auth, full API reference |

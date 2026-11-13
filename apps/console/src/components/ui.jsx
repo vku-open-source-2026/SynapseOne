@@ -196,6 +196,94 @@ const ERROR_COPY = {
     title: 'Mã kích hoạt không hợp lệ',
     message: 'Mã đã hết hạn hoặc đã được dùng. Nhờ admin cấp mã mới.',
   },
+  mfa_required: {
+    title: 'Cần xác thực MFA',
+    message: 'Nhập mã từ ứng dụng authenticator để hoàn tất đăng nhập.',
+  },
+  oidc_token_failed: {
+    title: 'IdP không trả về ID token',
+    message: 'Kiểm tra cấu hình client, redirect URI và scope openid/email/profile.',
+  },
+  oidc_bad_id_token: {
+    title: 'ID token không hợp lệ',
+    message: 'Chữ ký, issuer, audience hoặc thời hạn của ID token không hợp lệ.',
+  },
+  oidc_unknown_kid: {
+    title: 'Không tìm thấy khóa ký IdP',
+    message: 'kid trong ID token không có trong JWKS. Kiểm tra signing key của provider.',
+  },
+  oidc_bad_azp: {
+    title: 'ID token sai client',
+    message: 'Authorized party (azp) không khớp client ID. Kiểm tra cấu hình OIDC.',
+  },
+  oidc_no_email: {
+    title: 'IdP không trả về email',
+    message: 'Bật scope email và trả email claim trong provider.',
+  },
+  oidc_no_sub: {
+    title: 'IdP không trả về subject',
+    message: 'ID token thiếu claim sub. Kiểm tra cấu hình provider.',
+  },
+  oidc_callback_failed: {
+    title: 'Đăng nhập SSO thất bại',
+    message: 'Callback xử lý lỗi. Thử lại hoặc dùng mật khẩu.',
+  },
+  sso_unavailable: {
+    title: 'SSO chưa sẵn sàng',
+    message: 'Identity provider chưa được public HTTPS. Dùng đăng nhập bằng mật khẩu hoặc liên hệ quản trị viên.',
+  },
+  oidc_org_required: {
+    title: 'Chưa chọn tổ chức',
+    message: 'Nhập organization slug trước khi đăng nhập bằng SSO.',
+  },
+  oidc_discovery_failed: {
+    title: 'Không kết nối được IdP SSO',
+    message: 'Identity provider chưa sẵn sàng hoặc cấu hình issuer chưa đúng. Dùng mật khẩu hoặc thử lại sau.',
+  },
+  oidc_unreachable: {
+    title: 'Không kết nối được IdP SSO',
+    message: 'Server không reachable tới identity provider. Dùng mật khẩu hoặc thử lại sau.',
+  },
+  oidc_issuer_mismatch: {
+    title: 'Cấu hình SSO không nhất quán',
+    message: 'Issuer trong discovery document không khớp với OIDC_ISSUER. Liên hệ quản trị viên.',
+  },
+  oidc_endpoint_origin: {
+    title: 'Cấu hình SSO không an toàn',
+    message: 'Endpoint IdP không cùng origin với issuer. Liên hệ quản trị viên.',
+  },
+  oidc_insecure_endpoint: {
+    title: 'Cấu hình SSO không an toàn',
+    message: 'Endpoint IdP phải dùng HTTPS trong production.',
+  },
+  oidc_bad_state: {
+    title: 'Phiên SSO không hợp lệ',
+    message: 'State đã hết hạn hoặc không hợp lệ. Bắt đầu đăng nhập lại.',
+  },
+  oidc_state_expired: {
+    title: 'Phiên SSO đã hết hạn',
+    message: 'Quá thời gian 10 phút. Bắt đầu đăng nhập lại.',
+  },
+  oidc_bad_nonce: {
+    title: 'Phản hồi SSO không hợp lệ',
+    message: 'Nonce trong ID token không khớp. Bắt đầu đăng nhập lại.',
+  },
+  oidc_email_unverified: {
+    title: 'Email IdP chưa xác minh',
+    message: 'Identity provider trả về email chưa verified. Liên hệ quản trị viên IdP.',
+  },
+  oidc_not_configured: {
+    title: 'SSO chưa được cấu hình',
+    message: 'OIDC client secret hoặc issuer chưa được cấu hình trên server.',
+  },
+  oidc_code_required: {
+    title: 'Thiếu mã đăng nhập SSO',
+    message: 'Authorization code không được gửi về. Bắt đầu đăng nhập lại.',
+  },
+  org_not_allowed: {
+    title: 'Tổ chức không được phép SSO',
+    message: 'Organization này không nằm trong OIDC_ALLOWED_ORGS. Liên hệ quản trị viên.',
+  },
   reserved_org_slug: {
     title: 'Slug tổ chức bị giữ chỗ',
     message: 'Slug này dành riêng cho platform administration. Chọn slug khác.',

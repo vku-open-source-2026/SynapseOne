@@ -24,7 +24,7 @@ echo "[le] 1/4 build + up edge http-only (xin cert can :80)..."
 $DC up -d --build nginx gateway console
 sleep 8
 
-ARGS="-d ${DOMAIN} -d cloud.${DOMAIN} -d api.${DOMAIN} -d synapsedx.sbs -d cloud.synapsedx.sbs -d api.synapsedx.sbs -d synapsecity.sbs -d sos.synapsecity.sbs -d contribution.synapsecity.sbs"
+ARGS="-d ${DOMAIN} -d cloud.${DOMAIN} -d api.${DOMAIN} -d auth.${DOMAIN} -d synapsedx.sbs -d cloud.synapsedx.sbs -d api.synapsedx.sbs -d synapsecity.sbs -d sos.synapsecity.sbs -d contribution.synapsecity.sbs"
 if [ "$STAGING" = "1" ]; then ARGS="$ARGS --staging"; fi
 
 echo "[le] 2/4 certonly webroot..."
@@ -41,4 +41,5 @@ echo "[le] 4/4 kiem tra..."
 curl -sk -o /dev/null -w "cloud: %{http_code}\n" "https://cloud.${DOMAIN}/config.js" || true
 curl -sk -o /dev/null -w "root : %{http_code}\n" "https://${DOMAIN}/" || true
 curl -sk -o /dev/null -w "api  : %{http_code}\n" "https://api.${DOMAIN}/health" || true
+curl -sk -o /dev/null -w "auth : %{http_code}\n" "https://auth.${DOMAIN}/application/o/synapseone/.well-known/openid-configuration" || true
 echo "[le] renew dinh ky: them cron: 0 3 * * * /home/$(whoami)/SynapseOne/infra/prod/renew.sh"

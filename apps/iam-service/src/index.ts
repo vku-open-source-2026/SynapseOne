@@ -50,7 +50,7 @@ import {
 import { decideForPrincipal, managedPolicyList, MANAGED_POLICIES, type PrincipalInput } from './authz';
 import { secretsEqual, hashCandidates } from './db';
 import { ingestUsageEvents, listUsageEvents, purgeUsage, usageSummary, type UsageFilter } from './usage';
-import { assertOidcConfig, isPublicHttpsUrl, signState, exchangeCode, authorizationEndpoint, oidcSettings, OidcError } from './oidc';
+import { assertOidcConfig, isPublicHttpsUrl, createOidcState, exchangeCode, authorizationEndpoint, oidcSettings, OidcError } from './oidc';
 import {
   hashPassword, verifyPassword, passwordPolicyError, newOneTimeToken,
   resetTokenExpiry, verifyTokenExpiry, inviteTokenExpiry, PASSWORD_MAX,
@@ -1089,6 +1089,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       codeExchange: true,
       // Whether a browser can actually reach the configured IdP (public HTTPS).
       issuerPublic: isPublicHttpsUrl(cfg.issuer),
+      ssoAvailable: isPublicHttpsUrl(cfg.issuer),
       demoCallback: isDemoCallbackEnabled(),
       note: 'Federated OIDC upstream. IAM keeps the shadow user + org/account/role/policy authorization.',
     });
@@ -1096,9 +1097,25 @@ async function auditMutation(req: express.Request, action: string, resource: str
 
   app.get('/v1/auth/oidc/start', async (req, res) => {
     const cfg = oidcSettings();
-    const org = typeof req.query.org === 'string' && /^[a-z0-9-]{1,64}$/.test(req.query.org) ? req.query.org : 'acme';
-    // HMAC-signed state binds the org + a 10-minute expiry (verified in /callback).
-    const state = signState(org);
+    if (process.env.NODE_ENV === 'production' && !isPublicHttpsUrl(cfg.issuer)) {
+      return res.status(503).json({
+        error: 'sso_unavailable',
+        message: 'SSO is not available: the configured issuer is not a public HTTPS URL.',
+      });
+    }
+    const org = typeof req.query.org === 'string' ? req.query.org.trim().toLowerCase() : '';
+    if (!/^[a-z0-9-]{1,64}$/.test(org)) {
+      return res.status(400).json({
+        error: 'oidc_org_required',
+        message: 'Choose an organization before signing in with SSO.',
+      });
+    }
+    const allowed = oidcAllowedOrgs();
+    if (allowed.length && !allowed.includes(org)) {
+      return res.status(403).json({ error: 'org_not_allowed', message: `organization '${org}' is not allowed for SSO` });
+    }
+    // Signed state binds org + nonce + encrypted PKCE verifier + 10-minute expiry.
+    const { state, nonce, codeChallenge } = createOidcState(org);
     try {
       // Use the IdP's discovery document instead of guessing `<issuer>/authorize`;
       // this validates the endpoint (https + issuer origin in production).
@@ -1109,9 +1126,12 @@ async function auditMutation(req: express.Request, action: string, resource: str
         scope: 'openid email profile',
         redirect_uri: cfg.redirectUri,
         state,
+        nonce,
+        code_challenge: codeChallenge,
+        code_challenge_method: 'S256',
       });
       const sep = endpoint.includes('?') ? '&' : '?';
-      res.json({ authorizeUrl: `${endpoint}${sep}${params.toString()}`, state });
+      res.json({ authorizeUrl: `${endpoint}${sep}${params.toString()}`, state, nonce });
     } catch (e: any) {
       if (e instanceof OidcError) {
         return res.status(e.status).json({ error: e.code, message: e.message, issuer: cfg.issuer });
@@ -1143,9 +1163,21 @@ async function auditMutation(req: express.Request, action: string, resource: str
             return res.status(403).json({ error: resolved.error, message: resolved.message });
           }
           const user = await bootstrapOrgAdmin(resolved.user);
+          if (user.active === false) return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated.' });
+          // Do not silently bypass local MFA assurance. Users with an enrolled
+          // TOTP factor must complete it even when the upstream IdP signed them in.
+          if (await mfaEnabled(user.id)) {
+            const left = await lockRemaining(user.id);
+            if (left > 0) return sendLocked(res, left);
+            return sendMfaChallenge(res, user.id, 'oidc');
+          }
           const { token, expiresIn } = signAccess({ sub: user.id, email: user.email, org: user.org_id });
           const rt = newRefreshToken();
           await storeRefresh(user.id, rt.hash, refreshExpiry());
+          await logAudit({
+            actor_type: 'user', actor_id: user.id, action: 'iam:auth:login', resource: `user:${user.id}`,
+            decision: true, context: { org: user.org_id, method: 'oidc', provider: oidcSettings().provider },
+          }).catch(() => undefined);
           noStore(res);
           return res.json({ accessToken: token, expiresIn, refreshToken: rt.value, user: publicUser(user) });
         } catch (e: any) {
@@ -1178,6 +1210,8 @@ async function auditMutation(req: express.Request, action: string, resource: str
         return res.status(403).json({ error: resolved.error, message: resolved.message });
       }
       const user = await bootstrapOrgAdmin(resolved.user);
+      if (user.active === false) return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated.' });
+      if (await mfaEnabled(user.id)) return sendMfaChallenge(res, user.id, 'oidc');
       const { token, expiresIn } = signAccess({ sub: user.id, email: user.email, org: user.org_id });
       const rt = newRefreshToken();
       await storeRefresh(user.id, rt.hash, refreshExpiry());
