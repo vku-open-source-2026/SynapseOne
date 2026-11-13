@@ -24,6 +24,7 @@ export default function Login() {
   const [mfaCode, setMfaCode] = useState('');
   const [useRecovery, setUseRecovery] = useState(false);
   const [sso, setSso] = useState(null);
+  const [orgError, setOrgError] = useState('');
   const { auth, login, loginWithKey, completeMfa } = useAuth();
   const nav = useNavigate();
   const { m } = useI18n();
@@ -45,9 +46,10 @@ export default function Login() {
   const submitSso = async () => {
     setErr(null);
     if (!orgSlug) {
-      setErr(new Error(t.orgRequired));
+      setOrgError(t.orgRequired);
       return;
     }
+    setOrgError('');
     setBusy(true);
     try {
       const start = await api.oidcStart(orgSlug);
@@ -69,7 +71,12 @@ export default function Login() {
     setBusy(true);
     try {
       if (mode === 'email') {
-        if (!orgSlug) throw new Error(t.orgRequired);
+        if (!orgSlug) {
+          setOrgError(t.orgRequired);
+          setBusy(false);
+          return;
+        }
+        setOrgError('');
         await login(email, orgSlug, password);
       }
       else {
@@ -163,7 +170,14 @@ export default function Login() {
               <Field label={t.org}>
                 {/* Not `required`: the submit handler explains the missing org in the
                     selected locale instead of the browser's generic tooltip. */}
-                <Input value={org} onChange={(e) => setOrg(e.target.value)} placeholder="your-org" autoComplete="organization" />
+                <Input
+                  value={org}
+                  onChange={(e) => { setOrg(e.target.value); if (orgError) setOrgError(''); }}
+                  placeholder="your-org"
+                  autoComplete="organization"
+                  aria-invalid={orgError ? 'true' : undefined}
+                />
+                {orgError && <p className="text-xs text-red-600 mt-1" role="alert">{orgError}</p>}
               </Field>
               <Field label={t.password}>
                 <Input
