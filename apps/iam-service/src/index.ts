@@ -860,6 +860,9 @@ export function createApp(): express.Express {
   }
   const app = express();
   app.disable('x-powered-by');
+  // IAM sits behind the gateway/edge; trust exactly one proxy hop so the
+  // brute-force limiter keys on the real client, never silently on the gateway.
+  if (process.env.NODE_ENV === 'production' || process.env.TRUST_PROXY === '1') app.set('trust proxy', 1);
   // Baseline security headers (no extra dep; API-only service).
   app.use((_req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
