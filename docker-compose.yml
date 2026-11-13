@@ -419,7 +419,7 @@ services:
     ports:
       - "${BASE_SERVICE_HOST_PORT:-127.0.0.1:4005}:4005"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:4005/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "/usr/local/bin/synapseone-base", "--healthcheck"]
       interval: 15s
       timeout: 5s
       retries: 5
