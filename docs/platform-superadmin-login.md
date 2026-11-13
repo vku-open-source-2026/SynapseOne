@@ -12,6 +12,30 @@ recovery codes are stored only in the Git-ignored file:
 > account and must never be copied to a production deployment. The stack binds
 > to `127.0.0.1` only.
 
+## Production account (current)
+
+The live production stack uses the normal SynapseOne login and the same Console
+origin. The account credentials are local-only and must never be committed.
+
+| Field | Value |
+|---|---|
+| Console login URL | <https://cloud.synapseone.space/login> |
+| Super Admin Dashboard | <https://cloud.synapseone.space/admin/overview> |
+| API / Gateway | <https://api.synapseone.space> |
+| Email / username | `platform.owner@synapseone.space` |
+| Organization slug | `synapseone-platform` |
+| Platform role | `owner` |
+| Account status | **Active**, TOTP MFA enabled |
+| Credential file | `/home/phamngoclananh30032009/OLP_OSS_2026/SynapseOne/.local/platform-superadmin-production-credentials.txt` |
+
+The production account was created through the internal bootstrap endpoint,
+activated with a one-time invite code, and enrolled in TOTP MFA. It is a member
+of the reserved platform organization and is **not** a tenant org administrator.
+Use `/admin/audit` for platform-wide audit and `/audit` only as an org admin.
+
+The isolated local development account below remains separate from production.
+Its database, ports and credentials are not shared with the production stack.
+
 ## Login information
 
 | Field | Value |
