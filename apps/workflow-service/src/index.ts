@@ -1490,6 +1490,11 @@ function runnerHeartbeatSeconds(): number {
   return Math.min(Math.max(Number.isFinite(n) ? n : 15, 5), 300);
 }
 
+function runnerLongPollSeconds(): number {
+  const n = Number(process.env.WORKFLOW_RUNNER_LONGPOLL_SECONDS || 20);
+  return Math.min(Math.max(Number.isFinite(n) ? n : 20, 0), 20);
+}
+
 function runnerStaleAfterSeconds(): number {
   const n = Number(process.env.WORKFLOW_RUNNER_STALE_SECONDS || 60);
   return Math.min(Math.max(Number.isFinite(n) ? n : 60, 30), 3600);
@@ -1513,6 +1518,7 @@ function runnerOptions(): any {
     },
     kinds: ['workflow', 'inference', 'hybrid'],
     heartbeatIntervalSeconds: runnerHeartbeatSeconds(),
+    longPollSeconds: runnerLongPollSeconds(),
     staleAfterSeconds: runnerStaleAfterSeconds(),
     maxConcurrency: runnerMaxConcurrency(),
     visibilityTimeoutSeconds: queueVisibilitySeconds(),
@@ -2735,6 +2741,7 @@ function tenantBinding(
       },
       apiBaseUrl: runnerPublicUrl(),
       heartbeatIntervalSeconds: runnerHeartbeatSeconds(),
+      longPollSeconds: runnerLongPollSeconds(),
       staleAfterSeconds: runnerStaleAfterSeconds(),
       pollIntervalMs: 500,
       visibilityTimeoutSeconds: queueVisibilitySeconds(),

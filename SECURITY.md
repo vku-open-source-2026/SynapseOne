@@ -36,7 +36,7 @@
    NO brute-force protection on `/v1/auth/*` (login/refresh). Never expose
    IAM/workflow directly.
 10. Track CVEs of external engines and pin images: Authentik, PostgreSQL,
-    Redis (see `docker-compose.yml`).
+    Valkey (see `docker-compose.yml`).
 11. Console stores the session token in `localStorage` (XSS-readable by design for a
     static SPA). Mitigate with a strict CSP on your reverse proxy, keep dependencies
     patched, and use short `IAM_JWT_EXPIRES_IN` + refresh rotation (already atomic).

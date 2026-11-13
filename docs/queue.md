@@ -6,7 +6,7 @@ acknowledge, retry or dead-letter each delivery. It is designed for
 **at-least-once** processing between services and background workers.
 
 - Service: `apps/queue-service` · port **4007** · gateway prefix `/v1/queue`
-- Storage: Redis (`QUEUE_REDIS_URL` / `REDIS_URL`) with an in-memory fallback
+- Storage: Valkey (`QUEUE_VALKEY_URL` / `QUEUE_REDIS_URL`, falling back to `VALKEY_URL` / `REDIS_URL`) with an in-memory fallback
   for dev/tests
 - Auth: gateway JWT/API key (`either`); direct calls need
   `x-synapseone-internal: <SYNAPSEONE_INTERNAL_SECRET>` when configured
@@ -284,7 +284,7 @@ constraint:
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/v1/queue/queues/:queue/consume` | Lease 1..100 ready messages |
+| `POST` | `/v1/queue/queues/:queue/consume` | Lease 1..100 ready messages (optionally long-poll) |
 | `POST` | `/v1/queue/queues/:queue/ack` | Ack one receipt or up to 100 |
 | `POST` | `/v1/queue/queues/:queue/nack` | Retry or dead-letter a delivery |
 | `POST` | `/v1/queue/queues/:queue/heartbeat` | Extend a lease |
@@ -292,7 +292,7 @@ constraint:
 ### Consume
 
 ```json
-{"maxMessages": 10, "visibilityTimeoutSeconds": 60, "consumer": "mailer-1"}
+{"maxMessages": 10, "visibilityTimeoutSeconds": 60, "consumer": "mailer-1", "waitSeconds": 20}
 ```
 
 | Field | Meaning |
@@ -300,6 +300,7 @@ constraint:
 | `maxMessages` | 1..100, default 1 |
 | `visibilityTimeoutSeconds` | 1..3600, default = queue config |
 | `consumer` | optional label (≤128 printable chars); defaults to the principal's `sub`, else `worker` |
+| `waitSeconds` | 0..20, default 0. Block until a message is ready (long-poll) instead of returning an empty batch immediately |
 
 Response:
 
@@ -308,6 +309,8 @@ Response:
   "queue": "emails",
   "count": 1,
   "visibilityTimeoutSeconds": 60,
+  "waitedMs": 12,
+  "waitSeconds": 20,
   "messages": [
     {
       "id": "...",
@@ -332,8 +335,28 @@ Response:
   before `leaseExpiresAt`.
 - If a lease expires, the message is moved back to pending (with its current
   attempt count) and can be delivered again.
-- Empty result → `200` with `count: 0` and `messages: []`. Polling with a short
-  sleep is expected; long-polling is not supported.
+- Empty result → `200` with `count: 0` and `messages: []`. With `waitSeconds: 0`
+  (default) the call returns immediately.
+
+### Long-poll (blocking dequeue)
+
+`waitSeconds` turns consume into a Celery/SQS-style blocking dequeue:
+
+- the request parks in queue-service until a message is published, a delayed
+  message becomes due, a lease expires, or the budget elapses;
+- new messages are announced over Valkey pub/sub, so every replica wakes at
+  once and the wake-up is O(1) (no scan loop);
+- delayed retries (`nack` with `delaySeconds`) and visibility timeouts are not
+  announced: the waiter computes the next pending/lease deadline and sleeps
+  exactly that long;
+- `waitedMs` reports how long the request was held, and `waitSeconds` is echoed
+  when non-zero.
+
+`waitSeconds` is capped at 20 so a blocked request always answers before the
+gateway's 30s upstream timeout. Use it from worker fleets; keep `0` for
+interactive reads (Console, tests, request/response APIs). An idle worker costs
+one request every 20s instead of one per second — roughly 60× less gateway,
+IAM-verification and queue work per worker.
 
 ### Ack
 
@@ -492,7 +515,7 @@ All errors use `{error, message}`.
 | 404 | `not_found`, `receipt_not_found`, `dead_message_not_found` | missing queue/receipt/dead letter |
 | 409 | `conflict` | caller-supplied message `id` already exists |
 | 413 | `payload_too_large` | payload or HTTP body exceeds the limit |
-| 503 | `storage_unavailable` | Redis connection lost |
+| 503 | `storage_unavailable` | Valkey connection lost |
 | 500 | `internal` | unexpected server error |
 
 ## Limits
@@ -644,10 +667,10 @@ _, err = c.ReplayDeadMessage("emails", id, 0, true)
   `synapseone_queue_backend_info{backend="redis"|"memory"}`,
   `synapseone_queue_http_requests_total{key="METHOD|route|status"}`,
   `synapseone_queue_process_uptime_seconds`
-- Production requires `SYNAPSEONE_INTERNAL_SECRET` and `QUEUE_REDIS_URL` (or
-  `REDIS_URL`). Without Redis the service uses a per-process in-memory store —
+- Production requires `SYNAPSEONE_INTERNAL_SECRET` and `QUEUE_VALKEY_URL`
+  (or `QUEUE_REDIS_URL` / `VALKEY_URL` / `REDIS_URL`). Without a Valkey URL the service uses a per-process in-memory store —
   fine for local development, but replicas would not share messages.
-- Redis keys live under `synapseone:queue:v1:<tenant>:`; do not write that
+- Valkey keys live under `synapseone:queue:v1:<tenant>:`; do not write that
   namespace directly. Queue metadata and messages are separate hashes/sorted
   sets, so `DEL`-ing a queue prefix by hand can corrupt in-flight leases.
 - Scale consumers freely: consume is atomic per message and leases guarantee

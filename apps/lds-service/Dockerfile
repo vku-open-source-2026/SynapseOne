@@ -1,18 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 VKU.VIC
-FROM node:20-alpine
-WORKDIR /app
-COPY package.json package-lock.json* ./
-RUN npm install --production=false || npm install
-COPY tsconfig.json ./
+FROM rust:1-bookworm AS builder
+WORKDIR /workspace
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY drizzle ./drizzle
-RUN npm run build \
-  && rm -f dist/*.test.js dist/*.test.d.ts \
-  && npm prune --omit=dev \
-  && chown -R node:node /app
+RUN cargo build --release --locked
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --create-home app
+COPY --from=builder /workspace/target/release/synapseone-lds /usr/local/bin/synapseone-lds
+
 ENV PORT=4004
 EXPOSE 4004
-# Least privilege: never run as root (ports >1024, no need for root).
-USER node
-CMD ["node", "dist/index.js"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/synapseone-lds", "--healthcheck"]
+
+USER app
+ENTRYPOINT ["/usr/local/bin/synapseone-lds"]

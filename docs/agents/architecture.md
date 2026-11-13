@@ -19,7 +19,7 @@ Browser / CLI / SDK
  :4001  :4002  :4004 :4005  :4006   :4007
     │      │      │      │                 │
     └──────┴──────┴──────┴─── Postgres 16 ─┘
-                  Redis 7 (Faststore + Queue)
+                  Valkey 8 (Faststore + Queue)
                   S3-compatible object storage (SynapseOCS)
 ```
 
@@ -42,7 +42,7 @@ Browser / CLI / SDK
 | Workflow | workflow definitions, DAG execution, triggers, executions, encrypted credentials | global authz (uses IAM nodes when needed) |
 | LDS | datasources, attribute registry, records, NGSI-LD exports, license headers | tenant identity (from gateway headers) |
 | Base | collections, mappings, documents, queries, vector search, change feed | authn |
-| Faststore | Redis data structures, TTLs, counters, locks | durability beyond Redis |
+| Faststore | Valkey data structures, TTLs, counters, locks | durability beyond the cache |
 | Queue | queue configs, publish/consume leases, retries, DLQ | exactly-once delivery |
 | AI | Console API-docs assistant; picks an endpoint + fills a try-it form | public API, authorization decisions |
 | Inference | OpenAI-compatible chat proxy, embeddings, Decision-2.0 routing | tenant data |
@@ -147,7 +147,7 @@ else                     -> "user:<sub>"
   caller's org. Anonymous direct calls keep a dev/test global view.
 - **LDS** datasources are org/account-bound; cross-tenant access returns 404
   rather than 403 to avoid existence leaks. Anonymous export is public-only.
-- **Faststore/Queue** keys are namespaced by tenant, so one Redis can serve all
+- **Faststore/Queue** keys are namespaced by tenant, so one Valkey can serve all
   tenants without key collisions.
 
 ## 5. Data plane
@@ -168,13 +168,13 @@ the `drizzle` schema; services create tables at startup.
 Migrations run on startup under a per-service PostgreSQL advisory lock. Never
 edit an applied migration; add a new one.
 
-### Redis
+### Valkey
 
 - Faststore keys: `synapseone:faststore:v1:<tenant>:...`; locks use
   `...:__lock__:<name>` and token-owned release/extend.
 - Queue keys: `synapseone:queue:v1:<tenant>:...`; sorted sets + hashes + Lua make
-  consume/ack/nack atomic. One Redis can back both services.
-- Gateway does **not** currently use Redis (edge limiting is in-memory).
+  consume/ack/nack atomic. One Valkey can back both services.
+- Gateway does **not** currently use Valkey/Redis (edge limiting is in-memory).
 
 ### Object storage
 
@@ -187,7 +187,7 @@ returned key instead of embedding base64 data URLs.
 
 Every stateful service falls back to an in-memory store when its backend env is
 missing. This is for unit tests/dev only; production boot rejects missing
-`DATABASE_URL` (IAM, Workflow, LDS, Base) and missing Redis URL (Faststore,
+`DATABASE_URL` (IAM, Workflow, LDS, Base) and missing Valkey URL (Faststore,
 Queue) to avoid split-brain behavior.
 
 ## 6. Gateway routing details

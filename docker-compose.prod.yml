@@ -4,7 +4,7 @@
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 # Edge cong khai duy nhat: nginx :80/:443 (synapseone.space, cloud.*, api.* + LE).
 # Moi service khac bind 127.0.0.1 qua .env (debug local), khong public.
-# Authentik/s3/postgres/redis: chi trong network noi bo.
+# Authentik/s3/postgres/valkey: chi trong network noi bo.
 
 services:
   gateway:
@@ -81,7 +81,8 @@ services:
       NODE_ENV: production
       HSTS_ENABLED: "true"
       # Durable engine + explicit CORS + internal secret (fail-closed at boot).
-      STREAM_ENGINE: redis
+      # `valkey` is an alias for the Redis-Streams engine.
+      STREAM_ENGINE: valkey
       CORS_ORIGIN: ${CORS_ORIGIN:?CORS_ORIGIN must be set in production}
       SYNAPSEONE_INTERNAL_SECRET: ${SYNAPSEONE_INTERNAL_SECRET:?SYNAPSEONE_INTERNAL_SECRET must be set in production}
     ports: !reset []

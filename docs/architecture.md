@@ -29,7 +29,7 @@
                            │                 │ LLM         │ licensed
                            │                 │ (OpenRouter)│ JSON-LD
                     ┌───────▼───────┐      ┌──▼─────────┐ ┌─▼──────────┐
-                    │ Postgres/Redis│      │  Postgres  │ │  Postgres  │
+                    │Postgres/Valkey│      │  Postgres  │ │  Postgres  │
                     │ SeaweedFS (S3)│      │ workflows+ │ │ lds_*      │
                     └───────────────┘      │ executions │ │ tables     │
                                            └────────────┘ └────────────┘
@@ -39,8 +39,8 @@ Data services (same gateway, same tenant model):
 
 ```
  Gateway ──┬──▶ Base      :4005  documents + object↔data mapping ──▶ Postgres
-           ├──▶ Faststore :4006  cache / KV / data structures    ──▶ Redis
-           └──▶ Queue     :4007  at-least-once messaging         ──▶ Redis
+           ├──▶ Faststore :4006  cache / KV / data structures    ──▶ Valkey
+           └──▶ Queue     :4007  at-least-once messaging         ──▶ Valkey
 ```
 
 Backups (no extra dependency, data stays on the host):
@@ -64,7 +64,7 @@ Backups (no extra dependency, data stays on the host):
   the shadow user plus all authorization data.
 - **Tokens**: short-lived JWT (Bearer), rotating opaque refresh tokens, long-lived
   `synapseone_...` API keys (hash + prefix), service accounts for workloads.
-- **Core data cluster**: Postgres 16 (source of truth), Redis (cache/rate-limit/session,
+- **Core data cluster**: Postgres 16 (source of truth), Valkey (cache/rate-limit/session,
   and the Faststore/Queue backends), SeaweedFS (S3-compatible object storage, bucket
   `synapseone-core`; OCS exposes it at `/v1/ocs` and legacy `/v1/storage`; point
   `STORAGE_S3_*` at AWS S3 instead if wanted). Daily `pg-backup` dumps and
@@ -94,13 +94,13 @@ Backups (no extra dependency, data stays on the host):
   a change feed. Postgres is the source of truth; an in-memory backend keeps local
   development dependency-free. Collections are bound to an org (optionally an account)
   and resolved inside the caller's scope.
-- **Synapse Faststore**: `faststore-service` exposes Redis as a tenant-scoped data
+- **Synapse Faststore**: `faststore-service` exposes a Valkey/Redis data API as a tenant-scoped data
   API — strings with TTLs, atomic counters, hashes, lists, sets, sorted sets, scans,
-  bulk operations and token-owned distributed locks. One Redis deployment can back it
+  bulk operations and token-owned distributed locks. One Valkey deployment can back it
   alongside the queue; keys are namespaced `synapseone:faststore:v1:<tenant>:`.
 - **SynapseQueue**: `queue-service` provides at-least-once messaging — delayed and
   deduplicated publishing, visibility-timeout leases with receipts, ack/nack/heartbeat,
-  retry budgets, dead letters and replay. Redis sorted sets + Lua make consume/ack/nack
+  retry budgets, dead letters and replay. Valkey sorted sets + Lua make consume/ack/nack
   atomic; an in-memory backend is used for dev/tests. Delivery is at-least-once by
   design, so consumers are expected to be idempotent.
 

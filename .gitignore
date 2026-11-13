@@ -54,3 +54,6 @@ Desktop.ini
 
 # local platform super admin credentials (never commit)
 .local/
+
+# Rust build output
+**/target/

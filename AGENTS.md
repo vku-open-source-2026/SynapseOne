@@ -6,9 +6,9 @@ by concern to keep context small.
 ## What this is
 
 SynapseOne v0.7.0 — Apache-2.0 "Tier-1 PaaS": one API gateway, AWS-style IAM,
-Postgres/Redis data plane + tenant-scoped object storage (S3-compatible), built-in
+Postgres/Valkey data plane + tenant-scoped object storage (S3-compatible), built-in
 workflow engine, NGSI-LD linked data (SynapseLDS), document DB (SynapseBase),
-Redis cache (Synapse Faststore), and at-least-once queue (SynapseQueue).
+Valkey cache (Synapse Faststore), and at-least-once queue (SynapseQueue).
 Clients: React Console, TypeScript/Python/Go SDKs, zero-dependency CLI.
 Authentik/Keycloak are optional external OIDC IdPs.
 
@@ -29,13 +29,19 @@ Skip: `node_modules/`, `apps/*/dist/`, `.pytest_cache/`, `.ruff_cache/`,
 
 ## Stack
 
-- Node 20 + TypeScript + Express for all platform services. `pg` for SQL; Drizzle
-  is used only for schema definitions and migrations. Platform-service tests run
-  as `node --test` on compiled JS.
+- Node 20 + TypeScript + Express for the remaining platform services (IAM,
+  Workflow, Base, Faststore, Queue, OCS, Warehouse, Gateway). `pg` for SQL;
+  Drizzle is used only for schema definitions and migrations. Platform-service
+  tests run as `node --test` on compiled JS.
+- Rust 1.82+ (Axum + Tokio) for `apps/ai-service`, `apps/stream-service`,
+  `apps/lds-service` and `apps/notifications-service`. Each has `Cargo.toml`,
+  `Cargo.lock`, a Rust `Dockerfile` and a `--healthcheck` mode. Their TypeScript
+  sources remain as the behavioural reference; the Rust binary is what ships.
+
 - React 18 + Vite + Tailwind Console (plain JSX, not TypeScript).
 - Python 3.11 FastAPI inference service (local embeddings/decision model +
   OpenRouter-compatible LLM proxy).
-- Postgres 16 (pgvector image), Redis 7, SeaweedFS (S3-compatible) in Compose.
+- Postgres 16 (pgvector image), Valkey 8 (Redis-protocol), SeaweedFS (S3-compatible) in Compose.
 - Every stateful service has an in-memory fallback for dev/tests; production
   boot fails if the real backend or internal secret is missing.
 
@@ -49,9 +55,9 @@ Skip: `node_modules/`, `apps/*/dist/`, `.pytest_cache/`, `.ruff_cache/`,
 | `apps/ai-service` | Console API-docs assistant (guidance-only) | 4003 | OpenRouter |
 | `apps/lds-service` | SynapseLDS NGSI-LD datasources + licensed exports | 4004 | Postgres / memory |
 | `apps/base-service` | SynapseBase document DB + mapping + vector search | 4005 | Postgres / memory |
-| `apps/faststore-service` | Synapse Faststore cache/KV/data structures/locks | 4006 | Redis / memory |
-| `apps/queue-service` | SynapseQueue messaging, leases, retries, DLQ | 4007 | Redis / memory |
-| `apps/stream-service` | SynapseStream tenant-scoped event log | 4009 | Redis Streams / memory |
+| `apps/faststore-service` | Synapse Faststore cache/KV/data structures/locks | 4006 | Valkey / memory |
+| `apps/queue-service` | SynapseQueue messaging, leases, retries, DLQ | 4007 | Valkey / memory |
+| `apps/stream-service` | SynapseStream tenant-scoped event log | 4009 | Valkey Streams / memory |
 | `apps/warehouse-service` | Synapse Warehouse OLAP datasets, SQL queries, batch/stream ETL | 4012 | DuckDB files / memory |
 | `apps/ocs-service` | SynapseOCS objects, multipart, presign, quotas | 4010 | S3 / filesystem |
 | `apps/notifications-service` | SynapseNotifications outbox, templates, preferences, delivery | 4011 | Postgres / memory + queue |
@@ -59,10 +65,10 @@ Skip: `node_modules/`, `apps/*/dist/`, `.pytest_cache/`, `.ruff_cache/`,
 | `apps/console` | Admin UI | 3000 (nginx :80) | calls gateway |
 | `pg-backup` (compose) | daily pg_dump of platform + Authentik DBs (`tools/backup/pg-backup.sh`) | — | volume `pgbackups` |
 | `s3-backup` (compose) | daily incremental object snapshots (`tools/backup/s3-backup.mjs`, OCS image) | — | volume `s3backups` |
-| `sdks/sdk-js`, `sdks/sdk-python`, `sdks/sdk-go` | Client SDKs | — | — |
+| `sdks/sdk-js`, `sdks/sdk-python`, `sdks/sdk-go`, `sdks/sdk-rust` | Client SDKs | — | — |
 | `tools/cli` | `synapseone` CLI (zero deps, Node 18+) | — | — |
 
-Infra: Postgres 5432, Redis 6379, S3 9090 (SeaweedFS), Prometheus 9091. In
+Infra: Postgres 5432, Valkey 6379, S3 9090 (SeaweedFS), Prometheus 9091. In
 production only the gateway (and TLS edge) is public; service ports stay
 internal. Object storage requires `STORAGE_BACKEND` explicitly in production
 (`s3` with real `STORAGE_S3_*` keys, or `fs` with a durable volume).
@@ -80,7 +86,7 @@ Gateway :8080 ── route match from apps/gateway/routes.yaml
 IAM / Workflow / LDS / Base / Faststore / Queue / AI / Inference
         │ derive tenant from stamped org/account/user
         ▼
-Postgres · Redis · S3-compatible object storage · notification relays
+Postgres · Valkey · S3-compatible object storage · notification relays
 ```
 
 ## Non-negotiable invariants
@@ -94,7 +100,7 @@ Postgres · Redis · S3-compatible object storage · notification relays
 3. **Tenant scope is org-first**: `org:<id>` > `account:<id>` > `user:<sub>`.
    Cross-tenant reads return 404/403; do not leak existence.
 4. **Production is fail-closed**: weak/missing JWT secret, missing internal
-   secret, or missing `DATABASE_URL`/Redis for stateful services must abort boot.
+   secret, or missing `DATABASE_URL`/Valkey for stateful services must abort boot.
 5. **LDS `core` metadata (`_core` in projector comments) is never serialized.**
    The NGSI-LD projector is a structural allowlist over `entity` + registered
    `attributes` only.
@@ -122,6 +128,8 @@ Postgres · Redis · S3-compatible object storage · notification relays
 make bootstrap                 # copy .env.example → .env, install workspaces
 make build                     # tsc/build all workspaces (needed before tests)
 make test                      # node --test on compiled dist/*.test.js
+# Rust services (ai, stream, lds, notifications): test inside the toolchain image
+docker run --rm -v "$PWD/apps/stream-service":/app -w /app rust:1-bookworm cargo test
 make license-check             # copyleft gate + SBOM
 make compose-up                # full platform (docker compose)
 make compose-down
@@ -161,6 +169,14 @@ E2E helpers: `bash tests/e2e/api-check.sh`, `node tests/e2e/services-check.js`,
   compatible backend. The runner HTTP client retries transient failures,
   supports HTTP(S)_PROXY/NO_PROXY and `SYNAPSEONE_CA_CERT`, verifies the API key
   and required scopes at startup, and reports actionable DNS/TLS/proxy errors.
+  Runners pull with a **blocking consume** (`waitSeconds`, default 20s from
+  `GET /v1/workflow-runners/:id/config`, `WORKFLOW_RUNNER_LONGPOLL_SECONDS`
+  to override): queue-service parks the request and wakes it over Valkey
+  pub/sub, so an idle lane costs ~3 requests/min instead of 60. Delayed
+  retries/lease expiry are timed with `nextActivityAt`; if pub/sub is
+  unavailable the API degrades to short polls. Runner loops back off
+  exponentially with jitter and never consume more messages than free slots
+  (no message stranded for the visibility timeout).
   Tests stay inline because they do not set
   `QUEUE_SERVICE_URL`/`NODE_ENV=production`; the
   `tests/e2e/workflow-runner-e2e.mjs` gate asserts `transport=queue`, runs

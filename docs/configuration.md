@@ -39,7 +39,7 @@ reads which key (audited from source):
 | `HSTS_ENABLED` | `false` | `true` → send `Strict-Transport-Security` (only behind TLS) |
 | `TRUST_PROXY` | `false` | Express trust-proxy: unset/`0` = direct exposure; `1` behind one nginx/Ingress hop; or a CIDR/name list. `true` is rejected (XFF spoofing). |
 | `INFERENCE_RATE_LIMIT_PER_MIN` | `60` | per-tenant AI/inference quota; `429` + `Retry-After` when exceeded |
-| `REDIS_URL` | — (memory) | `redis://...` → Redis-backed rate limiting (shared across replicas, fail-open when Redis is down) |
+| `VALKEY_URL` / `REDIS_URL` | — (memory) | `redis://...` → Redis-protocol backend for services that opt in (legacy name `REDIS_URL` still honoured). The gateway's edge limiter is in-memory. |
 | `GATEWAY_HOST_PORT` | 8080 | host port (compose only) |
 
 ## IAM (`apps/iam-service`)
@@ -148,7 +148,7 @@ attributes default-deny; visibility is resolved at read time from the registry
 | Key | Default | Meaning |
 |---|---|---|
 | `PORT` | 4006 | listen port (gateway route `/v1/faststore`, auth `either`) |
-| `FASTSTORE_REDIS_URL` | falls back to `REDIS_URL` | `redis://...` → Redis backend; **required in production** |
+| `FASTSTORE_VALKEY_URL` | falls back to `FASTSTORE_REDIS_URL`, `VALKEY_URL`, `REDIS_URL` | `redis://...` → Valkey backend (Redis protocol); **required in production** |
 | `SYNAPSEONE_INTERNAL_SECRET` | — (dev) | requires a matching `x-synapseone-internal` header on every `/v1/*` — blocks direct `:4006` bypass |
 | `HSTS_ENABLED` / `CORS_ORIGIN` | `false` / — | same semantics as the other services |
 | `FASTSTORE_SERVICE_HOST_PORT` | `127.0.0.1:4006` | compose host binding |
@@ -158,7 +158,7 @@ attributes default-deny; visibility is resolved at read time from the registry
 | Key | Default | Meaning |
 |---|---|---|
 | `PORT` | 4007 | listen port (gateway route `/v1/queue`, auth `either`) |
-| `QUEUE_REDIS_URL` | falls back to `REDIS_URL` | `redis://...` → Redis backend; **required in production** (an in-memory queue would split-brain across replicas) |
+| `QUEUE_VALKEY_URL` | falls back to `QUEUE_REDIS_URL`, `VALKEY_URL`, `REDIS_URL` | `redis://...` → Valkey backend (Redis protocol); **required in production** (an in-memory queue would split-brain across replicas) |
 | `QUEUE_MAX_PAYLOAD_BYTES` | 262144 | max serialized message payload, clamped 1024..1048576 |
 | `SYNAPSEONE_INTERNAL_SECRET` | — (dev) | requires a matching `x-synapseone-internal` header on every `/v1/*` — blocks direct `:4007` bypass |
 | `HSTS_ENABLED` / `CORS_ORIGIN` | `false` / — | same semantics as the other services |
@@ -176,8 +176,8 @@ API-key traffic of one org share the `org:<id>` namespace and usage attribution 
 | Key | Default | Meaning |
 |---|---|---|
 | `PORT` | 4009 | listen port (gateway route `/v1/stream`) |
-| `STREAM_ENGINE` | derives from Redis | `redis`/`memory`/registered driver; **`memory` is forbidden in production** |
-| `STREAM_REDIS_URL` | falls back to `REDIS_URL` | durable engine URL; required in production when `STREAM_ENGINE` is unset |
+| `STREAM_ENGINE` | derives from the URL | `valkey`/`redis` (same engine)/`memory`/registered driver; **`memory` is forbidden in production** |
+| `STREAM_VALKEY_URL` | falls back to `STREAM_REDIS_URL`, `VALKEY_URL`, `REDIS_URL` | durable engine URL; required in production when `STREAM_ENGINE` is unset |
 | `STREAM_MAX_PAYLOAD_BYTES` | 262144 | max message payload |
 | `SYNAPSEONE_INTERNAL_SECRET` | — | required in production (boot aborts without it) |
 | `CORS_ORIGIN` | — | required in production (wildcard CORS is rejected) |
@@ -232,8 +232,19 @@ See `docs/notifications.md`. Key settings: `DATABASE_URL` (required in productio
 
 ## Core data / external engines
 
-Postgres (`POSTGRES_*`; IAM, workflow, LDS and Base), Redis (`REDIS_URL`; gateway
-rate limiting, Faststore and Queue), Authentik (`AUTHENTIK_*`, host ports
+> **Valkey, not Redis.** The datastore is [Valkey](https://valkey.io) 8 (BSD-3,
+> Linux Foundation). It is wire-compatible with Redis 7: the same client
+> library, Lua scripts, Streams and pub/sub work unchanged, and it loads an
+> existing Redis AOF/RDB. Redis 7.4+ switched to a non-OSI licence, so the
+> platform no longer ships it. Preferred env names are `VALKEY_URL`,
+> `FASTSTORE_VALKEY_URL`, `QUEUE_VALKEY_URL`, `STREAM_VALKEY_URL`; the
+> `*_REDIS_URL` names remain supported as aliases. In compose the service is
+> `valkey` and the volume keeps its original name (`redisdata`) so an in-place
+> upgrade preserves data.
+
+Postgres (`POSTGRES_*`; IAM, workflow, LDS and Base), Valkey (`VALKEY_URL`;
+Faststore, Queue and Stream; `REDIS_URL` is still accepted as the legacy alias and
+the URL keeps the `redis://` scheme), Authentik (`AUTHENTIK_*`, host ports
 `AUTHENTIK_HTTP_PORT=19000`), object storage = SeaweedFS (`s3` service; its only
 identity is `STORAGE_S3_ACCESS_KEY`/`STORAGE_S3_SECRET_KEY`, falling back to
 `S3_ACCESS_KEY`/`S3_SECRET_KEY`; host port `S3_HOST_PORT=9090`; data volume

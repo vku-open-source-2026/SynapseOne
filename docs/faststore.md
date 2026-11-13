@@ -1,11 +1,11 @@
 # Synapse Faststore — cache, key/value and data structures
 
-Synapse Faststore is the platform's Redis-backed data-structure service: string
+Synapse Faststore is the platform's Valkey-backed (Redis-protocol) data-structure service: string
 keys with TTLs, atomic counters, hashes, lists, sets, sorted sets, bulk reads,
 key scans and distributed locks — all tenant-scoped.
 
 - Service: `apps/faststore-service` · port **4006** · gateway prefix `/v1/faststore`
-- Storage: Redis (`FASTSTORE_REDIS_URL` / `REDIS_URL`) with an in-memory fallback
+- Storage: Valkey (`FASTSTORE_VALKEY_URL` / `FASTSTORE_REDIS_URL`, falling back to `VALKEY_URL` / `REDIS_URL`) with an in-memory fallback
   for dev/tests
 - Auth: gateway JWT/API key (`either`); direct calls need
   `x-synapseone-internal: <SYNAPSEONE_INTERNAL_SECRET>` when configured
@@ -438,7 +438,7 @@ if acquired, _ := lock["acquired"].(bool); acquired {
   `synapseone_faststore_http_requests_total{key="METHOD|route|status"}`,
   `synapseone_faststore_process_uptime_seconds`
 - Production requires `SYNAPSEONE_INTERNAL_SECRET` and
-  `FASTSTORE_REDIS_URL` (or `REDIS_URL`). Without Redis the service uses a
+  `FASTSTORE_VALKEY_URL` (or `FASTSTORE_REDIS_URL` / `VALKEY_URL` / `REDIS_URL`). Without a Valkey/Redis URL the service uses a
   per-process in-memory store — fine for local development, not for replicas.
-- Redis keys live under `synapseone:faststore:v1:<tenant>:`; do not write that
+- Valkey keys live under `synapseone:faststore:v1:<tenant>:`; do not write that
   namespace directly.

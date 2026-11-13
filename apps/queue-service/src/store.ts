@@ -107,7 +107,10 @@ interface Envelope {
 // Backend selection
 // ---------------------------------------------------------------------------
 
-const REDIS_URL = process.env.QUEUE_REDIS_URL || process.env.REDIS_URL || '';
+// Valkey is the deployed datastore; it speaks the Redis protocol, so the
+// client and the legacy env names stay unchanged. VALKEY_URL wins.
+const REDIS_URL = process.env.QUEUE_VALKEY_URL || process.env.VALKEY_URL
+  || process.env.QUEUE_REDIS_URL || process.env.REDIS_URL || '';
 let redis: Redis | null = null;
 let connecting: Promise<boolean> | null = null;
 
@@ -127,15 +130,15 @@ export async function initStore(): Promise<boolean> {
       enableOfflineQueue: false,
       retryStrategy: () => null,
     });
-    client.on('error', (e: any) => console.error('[queue][redis]', e?.message || e));
+    client.on('error', (e: any) => console.error('[queue][valkey]', e?.message || e));
     try {
       await client.connect();
       await client.ping();
       redis = client;
-      console.log('[queue] connected to Redis');
+      console.log('[queue] connected to Valkey');
       return true;
     } catch (e: any) {
-      console.warn('[queue] Redis unavailable, using in-memory fallback:', e?.message || e);
+      console.warn('[queue] Valkey unavailable, using in-memory fallback:', e?.message || e);
       client.disconnect();
       redis = null;
       return false;
@@ -149,6 +152,19 @@ export async function initStore(): Promise<boolean> {
 }
 
 export async function closeStore(): Promise<void> {
+  // Release parked long-polls so their HTTP handlers can finish.
+  for (const set of [...signalWaiters.values(), ...memSignals.values()]) {
+    for (const fn of [...set]) {
+      try { fn(); } catch { /* ignore */ }
+    }
+  }
+  signalWaiters.clear();
+  channelSubs.clear();
+  memSignals.clear();
+  if (signalSubscriber) {
+    signalSubscriber.disconnect();
+    signalSubscriber = null;
+  }
   if (redis) {
     redis.disconnect();
     redis = null;
@@ -302,6 +318,12 @@ function memMessage(q: MemQueue, id: string): InternalMessage | null {
 }
 
 export function __clearQueueMem(): void {
+  for (const set of [...memSignals.values()]) {
+    for (const fn of [...set]) {
+      try { fn(); } catch { /* ignore */ }
+    }
+  }
+  memSignals.clear();
   memQueues.clear();
 }
 
@@ -473,6 +495,7 @@ export async function publishMessage(tenant: string, name: string, input: Publis
     q.pending.set(id, availableAt);
     if (input.dedupeKey) q.dedupe.set(input.dedupeKey, id);
     q.counters.published += 1;
+    announce(tenant, name);
     return { id, duplicate: false, message: memMessage(q, id)! };
   }
 
@@ -497,6 +520,7 @@ export async function publishMessage(tenant: string, name: string, input: Publis
   const duplicate = String(out?.[1] || '0') === '1';
   const message = duplicate ? await getMessage(tenant, name, resultId) : await getMessage(tenant, name, id);
   if (!message) throw new QueueError('conflict', 'message could not be read after publish');
+  if (!duplicate) announce(tenant, name);
   return { id: resultId, duplicate, message };
 }
 
@@ -620,6 +644,188 @@ const CONSUME_LUA = `
   end
   return out
 `;
+
+// ---------------------------------------------------------------------------
+// Blocking dequeue (long-poll) support
+// ---------------------------------------------------------------------------
+//
+// `consume` is still the only way to take a message; a long-poll just parks
+// the caller until work exists instead of polling once per second. New work is
+// announced over Redis pub/sub (one subscriber connection per process, every
+// replica receives it) and, when the backend is in-memory, through a local
+// waiter set. Delayed messages and expired leases are not announced: the HTTP
+// layer bounds each wait with `nextActivityAt`, the earliest pending message
+// or lease deadline, so both are picked up at the right time without a scan
+// loop.
+
+export interface ActivitySignal {
+  /** Resolves true when new activity was announced. */
+  signalled: Promise<boolean>;
+  /** Remove the waiter (idempotent; safe after the signal fired). */
+  cancel(): void;
+}
+
+const MAX_SIGNAL_WAIT_MS = 25000;
+let signalSubscriber: Redis | null = null;
+let signalConnecting: Promise<Redis | null> | null = null;
+const signalWaiters = new Map<string, Set<() => void>>();
+const channelSubs = new Map<string, Promise<boolean>>();
+const memSignals = new Map<string, Set<() => void>>();
+
+function signalChannel(tenant: string, name: string): string {
+  return `${keysFor(tenant, name).prefix}signal`;
+}
+
+/** Dedicated subscriber connection: a subscribed client cannot run commands,
+ *  so it must never be the shared one. */
+async function subscriber(): Promise<Redis | null> {
+  if (!REDIS_URL) return null;
+  if (signalSubscriber) return signalSubscriber;
+  if (signalConnecting) return signalConnecting;
+  signalConnecting = (async () => {
+    const client = new Redis(REDIS_URL, {
+      lazyConnect: true,
+      connectTimeout: 2000,
+      maxRetriesPerRequest: null,
+      enableOfflineQueue: true,
+    });
+    client.on('error', (e: any) => console.error('[queue][valkey][subscribe]', e?.message || e));
+    client.on('message', (channel: string) => {
+      const set = signalWaiters.get(channel);
+      if (!set) return;
+      for (const fn of [...set]) {
+        try { fn(); } catch { /* a waiter must never break the others */ }
+      }
+    });
+    try {
+      await client.connect();
+      await client.ping();
+      signalSubscriber = client;
+      return client;
+    } catch (e: any) {
+      console.warn('[queue] pub/sub subscriber unavailable, long-poll will fall back to short polls:', e?.message || e);
+      client.disconnect();
+      return null;
+    }
+  })();
+  try {
+    return await signalConnecting;
+  } finally {
+    signalConnecting = null;
+  }
+}
+
+function resolveLocal(key: string): void {
+  const set = memSignals.get(key);
+  if (!set) return;
+  memSignals.delete(key);
+  for (const fn of [...set]) {
+    try { fn(); } catch { /* ignore */ }
+  }
+}
+
+/** Wake local waiters and every queue-service replica. Fire-and-forget: a
+ *  publish failure must never fail the write that caused it. */
+function announce(tenant: string, name: string): void {
+  resolveLocal(memKey(tenant, name));
+  if (!redis) return;
+  void redis.publish(signalChannel(tenant, name), String(Date.now())).catch(() => undefined);
+}
+
+/**
+ * Register a waiter *before* scanning the queue. The caller then consumes; if
+ * that scan is empty it awaits `signalled`, so work published in between is
+ * never missed (the classic register-before-check pattern).
+ *
+ * Returns null when the pub/sub subscriber is unavailable: callers must then
+ * behave like a short poll instead of holding the request.
+ */
+export async function armActivitySignal(tenant: string, name: string): Promise<ActivitySignal | null> {
+  const channel = signalChannel(tenant, name);
+  const key = memKey(tenant, name);
+  let fired = false;
+  let resolveSignal: (v: boolean) => void = () => undefined;
+  const signalled = new Promise<boolean>((resolve) => { resolveSignal = resolve; });
+
+  const detach = (): void => {
+    if (!redis) {
+      const set = memSignals.get(key);
+      set?.delete(onSignal);
+      if (set && !set.size) memSignals.delete(key);
+      return;
+    }
+    const set = signalWaiters.get(channel);
+    set?.delete(onSignal);
+    if (set && !set.size) {
+      signalWaiters.delete(channel);
+      channelSubs.delete(channel);
+      void signalSubscriber?.unsubscribe(channel).catch(() => undefined);
+    }
+  };
+  const onSignal = (): void => {
+    if (fired) return;
+    fired = true;
+    detach();
+    resolveSignal(true);
+  };
+  const cancel = (): void => {
+    if (fired) return;
+    fired = true;
+    detach();
+  };
+
+  if (!redis) {
+    let set = memSignals.get(key);
+    if (!set) { set = new Set(); memSignals.set(key, set); }
+    set.add(onSignal);
+    return { signalled, cancel };
+  }
+
+  const client = await subscriber();
+  if (!client) return null;
+  let set = signalWaiters.get(channel);
+  if (!set) { set = new Set(); signalWaiters.set(channel, set); }
+  set.add(onSignal);
+  if (!channelSubs.has(channel)) {
+    channelSubs.set(channel, (client as any).subscribe(channel).then(() => true).catch(() => false));
+  }
+  // Wait for the SUBSCRIBE acknowledgement: once it returns, a publish is
+  // delivered, so the scan that follows can no longer miss one.
+  if (!(await channelSubs.get(channel))) {
+    cancel();
+    return null;
+  }
+  return { signalled, cancel };
+}
+
+/**
+ * Earliest moment at which a queued message can become consumable: the next
+ * pending `available_at` or the next lease deadline (which `consume` reclaims
+ * automatically). Null means "nothing scheduled".
+ */
+export async function nextActivityAt(tenant: string, name: string): Promise<number | null> {
+  if (!redis) {
+    const q = memQueues.get(memKey(tenant, name));
+    if (!q) return null;
+    let min = Number.POSITIVE_INFINITY;
+    for (const at of q.pending.values()) if (at < min) min = at;
+    for (const entry of q.inflight.values()) if (entry.deadline < min) min = entry.deadline;
+    return Number.isFinite(min) ? min : null;
+  }
+  const k = keysFor(tenant, name);
+  return r(async () => {
+    const [pending, inflight] = await Promise.all([
+      redis!.zrange(k.pending, '0', '0', 'WITHSCORES'),
+      redis!.zrange(k.inflight, '0', '0', 'WITHSCORES'),
+    ]);
+    const times = [pending, inflight]
+      .map((row) => (Array.isArray(row) && row.length >= 2 ? Number(row[1]) : Number.NaN))
+      .filter((n) => Number.isFinite(n));
+    return times.length ? Math.min(...times) : null;
+  });
+}
+
+export { MAX_SIGNAL_WAIT_MS };
 
 /** Opaque, unguessable lease receipt (128 bits, base64url). */
 export function newReceipt(): string {
@@ -780,6 +986,7 @@ export async function nackMessage(
     env.available_at = availableAt;
     q.pending.set(id, availableAt);
     q.counters.retried += 1;
+    announce(tenant, name);
     return { id, state: 'retry', attempts: env.attempts || 0, availableAt };
   }
   const k = keysFor(tenant, name);
@@ -791,6 +998,7 @@ export async function nackMessage(
   if (!Array.isArray(raw) || !raw.length) return null;
   const state = String(raw[1]);
   const attempts = Number(raw[2] || 0);
+  if (state !== 'dead') announce(tenant, name);
   return state === 'dead'
     ? { id: String(raw[0]), state: 'dead', attempts, deadAt: Number(raw[3] || now) }
     : { id: String(raw[0]), state: 'retry', attempts, availableAt: Number(raw[3] || now) };
@@ -907,6 +1115,7 @@ export async function replayDeadMessage(
     q.dead.delete(id);
     q.pending.set(id, availableAt);
     q.counters.replayed += 1;
+    announce(tenant, name);
     return memMessage(q, id);
   }
   const k = keysFor(tenant, name);
@@ -914,6 +1123,7 @@ export async function replayDeadMessage(
     REPLAY_LUA, 4, k.messages, k.dead, k.pending, k.meta,
     id, String(now), String(delayMs), opts.resetAttempts ? '1' : '0',
   )));
+  if (ok === 1) announce(tenant, name);
   return ok === 1 ? getMessage(tenant, name, id) : null;
 }
 

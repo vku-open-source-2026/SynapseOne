@@ -46,10 +46,10 @@ groups:
           summary: "Postgres exporter is down"
           description: "postgres-exporter:9187 unreachable for >2m (check postgres + exporter)."
 
-      - alert: RedisDown
-        expr: up{job="redis"} == 0
+      - alert: ValkeyDown
+        expr: up{job="valkey"} == 0
         for: 2m
         labels: { severity: warning }
         annotations:
-          summary: "Redis exporter is down"
-          description: "redis-exporter:9121 unreachable for >2m (check redis + exporter)."
+          summary: "Valkey exporter is down"
+          description: "valkey-exporter:9121 unreachable for >2m (check valkey + exporter)."

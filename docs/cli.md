@@ -86,9 +86,24 @@ synapseone config
 | `--apikey <key>` | API key |
 | `--json` | Output raw JSON (script-friendly) |
 | `--context k=v` | Add context key-value (repeatable) |
-| `--file <path>` | Read JSON body from file |
-| `--data <json\|path>` | Inline JSON or JSON file for workflow input / webhook payload (alias: `--input`) |
+| `--file <path>` | Read a JSON body (or binary object for `ocs put`) from a file |
+| `--data <json\|path>` | Inline JSON or JSON file for workflow input / payloads (alias: `--input`) |
 | `--input <json\|path>` | Same as `--data` |
+| `--value <json\|text>` | Value for faststore/queue/stream/set operations (JSON when parseable) |
+| `--value-file <path>` | Read a literal string value from a file (secrets, credentials) |
+| `--ttl <seconds>` | TTL for faststore keys, queue locks/visibility |
+| `--payload <json\|text>` | Queue/stream event payload (alias: `--data`) |
+| `--output <path>` | Write binary `ocs get` output to a file |
+| `--channel <name>` | Notification channel (`email`\|`sms`\|`webhook`\|`push`\|`log`) |
+| `--to <recipient>` | Notification recipient (email, phone, or webhook URL) |
+| `--subject <s>` / `--body <s>` | Notification subject/body |
+| `--scope <s>` | Secret scope (`tenant`\|`account`\|`workflow`) |
+| `--from <ISO>` / `--to <ISO>` | Usage analytics time window |
+| `--column name:type` | Warehouse dataset column (repeatable) |
+| `--sql <query>` | Read-only warehouse SQL |
+| `--collection <name>` | Search/reindex collection filter (repeatable) |
+| `--filter k=v` | Search filter (repeatable) |
+| `--secret-version <N>` | Secret version for `secrets read`/`revoke` |
 | `--limit <N>` | Limit results (`0..9999`) |
 | `--offset <N>` | Skip N executions (`0..9999`, `0` = first page) |
 | `--workflow-id <ID>` | Filter executions by workflow (alias: `--workflow`, `--workflowId`) |
@@ -538,12 +553,18 @@ synapseone credentials delete cred_abc123
 
 ### Generic call (escape hatch)
 
+Every supported service has a first-class command group (see
+[Synapse Faststore](#synapse-faststore), [SynapseQueue](#synapsequeue),
+[SynapseStream](#synapsestream), [SynapseOCS](#synapseocs),
+[SynapseNotifications](#synapsenotifications), and
+[Inference](#inference-chat-embeddings-decision-routing)).
+Use `call` only for new endpoints that do not have a command yet.
+
 #### `call`
 ```bash
 synapseone call <METHOD> <path> [--data '{...}'|body.json] [--file body.json]
 ```
-Calls any gateway endpoint directly — forward-compat with endpoints added after
-this CLI (e.g. the proposed credentials API).
+Calls any gateway endpoint directly.
 
 ```bash
 synapseone call GET /v1/accounts/acc_abc123/credentials
@@ -784,6 +805,281 @@ synapseone base vector-search <col> --query "authentication guide" [--limit 5] [
 
 # Structured Queries
 synapseone base query <col> (--file query.json | --data '{"where":{"type":{"eq":"guide"}},"limit":10}')
+```
+
+### Synapse Faststore
+
+Tenant-scoped cache with Redis-compatible primitives. Values are JSON when
+`--value` parses as JSON, otherwise the literal string. TTLs are seconds.
+
+```bash
+# Key/value
+synapseone faststore stats
+synapseone faststore keys [--prefix cache:] [--limit 100] [--cursor 0]
+synapseone faststore get cache:demo
+synapseone faststore set cache:demo --value '{"ok":true}' --ttl 300 \
+  [--if-not-exists | --if-exists]
+synapseone faststore del cache:demo
+synapseone faststore ttl cache:demo
+synapseone faststore expire cache:demo --ttl 60
+synapseone faststore incr page:views --by 1 --ttl 3600
+synapseone faststore batch --file batch.json
+
+# Hashes
+synapseone faststore hashes set session --data '{"u1":"alice","u2":"bob"}'
+synapseone faststore hashes set session u1 --value alice
+synapseone faststore hashes get session [u1]
+synapseone faststore hashes del session [u1]
+synapseone faststore hashes incr session u1 --by 1
+synapseone faststore hashes len session
+
+# Lists
+synapseone faststore lists range jobs [--start 0] [--stop -1]
+synapseone faststore lists push jobs --values a,b [--side left|right] [--ttl 300]
+synapseone faststore lists pop jobs [--side left|right] [--count 1]
+synapseone faststore lists trim jobs --start 0 --stop 99
+synapseone faststore lists len jobs
+synapseone faststore lists del jobs
+
+# Sets
+synapseone faststore sets members tags
+synapseone faststore sets add tags --members a,b [--ttl 300]
+synapseone faststore sets remove tags --members a
+synapseone faststore sets contains tags --value a
+synapseone faststore sets card tags
+synapseone faststore sets del tags
+
+# Sorted sets
+synapseone faststore zsets add leaderboard --members alice,bob --score 10
+synapseone faststore zsets add leaderboard --data '[{"member":"alice","score":10}]'
+synapseone faststore zsets range leaderboard [--start 0] [--stop -1] [--with-scores] [--rev]
+synapseone faststore zsets score leaderboard alice
+synapseone faststore zsets rank leaderboard alice [--rev]
+synapseone faststore zsets incr leaderboard alice --by 5
+synapseone faststore zsets remove leaderboard --members alice
+synapseone faststore zsets card leaderboard
+
+# Distributed locks
+synapseone faststore locks acquire deploy:prod --ttl 30 --wait-ms 5000
+synapseone faststore locks extend deploy:prod <token> --ttl 30
+synapseone faststore locks release deploy:prod <token>
+```
+
+### SynapseQueue
+
+Queues with delayed/deduplicated publish, visibility timeouts, receipts,
+dead letters and replay.
+
+```bash
+synapseone queue [list]
+synapseone queue create emails --max-attempts 5 --visibility-timeout 30
+synapseone queue get emails
+synapseone queue stats emails
+synapseone queue purge emails
+synapseone queue delete emails
+
+# Publish
+synapseone queue send emails --payload '{"to":"a@b.c"}' \
+  [--delay 60] [--dedupe-key K] [--max-attempts 3] [--header k=v] [--id ID]
+synapseone queue send-batch emails --file messages.json
+
+# Consume → receipt → ack/nack/heartbeat
+synapseone queue consume emails [--count 10] [--wait-seconds 20] \
+  [--visibility-timeout 30] [--consumer worker-1]
+synapseone queue ack emails <receipt> [<receipt>...]
+synapseone queue nack emails <receipt> [--no-requeue] [--delay 30] [--error "boom"]
+synapseone queue heartbeat emails <receipt> [--visibility-timeout 60]
+
+# Inspect and repair
+synapseone queue peek emails [--limit 20] [--ready]
+synapseone queue dead emails [--limit 20]
+synapseone queue replay emails <message-id> [--delay 0] [--reset-attempts]
+synapseone queue rm-dead emails <message-id>
+```
+
+`queue consume` prints the `receipt` verbatim (not truncated) so it can be
+passed straight to `ack`/`nack`.
+
+### SynapseStream
+
+Append-only event topics with consumer groups.
+
+```bash
+synapseone stream [topics]
+synapseone stream create telemetry [--max-len 100000] [--retention-ms 86400000]
+synapseone stream get telemetry
+synapseone stream stats telemetry
+synapseone stream delete telemetry
+
+synapseone stream publish telemetry --payload '{"value":25.4}' \
+  [--key sensor-1] [--header k=v] [--id event-1]
+synapseone stream publish-batch telemetry --file events.json
+synapseone stream read telemetry [--from-id 0-0] [--count 100] [--block-ms 5000]
+synapseone stream range telemetry [--start -] [--end +] [--count 100]
+
+synapseone stream group create telemetry workers [--start-id '$']
+synapseone stream group read telemetry workers [--consumer w1] [--count 10] \
+  [--block-ms 5000] [--auto-ack]
+synapseone stream group ack telemetry workers <event-id>...
+synapseone stream group delete telemetry workers
+```
+
+### SynapseOCS
+
+Object storage with buckets, binary upload/download, presigned URLs and
+multipart uploads.
+
+```bash
+synapseone ocs buckets [--stats]
+synapseone ocs bucket create city-assets [--quota-bytes 1073741824]
+synapseone ocs bucket get city-assets
+synapseone ocs bucket stats city-assets
+synapseone ocs bucket delete city-assets
+
+synapseone ocs ls city-assets [--prefix maps/] [--delimiter /] [--limit 100] [--cursor C]
+synapseone ocs put city-assets maps/a.png --file ./a.png [--content-type image/png]
+synapseone ocs put city-assets notes/readme.txt --data 'hello'
+synapseone ocs get city-assets maps/a.png [--output ./a.png]
+synapseone ocs head city-assets maps/a.png
+synapseone ocs rm city-assets maps/a.png
+synapseone ocs copy city-assets src.txt dst.txt [source-bucket]
+synapseone ocs presign city-assets maps/a.png [--method GET] [--expires 3600]
+
+# Multipart
+synapseone ocs uploads create city-assets big.bin
+synapseone ocs part city-assets 1 big.bin --upload-id <id> --file part1.bin
+synapseone ocs uploads complete city-assets <id> big.bin --file parts.json
+synapseone ocs uploads abort city-assets <id> big.bin
+```
+
+Without `--output`, `ocs get` writes the object bytes to stdout (safe for
+pipes: `synapseone ocs get b key | jq .`).
+
+### SynapseNotifications
+
+Outbox-backed email/SMS/push/webhook notifications with retries and
+preferences.
+
+```bash
+synapseone notifications [list] [--status queued] [--limit 50]
+synapseone notifications get <id>
+synapseone notifications cancel <id>
+
+synapseone notifications send a@b.c --channel email --subject Hi --body Hello \
+  [--data '{"name":"Lan"}'] [--idempotency-key K]
+synapseone notifications send --to +84901234567 --channel sms --body '...'
+synapseone notifications send --to https://example.com/hook --channel webhook --body '...'
+
+synapseone notifications prefs get a@b.c
+synapseone notifications prefs set a@b.c --channels email,sms [--unsubscribed]
+synapseone notifications unsubscribe a@b.c
+```
+
+### Search
+
+Tenant-scoped search over SynapseBase documents.
+
+```bash
+synapseone search "authentication guide" [--mode fulltext|semantic|hybrid] \
+  [--collection kb] [--limit 20] [--cursor C] [--filter status=published]
+synapseone search reindex [--collection kb]... [--max-per-collection 50000]
+synapseone search status
+```
+
+`--filter k=v` is repeatable; `--filters '{"status":"published"}'` accepts a
+JSON object or file.
+
+### Secrets
+
+Versioned tenant secret vault. Values are never returned by `list`/`get`;
+`read` is an explicit, audited operation.
+
+```bash
+synapseone secrets [list]
+synapseone secrets create stripe --value-file ./secret.txt \
+  [--description 'Stripe live key'] [--scope tenant|account|workflow] [--account <id>]
+synapseone secrets get stripe
+synapseone secrets read stripe [--secret-version 2]
+synapseone secrets rotate stripe --value-file ./new.txt [--grace 86400]
+synapseone secrets revoke stripe [--secret-version 2]
+synapseone secrets delete stripe
+```
+
+### Inference: chat, embeddings, decision routing
+
+```bash
+synapseone inference health
+synapseone inference chat "summarize the incident" \
+  [--system "You are a terse SRE"] [--model <model>] [--temperature 0.7] [--max-tokens 1024]
+synapseone inference chat --file request.json
+synapseone inference embeddings "authentication guide" [--model <model>] [--dimensions 384]
+synapseone inference decision --state "..." --questions '{"intent":{"type":"choice","instructions":"Pick one","criteria":{"billing":"billing issue","tech":"technical issue"}}}'
+synapseone inference route --input "payment failed" \
+  --choice billing="billing question" --choice tech="technical issue"
+
+synapseone inference jobs [list] [--status success] [--limit 20]
+synapseone inference jobs get <id>
+synapseone inference jobs submit --job-type chat --file payload.json \
+  [--queue inference] [--wait] [--timeout-ms 120000]
+
+synapseone ai agent "What changed in the last deploy?" [--history '[...]']
+```
+
+`inference chat` prints only the assistant message by default; `--json` prints
+the full OpenAI-compatible response.
+
+### Synapse Warehouse
+
+```bash
+synapseone warehouse datasets
+synapseone warehouse dataset create incidents \
+  --column id:string --column severity:string --column opened_at:timestamp \
+  [--description D] [--mode batch|stream] [--stream-topic telemetry]
+synapseone warehouse dataset get <id>
+synapseone warehouse dataset rows <id> --file rows.json
+synapseone warehouse dataset delete <id>
+
+synapseone warehouse query --sql 'SELECT severity, count(*) FROM incidents GROUP BY 1' [--limit 200]
+synapseone warehouse templates
+
+synapseone warehouse jobs
+synapseone warehouse job create nightly --dataset incidents --mode batch \
+  --sql 'SELECT * FROM incidents' [--write-mode append|replace]
+synapseone warehouse job create ingest --dataset incidents --mode stream \
+  --stream-topic telemetry [--stream-group g] [--batch-size 100] [--interval-ms 1000]
+synapseone warehouse job get|run|pause|resume|delete <id>
+synapseone warehouse etl-batch --dataset incidents --sql '...' [--name N] [--write-mode replace]
+```
+
+### Human tasks
+
+```bash
+synapseone human-tasks [list] [--status pending] [--assignee u1] \
+  [--workflow-id wf] [--execution-id exe] [--limit 50]
+synapseone human-tasks get <id>
+synapseone human-tasks create "Approve deploy" [--description D] [--assignee u1] \
+  [--role approver]... [--deadline 2026-12-01T00:00:00Z] \
+  [--workflow-id wf] [--execution-id exe] [--node approve] [--data '{"k":"v"}']
+synapseone human-tasks claim <id>
+synapseone human-tasks approve <id> [--note "LGTM"] [--decision '{"k":"v"}']
+synapseone human-tasks reject <id> --note "missing rollback plan"
+synapseone human-tasks expire <id> [--force]
+```
+
+### Usage analytics
+
+```bash
+synapseone usage summary [--from ISO] [--to ISO] [--feature base] \
+  [--account UUID] [--actor UUID] [--method GET] [--status 200] [--status-class 4xx] [--q TEXT]
+synapseone usage events [--from ISO] [--to ISO] [--limit 200] [--offset 0]
+```
+
+### SCIM provisioning tokens
+
+```bash
+synapseone scim tokens
+synapseone scim token create [--description okta] [--scopes scim:read,scim:write] [--ttl 86400]
+synapseone scim token revoke <id>
 ```
 
 ### Webhooks (public, no auth)

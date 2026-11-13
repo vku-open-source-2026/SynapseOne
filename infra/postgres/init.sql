@@ -13,6 +13,8 @@
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 CREATE EXTENSION IF NOT EXISTS "vector";
 CREATE EXTENSION IF NOT EXISTS "postgis";
+-- Query-level observability (enabled by shared_preload_libraries in compose).
+CREATE EXTENSION IF NOT EXISTS "pg_stat_statements";
 
 -- Drizzle stores each service's migration journal here. Create it up front so
 -- concurrent first-boot migrations don't race on schema creation.

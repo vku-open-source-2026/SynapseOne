@@ -27,6 +27,11 @@ docker run -d --restart unless-stopped \
   ghcr.io/vku-open-source-2026/synapseone-workflow-runner:latest
 ```
 
+The runner uses a blocking pull loop (`consume` with `waitSeconds`, 20s by
+default) instead of polling empty queues once per second. Tune it with
+`WORKFLOW_RUNNER_LONGPOLL_SECONDS` (`0` disables long-polling) and
+`WORKFLOW_RUNNER_POLL_MS` (idle sleep when every slot is busy).
+
 Network options:
 
 - `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`

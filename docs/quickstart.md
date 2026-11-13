@@ -21,7 +21,7 @@ curl localhost:4007/health      # queue (messaging)
 ```
 
 - First pull takes a while (authentik). For a lighter start:
-  `docker compose up -d --build postgres redis s3 s3-init iam workflow base faststore queue gateway`
+  `docker compose up -d --build postgres valkey s3 s3-init iam workflow base faststore queue gateway`
   (authentik only starts when named).
 - Host port busy? Change `GATEWAY_HOST_PORT` (or any `*_HOST_PORT`) in `.env` —
   see `docs/troubleshooting.md`.
@@ -112,7 +112,7 @@ curl -s -XPOST localhost:8080/v1/queue/queues/emails/consume \
 ```
 
 Guides: [synapsebase.md](synapsebase.md) · [faststore.md](faststore.md) ·
-[queue.md](queue.md). Base persists to Postgres, Faststore and Queue to Redis;
+[queue.md](queue.md). Base persists to Postgres, Faststore and Queue to Valkey;
 without those env vars they fall back to per-process memory (dev only).
 
 ## 7. Object storage (S3)

@@ -246,8 +246,9 @@ export function createApp(): express.Express {
     if (!process.env.SYNAPSEONE_INTERNAL_SECRET) {
       throw new Error('[faststore] SYNAPSEONE_INTERNAL_SECRET must be set in production');
     }
-    if (!process.env.FASTSTORE_REDIS_URL && !process.env.REDIS_URL) {
-      throw new Error('[faststore] FASTSTORE_REDIS_URL/REDIS_URL must be set in production (in-memory fallback would split-brain)');
+    if (!process.env.FASTSTORE_VALKEY_URL && !process.env.VALKEY_URL
+      && !process.env.FASTSTORE_REDIS_URL && !process.env.REDIS_URL) {
+      throw new Error('[faststore] FASTSTORE_VALKEY_URL/VALKEY_URL (or legacy FASTSTORE_REDIS_URL/REDIS_URL) must be set in production (in-memory fallback would split-brain)');
     }
   }
   const app = express();

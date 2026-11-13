@@ -32,11 +32,25 @@ export interface PlatformAdmin {
 }
 
 const DATABASE_URL = process.env.DATABASE_URL || '';
+// Migrations and advisory-lock work need a stable Postgres session; when
+// DATABASE_URL points at PgBouncer in transaction mode they must bypass it.
+const DIRECT_DATABASE_URL = process.env.DATABASE_DIRECT_URL || DATABASE_URL;
 
 let pool: Pool | null = null;
 if (DATABASE_URL) {
   pool = new Pool({ connectionString: DATABASE_URL });
   pool.on('error', (e) => console.error('[iam][db] pool error', e.message));
+}
+
+let directPool: Pool | null = null;
+/** Small bypass pool for migrations and session-scoped advisory locks. */
+export function getDirectPool(): Pool | null {
+  if (!DIRECT_DATABASE_URL) return null;
+  if (!directPool) {
+    directPool = new Pool({ connectionString: DIRECT_DATABASE_URL, max: 2 });
+    directPool.on('error', (e) => console.error('[iam][db] direct pool error', e.message));
+  }
+  return directPool;
 }
 const baseDb: NodePgDatabase<typeof schema> | null = pool ? drizzle(pool, { schema }) : null;
 /** Request-scoped transaction context. A Proxy keeps every existing helper on
@@ -64,7 +78,7 @@ export async function ensureTables(): Promise<void> {
   if (!db || ensured) return;
   ensured = true;
   try {
-    const client = await pool!.connect();
+    const client = await getDirectPool()!.connect();
     try {
       // Hold the advisory lock on the same dedicated session that runs the
       // migration (pool connections are not guaranteed to be reused).

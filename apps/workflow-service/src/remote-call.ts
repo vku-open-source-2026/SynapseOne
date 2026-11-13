@@ -331,6 +331,7 @@ export function createRemoteSynapseOneCall(api: ReturnType<typeof createRunnerAp
           maxMessages: a.maxMessages !== undefined ? Number(a.maxMessages) : a.count !== undefined ? Number(a.count) : 1,
           consumer: a.consumer || 'workflow-runner',
           visibilityTimeoutSeconds: a.visibilityTimeoutSeconds,
+          ...(a.waitSeconds !== undefined ? { waitSeconds: Number(a.waitSeconds) } : {}),
         });
       case 'queue.ack':
         return api.request('POST', `/v1/queue/queues/${enc(a.queue, 'queue', 128)}/ack`, {

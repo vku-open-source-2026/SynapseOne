@@ -1009,20 +1009,69 @@ synapseone lds entities <id> [--limit N] [--visibility public|restricted]
 synapseone lds entity <id> <entity-id>
 synapseone lds stats <id>`;
 
-const CLI_CALL = `# Base, Faststore and Queue are available through the generic gateway call:
-synapseone call POST /v1/base/collections --data '{"name":"parks"}'
-synapseone call GET /v1/base/collections
-synapseone call PUT /v1/faststore/keys/cache:demo --data '{"value":{"ok":true},"ttlSeconds":300}'
-synapseone call POST /v1/queue/queues/emails/messages --data '{"payload":{"to":"a@b.c"}}'
+const CLI_BASE_FASTSTORE_QUEUE = `# SynapseBase
+synapseone base collections create parks
+synapseone base collections list
+synapseone base documents insert parks --id park-1 --data '{"name":"Central"}'
+synapseone base vector-search parks --query "central park" --limit 5
 
-# The same escape hatch covers LDS, Stream, OCS and Notifications:
-synapseone call GET /v1/lds/licenses
-synapseone call PUT /v1/stream/topics/telemetry --data '{"maxLen":100000}'
-synapseone call POST /v1/stream/topics/telemetry/events --data '{"payload":{"value":25.4}}'
-synapseone call POST /v1/ocs/buckets --data '{"name":"city-assets"}'
-synapseone call POST /v1/notifications --data '{"channel":"email","recipient":{"email":"a@b.c"},"subject":"Hi","body":"Hello"}'
+# Synapse Faststore
+synapseone faststore set cache:demo --value '{"ok":true}' --ttl 300
+synapseone faststore get cache:demo
+synapseone faststore hashes set session --data '{"u1":"alice"}'
+synapseone faststore lists push jobs --values a,b
+synapseone faststore sets add tags --members a,b
+synapseone faststore zsets add leaderboard --members alice,bob --score 10
+synapseone faststore locks acquire deploy:prod --ttl 30
 
-# Raw paths include gateway prefixes; use --file for larger JSON payloads.`;
+# SynapseQueue
+synapseone queue create emails --max-attempts 5
+synapseone queue send emails --payload '{"to":"a@b.c"}'
+synapseone queue consume emails --count 10
+synapseone queue ack emails <receipt>
+synapseone queue dead emails`;
+
+const CLI_STREAM_OCS_NOTIFICATIONS = `# SynapseStream
+synapseone stream create telemetry --max-len 100000
+synapseone stream publish telemetry --payload '{"value":25.4}'
+synapseone stream read telemetry --count 100
+synapseone stream group create telemetry workers
+synapseone stream group read telemetry workers --consumer w1
+
+# SynapseOCS
+synapseone ocs bucket create city-assets
+synapseone ocs ls city-assets --prefix maps/
+synapseone ocs put city-assets maps/a.png --file ./a.png
+synapseone ocs get city-assets maps/a.png --output ./a.png
+synapseone ocs presign city-assets maps/a.png --expires 3600
+
+# SynapseNotifications
+synapseone notifications send a@b.c --channel email --subject Hi --body Hello
+synapseone notifications list --status queued
+synapseone notifications prefs set a@b.c --channels email,sms`;
+
+const CLI_PLATFORM_SERVICES = `# Search, secrets, inference
+synapseone search "authentication guide" --mode hybrid --collection kb
+synapseone secrets create stripe --value-file ./secret.txt
+synapseone secrets read stripe
+synapseone inference chat "summarize the incident"
+synapseone inference embeddings "authentication guide"
+synapseone inference route --input "payment failed" \\
+  --choice billing="billing question" --choice tech="technical issue"
+
+# Warehouse and human tasks
+synapseone warehouse dataset create incidents \\
+  --column id:string --column severity:string --column opened_at:timestamp
+synapseone warehouse query --sql 'SELECT severity, count(*) FROM incidents GROUP BY 1'
+synapseone human-tasks list --status pending
+synapseone human-tasks approve <id> --note "LGTM"
+
+# Usage and SCIM
+synapseone usage summary --from 2026-01-01T00:00:00Z --feature base
+synapseone scim token create --description okta
+
+# Escape hatch for endpoints without a first-class command:
+synapseone call GET /v1/accounts/acc_abc123/credentials`;
 
 const JS_INSTALL = `npm install @synapseone/sdk
 # or: yarn add @synapseone/sdk
@@ -1100,7 +1149,9 @@ const CLI_SECTIONS = [
   { title: 'API keys, service accounts & credentials', code: CLI_ACCESS },
   { title: 'Workflows, templates & executions', code: CLI_WORKFLOWS },
   { title: 'Linked Data (LDS)', code: CLI_LDS },
-  { title: 'Base, Faststore & Queue (generic call)', code: CLI_CALL },
+  { title: 'Base, Faststore & Queue', code: CLI_BASE_FASTSTORE_QUEUE },
+  { title: 'Stream, OCS & notifications', code: CLI_STREAM_OCS_NOTIFICATIONS },
+  { title: 'Search, secrets, inference, warehouse & tasks', code: CLI_PLATFORM_SERVICES },
 ];
 
 const BASE_COLLECTION_ENDPOINTS = [

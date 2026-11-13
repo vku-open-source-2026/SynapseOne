@@ -101,7 +101,8 @@ gateway.
 | `WORKFLOW_RUNNER_QUEUE` | no | server config | Informational; server queue wins |
 | `WORKFLOW_RUNNER_MODE` | no | server config | `custom` or `hybrid` |
 | `WORKFLOW_RUNNER_CONCURRENCY` | no | `1` | Parallel jobs (1..32) |
-| `WORKFLOW_RUNNER_POLL_MS` | no | `1000` | Queue poll interval |
+| `WORKFLOW_RUNNER_POLL_MS` | no | `1000` | Idle sleep when every slot is busy (short-poll mode) |
+| `WORKFLOW_RUNNER_LONGPOLL_SECONDS` | no | server `20` | Blocking `consume` budget, `0..20` (server cap); `0` disables long-poll |
 | `WORKFLOW_RUNNER_LEASE_SECONDS` | no | `300` | Claim/visibility lease |
 | `WORKFLOW_RUNNER_HEARTBEAT_SECONDS` | no | `15` | Connector heartbeat + lease refresh |
 | `WORKFLOW_RUNNER_INSTANCE_ID` | no | host-pid-random | Stable connector id for this process |
@@ -122,6 +123,32 @@ job. Types: `chat`, `embeddings`, `decision`, `route`, `generic` (`generic` uses
 `payload.path` and `payload.body`). The inference/hybrid runner claims the job,
 POSTs to the local backend, stores the result, and acks the queue. Consumers can
 poll `GET /v1/inference-jobs/:id` or call with `wait: true`.
+
+### Pull loop and long-poll
+
+The runner does **not** poll empty queues once per second. Each lane runs a
+small pull loop that calls `consume` with `waitSeconds` (default 20, from
+`GET /v1/workflow-runners/:id/config`):
+
+- an idle runner parks in queue-service and is woken by Valkey pub/sub the
+  moment a message is published — latency stays ~0 while the request rate drops
+  from **60/min to 3/min per lane** (plus far fewer IAM key verifications and
+  Redis round trips behind the gateway);
+- delayed retries and expired leases are not announced; the waiter computes the
+  next pending/lease deadline and sleeps exactly until then;
+- the loop re-consumes immediately after dispatching work, so a backlog drains
+  at full concurrency;
+- when all slots are busy the loop stops calling `consume` (no request holds a
+  message it cannot run) and sleeps ~250ms before checking for a free slot;
+- transport errors back off exponentially (1s → 15s) with ±20% jitter, so a
+  fleet restart does not stampede the gateway.
+
+`longPollSeconds: 0` falls back to short polling with `WORKFLOW_RUNNER_POLL_MS`.
+The cap stays below the gateway's 30s upstream timeout, and `POST
+/v1/queue/queues/:queue/consume` is backwards compatible: omitting
+`waitSeconds` keeps the old immediate-return behaviour. If you lower
+`PROXY_TIMEOUT_MS` or the reverse-proxy `proxy_read_timeout`, keep it above
+`waitSeconds` (nginx in `infra/prod` allows 30–60s for `/v1/`).
 
 ### Network hardening
 
@@ -208,6 +235,9 @@ effects). Unexpected transport/DB errors release the execution and nack with a
 
 - Health: `GET /health` reports `transport: queue|inline` and `worker:
   platform|off`; `GET /metrics` counts runs by trigger/status.
+- A runner holding a long-poll still heartbeats every 15s and refreshes job
+  leases; `SIGTERM` stops the loop after the current request and sends the
+  `offline` heartbeat.
 - Queue stats: `GET /v1/queue/queues/synapseone-wf-platform/stats` (and
   `-custom`, `-shared`).
 - Dead letters: `GET /v1/queue/queues/<queue>/dead`, replay with

@@ -7,7 +7,7 @@
  * publishing, visibility-timeout consumption, receipts, ack/nack/heartbeat,
  * retries, dead-letter queues and replay.
  *
- * Redis is the production backend; an in-memory fallback keeps local
+ * Valkey (Redis-protocol) is the production backend; an in-memory fallback keeps local
  * development and tests dependency-free. Auth matches the platform:
  * gateway-stamped x-synapseone-* headers plus SYNAPSEONE_INTERNAL_SECRET.
  */
@@ -22,8 +22,9 @@ import {
   QueueError, useRedis, initStore, closeStore,
   ensureQueue, getQueue, listQueues, deleteQueue, purgeQueue,
   publishMessage, consumeMessages, ackMessage, nackMessage, heartbeatMessage,
+  armActivitySignal, nextActivityAt, MAX_SIGNAL_WAIT_MS,
   peekMessages, deadMessages, replayDeadMessage, deleteDeadMessage, queueStats,
-  InternalMessage, QueueConfig, PublishInput,
+  InternalMessage, ConsumedMessage, QueueConfig, PublishInput,
 } from './store';
 
 dotenv.config();
@@ -42,6 +43,9 @@ const MAX_HEADERS_BYTES = 8192;
 const MAX_DELAY_SECONDS = 7 * 24 * 60 * 60;
 const MAX_VISIBILITY_SECONDS = 3600;
 const MAX_MESSAGES_PER_CONSUME = 100;
+// Long-poll cap: the HTTP edge (gateway) times out at 30s, so a blocked
+// consume must always answer before that.
+const MAX_WAIT_SECONDS = Math.max(1, Math.min(20, Math.floor(MAX_SIGNAL_WAIT_MS / 1000)));
 const MAX_BATCH = 100;
 const QUEUE_RE = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const MESSAGE_ID_RE = /^[A-Za-z0-9_@.:+-]{1,128}$/;
@@ -217,6 +221,10 @@ function visibilityOrThrow(v: unknown, def: number): number {
   return intOrThrow(v, 'visibilityTimeoutSeconds', 1, MAX_VISIBILITY_SECONDS, def);
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.round(ms))));
+}
+
 function iso(ms?: number): string | undefined {
   return ms === undefined || ms === null || !Number.isFinite(ms) ? undefined : new Date(ms).toISOString();
 }
@@ -294,8 +302,9 @@ export function createApp(): express.Express {
     if (!process.env.SYNAPSEONE_INTERNAL_SECRET) {
       throw new Error('[queue] SYNAPSEONE_INTERNAL_SECRET must be set in production');
     }
-    if (!process.env.QUEUE_REDIS_URL && !process.env.REDIS_URL) {
-      throw new Error('[queue] QUEUE_REDIS_URL/REDIS_URL must be set in production (in-memory fallback would split-brain)');
+    if (!process.env.QUEUE_VALKEY_URL && !process.env.VALKEY_URL
+      && !process.env.QUEUE_REDIS_URL && !process.env.REDIS_URL) {
+      throw new Error('[queue] QUEUE_VALKEY_URL/VALKEY_URL (or legacy QUEUE_REDIS_URL/REDIS_URL) must be set in production (in-memory fallback would split-brain)');
     }
   }
   const app = express();
@@ -501,6 +510,9 @@ export function createApp(): express.Express {
     const maxMessages = intOrThrow(body.maxMessages, 'maxMessages', 1, MAX_MESSAGES_PER_CONSUME, 1);
     const config = await ensureQueue(tenant, name);
     const visibility = visibilityOrThrow(body.visibilityTimeoutSeconds, config.visibilityTimeoutSeconds);
+    // Long-poll (Celery/SQS style): hold the request until work arrives or
+    // `waitSeconds` elapses. 0 keeps the original immediate-return behaviour.
+    const waitSeconds = intOrThrow(body.waitSeconds, 'waitSeconds', 0, MAX_WAIT_SECONDS, 0);
     const caller = resolveCaller(req);
     const consumer = body.consumer !== undefined
       ? String(body.consumer).slice(0, 128)
@@ -508,12 +520,38 @@ export function createApp(): express.Express {
     if (!consumer || /[\r\n\x00-\x1F\x7F]/.test(consumer)) {
       throw new RequestError(400, 'invalid_consumer', 'consumer must be a printable string');
     }
-    const consumed = await consumeMessages(tenant, name, { maxMessages, visibilityTimeoutSeconds: visibility, consumer });
+
+    const startedAt = Date.now();
+    const deadline = startedAt + waitSeconds * 1000;
+    let messages: ConsumedMessage[] = [];
+    for (;;) {
+      // Arm the wake-up *before* scanning so a publish that lands between the
+      // scan and the park is not lost. `armActivitySignal` returns null when
+      // pub/sub is unavailable, which degrades to a short poll.
+      const signal = deadline > Date.now() ? await armActivitySignal(tenant, name) : null;
+      try {
+        messages = await consumeMessages(tenant, name, { maxMessages, visibilityTimeoutSeconds: visibility, consumer });
+        if (messages.length) break;
+        const remaining = deadline - Date.now();
+        if (!signal || remaining <= 0) break;
+        const due = await nextActivityAt(tenant, name);
+        const waitMs = Math.min(remaining, due === null ? remaining : Math.max(0, due - Date.now()));
+        if (waitMs > 0) await Promise.race([signal.signalled, sleep(waitMs)]);
+        // A due timestamp in the past means another consumer won the race (or
+        // a lease just expired): re-scan instead of holding the request.
+        else await sleep(5);
+      } finally {
+        signal?.cancel();
+      }
+    }
+
     res.json({
       queue: name,
-      count: consumed.length,
+      count: messages.length,
       visibilityTimeoutSeconds: visibility,
-      messages: consumed.map((c) => ({
+      waitedMs: Date.now() - startedAt,
+      ...(waitSeconds > 0 ? { waitSeconds } : {}),
+      messages: messages.map((c) => ({
         ...apiMessage(c.message),
         receipt: c.receipt,
         leaseExpiresAt: iso(c.leaseExpiresAt),
@@ -650,7 +688,7 @@ if (require.main === module) {
   initStore()
     .then((ok) => {
       if (!ok && IS_PROD) {
-        console.error('[queue] Redis is required in production');
+        console.error('[queue] Valkey (QUEUE_VALKEY_URL/VALKEY_URL or legacy QUEUE_REDIS_URL/REDIS_URL) is required in production');
         process.exit(1);
       }
     })

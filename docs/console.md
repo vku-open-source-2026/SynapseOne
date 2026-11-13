@@ -13,7 +13,7 @@ Org/Account switcher, IAM CRUD, authorize simulator, workflows, audit log.
 
 ```bash
 # together with the platform (console on :3000)
-docker compose up -d --build postgres redis s3 iam workflow gateway console
+docker compose up -d --build postgres valkey s3 iam workflow gateway console
 # open http://localhost:3000 → sign in demo@acme.local / org acme
 ```
 

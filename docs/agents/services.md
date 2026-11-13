@@ -5,6 +5,10 @@ Ports assume Compose defaults. Apart from explicit public gateway routes
 (`/v1/auth/*`, LDS public reads, `/webhook/*`), services are internal in
 production and require `x-synapseone-internal` when the shared secret is set.
 
+Implementation: `ai`, `stream`, `lds` and `notifications` are Rust/Axum
+services (`apps/*/Cargo.toml`). This document describes their HTTP contract,
+which is unchanged; the TypeScript sources remain as a behavioural reference.
+
 ---
 
 ## Gateway — `apps/gateway` (:8080)
@@ -222,8 +226,9 @@ chat/embeddings/decision work for inference/hybrid runners),
 **Purpose:** SynapseLDS — publish licensed data as NGSI-LD with a default-deny
 attribute registry.
 
-**Files:** `src/index.ts` (routes/visibility), `src/projector.ts` (security core),
-`src/store.ts`, `src/licenses.ts`, `src/schema.ts`, `drizzle/`.
+**Files:** `src/main.rs` (Rust routes/visibility), `src/projector.rs` (security
+core), `src/store.rs`, `src/licenses.rs`; the original `src/index.ts` remains as
+the behavioural reference.
 
 **API:**
 - Public: `GET /v1/lds/licenses`,
@@ -323,9 +328,9 @@ account-bound same account. Production requires DB + internal secret.
 
 ## Faststore — `apps/faststore-service` (:4006)
 
-**Purpose:** tenant-scoped Redis data API.
+**Purpose:** tenant-scoped Valkey/Redis data API.
 
-**Files:** `src/index.ts` (routes/tenant), `src/store.ts` (Redis/memory).
+**Files:** `src/index.ts` (routes/tenant), `src/store.ts` (Valkey/memory).
 
 **API groups:**
 - Strings: `GET/PUT/POST/DELETE /v1/faststore/keys/:key`, `GET .../ttl`,
@@ -347,10 +352,10 @@ batch ≤100. Conditional writes `ifNotExists`/`ifExists`. Locks are token-owned
 and must be released/extended with the returned token. Keys live under
 `synapseone:faststore:v1:<tenant>:`; locks under `...:__lock__:<name>`.
 
-**Rules:** anonymous rejected; platform callers must pass tenant. Redis required
+**Rules:** anonymous rejected; platform callers must pass tenant. Valkey required
 in production (else split-brain). Memory fallback for tests/dev.
 
-**Env:** `PORT`, `FASTSTORE_REDIS_URL`/`REDIS_URL`,
+**Env:** `PORT`, `FASTSTORE_VALKEY_URL`/`FASTSTORE_REDIS_URL` (`VALKEY_URL`/`REDIS_URL` fallback),
 `SYNAPSEONE_INTERNAL_SECRET`, `HSTS_ENABLED`, `CORS_ORIGIN`.
 
 ---
@@ -360,7 +365,7 @@ in production (else split-brain). Memory fallback for tests/dev.
 **Purpose:** at-least-once queue with delayed/deduped publish, visibility
 leases, retries, DLQ and replay.
 
-**Files:** `src/index.ts` (routes/limits), `src/store.ts` (Redis Lua/memory).
+**Files:** `src/index.ts` (routes/limits), `src/store.ts` (Valkey Lua/memory).
 
 **API:**
 - Queues: `GET/PUT /v1/queue/queues`, `GET/DELETE /v1/queue/queues/:queue`,
@@ -368,6 +373,7 @@ leases, retries, DLQ and replay.
 - Publish: `POST /v1/queue/queues/:queue/messages`,
   `POST .../messages:batch`.
 - Consume: `POST .../consume` → message + `receipt` + lease expiry;
+  `waitSeconds` (0..20) blocks until work exists (long-poll);
   `POST .../ack|nack|heartbeat`.
 - Inspect/DLQ: `GET .../messages`, `GET .../dead`,
   `POST .../dead/:id/replay`, `DELETE .../dead/:id`.
@@ -384,8 +390,16 @@ leases, retries, DLQ and replay.
 - Keys: `synapseone:queue:v1:<tenant>:...`.
 - At-least-once by design → consumers must be idempotent; dedupe keys are the
   tool for duplicate suppression.
+- Long-poll wake-ups use a **dedicated** Valkey subscriber connection
+  (`store.ts: armActivitySignal`); the shared client cannot be subscribed.
+  Publish/nack-retry/replay announce on `...:signal`; delayed messages and lease
+  expiry are timed via `nextActivityAt` (next pending `available_at` or lease
+  deadline), so a parked consume wakes exactly when work can appear. If the
+  subscriber is unavailable the service degrades to short polls.
+- The queue-service pods are stateless for waits: any replica can answer any
+  wait because the signal is broadcast over pub/sub.
 
-**Env:** `PORT`, `QUEUE_REDIS_URL`/`REDIS_URL`, `QUEUE_MAX_PAYLOAD_BYTES`,
+**Env:** `PORT`, `QUEUE_VALKEY_URL`/`QUEUE_REDIS_URL` (`VALKEY_URL`/`REDIS_URL` fallback), `QUEUE_MAX_PAYLOAD_BYTES`,
 `SYNAPSEONE_INTERNAL_SECRET`, `HSTS_ENABLED`, `CORS_ORIGIN`.
 
 ---
@@ -395,9 +409,10 @@ leases, retries, DLQ and replay.
 **Purpose:** Console API-docs chatbot. Two-step: decision model picks a catalog
 endpoint; LLM fills path/body or returns guidance.
 
-**Files:** `src/index.ts` (route/limits/internal auth), `src/agent.ts`
-(orchestration + validation), `src/catalog.ts` (allowed endpoints), `src/llm.ts`
-(OpenAI-compatible client, retries/fallback).
+**Files:** `src/main.rs` (Rust route/limits/internal auth), `src/agent.rs`
+(orchestration + validation), `src/catalog.json` (allowed endpoints), `src/llm.rs`
+(OpenAI-compatible client, retries/fallback). The TypeScript sources remain as
+the behavioural reference.
 
 **API:** `POST /v1/ai/agent` only, plus `/health`. Internal secret required on
 `/v1/*`; per-principal rate limit (`AI_RATE_LIMIT`, default 30/min); API key
@@ -520,7 +535,7 @@ surface is user-facing.
 
 ## Infra
 
-- `docker-compose.yml` — postgres, redis, s3 + s3-init, Authentik
+- `docker-compose.yml` — postgres, valkey, s3 + s3-init, Authentik
   server/worker + DB init, all services, console, Prometheus + exporters.
 - `docker-compose.prod.yml`/`.tls.yml` — production edge (nginx/Certbot),
   hardened secrets; `infra/prod/`.

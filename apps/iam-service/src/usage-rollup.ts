@@ -11,7 +11,7 @@
  * Rollups are idempotent: each [from, to) window replaces the same window.
  */
 import { sql } from 'drizzle-orm';
-import { ensureTables, getDb, getPool, useDb } from './db';
+import { ensureTables, getDb, getDirectPool, useDb } from './db';
 import type { UsageFilter } from './usage';
 
 export const USAGE_LATENCY_BOUNDS = [1, 2, 5, 10, 20, 30, 40, 50, 60, 75, 90, 100, 125, 150, 175, 200, 250, 300, 350, 400, 500, 750, 1000, 1500, 2000, 3000, 5000, 10000, 30000] as const;
@@ -276,7 +276,9 @@ export async function runUsageRollupOnce(): Promise<{ orgs: number; pushed: numb
   if (!base || !useDb()) return null;
   await ensureTables();
   const db = getDb();
-  const pool = getPool();
+  // The advisory lock is session-scoped, so it must use the direct Postgres
+  // pool rather than PgBouncer's transaction pool.
+  const pool = getDirectPool();
   if (!db || !pool) return null;
 
   const client = await pool.connect();

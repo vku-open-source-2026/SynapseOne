@@ -47,7 +47,7 @@ Use when taking SynapseOne off your laptop. Every item already has a mechanism â
 ## 2. Network & TLS
 
 - [ ] Gateway is the single entry point (Ingress + TLS); IAM/workflow/AI/LDS/base/
-      faststore/queue/stream/inference/storage/notifications/postgres/redis are not
+      faststore/queue/stream/inference/storage/notifications/postgres/valkey are not
       internet-exposed (ClusterIP / internal compose network).
 - [ ] Lock down the gateway CORS to the real frontend origins (MVP default is wide open).
 - [ ] Rate limiting at the outer layer (Ingress NGINX `limit_req`, Cloudflare/AWS WAF):
@@ -82,7 +82,17 @@ Use when taking SynapseOne off your laptop. Every item already has a mechanism â
       `NOTIFICATIONS_EMAIL_RELAY_URL`/`_SMS_`/`_PUSH_` as needed; the service
       refuses to boot without the DB, internal secret and CORS origin
       (`docs/notifications.md`).
-- [ ] Redis AOF already on in compose; on K8s use a redis chart with persistence.
+- [ ] Valkey AOF already on in compose; on K8s use a Valkey/Redis-protocol chart with persistence (Valkey loads Redis RDB/AOF in place).
+- [ ] **Upgrading a running Redis deployment to Valkey** (in place, no data loss):
+      the compose service is now `valkey` (`valkey/valkey:8-alpine`) but it keeps
+      the `redisdata` volume and the `redis://` URL scheme, so Valkey loads the
+      existing AOF on boot. Sequence: `docker compose stop valkey` (or `redis` on
+      the old file) â†’ `docker compose up -d valkey` â†’ verify
+      `docker compose exec valkey valkey-cli dbsize` and
+      `GET /health` on queue/faststore/stream (`backend` stays `"redis"` because
+      that names the wire protocol). Keep `REDIS_URL`/`*_REDIS_URL` in `.env`
+      during a rolling deploy: images built before this release only read the
+      legacy names, and both point at the same instance.
 - [ ] Database schema is managed by Drizzle migrations in `apps/*/drizzle/`.
       Services apply their own migrations at startup under a per-service
       advisory lock and migration journal (`drizzle.__drizzle_migrations_*`).
@@ -110,8 +120,8 @@ Use when taking SynapseOne off your laptop. Every item already has a mechanism â
       `AUDIT_RETENTION_DAYS` (e.g. `180`) â€” the IAM service purges hourly by
       itself (see `docs/configuration.md`). External cron `DELETE` only needed
       for custom windows.
-- [ ] Monitoring: confirm Prometheus scrapes gateway/PG/Redis (`/targets` all up)
-      and the `GatewayDown`/`PostgresDown`/`RedisDown` alerts are visible
+- [ ] Monitoring: confirm Prometheus scrapes gateway/PG/Valkey (`/targets` all up)
+      and the `GatewayDown`/`PostgresDown`/`ValkeyDown` alerts are visible
       (see `docs/monitoring.md`). The Prometheus port stays internal in prod
       (port-forward only).
 - [ ] Periodic `npm audit`; track advisories recorded in `SECURITY.md`.

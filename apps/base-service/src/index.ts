@@ -33,6 +33,9 @@ import { auditMiddleware } from './audit';
 import { searchRecords, indexStatus, replaceCollectionIndex, upsertDocumentIndex, removeDocumentIndex, dropCollectionIndex } from './search';
 import { upsertNodes, upsertEdges, getNode, subgraph, deleteNode, graphStats } from './graph';
 import { upsertFeatures, listFeatures, near, within, deleteFeature, geoStats } from './gis';
+import {
+  getCachedDocument, setCachedDocument, deleteCachedDocument, deleteCachedDocuments, cacheMetrics,
+} from './cache';
 
 dotenv.config();
 const PORT = Number(process.env.PORT || 4005);
@@ -356,6 +359,21 @@ export function createApp(): express.Express {
         `synapseone_base_outbox_pending ${outbox.pending}`,
       );
     } catch { /* scrape never fails on db blips */ }
+    const cache = cacheMetrics();
+    lines.push(
+      '# HELP synapseone_base_cache_enabled Whether the Faststore document cache is configured.',
+      '# TYPE synapseone_base_cache_enabled gauge',
+      `synapseone_base_cache_enabled ${cache.enabled ? 1 : 0}`,
+      '# HELP synapseone_base_cache_document_total Document cache outcomes by result.',
+      '# TYPE synapseone_base_cache_document_total counter',
+      `synapseone_base_cache_document_total{result="hit"} ${cache.hits}`,
+      `synapseone_base_cache_document_total{result="miss"} ${cache.misses}`,
+      `synapseone_base_cache_document_total{result="error"} ${cache.errors}`,
+      '# HELP synapseone_base_cache_write_total Cache writes and invalidations.',
+      '# TYPE synapseone_base_cache_write_total counter',
+      `synapseone_base_cache_write_total{result="set"} ${cache.sets}`,
+      `synapseone_base_cache_write_total{result="delete"} ${cache.deletes}`,
+    );
     res.type('text/plain').send(`${lines.join('\n')}\n`);
   });
 
@@ -667,6 +685,7 @@ export function createApp(): express.Express {
     try {
       const doc = await createDocumentRec(loaded.collection.id, id, data);
       await upsertDocumentIndex(loaded.collection, doc).catch(() => undefined);
+      await deleteCachedDocument(req, loaded.collection.id, id);
       res.status(201).json({ ...toApiDocument(doc, 'data', loaded.collection.mapping), collection: loaded.collection.name });
     } catch (e: any) {
       if (e instanceof StoreError && e.code === 'conflict') return res.status(409).json({ error: 'document_exists', message: e.message });
@@ -681,8 +700,10 @@ export function createApp(): express.Express {
     if (!id) return res.status(400).json({ error: 'invalid_document_id' });
     const as = req.query.as === undefined ? 'data' : String(req.query.as);
     if (as !== 'data' && as !== 'object') return res.status(400).json({ error: 'invalid_view', message: "as must be 'data' or 'object'" });
-    const doc = await getDocumentRec(loaded.collection.id, id);
+    const cached = await getCachedDocument(req, loaded.collection.id, id);
+    const doc = cached ?? await getDocumentRec(loaded.collection.id, id);
     if (!doc) return res.status(404).json({ error: 'not_found', message: `document '${id}' not found` });
+    if (!cached) await setCachedDocument(req, doc);
     res.json({ ...toApiDocument(doc, as, loaded.collection.mapping), collection: loaded.collection.name });
   });
 
@@ -710,6 +731,7 @@ export function createApp(): express.Express {
     try {
       const out = await setDocumentRec(loaded.collection.id, id, data, { merge, ifVersion });
       await upsertDocumentIndex(loaded.collection, out.doc).catch(() => undefined);
+      await deleteCachedDocument(req, loaded.collection.id, id);
       res.status(out.created ? 201 : 200).json({ ...toApiDocument(out.doc, 'data', loaded.collection.mapping), collection: loaded.collection.name });
     } catch (e: any) {
       if (e instanceof StoreError && e.code === 'version_conflict') return res.status(409).json({ error: 'version_conflict', message: e.message });
@@ -761,6 +783,7 @@ export function createApp(): express.Express {
     }
     const out = await setDocumentRec(loaded.collection.id, id, next, { merge: false, ifVersion: cur.version });
     await upsertDocumentIndex(loaded.collection, out.doc).catch(() => undefined);
+    await deleteCachedDocument(req, loaded.collection.id, id);
     res.json({ ...toApiDocument(out.doc, 'data', loaded.collection.mapping), collection: loaded.collection.name });
   });
 
@@ -784,6 +807,7 @@ export function createApp(): express.Express {
       const ok = await deleteDocumentRec(loaded.collection.id, id, { ifVersion });
       if (!ok) return res.status(404).json({ error: 'not_found', message: `document '${id}' not found` });
       await removeDocumentIndex(loaded.collection.id, id).catch(() => undefined);
+      await deleteCachedDocument(req, loaded.collection.id, id);
       res.json({ ok: true, id, collection: loaded.collection.name });
     } catch (e: any) {
       if (e instanceof StoreError && e.code === 'version_conflict') return res.status(409).json({ error: 'version_conflict', message: e.message });
@@ -988,6 +1012,7 @@ export function createApp(): express.Express {
     try { ifVersion = etagVersion(req, b); } catch (e: any) { return res.status(400).json({ error: 'invalid_version', message: e.message }); }
     try {
       const doc = await incrementDocumentRec(loaded.collection.id, id, field, by, { ifVersion });
+      await deleteCachedDocument(req, loaded.collection.id, id);
       res.json({ ...toApiDocument(doc, 'data', loaded.collection.mapping), collection: loaded.collection.name });
     } catch (e: any) {
       if (e instanceof StoreError && e.code === 'version_conflict') return res.status(409).json({ error: 'version_conflict', message: e.message });
@@ -1005,12 +1030,14 @@ export function createApp(): express.Express {
       return res.status(400).json({ error: 'invalid_batch', message: 'operations must contain 1..100 entries' });
     }
     const results: any[] = [];
+    const touched = new Set<string>();
     for (let i = 0; i < ops.length; i++) {
       const op = ops[i] || {};
       try {
         if (op.op === 'create') {
           const id = op.id ? cleanDocId(op.id) : randomUUID();
           if (!id) throw new StoreError('invalid', 'invalid document id');
+          touched.add(id);
           const data = parseDataBody(op, loaded.collection.mapping);
           const doc = await createDocumentRec(loaded.collection.id, id, data);
           await upsertDocumentIndex(loaded.collection, doc).catch(() => undefined);
@@ -1018,6 +1045,7 @@ export function createApp(): express.Express {
         } else if (op.op === 'set' || op.op === 'update') {
           const id = cleanDocId(op.id);
           if (!id) throw new StoreError('invalid', 'id is required');
+          touched.add(id);
           const data = parseDataBody(op, loaded.collection.mapping, { partial: op.op === 'update' });
           const out = await setDocumentRec(loaded.collection.id, id, data, { merge: op.op === 'update' });
           await upsertDocumentIndex(loaded.collection, out.doc).catch(() => undefined);
@@ -1025,12 +1053,14 @@ export function createApp(): express.Express {
         } else if (op.op === 'delete') {
           const id = cleanDocId(op.id);
           if (!id) throw new StoreError('invalid', 'id is required');
+          touched.add(id);
           const ok = await deleteDocumentRec(loaded.collection.id, id, { ifVersion: op.ifVersion === undefined ? undefined : Number(op.ifVersion) });
           if (ok) await removeDocumentIndex(loaded.collection.id, id).catch(() => undefined);
           results.push({ index: i, ok, op: 'delete', id });
         } else if (op.op === 'increment') {
           const id = cleanDocId(op.id);
           if (!id) throw new StoreError('invalid', 'id is required');
+          touched.add(id);
           const doc = await incrementDocumentRec(loaded.collection.id, id, String(op.field || ''), Number(op.by ?? 1));
           results.push({ index: i, ok: true, op: 'increment', document: toApiDocument(doc, 'data', loaded.collection.mapping) });
         } else {
@@ -1041,6 +1071,7 @@ export function createApp(): express.Express {
         results.push({ index: i, ok: false, op: op.op, error: code, message: String(e?.message || e).slice(0, 300) });
       }
     }
+    await deleteCachedDocuments(req, loaded.collection.id, [...touched]);
     res.json({ results, ok: results.every((r) => r.ok) });
   });
 

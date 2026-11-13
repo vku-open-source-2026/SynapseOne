@@ -27,7 +27,8 @@ spec:
             - { name: IAM_JWT_SECRET, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: iam-jwt-secret } } }
             - { name: IAM_API_KEY_PEPPER, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: api-key-pepper } } }
             - { name: SYNAPSEONE_INTERNAL_SECRET, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: internal-secret } } }
-            - { name: REDIS_URL, value: "redis://redis:6379" }
+            - { name: VALKEY_URL, value: "redis://valkey:6379" }
+            - { name: REDIS_URL, value: "redis://valkey:6379" }
             - { name: OIDC_ISSUER, value: "https://auth.example.com/application/o/synapseone/" }
             - { name: OIDC_CLIENT_ID, value: "synapseone-platform" }
             - { name: OIDC_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: oidc-client-secret } } }
@@ -263,7 +264,8 @@ spec:
           image: ghcr.io/synapseone/faststore:0.7.0
           ports: [{ containerPort: 4006 }]
           env:
-            - { name: FASTSTORE_REDIS_URL, value: "redis://redis:6379" }
+            - { name: FASTSTORE_VALKEY_URL, value: "redis://valkey:6379" }
+            - { name: FASTSTORE_REDIS_URL, value: "redis://valkey:6379" }
             - { name: SYNAPSEONE_INTERNAL_SECRET, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: internal-secret } } }
             - { name: IAM_SERVICE_URL, value: "http://iam:4001" }
             - { name: AUDIT_TRAIL, value: "true" }
@@ -302,7 +304,8 @@ spec:
           image: ghcr.io/synapseone/queue:0.7.0
           ports: [{ containerPort: 4007 }]
           env:
-            - { name: QUEUE_REDIS_URL, value: "redis://redis:6379" }
+            - { name: QUEUE_VALKEY_URL, value: "redis://valkey:6379" }
+            - { name: QUEUE_REDIS_URL, value: "redis://valkey:6379" }
             - { name: SYNAPSEONE_INTERNAL_SECRET, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: internal-secret } } }
             - { name: IAM_SERVICE_URL, value: "http://iam:4001" }
             - { name: AUDIT_TRAIL, value: "true" }
@@ -343,8 +346,9 @@ spec:
           env:
             - { name: PORT, value: "4009" }
             # Durable engine required in production (no memory fallback).
-            - { name: STREAM_ENGINE, value: "redis" }
-            - { name: STREAM_REDIS_URL, value: "redis://redis:6379" }
+            - { name: STREAM_ENGINE, value: "valkey" }
+            - { name: STREAM_VALKEY_URL, value: "redis://valkey:6379" }
+            - { name: STREAM_REDIS_URL, value: "redis://valkey:6379" }
             - { name: SYNAPSEONE_INTERNAL_SECRET, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: internal-secret } } }
             - { name: IAM_SERVICE_URL, value: "http://iam:4001" }
             - { name: AUDIT_TRAIL, value: "true" }

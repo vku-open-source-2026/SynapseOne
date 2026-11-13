@@ -139,10 +139,21 @@ export interface StoredInferenceJob {
 }
 
 const DATABASE_URL = process.env.DATABASE_URL || '';
+// Migrations need a stable Postgres session; bypass PgBouncer transaction mode.
+const DIRECT_DATABASE_URL = process.env.DATABASE_DIRECT_URL || DATABASE_URL;
 let pool: Pool | null = null;
 if (DATABASE_URL) {
   pool = new Pool({ connectionString: DATABASE_URL });
   pool.on('error', (e) => console.error('[workflow][db] pool error', (e as any)?.message || e));
+}
+let directPool: Pool | null = null;
+function getDirectPool(): Pool | null {
+  if (!DIRECT_DATABASE_URL) return null;
+  if (!directPool) {
+    directPool = new Pool({ connectionString: DIRECT_DATABASE_URL, max: 2 });
+    directPool.on('error', (e) => console.error('[workflow][db] direct pool error', (e as any)?.message || e));
+  }
+  return directPool;
 }
 const db = pool ? drizzle(pool, { schema: { credentials, executions, inferenceJobs, workflowRunnerInstances, workflowRunners, workflows } }) : null;
 
@@ -178,7 +189,7 @@ export async function ensureTables(): Promise<void> {
   if (!db || ensured) return;
   ensured = true;
   try {
-    const client = await pool!.connect();
+    const client = await getDirectPool()!.connect();
     try {
       // Hold the advisory lock on the same dedicated session that runs the
       // migration (pool connections are not guaranteed to be reused).

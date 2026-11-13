@@ -25,7 +25,8 @@
  *   WORKFLOW_RUNNER_INSTANCE_ID  stable connector id (default host-pid-random)
  *   WORKFLOW_RUNNER_CONCURRENCY, WORKFLOW_RUNNER_INFERENCE_CONCURRENCY,
  *   WORKFLOW_RUNNER_POLL_MS, WORKFLOW_RUNNER_LEASE_SECONDS,
- *   WORKFLOW_RUNNER_HEARTBEAT_SECONDS, WORKFLOW_RUNNER_ONCE
+ *   WORKFLOW_RUNNER_HEARTBEAT_SECONDS, WORKFLOW_RUNNER_LONGPOLL_SECONDS,
+ *   WORKFLOW_RUNNER_ONCE
  * Inference lane:
  *   INFERENCE_RUNNER_URL        OpenAI-compatible base URL (http://vllm:8000/v1)
  *   INFERENCE_RUNNER_API_KEY    optional backend bearer token
@@ -64,6 +65,15 @@ function errorLog(...args: any[]): void {
   console.error(`[runner ${new Date().toISOString()}]`, ...args);
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.round(ms))));
+}
+
+/** +/-20% so a fleet restarting at once does not hit the queue in lockstep. */
+function jitter(ms: number): number {
+  return Math.max(0, Math.round(ms * (0.8 + Math.random() * 0.4)));
+}
+
 interface RunnerConfig {
   runnerId: string;
   name?: string;
@@ -73,6 +83,7 @@ interface RunnerConfig {
   inferenceQueue?: string | null;
   queues?: { workflow?: string | null; inference?: string | null };
   heartbeatIntervalSeconds: number;
+  longPollSeconds?: number;
   staleAfterSeconds?: number;
   maxConcurrency?: number;
   visibilityTimeoutSeconds: number;
@@ -205,6 +216,14 @@ async function main(): Promise<void> {
   const heartbeatSeconds = heartbeatOverride
     ? intEnv('WORKFLOW_RUNNER_HEARTBEAT_SECONDS', 15, 5, 300)
     : Math.min(Math.max(Number(config.heartbeatIntervalSeconds) || 15, 5), 300);
+  // Blocking dequeue: the server tells us how long a consume may park (capped
+  // below the 30s gateway timeout). 0 falls back to short polling.
+  const longPollOverride = process.env.WORKFLOW_RUNNER_LONGPOLL_SECONDS;
+  // The server rejects waitSeconds > 20 (it must answer below the gateway's
+  // 30s upstream timeout), so never send more than that.
+  const longPollSeconds = longPollOverride !== undefined && longPollOverride !== ''
+    ? intEnv('WORKFLOW_RUNNER_LONGPOLL_SECONDS', 20, 0, 20)
+    : Math.min(Math.max(Number(config.longPollSeconds ?? 20) || 0, 0), 20);
   const consumer = `runner-${runnerId}-${instanceId}`.slice(0, 128);
   const capabilities = [
     ...(workflowLane ? ['workflow'] : []),
@@ -242,7 +261,7 @@ async function main(): Promise<void> {
     }
   }
 
-  log(`starting runner=${runnerId} instance=${instanceId} host=${hostname} kind=${kind} capabilities=${capabilities.join('+')} workflowQueue=${workflowQueue || '-'} inferenceQueue=${inferenceQueue || '-'} concurrency=${concurrency}/${inferenceConcurrency} version=${VERSION}`);
+  log(`starting runner=${runnerId} instance=${instanceId} host=${hostname} kind=${kind} capabilities=${capabilities.join('+')} workflowQueue=${workflowQueue || '-'} inferenceQueue=${inferenceQueue || '-'} concurrency=${concurrency}/${inferenceConcurrency} longPoll=${longPollSeconds}s version=${VERSION}`);
 
   let stopping = false;
   const workflowInFlight = new Set<string>();
@@ -405,97 +424,146 @@ async function main(): Promise<void> {
     }
   };
 
-  const tickWorkflow = async (): Promise<void> => {
-    if (stopping || workflowTicking || !workflowLane) return;
+  interface TickResult { dispatched: number; blocked: boolean; full: boolean }
+
+  const tickWorkflow = async (waitSeconds: number): Promise<TickResult> => {
+    if (stopping || workflowTicking || !workflowLane) return { dispatched: 0, blocked: false, full: true };
     workflowTicking = true;
     try {
       const slots = concurrency - workflowInFlight.size;
-      if (slots <= 0) return;
+      if (slots <= 0) return { dispatched: 0, blocked: false, full: true };
+      const startedAt = Date.now();
       const consumed: any = await api.request('POST', `/v1/queue/queues/${encodeURIComponent(workflowQueue)}/consume`, {
-        maxMessages: Math.min(slots + 1, 10),
+        // Ask only for free slots: over-consuming leaves a message invisible
+        // for the whole visibility timeout when the batch cannot be dispatched.
+        maxMessages: Math.min(slots, 10),
         visibilityTimeoutSeconds: leaseSeconds,
         consumer: `${consumer}-wf`,
+        ...(waitSeconds > 0 ? { waitSeconds } : {}),
       });
       const messages = Array.isArray(consumed?.messages) ? consumed.messages : [];
+      let dispatched = 0;
       for (const m of messages) {
-        if (workflowInFlight.size >= concurrency) break;
         const executionId = executionIdFromMessage(m.payload);
         const receipt = String(m.receipt || '');
         if (!executionId || !receipt) {
           await api.request('POST', `/v1/queue/queues/${encodeURIComponent(workflowQueue)}/ack`, { receipt }).catch(() => null);
           continue;
         }
-        if (workflowInFlight.has(executionId)) {
+        if (workflowInFlight.size >= concurrency || workflowInFlight.has(executionId)) {
+          // Hand the message straight back instead of letting it sit invisible
+          // until the visibility timeout expires.
           await api.request('POST', `/v1/queue/queues/${encodeURIComponent(workflowQueue)}/nack`, {
-            receipt, requeue: true, delaySeconds: 5,
+            receipt, requeue: true,
+            delaySeconds: workflowInFlight.has(executionId) ? 5 : 0,
           }).catch(() => null);
           continue;
         }
         workflowInFlight.add(executionId);
+        dispatched += 1;
         void runWorkflowJob(executionId, receipt);
       }
-    } catch (e: any) {
-      errorLog('workflow consume failed:', e?.message || e);
+      // `blocked` means the server actually parked the request. An older
+      // queue-service that ignores `waitSeconds` answers immediately, so the
+      // loop must not treat that as a completed wait (it would spin).
+      const held = Date.now() - startedAt >= Math.min(2000, waitSeconds * 500);
+      return { dispatched, blocked: waitSeconds > 0 && messages.length === 0 && held, full: false };
     } finally {
       workflowTicking = false;
     }
   };
 
-  const tickInference = async (): Promise<void> => {
-    if (stopping || inferenceTicking || !inferenceLane) return;
+  const tickInference = async (waitSeconds: number): Promise<TickResult> => {
+    if (stopping || inferenceTicking || !inferenceLane) return { dispatched: 0, blocked: false, full: true };
     inferenceTicking = true;
     try {
       const slots = inferenceConcurrency - inferenceInFlight.size;
-      if (slots <= 0) return;
+      if (slots <= 0) return { dispatched: 0, blocked: false, full: true };
+      const startedAt = Date.now();
       const consumed: any = await api.request('POST', `/v1/queue/queues/${encodeURIComponent(inferenceQueue)}/consume`, {
-        maxMessages: Math.min(slots + 1, 10),
+        maxMessages: Math.min(slots, 10),
         visibilityTimeoutSeconds: leaseSeconds,
         consumer: `${consumer}-inf`,
+        ...(waitSeconds > 0 ? { waitSeconds } : {}),
       });
       const messages = Array.isArray(consumed?.messages) ? consumed.messages : [];
+      let dispatched = 0;
       for (const m of messages) {
-        if (inferenceInFlight.size >= inferenceConcurrency) break;
         const jobId = inferenceJobIdFromMessage(m.payload);
         const receipt = String(m.receipt || '');
         if (!jobId || !receipt) {
           await api.request('POST', `/v1/queue/queues/${encodeURIComponent(inferenceQueue)}/ack`, { receipt }).catch(() => null);
           continue;
         }
-        if (inferenceInFlight.has(jobId)) {
+        if (inferenceInFlight.size >= inferenceConcurrency || inferenceInFlight.has(jobId)) {
           await api.request('POST', `/v1/queue/queues/${encodeURIComponent(inferenceQueue)}/nack`, {
-            receipt, requeue: true, delaySeconds: 5,
+            receipt, requeue: true,
+            delaySeconds: inferenceInFlight.has(jobId) ? 5 : 0,
           }).catch(() => null);
           continue;
         }
         inferenceInFlight.add(jobId);
+        dispatched += 1;
         void runInferenceJob(jobId, receipt);
       }
-    } catch (e: any) {
-      errorLog('inference consume failed:', e?.message || e);
+      // `blocked` means the server actually parked the request. An older
+      // queue-service that ignores `waitSeconds` answers immediately, so the
+      // loop must not treat that as a completed wait (it would spin).
+      const held = Date.now() - startedAt >= Math.min(2000, waitSeconds * 500);
+      return { dispatched, blocked: waitSeconds > 0 && messages.length === 0 && held, full: false };
     } finally {
       inferenceTicking = false;
     }
   };
 
-  const timers: NodeJS.Timeout[] = [];
   if (once) {
-    await Promise.allSettled([tickWorkflow(), tickInference()]);
+    // Drain one poll per lane, without holding the request open.
+    await Promise.allSettled([tickWorkflow(0), tickInference(0)]);
     const deadline = Date.now() + 120000;
-    while ((workflowInFlight.size || inferenceInFlight.size) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
+    while ((workflowInFlight.size || inferenceInFlight.size) && Date.now() < deadline) await sleep(200);
     clearInterval(hbTimer);
     await heartbeat('offline').catch(() => undefined);
     return;
   }
 
-  if (workflowLane) timers.push(setInterval(() => { void tickWorkflow(); }, pollMs));
-  if (inferenceLane) timers.push(setInterval(() => { void tickInference(); }, pollMs));
-  setTimeout(() => { void tickWorkflow(); void tickInference(); }, 100).unref?.();
+  /** Pull loop: a blocking consume parks until work exists, so an idle runner
+   *  costs one request per lane every `longPollSeconds` instead of one per
+   *  `pollMs`. Errors back off exponentially; a full lane sleeps for a slot. */
+  const laneLoop = async (lane: 'workflow' | 'inference'): Promise<void> => {
+    let failures = 0;
+    while (!stopping) {
+      let result: TickResult = { dispatched: 0, blocked: false, full: false };
+      try {
+        result = lane === 'workflow'
+          ? await tickWorkflow(longPollSeconds)
+          : await tickInference(longPollSeconds);
+        failures = 0;
+      } catch (e: any) {
+        if (stopping) return;
+        failures += 1;
+        const backoff = Math.min(1000 * 2 ** Math.min(failures - 1, 4), 15000);
+        errorLog(`${lane} lane error (retry in ~${backoff}ms):`, e?.message || e);
+        await sleep(jitter(backoff));
+        continue;
+      }
+      // More work was dispatched, or the long-poll timed out: poll again
+      // immediately (a fresh blocking consume is the cheapest next step).
+      if (result.dispatched > 0 || result.blocked) continue;
+      // All slots busy: check for a free slot soon. Otherwise this was an
+      // immediate empty answer (short-poll mode, or pub/sub unavailable):
+      // honour WORKFLOW_RUNNER_POLL_MS so a fallback never becomes a hot loop.
+      await sleep(jitter(result.full && longPollSeconds > 0 ? 250 : pollMs));
+    }
+  };
+
+  if (workflowLane) void laneLoop('workflow');
+  if (inferenceLane) void laneLoop('inference');
+  log(`pull loops started (long-poll=${longPollSeconds}s, idle sleep=${longPollSeconds > 0 ? 250 : pollMs}ms)`);
 
   const shutdown = async (signal: string): Promise<void> => {
     if (stopping) return;
     stopping = true;
     log(`${signal} received — draining ${workflowInFlight.size + inferenceInFlight.size} job(s)`);
-    for (const t of timers) clearInterval(t);
     clearInterval(hbTimer);
     const deadline = Date.now() + 30000;
     while ((workflowInFlight.size || inferenceInFlight.size) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 250));

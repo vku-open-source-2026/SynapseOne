@@ -726,7 +726,7 @@ Full guide: [queue.md](queue.md).
 
 ## Stream — distributed event streaming (`stream-service:4009`, gateway `/v1/stream`)
 
-Tenant-scoped distributed event streaming log (pluggable Redis Streams / Kafka backend) with consumer groups, time-range replay and retention trimming.
+Tenant-scoped distributed event streaming log (pluggable Valkey/Redis Streams or Kafka backend) with consumer groups, time-range replay and retention trimming.
 
 - `GET /v1/stream/topics` → list topics for tenant
 - `PUT /v1/stream/topics/:topic {maxLen?, minId?, retentionMs?}` — create or update stream topic

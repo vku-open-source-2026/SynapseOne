@@ -16,13 +16,13 @@
 
 **SynapseOne is an open-source Tier-1 PaaS (Apache-2.0): one API gateway, AWS-style access
 management, a core data cluster (documents, cache and queue), and native workflows —
-operated through a web Console, SDKs in three languages, and a zero-dependency CLI.**
+operated through a web Console, SDKs in four languages, and a zero-dependency CLI.**
 
 No lock-in: Authentik/Keycloak runs as an optional external IdP over
 standard OIDC. Everything else is SynapseOne code, pure Apache-2.0.
 
 - 🌐 **Live demo:** [synapseone.space](https://synapseone.space) · Console: [cloud.synapseone.space](https://cloud.synapseone.space) · API: `https://api.synapseone.space/health`
-- 📦 **Install:** `npm i @synapseone/sdk` · `pip install synapseone-sdk` · `npx @synapseone/cli` · Go SDK via the monorepo (see below)
+- 📦 **Install:** `npm i @synapseone/sdk` · `pip install synapseone-sdk` · `npx @synapseone/cli` · Go and Rust SDKs via the monorepo (see below)
 - 🚀 **Self-host:** public GHCR images (`docker compose pull`) or build from source (`docker compose up -d --build`) — see [Self-host](#self-host)
 
 ## Why SynapseOne
@@ -32,18 +32,18 @@ standard OIDC. Everything else is SynapseOne code, pure Apache-2.0.
 | **API Gateway** | Single entry point: JWT/API-key auth, principal propagation (`x-synapseone-*`), edge rate limiting, tracing, aggregate `/ready`, Prometheus `/metrics` |
 | **AWS-style IAM** | Organization → Account → User → Role → JSON Policy (Allow/Deny + Condition), enforced per-route scopes, `authorize` API + dry-run simulator, mutation audit trail, tenant isolation on every write (role-based, same-org fallback) |
 | **Flexible identity** | First-party password lifecycle (register/login/change/reset/verify), TOTP MFA with recovery codes, sign-in lockout, short-lived JWT, atomic rotating refresh tokens, API keys, service accounts, delegated user-token exchange for Tier 2, and real OIDC Authorization Code flow (Authentik/Keycloak) with shadow users |
-| **Core data** | Postgres (source of truth) + Redis + SeaweedFS (S3-compatible, Apache-2.0) object storage, versioned schema, idempotent seed, daily Postgres dumps and incremental object snapshots with restore |
+| **Core data** | Postgres (source of truth) + Valkey (Redis-protocol) + SeaweedFS (S3-compatible, Apache-2.0) object storage, versioned schema, idempotent seed, daily Postgres dumps and incremental object snapshots with restore |
 | **SynapseBase** | Self-managed document database: collections, object↔data mapping with validation, filters/cursors, optimistic concurrency, atomic counters, batches and a change feed (`/v1/base`) |
-| **Synapse Faststore** | Redis-backed cache/KV and data structures: TTL strings, counters, hashes, lists, sets, sorted sets, scans, batches and distributed locks (`/v1/faststore`) |
+| **Synapse Faststore** | Valkey-backed cache/KV and data structures: TTL strings, counters, hashes, lists, sets, sorted sets, scans, batches and distributed locks (`/v1/faststore`) |
 | **SynapseQueue** | At-least-once messaging: delayed/deduplicated publishing, visibility-timeout leases, ack/nack/heartbeat, retries, dead letters and replay (`/v1/queue`) |
-| **SynapseStream** | Tenant-scoped event log over Redis Streams/Kafka with consumer groups, acks and retention (`/v1/stream`) |
+| **SynapseStream** | Tenant-scoped event log over Valkey/Redis Streams or Kafka with consumer groups, acks and retention (`/v1/stream`) |
 | **Synapse Warehouse** | Tenant-scoped OLAP: DuckDB datasets, read-only SQL, batch SQL transforms and SynapseStream-driven stream ETL, plus workflow templates (`/v1/warehouse`) |
 | **SynapseOCS** | Tenant-scoped buckets/objects with direct + multipart upload, presigned URLs, checksums, size/type limits and quotas (`/v1/ocs`, legacy `/v1/storage`) |
 | **SynapseNotifications** | Durable outbox + `{{var}}` templates, per-recipient preferences/unsubscribe, email/SMS/push relays, webhooks, retries and dead letters (`/v1/notifications`) |
 | **Workflows** | Built-in workflow engine (Apache-2.0): queue-backed DAG runner, versioned templates, activate/deactivate/execute (real webhook & cron triggers), sandboxed code execution, execution history, visual graph editor, and self-hosted runner image for hybrid/private execution |
 | **Linked Data (SynapseLDS)** | Licence-picked NGSI-LD datasources: structural-allowlist projection (`_core` never serialized), per-attribute visibility (public/restricted/internal), default-deny schema registry, workflow publish node (`lds.publish-record`) |
 | **AI assistant** | Chatbot on the API Docs page: decision model picks the endpoint, LLM pre-fills the try-it form (server-side key, guidance-only, never public) |
-| **Clients** | TypeScript, Python and Go SDKs with full API parity, zero-dependency CLI, admin Console |
+| **Clients** | TypeScript, Python, Go and Rust SDKs with full API parity, zero-dependency CLI, admin Console |
 
 ## Try it in 30 seconds
 
@@ -102,11 +102,14 @@ await c.faststore.set('cache:demo', { ok: true }, { ttlSeconds: 300 });
 await c.queue.publish('emails', { to: 'demo@acme.local' });
 ```
 
-All clients cover the full API (`docs/api.md`): password lifecycle + OIDC,
+The TypeScript, Python and Go clients cover the full API (`docs/api.md`): password lifecycle + OIDC,
 refresh/logout, delegated token exchange, orgs/accounts/users, roles/policies,
 authorize + dry-run, audit, API keys, service accounts, workflows/templates/
 executions, LDS, Base, Faststore, Queue, Stream, Object Storage, Notifications,
-AI and inference (streaming). The SDKs are split per service namespace
+AI and inference (streaming). A Rust SDK (`sdks/sdk-rust`, crate `synapseone`,
+version `0.9.0`) covers the same service namespaces and is ready for crates.io
+publication.
+The SDKs are split per service namespace
 (`c.iam`, `c.workflow`, `c.lds`, `c.base`, `c.faststore`, `c.queue`,
 `c.stream`, `c.storage`, `c.notifications`, `c.ai`, `c.inference`, `c.health`);
 legacy flat methods still work with a deprecation warning. See the parity
@@ -203,7 +206,7 @@ Client → Gateway :8080 ─┬─► IAM :4001           (Org/Account/Role/Poli
                          ├─► Stream :4009        (event log / consumer groups)
                          ├─► Storage :4010       (objects, multipart, presign)
                          └─► Notifications :4011 (outbox + delivery)
-                         Postgres :5432 / Redis :6379 / SeaweedFS (S3) :9090
+                         Postgres :5432 / Valkey :6379 / SeaweedFS (S3) :9090
                          pg-backup + s3-backup → volumes pgbackups / s3backups
 ```
 
@@ -228,10 +231,11 @@ apps/notifications-service SynapseNotifications — outbox, templates, preferenc
 sdks/sdk-js                @synapseone/sdk (TypeScript, zero runtime deps)
 sdks/sdk-python            synapseone-sdk (Python, requests only)
 sdks/sdk-go                synapseone-sdk-go (Go, stdlib only)
+sdks/sdk-rust              synapseone (Rust, async reqwest/tokio)
 tools/cli                  synapseone CLI (zero deps, Node 18+) + install.sh
 tools/backup               pg-backup.sh / pg-restore.sh / s3-backup.mjs (backup + restore)
 infra/prod                 Production edge: nginx + Certbot overlay
-infra/monitoring           Prometheus (scrape gateway/PG/Redis + alert rules)
+infra/monitoring           Prometheus (scrape gateway/PG/Valkey + alert rules)
 infra/k8s/base             Kustomize manifests for Kubernetes
 infra/postgres/init.sql    Database bootstrap (extensions + journal schema; services own migrations)
 examples/quickstart        End-to-end demo script

@@ -27,6 +27,16 @@ Format based on Keep a Changelog; versioning follows SemVer.
   model-token table, step-up dialog fixes, mobile/dark-mode fixes and an admin
   404 route.
 - IAM migration `0008_shocking_grandmaster.sql`: `platform_step_ups`.
+- `@synapseone/cli` 0.10.0: first-class commands for Faststore, Queue,
+  Stream, OCS, Notifications, Search, Secrets, Inference/AI, Warehouse,
+  Human tasks, Usage and SCIM. `synapseone call` remains only as an escape
+  hatch for endpoints without a dedicated command.
+
+### Changed
+- Database performance: transaction-mode PgBouncer for IAM, workflow and
+  SynapseBase; tuned Postgres settings for the production host; and a
+  fail-open SynapseBase document read cache backed by Synapse Faststore.
+  See `docs/database-performance.md`.
 
 ### Fixed
 - `/v1/platform/session` reaches IAM for a normal user JWT instead of being

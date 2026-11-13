@@ -58,7 +58,7 @@ scrape_configs:
       - targets: ['postgres-exporter:9187']
         labels: { service: postgres }
 
-  - job_name: redis
+  - job_name: valkey
     static_configs:
-      - targets: ['redis-exporter:9121']
-        labels: { service: redis }
+      - targets: ['valkey-exporter:9121']
+        labels: { service: valkey }
