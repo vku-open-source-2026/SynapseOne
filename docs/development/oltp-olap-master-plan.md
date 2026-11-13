@@ -1,6 +1,6 @@
 # OLTP → OLAP Data Platform — Master Plan
 
-Status: **IN PROGRESS**
+Status: **IMPLEMENTED, VERIFIED IN ISOLATED + PRODUCTION CANARY**
 Owner: SynapseOne Tier-1
 Baseline commit: `38a87d2`
 Last updated: 2026-11-13
@@ -212,3 +212,22 @@ Guarantees:
 | Date | Work | Evidence |
 |---|---|---|
 | 2026-11-13 | Recon complete; plan written | source inspection, baseline `38a87d2` |
+| 2026-11-13 | Base transactional outbox + tombstones | API tests, Postgres QA `create/update/delete`, rollback-safe duplicate |
+| 2026-11-13 | Outbox → Stream relay | fake Stream test: publish once, second relay 0 |
+| 2026-11-13 | Warehouse durable dedup + tombstones | 12/12 service tests; crash/replay marker |
+| 2026-11-13 | SQL safety + timeout | literal-aware guard, DuckDB escape corpus, query timeout |
+| 2026-11-13 | 1,000-event exact test | 1,000 unique rows, sum 500500, reopen, duplicate delivery, tenant isolation |
+| 2026-11-13 | Flow B E2E | Base create/update/delete → outbox → Stream → DuckDB, duplicate + restart |
+| 2026-11-13 | Flow A exactness | Production completed-hour warehouse 2,564 = Postgres 2,564 |
+| 2026-11-13 | Production canary | platform tenant: 3 events, 3 rows, duplicate stayed 3; cleaned up |
+| 2026-11-13 | Release | `96e902c` + `960947c`, images `0.9.2-data` |
+
+## Deployed State
+
+- Base/Warehouse/IAM/Gateway/Console: `0.9.2-data`.
+- Warehouse volume backed up at `backups/pre-data-platform-20261113/warehouse-data.tgz`.
+- Platform DB backup: `synapseone-pre-data.dump`.
+- Migration `synapseone_base_outbox` applied.
+- `/ready` includes warehouse (12/12).
+- Production canary dataset/job/collection deleted after verification.
+
