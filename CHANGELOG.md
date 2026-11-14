@@ -5,6 +5,12 @@ Format based on Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added
+- SynapseBase now has a tenant → database → collection → document namespace.
+  Existing collections migrate to a per-scope `default` database, legacy flat
+  routes keep working, and databases support CRUD, stats and cascade delete.
+  The console adds database selection plus create/rename/delete actions.
+
 ### Changed
 - Faststore, Queue, OCS, Warehouse, Base and the Tier-1 gateway now ship as
   Rust/Axum services. They keep the existing HTTP contracts, tenant/auth/audit
@@ -12,6 +18,17 @@ Format based on Keep a Changelog; versioning follows SemVer.
   bootstrap and use `--healthcheck` instead of Node.js.
 
 ### Added
+- **SynapseBase database namespaces**: `synapseone_base_databases` adds a
+  tenant-scoped `database → collection → documents` hierarchy. Collection
+  names are unique per database (`(database_id, name)`), so independent apps can
+  reuse names such as `users` without collisions. New
+  `/v1/base/databases[/:database[/collections/...]]` routes; the legacy flat
+  `/v1/base/collections/...` routes keep working against a per-tenant `default`
+  database (or `?database=<name>`). `DELETE` refuses non-empty databases unless
+  `?cascade=true`. SDKs expose database-scoped handles (`base.database(name)`,
+  `WithBaseDatabase`, `BaseService::database`). Migration
+  `0008_base_databases` is replay-safe and attaches all existing collections to
+  `default` without rewriting documents. See `docs/synapsebase.md`.
 - **Platform Super Admin** (`/admin`, `/v1/platform/*`): dedicated cross-tenant
   control plane with Overview, Organizations, Users & Access, Service Health,
   Usage and Audit & Security. Platform administrators are stored separately from
