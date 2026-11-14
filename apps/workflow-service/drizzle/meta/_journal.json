@@ -50,6 +50,13 @@
       "when": 1799000000000,
       "tag": "0006_optimal_firestar",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1800000000000,
+      "tag": "0007_workflow_credential_owner",
+      "breakpoints": true
     }
   ]
 }

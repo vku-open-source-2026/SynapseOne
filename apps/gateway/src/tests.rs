@@ -153,6 +153,8 @@ enum KeyMode {
         account: &'static str,
         org: &'static str,
         scopes: Vec<&'static str>,
+        /// Verified IAM `user_id`; `Some` = user-bound key, `None` = account key.
+        owner: Option<&'static str>,
     },
     Invalid,
     Error,
@@ -315,12 +317,13 @@ async fn mock_keys(
             account,
             org,
             scopes,
+            owner,
         } => Json(json!({
             "valid": true,
             "id": "key-1",
             "account_id": account,
             "org_id": org,
-            "user_id": Value::Null,
+            "user_id": owner.map(Value::from).unwrap_or(Value::Null),
             "scopes": scopes,
         }))
         .into_response(),
@@ -852,6 +855,83 @@ fn propagate_principal_strips_spoofs_and_mirrors_legacy() {
         Some("platform-admin")
     );
     assert!(headers.get("x-synapseone-org").is_none());
+}
+
+#[test]
+fn propagate_principal_stamps_api_key_owner_only_for_user_bound_keys() {
+    // User-bound API key: verified IAM `user_id` becomes the principal user so
+    // workflow/audit see the real user, while the credential stays `kind=apikey`.
+    let user_bound = Principal {
+        r#type: "apikey".into(),
+        org: Some("o1".into()),
+        account: Some("a1".into()),
+        scopes: vec!["faststore:*".into()],
+        key_id: Some("k1".into()),
+        owner: Some("user-42".into()),
+        ..Principal::default()
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert("x-synapseone-user", HeaderValue::from_static("mallory"));
+    headers.insert("x-synapseone-kind", HeaderValue::from_static("user"));
+    headers.insert("x-synapseone-org", HeaderValue::from_static("victim-org"));
+    headers.insert("x-synapsedx-user", HeaderValue::from_static("mallory"));
+    propagate_principal(&mut headers, Some(&user_bound), Some(AuthMode::ApiKey), "");
+    assert_eq!(
+        header_value(&headers, "x-synapseone-kind").as_deref(),
+        Some("apikey")
+    );
+    assert_eq!(
+        header_value(&headers, "x-synapseone-user").as_deref(),
+        Some("user-42"),
+        "forged user header must be replaced by the verified key owner"
+    );
+    assert_eq!(
+        header_value(&headers, "x-synapsedx-user").as_deref(),
+        Some("user-42"),
+        "the legacy mirror must carry the verified owner too"
+    );
+    assert_eq!(
+        header_value(&headers, "x-synapseone-org").as_deref(),
+        Some("o1"),
+        "forged org header must be replaced by the verified key org"
+    );
+    assert_eq!(
+        header_value(&headers, "x-synapseone-account").as_deref(),
+        Some("a1")
+    );
+
+    // Account-level key: no owner, stays a pure machine even if the client
+    // forges user headers (canonical or legacy).
+    let account_key = Principal {
+        r#type: "apikey".into(),
+        org: Some("o1".into()),
+        account: Some("a1".into()),
+        scopes: vec!["faststore:*".into()],
+        key_id: Some("k2".into()),
+        owner: None,
+        ..Principal::default()
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert("x-synapseone-user", HeaderValue::from_static("mallory"));
+    headers.insert("x-synapsedx-user", HeaderValue::from_static("mallory"));
+    propagate_principal(&mut headers, Some(&account_key), Some(AuthMode::ApiKey), "");
+    assert_eq!(
+        header_value(&headers, "x-synapseone-kind").as_deref(),
+        Some("apikey")
+    );
+    assert!(headers.get("x-synapseone-user").is_none());
+    assert!(headers.get("x-synapsedx-user").is_none());
+
+    // An empty owner (malformed IAM payload) must never stamp an empty user.
+    let empty_owner = Principal {
+        r#type: "apikey".into(),
+        account: Some("a1".into()),
+        owner: Some(String::new()),
+        ..Principal::default()
+    };
+    let mut headers = HeaderMap::new();
+    propagate_principal(&mut headers, Some(&empty_owner), Some(AuthMode::ApiKey), "");
+    assert!(headers.get("x-synapseone-user").is_none());
 }
 
 #[test]
@@ -1650,6 +1730,7 @@ async fn public_routes_optional_auth_and_anon_marker() {
         account: "a1",
         org: "o1",
         scopes: vec!["*"],
+        owner: None,
     });
     let response = client
         .get(format!("{}/v1/auth/login", gateway.base))
@@ -1683,6 +1764,7 @@ async fn api_key_verification_and_fail_closed() {
         account: "a1",
         org: "o1",
         scopes: vec!["faststore:*"],
+        owner: None,
     });
     let gateway = spawn_gateway(test_config(&iam.base), routes).await;
     let client = http();
@@ -1711,6 +1793,68 @@ async fn api_key_verification_and_fail_closed() {
     assert_eq!(mock.key_internal().as_deref(), Some(TEST_INTERNAL));
     assert_eq!(mock.key_body().unwrap()["apiKey"], "good-key");
     assert!(mock.key_hits() >= 1);
+
+    // A user-bound key (verified IAM `user_id`) must reach the upstream as the
+    // real user with `kind=apikey` preserved, on both header spellings, and any
+    // forged identity headers must be replaced.
+    mock.set_key(KeyMode::Valid {
+        account: "a1",
+        org: "o1",
+        scopes: vec!["faststore:*"],
+        owner: Some("user-42"),
+    });
+    let response = client
+        .get(format!("{}/v1/faststore/keys/b", gateway.base))
+        .header("x-api-key", "user-bound-key")
+        .header("x-synapseone-user", "mallory")
+        .header("x-synapseone-kind", "user")
+        .header("x-synapseone-org", "victim-org")
+        .header("x-synapsedx-user", "mallory-legacy")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        upstream.header("x-synapseone-kind").as_deref(),
+        Some("apikey"),
+        "a user-bound key must not become an end-user JWT"
+    );
+    assert_eq!(
+        upstream.header("x-synapseone-user").as_deref(),
+        Some("user-42")
+    );
+    assert_eq!(
+        upstream.header("x-synapsedx-user").as_deref(),
+        Some("user-42")
+    );
+    assert_eq!(upstream.header("x-synapseone-org").as_deref(), Some("o1"));
+    assert_eq!(
+        upstream.header("x-synapseone-account").as_deref(),
+        Some("a1")
+    );
+
+    // Account-level key: machine semantics, forged user headers are dropped.
+    mock.set_key(KeyMode::Valid {
+        account: "a1",
+        org: "o1",
+        scopes: vec!["faststore:*"],
+        owner: None,
+    });
+    let response = client
+        .get(format!("{}/v1/faststore/keys/c", gateway.base))
+        .header("x-api-key", "account-key")
+        .header("x-synapseone-user", "mallory")
+        .header("x-synapsedx-user", "mallory-legacy")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        upstream.header("x-synapseone-kind").as_deref(),
+        Some("apikey")
+    );
+    assert!(upstream.header("x-synapseone-user").is_none());
+    assert!(upstream.header("x-synapsedx-user").is_none());
 
     // MCP/CLI clients may use Bearer <api-key> on `either` routes.
     let response = client
@@ -1805,6 +1949,7 @@ async fn verify_api_key_upstream_direct() {
         account: "a1",
         org: "o1",
         scopes: vec!["*"],
+        owner: None,
     });
     let info = verify_api_key_upstream(&http(), &iam.base, "k", "s3cret")
         .await
@@ -1929,6 +2074,7 @@ async fn scope_denied_for_read_only_api_key() {
         account: "a1",
         org: "o1",
         scopes: vec!["faststore:get"],
+        owner: None,
     });
     let routes = vec![with_service(
         route("/v1/faststore", upstream.base(), AuthMode::Either),
@@ -1968,6 +2114,7 @@ async fn inference_quota_per_tenant() {
         account: "a1",
         org: "o1",
         scopes: vec!["*"],
+        owner: None,
     });
     let mut config = test_config(&iam.base);
     config.inference_rate_limit_per_min = 2;

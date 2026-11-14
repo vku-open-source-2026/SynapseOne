@@ -17,6 +17,7 @@ import dotenv from 'dotenv';
 import { timingSafeEqual, randomUUID } from 'crypto';
 import { auditMiddleware } from './audit';
 import { AsyncLocalStorage } from 'async_hooks';
+import { workflowVisibleTo, validateWorkflowAccess } from './access';
 import {
   createWorkflowRec, getWorkflowRec, listWorkflowRecs, updateWorkflowRec, deleteWorkflowRec,
   createExecutionRec, getExecutionRec, listExecutionRecs, findActiveWebhookWorkflow,
@@ -43,7 +44,7 @@ import {
 } from './queue';
 import type { WorkflowRunnerMode } from './queue';
 import { startPlatformWorker, platformWorkerId } from './worker';
-import { runWorkflow, HumanTaskPause, detectCycle, workflowCronIntervalMs, workflowCronNextRunAt, validateCronParams, validateSynapseOneParams, validateIntegrationParams, validateAgentToolIds, extractEmbeddingVector, isBlockedUrl as engineIsBlockedUrl, isAllowedSelfUrl, selfAllowlist, actorFor, isWebhookType, isCronType, isTriggerType, isCodeType, isHttpRequestType, isIfType, isSetType, isNoOpType, isAiAgentType, isDecisionType, isModelType, isIntegrationType, isMcpTriggerType, normalizeNodeType, edgeTargetPort, auxiliaryEdges } from './engine';
+import { runWorkflow, HumanTaskPause, detectCycle, workflowCronIntervalMs, workflowCronNextRunAt, validateCronParams, validateSynapseOneParams, validateIntegrationParams, validateAgentToolIds, extractEmbeddingVector, isBlockedUrl as engineIsBlockedUrl, isAllowedSelfUrl, selfAllowlist, actorFor, isWebhookType, isCronType, isTriggerType, isCodeType, isHttpRequestType, isIfType, isSetType, isNoOpType, isAiAgentType, isDecisionType, isModelType, isIntegrationType, isMcpTriggerType, normalizeNodeType, edgeTargetPort, auxiliaryEdges, HTTP_CREDENTIAL_DESTINATION_PROTECTION } from './engine';
 import type { CredentialResolver, RunPrincipal, SynapseOneCall, EngineNode, Connections } from './engine';
 
 /** May this credential be resolved for this run principal? (P0-4/#5)
@@ -51,6 +52,7 @@ import type { CredentialResolver, RunPrincipal, SynapseOneCall, EngineNode, Conn
  *  - legacy unbound credentials (no org): only the owning account — org
  *    principals cannot reach secrets of unknown tenancy. */
 export function credentialVisibleTo(rec: StoredCredential, p: Principal | null | undefined): boolean {
+  if (rec.owner_sub && (!p || p.sub !== rec.owner_sub)) return false;
   if (!p) return true; // anonymous direct calls (dev/tests)
   const acctOk = !!p.account && rec.account_id === p.account;
   const orgOk = !!p.org && !!rec.org_id && rec.org_id === p.org;
@@ -80,10 +82,7 @@ export function makeCredentialResolver(p: Principal | null | undefined): Credent
  *  authenticated callers never see pre-tenancy leftovers. Returns false →
  *  caller gets 404 (existence not leaked). */
 function canAccessWorkflow(w: StoredWorkflow, p: Principal | null | undefined): boolean {
-  if (!p) return true; // anonymous direct calls (dev/tests)
-  if (p.account && w.account_id === p.account) return true;
-  if (p.org && w.org_id === p.org) return true;
-  return false;
+  return workflowVisibleTo(w, p);
 }
 
 /** Tenant filter for execution lists (P0-3/#6): match the principal snapshot
@@ -98,11 +97,14 @@ function executionScope(p: Principal | null | undefined): { orgId?: string; acco
 }
 
 /** Human-task tenant guard (#44). */
-function canAccessHumanTask(t: { org_id?: string | null; account_id?: string | null }, p: Principal | null | undefined): boolean {
-  if (!p) return true;
-  if (p.account && t.account_id === p.account) return true;
-  if (p.org && t.org_id === p.org) return true;
-  return false;
+async function canAccessHumanTask(
+  t: { org_id?: string | null; account_id?: string | null; workflow_id?: string | null },
+  p: Principal | null | undefined,
+): Promise<boolean> {
+  if (p && !((p.account && t.account_id === p.account) || (p.org && t.org_id === p.org))) return false;
+  if (!t.workflow_id) return true;
+  const workflow = await getWorkflowRec(t.workflow_id);
+  return !!workflow && canAccessWorkflow(workflow, p);
 }
 
 function humanTaskScope(p: Principal | null | undefined): { orgId?: string; accountId?: string } | null {
@@ -128,6 +130,16 @@ function canAccessExecution(e: { principal?: Principal | null }, p: Principal | 
   if (p.account && e.principal?.account === p.account) return true;
   if (p.org && e.principal?.org === p.org) return true;
   return false;
+}
+
+/** API viewers must also satisfy the workflow policy. Runner claims retain
+ * their separately authenticated tenant/queue checks below. */
+async function canReadExecution(e: StoredExecution, p: Principal | null | undefined): Promise<boolean> {
+  if (!canAccessExecution(e, p)) return false;
+  const workflow = await getWorkflowRec(e.workflow_id);
+  // A deleted workflow cannot grant a new viewer access to its old payloads.
+  if (!workflow) return !p || e.principal?.sub === p.sub;
+  return canAccessWorkflow(workflow, p);
 }
 
 /** Nested workflow executions (agent `workflow_run` / SynapseFlow node).
@@ -209,10 +221,11 @@ export const synapseoneCall: SynapseOneCall = async (resource, operation, args, 
       const scope = executionScope(principal);
       if (!scope) return { data: [] };
       const { items } = await listExecutionRecs({ workflowId, status, limit, offset, ...scope });
-      return { data: items.map((e) => toApiExecution(e, false)) };
+      const visibility = await Promise.all(items.map((e) => canReadExecution(e, principal)));
+      return { data: items.filter((_e, i) => visibility[i]).map((e) => toApiExecution(e, false)) };
     }
     const e = await getExecutionRec(cleanId(a.id, 'id', 128));
-    if (!e || !canAccessExecution(e, principal)) throw new Error('synapseone.api: executions.get -> 404 (not found)');
+    if (!e || !await canReadExecution(e, principal)) throw new Error('synapseone.api: executions.get -> 404 (not found)');
     return toApiExecution(e, true);
   }
   if (resource === 'templates') {
@@ -1279,8 +1292,9 @@ export function principalFromHeaders(req: express.Request): import('./store').Pr
       kind: clean(h('x-synapseone-kind')),
     };
   }
-  // API keys are machine identities: the gateway stamps kind=apikey + account
-  // but no user (keys carry no user claim). Without this fallback they would
+  // Account-level API keys have kind=apikey + account without a user. The
+  // gateway stamps a verified user for user-bound keys handled above. Without
+  // this fallback, account-level keys would
   // look like an internal/direct call — workflow scoping would treat them as
   // tenant-free (global list, arbitrary tenant binding). Any tenant marker
   // means "authenticated principal"; synthesize a non-user subject.
@@ -1305,7 +1319,10 @@ export function principalFromHeaders(req: express.Request): import('./store').Pr
 export function workflowRunPrincipal(wf: {
   org_id?: string | null; account_id?: string | null; owner_sub?: string | null; run_as?: string | null;
 }): import('./store').Principal | null {
-  const sub = String(wf.run_as || '').trim() || String(wf.owner_sub || '').trim();
+  // A caller-controlled runAs value is never proof of another identity.
+  // Existing owned workflows must run as their stored creator, including
+  // workflows saved before runAs validation was introduced.
+  const sub = String(wf.owner_sub || '').trim() || String(wf.run_as || '').trim();
   if (!sub && !wf.org_id && !wf.account_id) return null;
   return { sub: sub || 'workflow', org: wf.org_id || undefined, account: wf.account_id || undefined, kind: 'workflow' };
 }
@@ -1517,6 +1534,11 @@ function runnerOptions(): any {
       inference: DEFAULT_INFERENCE_QUEUE,
     },
     kinds: ['workflow', 'inference', 'hybrid'],
+    engineCapabilities: {
+      httpCredentialAllowedOrigins: HTTP_CREDENTIAL_DESTINATION_PROTECTION === 1,
+      httpCredentialDestinationProtection: HTTP_CREDENTIAL_DESTINATION_PROTECTION,
+      httpIncludeInput: true,
+    },
     heartbeatIntervalSeconds: runnerHeartbeatSeconds(),
     longPollSeconds: runnerLongPollSeconds(),
     staleAfterSeconds: runnerStaleAfterSeconds(),
@@ -1758,6 +1780,12 @@ export function createApp(): express.Express {
         recordWebhookReject('not_found');
         return res.status(404).json({ error: 'webhook_not_found' });
       }
+      // An owner-only graph cannot be made callable by an anonymous webhook,
+      // even if its trigger was accidentally imported with auth.mode=none.
+      if (wf.settings?.access !== undefined && wf.settings.access?.mode !== 'tenant') {
+        recordWebhookReject('not_found');
+        return res.status(404).json({ error: 'webhook_not_found' });
+      }
       const node = webhookNodeFor(wf, clean);
       const params = (node as any)?.parameters || {};
       // Rate limit (fixed window per workflow).
@@ -1914,6 +1942,7 @@ export function createApp(): express.Express {
       if (!w.active) continue;
       const tool = findMcpTrigger({ nodes: w.nodes });
       if (!tool) continue;
+      if (w.settings?.access !== undefined && !canAccessWorkflow(w, principal)) continue;
       // Anonymous callers only see explicitly public, read-only tools. A
       // logged-in caller sees its tenant tools plus other tenants' public
       // read-only docs tools.
@@ -2162,6 +2191,9 @@ function tenantBinding(
   if (!accBody.ok) return { ok: false, status: 400, error: 'invalid_tenant', message: 'accountId must be 1..128 chars' };
   const runAsBody = read('runAs');
   if (!runAsBody.ok) return { ok: false, status: 400, error: 'invalid_tenant', message: 'runAs must be 1..128 chars' };
+  if (p && runAsBody.value && runAsBody.value !== (cur?.owner_sub || p.sub)) {
+    return { ok: false, status: 403, error: 'invalid_run_as', message: 'runAs must match the workflow creator' };
+  }
 
   if (p?.org && orgBody.value && orgBody.value !== p.org) {
     return { ok: false, status: 403, error: 'cross_tenant', message: 'cannot bind a workflow outside your own org' };
@@ -2213,11 +2245,11 @@ function tenantBinding(
     }
     if (orgQ || acctQ) {
       const all = await listWorkflowRecs({ ...(orgQ ? { orgId: orgQ } : {}), ...(acctQ ? { accountId: acctQ } : {}) });
-      res.json(all.map(toApiWorkflow));
+      res.json(all.filter((w) => canAccessWorkflow(w, null)).map(toApiWorkflow));
       return;
     }
     const all = await listWorkflowRecs();
-    res.json(all.map(toApiWorkflow));
+    res.json(all.filter((w) => canAccessWorkflow(w, null)).map(toApiWorkflow));
   });
 
   // Get one workflow
@@ -2298,6 +2330,8 @@ function tenantBinding(
     }
     const execSettingsErr = validateExecutionSettings(settingsOut);
     if (execSettingsErr) return res.status(400).json({ error: 'invalid_settings', message: execSettingsErr });
+    const accessErr = validateWorkflowAccess(settingsOut, principalFromHeaders(req));
+    if (accessErr) return res.status(400).json({ error: 'invalid_settings', message: accessErr });
     // P0-3: tenant binding — explicit body org/account must stay inside the
     // caller's own org; otherwise inherit from the stamped principal.
     const tenant = tenantBinding(req, req.body || {});
@@ -2333,6 +2367,8 @@ function tenantBinding(
     }
     const execSettingsErr = validateExecutionSettings(settings ?? cur.settings);
     if (execSettingsErr) return res.status(400).json({ error: 'invalid_settings', message: execSettingsErr });
+    const accessErr = validateWorkflowAccess(settings ?? cur.settings, principalFromHeaders(req), cur);
+    if (accessErr) return res.status(400).json({ error: 'invalid_settings', message: accessErr });
     let nodes = cur.nodes;
     let connections = cur.connections;
     if (definition != null) {
@@ -2375,6 +2411,18 @@ function tenantBinding(
     const wf = await getWorkflowRec(id);
     const principal = principalFromHeaders(req);
     if (!wf || !canAccessWorkflow(wf, principal)) return res.status(404).json({ error: 'not_found', message: 'workflow not found' });
+    // Check the revision on the SAME workflow object that is executed or
+    // enqueued. A separate client GET followed by execute leaves a race in
+    // which an edited, unreviewed definition could run from a published page.
+    if (req.query.expectedRevision !== undefined) {
+      const raw = req.query.expectedRevision;
+      if (typeof raw !== 'string' || !/^[1-9]\d{0,9}$/.test(raw) || !Number.isSafeInteger(Number(raw))) {
+        return res.status(400).json({ error: 'invalid_revision', message: 'expectedRevision must be a positive integer' });
+      }
+      if (Number(raw) !== wf.revision) {
+        return res.status(409).json({ error: 'workflow_revision_conflict', message: 'workflow changed since approval', revision: wf.revision });
+      }
+    }
     const input = (req.body && typeof req.body === 'object' ? req.body : { value: req.body }) || {};
     const startedAt = new Date().toISOString();
     const executionId = randomUUID();
@@ -2553,7 +2601,8 @@ function tenantBinding(
     const scope = executionScope(principal);
     if (!scope) return res.status(403).json({ error: 'forbidden', message: 'caller has no tenant scope' });
     const { items } = await listExecutionRecs({ workflowId, status, triggeredBy, limit, offset, ...scope });
-    const mapped = items.map((e) => toApiExecution(e, includeData));
+    const visibility = await Promise.all(items.map((e) => canReadExecution(e, principal)));
+    const mapped = items.filter((_e, i) => visibility[i]).map((e) => toApiExecution(e, includeData));
     // Console accepts both a raw array and {data: []} — return the envelope
     // with data for forward-compat (n8n proxied {data} before).
     res.json({ data: mapped });
@@ -2564,7 +2613,7 @@ function tenantBinding(
     const id = idGate(req, res);
     if (id === null) return;
     const e = await getExecutionRec(id);
-    if (!e || !canAccessExecution(e, principalFromHeaders(req))) {
+    if (!e || !await canReadExecution(e, principalFromHeaders(req))) {
       return res.status(404).json({ error: 'not_found', message: 'execution not found' });
     }
     const includeData = (req.query as any).includeData === 'true';
@@ -3043,6 +3092,11 @@ function tenantBinding(
       res.status(404).json({ error: 'not_found', message: 'execution not found' });
       return null;
     }
+    const workflow = await getWorkflowRec(execution.workflow_id);
+    if (workflow?.settings?.access !== undefined && !canAccessWorkflow(workflow, principal)) {
+      res.status(404).json({ error: 'not_found', message: 'execution not found' });
+      return null;
+    }
     if (!execution.queue_name || execution.queue_name !== runner.queue || execution.runner !== runner.mode) {
       res.status(403).json({ error: 'runner_mismatch', message: `execution belongs to queue '${execution.queue_name || '-'}' / mode '${execution.runner || '-'}'` });
       return null;
@@ -3076,6 +3130,16 @@ function tenantBinding(
         finishedAt: new Date().toISOString(), workerId: ctx.runner.id, allowedStatuses: ['running'],
       });
       return res.status(410).json({ error: 'workflow_not_found' });
+    }
+    // A queued run must never silently adopt a newer workflow definition.
+    // Check after claiming, before returning any executable graph to a runner.
+    if (claimed.workflow_revision != null && claimed.workflow_revision !== wf.revision) {
+      await finishExecutionRec(claimed.id, {
+        status: 'error', output: null, node_runs: [],
+        error: 'workflow revision changed after this execution was queued; submit a new execution',
+        finishedAt: new Date().toISOString(), workerId: ctx.runner.id, allowedStatuses: ['running'],
+      });
+      return res.status(409).json({ error: 'workflow_revision_conflict', message: 'queued workflow revision is no longer available' });
     }
     await heartbeatRunnerRec(ctx.runner.id, { status: 'connected' }).catch(() => null);
     res.setHeader('Cache-Control', 'no-store');
@@ -3243,6 +3307,9 @@ function tenantBinding(
 
   /** Tenant check shared by read/delete/rotate of an existing credential. */
   function canAccessCredential(req: any, cur: StoredCredential): { ok: boolean; status?: number; error?: string; message?: string } {
+    if (cur.owner_sub && !credentialVisibleTo(cur, principalFromHeaders(req))) {
+      return { ok: false, status: 404, error: 'not_found', message: 'credential not found' };
+    }
     const scope = credentialAccountScope(req, cur.account_id);
     if (!scope.ok) return scope;
     // Org-scoped callers may only touch credentials actually bound to their
@@ -3267,14 +3334,14 @@ function tenantBinding(
       const scope = credentialAccountScope(req, accountId);
       if (!scope.ok) return res.status(scope.status!).json({ error: scope.error, message: scope.message });
       const items = await listCredentialRecs(accountId, scope.orgId ?? undefined);
-      return res.json({ data: items.map(toPublicCredential) });
+      return res.json({ data: items.filter((c) => credentialVisibleTo(c, p)).map(toPublicCredential) });
     }
     // No account scope: anonymous dev view only (never secret material).
     if (p) {
       return res.status(400).json({ error: 'account_required', message: 'pass ?accountId= (credentials are account-scoped)' });
     }
     const items = await listCredentialRecs();
-    res.json({ data: items.map(toPublicCredential) });
+    res.json({ data: items.filter((c) => credentialVisibleTo(c, p)).map(toPublicCredential) });
   };
   app.get('/v1/credentials', listCredentialsHandler);
   app.get('/v1/accounts/:accountId/credentials', listCredentialsHandler);
@@ -3300,7 +3367,10 @@ function tenantBinding(
     const secretErr = credentialSecretError(kind, secret);
     if (secretErr) return res.status(400).json(secretErr);
     try {
-      const c = await createCredentialRec({ account_id: accountId, org_id: scope.orgId ?? null, name, kind, secret });
+      const c = await createCredentialRec({
+        account_id: accountId, org_id: scope.orgId ?? null,
+        owner_sub: principalFromHeaders(req)?.sub ?? null, name, kind, secret,
+      });
       res.status(201).json(toPublicCredential(c));
     } catch (e: any) {
       if ((e as any)?.code === 'conflict') return res.status(409).json({ error: 'conflict', message: (e as any).message });
@@ -3360,9 +3430,22 @@ function tenantBinding(
     if (!title || title.length > 300) return res.status(400).json({ error: 'invalid_title', message: 'title is required (≤300 chars)' });
     const deadline = b.deadline ? new Date(String(b.deadline)) : null;
     if (deadline && Number.isNaN(deadline.getTime())) return res.status(400).json({ error: 'invalid_deadline' });
+    // A fabricated task must not become a back door for resuming another
+    // principal's protected execution with the workflow owner's authority.
+    let linkedWorkflowId = b.workflowId ? String(b.workflowId) : null;
+    if (b.executionId) {
+      const execution = await getExecutionRec(String(b.executionId));
+      if (!execution || !await canReadExecution(execution, principal)) return res.status(404).json({ error: 'not_found' });
+      if (linkedWorkflowId && linkedWorkflowId !== execution.workflow_id) return res.status(400).json({ error: 'workflow_mismatch' });
+      linkedWorkflowId = execution.workflow_id;
+    }
+    if (linkedWorkflowId) {
+      const workflow = await getWorkflowRec(linkedWorkflowId);
+      if (!workflow || !canAccessWorkflow(workflow, principal)) return res.status(404).json({ error: 'not_found' });
+    }
     const task = await createHumanTaskRec({
       execution_id: b.executionId ? String(b.executionId) : null,
-      workflow_id: b.workflowId ? String(b.workflowId) : null,
+      workflow_id: linkedWorkflowId,
       node_name: b.node ? String(b.node) : 'manual',
       title,
       description: String(b.description || '').slice(0, 4000),
@@ -3391,13 +3474,15 @@ function tenantBinding(
       limit: Number(q.limit) || 50,
       offset: Number(q.offset) || 0,
     });
-    res.json({ items: items.map(toPublicHumanTask), total: items.length });
+    const visibility = await Promise.all(items.map((task) => canAccessHumanTask(task, principal)));
+    const visible = items.filter((_task, i) => visibility[i]);
+    res.json({ items: visible.map(toPublicHumanTask), total: visible.length });
   });
 
   app.get('/v1/human-tasks/:id', async (req, res) => {
     const task = await getHumanTaskRec(String(req.params.id || ''));
     const principal = principalFromHeaders(req);
-    if (!task || !canAccessHumanTask(task, principal)) return res.status(404).json({ error: 'not_found' });
+    if (!task || !await canAccessHumanTask(task, principal)) return res.status(404).json({ error: 'not_found' });
     res.json({ task: toPublicHumanTask(task) });
   });
 
@@ -3405,7 +3490,7 @@ function tenantBinding(
     const principal = principalFromHeaders(req);
     if (!principal) return res.status(401).json({ error: 'unauthenticated' });
     const task = await getHumanTaskRec(String(req.params.id || ''));
-    if (!task || !canAccessHumanTask(task, principal)) return res.status(404).json({ error: 'not_found' });
+    if (!task || !await canAccessHumanTask(task, principal)) return res.status(404).json({ error: 'not_found' });
     if (!canActOnHumanTask(task, principal)) return res.status(403).json({ error: 'not_assignee' });
     if (task.status !== 'pending' && task.status !== 'claimed') return res.status(409).json({ error: 'task_not_claimable', status: task.status });
     const updated = await transitionHumanTaskRec(task.id, ['pending', 'claimed'], {
@@ -3419,7 +3504,7 @@ function tenantBinding(
     const principal = principalFromHeaders(req);
     if (!principal) return res.status(401).json({ error: 'unauthenticated' });
     const task = await getHumanTaskRec(String(req.params.id || ''));
-    if (!task || !canAccessHumanTask(task, principal)) return res.status(404).json({ error: 'not_found' });
+    if (!task || !await canAccessHumanTask(task, principal)) return res.status(404).json({ error: 'not_found' });
     if (!canActOnHumanTask(task, principal)) return res.status(403).json({ error: 'not_assignee' });
     if (task.status === 'completed' || task.status === 'rejected') return res.status(409).json({ error: 'already_decided', status: task.status });
     if (task.status === 'expired' || task.status === 'cancelled') return res.status(409).json({ error: 'task_closed', status: task.status });
@@ -3509,7 +3594,7 @@ function tenantBinding(
   app.post('/v1/human-tasks/:id/expire', async (req, res) => {
     const principal = principalFromHeaders(req);
     const task = await getHumanTaskRec(String(req.params.id || ''));
-    if (!task || !canAccessHumanTask(task, principal)) return res.status(404).json({ error: 'not_found' });
+    if (!task || !await canAccessHumanTask(task, principal)) return res.status(404).json({ error: 'not_found' });
     if (task.status === 'completed' || task.status === 'rejected' || task.status === 'expired' || task.status === 'cancelled') {
       return res.status(409).json({ error: 'task_closed', status: task.status });
     }

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 VKU.VIC
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { usePlatformAuth } from '../../lib/platform-auth.jsx';
 import { Badge, Btn, Card, Empty, Err, Field, Input, PageTitle, Table, TableSkeleton } from '../../components/ui.jsx';
@@ -13,16 +13,20 @@ export default function AdminAccounts() {
   const [data, setData] = useState({ items: [], total: 0 });
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState(null);
+  const seqRef = useRef(0);
   const PAGE = 50;
 
   const load = useCallback(async (nextOffset = offset) => {
+    const seq = ++seqRef.current;
     setErr(null); setLoading(true);
     try {
       const p = new URLSearchParams({ limit: String(PAGE), offset: String(nextOffset) });
       if (query) p.set('q', query);
       const out = await platform.request(`/v1/platform/accounts?${p}`);
+      if (seq !== seqRef.current) return;
       setData({ items: Array.isArray(out.items) ? out.items : [], total: Number(out.total) || 0 });
-    } catch (e) { setErr(e); } finally { setLoading(false); }
+    } catch (e) { if (seq === seqRef.current) setErr(e); }
+    finally { if (seq === seqRef.current) setLoading(false); }
   }, [platform, query, offset]);
   useEffect(() => { load(); }, [load]);
 

@@ -56,17 +56,46 @@ export function AuthProvider({ children }) {
     [auth],
   );
 
+  /** Persist a server-issued login session. Context metadata is authoritative
+   *  when the server includes it; otherwise it is loaded with one retry. */
   const persistSession = useCallback(async (r) => {
-    let contexts = [];
-    let current = null;
-    try {
-      const ctx = await api.authContexts({ token: r.accessToken });
-      contexts = Array.isArray(ctx?.contexts) ? ctx.contexts : [];
-      current = ctx?.current || null;
-    } catch { /* older deployment or transient failure */ }
-    const next = { token: r.accessToken, refreshToken: r.refreshToken, user: r.user, email: r.user?.email, contexts, currentContext: current };
+    let contexts = Array.isArray(r?.contexts) ? r.contexts : null;
+    let current = r?.currentContext || null;
+    let preferred = r?.preferredContext || null;
+    if (!contexts) {
+      // Login responses include contexts, but older deployments do not. Retry
+      // once; on failure surface an error instead of pretending there are no
+      // contexts (which used to send a superadmin to /dashboard).
+      for (let attempt = 0; attempt < 2 && !contexts; attempt += 1) {
+        try {
+          const ctx = await api.authContexts({ token: r.accessToken });
+          contexts = Array.isArray(ctx?.contexts) ? ctx.contexts : [];
+          current = ctx?.current || current;
+          preferred = ctx?.preferred || ctx?.preferredContext || preferred;
+        } catch { /* retry once below */ }
+      }
+    }
+    if (!contexts) {
+      // This session could not be adopted. Revoke its refresh token instead
+      // of leaving an unused long-lived session behind on the server.
+      if (r?.refreshToken) {
+        try { await api.logoutServer(r.refreshToken); } catch { /* preserve context error */ }
+      }
+      const e = new Error('Signed in, but your authorized contexts could not be loaded. Retry sign-in.');
+      e.code = 'contexts_unavailable';
+      throw e;
+    }
+    const next = {
+      token: r.accessToken,
+      refreshToken: r.refreshToken,
+      user: r.user,
+      email: r.user?.email,
+      contexts,
+      currentContext: current,
+      preferredContext: preferred || current,
+    };
     setAuth(next);
-    return { ...r, contexts, currentContext: current };
+    return { ...r, contexts, currentContext: current, preferredContext: preferred || current };
   }, []);
 
   const login = useCallback(async (email, orgSlug, password) => {
@@ -104,18 +133,27 @@ export function AuthProvider({ children }) {
         if (!alive) return;
         const contexts = Array.isArray(ctx?.contexts) ? ctx.contexts : [];
         const current = ctx?.current || null;
-        const before = JSON.stringify({ c: auth.contexts || [], u: auth.currentContext || null });
-        const after = JSON.stringify({ c: contexts, u: current });
-        if (before !== after) setAuth((prev) => prev ? { ...prev, contexts, currentContext: current } : prev);
+        const preferred = ctx?.preferred || ctx?.preferredContext || current;
+        const before = JSON.stringify({ c: auth.contexts || [], u: auth.currentContext || null, p: auth.preferredContext || null });
+        const after = JSON.stringify({ c: contexts, u: current, p: preferred || null });
+        if (before !== after) setAuth((prev) => prev ? { ...prev, contexts, currentContext: current, preferredContext: preferred } : prev);
       })
       .catch(() => undefined);
     return () => { alive = false; };
   }, [auth?.token]);
 
-  const switchContext = useCallback(async (orgId) => {
+  const switchContext = useCallback(async (orgId, password) => {
     if (!auth?.token) throw new Error('Not signed in');
-    const r = await api.switchContext(orgId, { token: auth.token });
-    return persistSession(r);
+    try {
+      const r = await api.switchContext(orgId, password, { token: auth.token });
+      return persistSession(r);
+    } catch (e) {
+      // The target identity may require its own MFA after password verification.
+      if (e?.status === 401 && e.body?.error === 'mfa_required' && e.body.mfaToken) {
+        return { mfaRequired: true, mfaToken: e.body.mfaToken, methods: e.body.methods || [] };
+      }
+      throw e;
+    }
   }, [auth?.token, persistSession]);
 
   // Server-side logout: revoke the refresh token so it can't be reused after
@@ -123,6 +161,9 @@ export function AuthProvider({ children }) {
   const logout = useCallback(() => {
     const rt = auth?.refreshToken;
     setAuth(null);
+    // A tenant logout must never leave a platform administrator token behind
+    // for the next identity in this tab.
+    try { sessionStorage.removeItem('synapseone.admin.session'); } catch { /* storage blocked */ }
     if (rt) api.logoutServer(rt);
   }, [auth?.refreshToken]);
 

@@ -11,8 +11,8 @@ import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import jwt from 'jsonwebtoken';
 import { createApp } from './index';
-import { getJwtSecret, verifyAccess, revokeAllRefresh } from './tokens';
-import { setUserActive } from './db';
+import { getJwtSecret, verifyAccess, revokeAllRefresh, signAccess } from './tokens';
+import { setUserActive, revokeServiceAccount, setOrganizationStatus } from './db';
 
 // Lifecycle tokens are opt-in; these tests assert the dev/mailer-less flow.
 process.env.IAM_EXPOSE_LIFECYCLE_TOKENS = 'true';
@@ -228,7 +228,10 @@ describe('delegated token exchange', () => {
     // The target user is a normal member of the same org.
     const target = await call('POST', `/v1/orgs/${orgId}/users`, { email: `target@${orgSlug}.local` }, owner.accessToken);
     assert.equal(target.status, 201, JSON.stringify(target.data));
-    return { owner, orgId, accountId, saToken: saToken.data.accessToken, targetUserId: target.data.id };
+    return {
+      owner, orgId, accountId, saId: sa.data.id, saToken: saToken.data.accessToken,
+      accountKey: key.data.apiKey, targetUserId: target.data.id,
+    };
   }
 
   it('exchanges a service credential for a user-bound delegated token', async () => {
@@ -260,6 +263,81 @@ describe('delegated token exchange', () => {
     // The exchange is audited.
     const audit = await call('GET', '/v1/audit?limit=200', undefined, f.owner.accessToken);
     assert.ok(audit.data.some((r: any) => r.action === 'iam:token:exchange'));
+  });
+
+  it('allows account-level keys but refuses user-bound keys for exchange', async () => {
+    const f = await fixture('xferuserkey');
+
+    // The operator-minted account key still delegates within its own org.
+    const accountExchange = await call('POST', '/v1/auth/exchange', {
+      userId: f.targetUserId, scopes: ['faststore:get'],
+    }, undefined, { 'X-API-Key': f.accountKey });
+    assert.equal(accountExchange.status, 200, JSON.stringify(accountExchange.data));
+
+    const selfKey = await call('POST', `/v1/accounts/${f.accountId}/keys`, {
+      name: 'self-bound', userId: f.targetUserId, scopes: ['*'],
+    }, f.owner.accessToken);
+    assert.equal(selfKey.status, 201, JSON.stringify(selfKey.data));
+
+    // Even a wildcard, self-bound key cannot delegate to itself...
+    const asSelf = await call('POST', '/v1/auth/exchange', {
+      userId: f.targetUserId, scopes: ['faststore:write'],
+    }, undefined, { 'X-API-Key': selfKey.data.apiKey });
+    assert.equal(asSelf.status, 403, JSON.stringify(asSelf.data));
+    assert.equal(asSelf.data.error, 'exchange_requires_account_key');
+    assert.equal(asSelf.data.accessToken, undefined);
+
+    // ...or impersonate the organization administrator in the same org.
+    const asAdmin = await call('POST', '/v1/auth/exchange', {
+      userId: f.owner.user.id, scopes: ['*'],
+    }, undefined, { 'X-API-Key': selfKey.data.apiKey });
+    assert.equal(asAdmin.status, 403, JSON.stringify(asAdmin.data));
+    assert.equal(asAdmin.data.error, 'exchange_requires_account_key');
+
+    // The public verification payload carries the verified owning org.
+    const verified = await call('GET', '/v1/auth/verify', undefined, undefined, { 'X-API-Key': f.accountKey });
+    assert.equal(verified.status, 200, JSON.stringify(verified.data));
+    assert.equal(verified.data.org_id, f.orgId);
+    assert.equal(verified.data.account_id, f.accountId);
+  });
+
+  it('rechecks service-account revocation, target state and account binding', async () => {
+    const f = await fixture('xfersa-state');
+    const ok = await call('POST', '/v1/auth/exchange', { userId: f.targetUserId }, f.saToken);
+    assert.equal(ok.status, 200, JSON.stringify(ok.data));
+
+    await setUserActive(f.targetUserId, false);
+    const deactivated = await call('POST', '/v1/auth/exchange', { userId: f.targetUserId }, f.saToken);
+    assert.equal(deactivated.status, 403);
+    assert.equal(deactivated.data.error, 'account_deactivated');
+    await setUserActive(f.targetUserId, true);
+
+    await revokeServiceAccount(f.saId);
+    const revoked = await call('POST', '/v1/auth/exchange', { userId: f.targetUserId }, f.saToken);
+    assert.equal(revoked.status, 403);
+    assert.equal(revoked.data.error, 'service_account_revoked');
+
+    const suspended = await fixture('xfersa-org');
+    await setOrganizationStatus(suspended.orgId, 'suspended', suspended.owner.user.id, 'test suspension');
+    const blocked = await call('POST', '/v1/auth/exchange', { userId: suspended.targetUserId }, suspended.saToken);
+    assert.equal(blocked.status, 403);
+    assert.equal(blocked.data.error, 'org_suspended');
+    const suspendedKey = await call('GET', '/v1/auth/verify', undefined, undefined, { 'X-API-Key': suspended.accountKey });
+    assert.equal(suspendedKey.status, 403);
+    assert.equal(suspendedKey.data.valid, false);
+    assert.equal(suspendedKey.data.error, 'org_suspended');
+
+    const rebound = await fixture('xfersa-bind');
+    const otherAccount = await call('POST', `/v1/orgs/${rebound.orgId}/accounts`, {
+      slug: 'other', displayName: 'Other',
+    }, rebound.owner.accessToken);
+    assert.equal(otherAccount.status, 201, JSON.stringify(otherAccount.data));
+    const forged = signAccess({
+      sub: rebound.saId, account: otherAccount.data.id, scopes: ['*'], kind: 'service-account',
+    });
+    const binding = await call('POST', '/v1/auth/exchange', { userId: rebound.targetUserId }, forged.token);
+    assert.equal(binding.status, 403);
+    assert.equal(binding.data.error, 'service_account_binding_changed');
   });
 
   it('refuses cross-tenant targets and scope escalation', async () => {

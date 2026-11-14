@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 VKU.VIC
-import React, { useCallback, useEffect, useState } from 'react';
-import { Link, useSearchParams } from 'react-router-dom';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { Link, useLocation, useSearchParams } from 'react-router-dom';
 import { usePlatformAuth } from '../../lib/platform-auth.jsx';
 import { Badge, Btn, Card, Empty, Err, Field, Input, PageTitle, Table, TableSkeleton } from '../../components/ui.jsx';
 
@@ -9,24 +9,27 @@ const PAGE = 25;
 
 export default function AdminUsers() {
   const platform = usePlatformAuth();
-  const [q, setQ] = useState('');
-  const [query, setQuery] = useState('');
-  const [params] = useSearchParams();
+  const [params, setParams] = useSearchParams();
+  const location = useLocation();
+  const [q, setQ] = useState(params.get('q') || '');
+  const [query, setQuery] = useState(params.get('q') || '');
   const [orgId, setOrgId] = useState(params.get('orgId') || '');
-  const [active, setActive] = useState('');
-  const [isOrgAdmin, setIsOrgAdmin] = useState('');
+  const [active, setActive] = useState(params.get('active') || '');
+  const [isOrgAdmin, setIsOrgAdmin] = useState(params.get('isOrgAdmin') || '');
   const [orgs, setOrgs] = useState([]);
-  const [offset, setOffset] = useState(0);
+  const [offset, setOffset] = useState(Math.max(0, Number(params.get('offset')) || 0));
   const [data, setData] = useState({ items: [], total: 0 });
   const [loaded, setLoaded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState(null);
+  const seqRef = useRef(0);
 
   useEffect(() => {
     platform.request('/v1/platform/orgs?limit=200').then((r) => setOrgs(Array.isArray(r.items) ? r.items : [])).catch(() => setOrgs([]));
   }, [platform]);
 
   const load = useCallback(async () => {
+    const seq = ++seqRef.current;
     setErr(null);
     setLoading(true);
     const p = new URLSearchParams({ q: query, limit: String(PAGE), offset: String(offset) });
@@ -35,22 +38,34 @@ export default function AdminUsers() {
     if (isOrgAdmin) p.set('isOrgAdmin', isOrgAdmin);
     try {
       const out = await platform.request(`/v1/platform/users?${p.toString()}`);
+      if (seq !== seqRef.current) return;
       setData({ items: Array.isArray(out.items) ? out.items : [], total: Number(out.total) || 0 });
     } catch (e) {
-      setErr(e);
+      if (seq === seqRef.current) setErr(e);
     } finally {
-      setLoading(false);
-      setLoaded(true);
+      if (seq === seqRef.current) {
+        setLoading(false);
+        setLoaded(true);
+      }
     }
   }, [platform, query, orgId, active, isOrgAdmin, offset]);
 
   useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    const next = new URLSearchParams();
+    if (query) next.set('q', query);
+    if (orgId) next.set('orgId', orgId);
+    if (active) next.set('active', active);
+    if (isOrgAdmin) next.set('isOrgAdmin', isOrgAdmin);
+    if (offset) next.set('offset', String(offset));
+    setParams(next, { replace: true });
+  }, [query, orgId, active, isOrgAdmin, offset, setParams]);
 
   const search = (e) => {
     e.preventDefault();
     setOffset(0);
     setQuery(q.trim());
-    if (q.trim() === query) load();
+    if (q.trim() === query && offset === 0) load();
   };
   const clear = () => {
     setQ(''); setQuery(''); setOrgId(''); setActive(''); setIsOrgAdmin(''); setOffset(0);
@@ -63,7 +78,7 @@ export default function AdminUsers() {
       <PageTitle
         title="Users & Access"
         sub="Search users across organizations and review access state"
-        right={<Btn kind="secondary" onClick={load} loading={loading}>Refresh</Btn>}
+        right={<Btn kind="secondary" onClick={() => load()} loading={loading}>Refresh</Btn>}
       />
       <Err e={err} />
       <Card className="mb-4">
@@ -94,7 +109,7 @@ export default function AdminUsers() {
           <Table head={['Email', 'Organization', 'Status', 'Org admin', 'MFA', 'Created']}>
             {data.items.map((u) => (
               <tr key={u.id} className="border-t border-slate-100">
-                <td className="py-2 pr-4"><Link to={`/admin/users/${u.id}`} className="font-medium text-main-blue hover:underline">{u.email}</Link><p className="text-xs text-normal-text">{u.display_name || '–'}</p></td>
+                <td className="py-2 pr-4"><Link to={`/admin/users/${u.id}`} state={{ from: `${location.pathname}${location.search}` }} className="font-medium text-main-blue hover:underline">{u.email}</Link><p className="text-xs text-normal-text">{u.display_name || '–'}</p></td>
                 <td className="py-2 pr-4 text-sm">{u.org_slug || '–'}</td>
                 <td className="py-2 pr-4"><Badge tone={u.active !== false ? 'green' : 'gray'}>{u.active !== false ? 'active' : 'inactive'}</Badge></td>
                 <td className="py-2 pr-4"><Badge tone={u.is_org_admin ? 'blue' : 'gray'}>{u.is_org_admin ? 'admin' : 'member'}</Badge></td>

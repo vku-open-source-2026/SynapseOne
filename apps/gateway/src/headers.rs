@@ -76,6 +76,15 @@ pub fn propagate_principal(
             if let Some(account) = &principal.account {
                 insert(headers, "x-synapseone-account", account);
             }
+            // A user-bound API key (verified IAM `user_id`) acts **for that
+            // user**: stamp the owner so workflow/audit/data-plane attribution
+            // and owner-only policies see the real user. `kind` stays `apikey`
+            // so the credential keeps machine semantics. Account-level keys have
+            // no owner and remain pure machines (no `x-synapseone-user`).
+            // Client-supplied user headers were stripped above.
+            if let Some(owner) = principal.owner.as_ref().filter(|value| !value.is_empty()) {
+                insert(headers, "x-synapseone-user", owner);
+            }
             if !principal.scopes.is_empty() {
                 insert(headers, "x-synapseone-scopes", &principal.scopes.join(","));
             }

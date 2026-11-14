@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 VKU.VIC
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { usePlatformAuth } from '../../lib/platform-auth.jsx';
 import { Badge, Btn, Card, Code, Empty, Err, Field, Input, Modal, PageTitle, Table, TableSkeleton } from '../../components/ui.jsx';
 
@@ -36,7 +36,10 @@ export default function AdminAudit() {
   const [loaded, setLoaded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState(null);
+  const [hasMore, setHasMore] = useState(false);
   const [selected, setSelected] = useState(null);
+  const seqRef = useRef(0);
+  const lastReqRef = useRef({ offset: 0, filters: null });
 
   useEffect(() => {
     platform.request('/v1/platform/orgs?limit=200')
@@ -46,11 +49,13 @@ export default function AdminAudit() {
 
   const orgNames = useMemo(() => new Map(orgs.map((o) => [o.id, o.slug])), [orgs]);
 
-  const load = useCallback(async (nextOffset = offset) => {
+  const load = useCallback(async (nextOffset = offset, nextFilters = filters) => {
+    const seq = ++seqRef.current;
+    lastReqRef.current = { offset: nextOffset, filters: nextFilters };
     setErr(null);
     setLoading(true);
-    const p = new URLSearchParams({ limit: String(PAGE), offset: String(nextOffset) });
-    for (const [k, v] of Object.entries(filters)) {
+    const p = new URLSearchParams({ limit: String(PAGE + 1), offset: String(nextOffset) });
+    for (const [k, v] of Object.entries(nextFilters || {})) {
       if (!v) continue;
       if (k === 'from' || k === 'to') {
         const iso = toIso(v);
@@ -61,21 +66,31 @@ export default function AdminAudit() {
     }
     try {
       const out = await platform.request(`/v1/platform/audit?${p.toString()}`);
-      setRows(Array.isArray(out) ? out : []);
+      if (seq !== seqRef.current) return;
+      const all = Array.isArray(out) ? out : [];
+      setRows(all.slice(0, PAGE));
+      setHasMore(all.length > PAGE);
       setOffset(nextOffset);
     } catch (e) {
-      setErr(e);
+      if (seq === seqRef.current) setErr(e);
     } finally {
-      setLoading(false);
-      setLoaded(true);
+      if (seq === seqRef.current) {
+        setLoading(false);
+        setLoaded(true);
+      }
     }
   }, [platform, filters, offset]);
 
   useEffect(() => { load(0); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [platform]);
 
   const set = (k, v) => setFilters((f) => ({ ...f, [k]: v }));
-  const apply = (e) => { e.preventDefault(); load(0); };
-  const clear = () => { setFilters({ orgId: '', actor: '', action: '', resource: '', allowed: '', from: '', to: '' }); setOffset(0); };
+  const apply = (e) => { e.preventDefault(); load(0, filters); };
+  const clear = () => {
+    const empty = { orgId: '', actor: '', action: '', resource: '', allowed: '', from: '', to: '' };
+    setFilters(empty);
+    setOffset(0);
+    load(0, empty);
+  };
   const openRow = (a) => setSelected(a);
   const onRowKey = (e, a) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openRow(a); } };
 
@@ -84,7 +99,7 @@ export default function AdminAudit() {
       <PageTitle
         title="Audit & Security"
         sub="Cross-tenant administrative and data-plane audit trail"
-        right={<div className="flex gap-2"><Btn kind="secondary" onClick={() => load(offset)} loading={loading}>Refresh</Btn></div>}
+        right={<div className="flex gap-2"><Btn kind="secondary" onClick={() => load(offset, filters)} loading={loading}>Refresh</Btn></div>}
       />
       <Err e={err} />
       <Card className="mb-4">
@@ -119,7 +134,7 @@ export default function AdminAudit() {
 
       <Card>
         {!loaded && !loading ? <TableSkeleton rows={8} cols={6} /> : err ? (
-          <div className="py-6 text-center"><Btn kind="secondary" onClick={() => load(offset)}>Retry</Btn></div>
+          <div className="py-6 text-center"><Btn kind="secondary" onClick={() => load(lastReqRef.current.offset, lastReqRef.current.filters || filters)}>Retry</Btn></div>
         ) : rows.length ? (
           <>
             <Table head={['Time', 'Org', 'Actor', 'Action', 'Resource', 'Decision']}>
@@ -144,9 +159,9 @@ export default function AdminAudit() {
             <div className="flex items-center justify-between mt-4 text-xs text-normal-text">
               <span>Showing {offset + 1}–{offset + rows.length}</span>
               <div className="flex gap-2 items-center">
-                <Btn kind="secondary" disabled={offset === 0 || loading} onClick={() => load(Math.max(0, offset - PAGE))}>Previous</Btn>
+                <Btn kind="secondary" disabled={offset === 0 || loading} onClick={() => load(Math.max(0, offset - PAGE), filters)}>Previous</Btn>
                 <span>Page {Math.floor(offset / PAGE) + 1}</span>
-                <Btn kind="secondary" disabled={rows.length < PAGE || loading} onClick={() => load(offset + PAGE)}>Next</Btn>
+                <Btn kind="secondary" disabled={!hasMore || loading} onClick={() => load(offset + PAGE, filters)}>Next</Btn>
               </div>
             </div>
           </>

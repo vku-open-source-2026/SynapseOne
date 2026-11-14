@@ -212,6 +212,8 @@ routes:
     actions:
       - { method: POST, path: /v1/base/collections/*/query, action: base:Read }
       - { method: POST, path: /v1/base/collections/*/vector-search, action: base:Read }
+      - { method: POST, path: /v1/base/databases/*/collections/*/query, action: base:Read }
+      - { method: POST, path: /v1/base/databases/*/collections/*/vector-search, action: base:Read }
 
   # Synapse Faststore — tenant-scoped cache, counters, data structures and locks.
   - path: /v1/faststore

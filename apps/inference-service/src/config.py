@@ -84,10 +84,18 @@ class Settings:
     EMBEDDING_BATCH_SIZE: int = _get_env_int(["EMBEDDING_BATCH_SIZE"], 32, 1, 512)
     EMBEDDING_MAX_LENGTH: int = _get_env_int(["EMBEDDING_MAX_LENGTH"], 256, 16, 8192)
 
-    # Decision Model (Self-hosted Decision-2.0-Eos-0.8B)
+    # Decision Model. "local" runs the self-hosted Decision-2.0-Eos-0.8B
+    # package; "openrouter" calls OpenRouter's /api/alpha/decisions endpoint
+    # (for decisions-only models such as perplexity/pplx-decider-*).
+    DECISION_BACKEND: str = _get_env_str(["DECISION_BACKEND"], "local").lower()
     DECISION_MODEL_NAME: str = _get_env_str(
         ["DECISION_MODEL_NAME"], "vllm-sr/Decision-2.0-Eos-0.8B"
     )
+    # Optional override. Empty derives <OPENROUTER_BASE_URL without /v1> +
+    # /alpha/decisions.
+    OPENROUTER_DECISIONS_URL: str = _get_env_str(
+        ["OPENROUTER_DECISIONS_URL"], ""
+    ).rstrip("/")
     # The 0.8B decision model needs ~3 GB RAM in FP32 on CPU. Disable it on
     # memory-constrained nodes; the deterministic router fallback stays active.
     DECISION_ENABLED: bool = _get_env_bool(["DECISION_ENABLED"], True)

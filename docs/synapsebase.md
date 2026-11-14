@@ -8,7 +8,91 @@ queries, optimistic concurrency, atomic counters, batch writes and a change feed
 - Storage: Postgres (`DATABASE_URL`) with an in-memory fallback for dev/tests
 - Auth: gateway JWT/API key (`either`); direct calls need
   `x-synapseone-internal: <SYNAPSEONE_INTERNAL_SECRET>` when the secret is configured
-- SDKs: `client.base` (Python/JS), `Client.*Base*` (Go)
+- SDKs: `client.base` (Python/JS), `Client.*Base*` (Go/Rust)
+
+## Databases and collections
+
+SynapseBase is namespaced as **tenant → database → collection → documents**.
+A database is the isolation boundary applications should use: two apps can both
+have a `users` collection without sharing data or colliding on names, even when
+they run in the same org/account.
+
+```text
+org/account
+└── database "analytics"
+    ├── collection "events"
+    └── collection "users"
+└── database "billing"
+    └── collection "users"      # same name, independent documents
+```
+
+- Database names follow the same rule as collection names:
+  `[A-Za-z][A-Za-z0-9_-]{0,63}` and are unique per tenant scope.
+- Collection names are unique **inside a database**, not across the tenant.
+- A collection inherits the database tenant (`orgId`/`accountId`). Moving a
+  collection between databases is not supported; create it in the target
+  database and migrate documents explicitly.
+- `GET/POST /v1/base/databases` and
+  `GET/PATCH/DELETE /v1/base/databases/:database` manage namespaces.
+- Every collection route also exists below a database:
+  `/v1/base/databases/:database/collections/:collection/...`.
+- The legacy flat routes (`/v1/base/collections/...`) keep working and target
+  the caller's **`default`** database, which is created on first write. Use
+  `?database=<name>` on a flat route to address another database without
+  changing the URL shape. `GET /v1/base/collections` is the exception: without
+  `?database=` it lists every visible collection (each item carries its
+  `database`) so existing dashboards keep working.
+- `DELETE /v1/base/databases/:database` refuses to delete a non-empty database
+  (`409 database_not_empty`); pass `?cascade=true` to delete its collections and
+  documents too.
+
+```bash
+# create a database and a collection inside it
+curl -s -XPOST localhost:8080/v1/base/databases \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"analytics","description":"Analytics workspace"}'
+
+curl -s -XPOST localhost:8080/v1/base/databases/analytics/collections \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"events"}'
+
+# documents are addressed inside the database
+curl -s -XPOST localhost:8080/v1/base/databases/analytics/collections/events/documents \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"id":"evt-1","data":{"type":"signup"}}'
+
+# legacy route, explicitly scoped to the same database
+curl -s "localhost:8080/v1/base/collections/events?database=analytics" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Applying the migration
+
+Migration `0008_base_databases` creates `synapseone_base_databases`, adds
+`synapseone_base_collections.database_id`, attaches every existing collection
+to a `default` database in its current tenant scope and replaces the old
+`(org, account, name)` unique index with `(database_id, name)`. It is
+replay-safe: running it twice is a no-op and no document is rewritten. The
+service runs it automatically at boot; for a manual Postgres upgrade:
+
+```bash
+# Use the direct/session connection when PgBouncer runs in transaction mode.
+psql "${DATABASE_DIRECT_URL:-$DATABASE_URL}" -v ON_ERROR_STOP=1 \
+  -f apps/base-service/drizzle/0008_base_databases.sql
+```
+
+Verify the result:
+
+```sql
+SELECT d.name, d.org_id, d.account_id, c.name
+FROM synapseone_base_collections c
+JOIN synapseone_base_databases d ON d.id = c.database_id
+ORDER BY d.name, c.name;
+```
+
+After the upgrade, keep clients on the flat routes (they target `default`) or
+move them to the nested `/v1/base/databases/...` routes. The outbox payload now
+also carries `database_id` and `database_name`.
 
 ## Why a mapping?
 
@@ -105,6 +189,11 @@ curl -s -XPOST localhost:8080/v1/base/collections/parks/query \
 
 ## Collections
 
+Every path below has a database-scoped equivalent by prefixing
+`/v1/base/databases/:database` (for example
+`GET /v1/base/databases/analytics/collections`). Flat routes target the
+`default` database unless `?database=<name>` is supplied.
+
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/v1/base/collections` | List visible collections; `?orgId` / `?accountId` narrow the list |
@@ -120,24 +209,31 @@ Create body:
 {
   "name": "parks",
   "description": "Public parks",
+  "database": "analytics",
   "mapping": {"fields": {"name": {"path": "profile.name", "type": "string", "required": true}}},
   "orgId": "org-1",
   "accountId": "acc-1"
 }
 ```
 
-- `name` is unique per tenant scope and must match `[A-Za-z][A-Za-z0-9_-]{0,63}`.
+- `name` is unique **per database** and must match `[A-Za-z][A-Za-z0-9_-]{0,63}`.
+- `database` is optional on the flat route (default: `default`). If it is also
+  present in the path or `?database=`, all three must agree or the request is
+  `400 invalid_database`. A named database must already exist.
 - `description` ≤ 500 chars; `PATCH {"description": null}` clears it.
 - `PATCH` accepts `name`, `description`, `mapping`; at least one is required.
-- Collection names are resolved **inside the caller's scope**. Two scopes may use
-  the same name; a platform caller that sees an ambiguous name gets
-  `409 ambiguous_collection` and must add `?orgId=` or `?accountId=`.
+- Collection names are resolved **inside a database**, and databases are
+  resolved inside the caller's scope. A platform caller that sees an ambiguous
+  database name gets `409 ambiguous_database` and must add `?orgId=` or
+  `?accountId=` (or use the nested route with a unique database).
 
 Collection object returned by the API:
 
 ```json
 {
   "id": "uuid",
+  "databaseId": "uuid",
+  "database": "analytics",
   "name": "parks",
   "description": "Public parks",
   "mapping": {"additional": false, "fields": {"name": {"path": "profile.name", "type": "string", "required": true}}},
@@ -659,19 +755,21 @@ Endpoints: `POST .../geo/features`, `GET .../geo/features?bbox=`,
 ## Tenancy and access
 
 SynapseBase requires an authenticated caller (anonymous calls are `401
-auth_required`). Access is derived from the gateway-stamped principal:
+auth_required`). Databases and collections use the same tenant rules. Access is
+derived from the gateway-stamped principal:
 
 | Caller | Sees | Creates |
 |---|---|---|
-| Org principal (`x-synapseone-org`) | collections owned by that org | org-bound (`org_id=<org>`), optional `accountId` |
-| Account-only principal | unbound-org collections owned by that account | `org_id=null, account_id=<account>` |
-| Platform caller (internal) | only **unbound** collections by default | unbound unless `orgId`/`accountId` supplied |
+| Org principal (`x-synapseone-org`) | databases/collections owned by that org | org-bound (`org_id=<org>`), optional `accountId` |
+| Account-only principal | unbound-org namespaces owned by that account | `org_id=null, account_id=<account>` |
+| Platform caller (internal) | only **unbound** namespaces by default | unbound unless `orgId`/`accountId` supplied |
 
-- A platform caller reaches tenant collections by adding `?orgId=` or
-  `?accountId=` to collection/document/query/change routes. With no scope it only
-  sees global (unbound) collections.
-- Cross-tenant creates are rejected with `403 cross_tenant`; foreign collections
-  read as `404 not_found`.
+- A platform caller reaches tenant databases/collections by adding `?orgId=` or
+  `?accountId=` to the route; create requests accept the same parameters as an
+  alternative to the body fields. With no scope it only sees global (unbound)
+  namespaces.
+- Cross-tenant creates are rejected with `403 cross_tenant`; foreign databases
+  and collections read as `404 not_found` / `database_not_found`.
 - Direct service calls (port 4005) must also carry the internal secret when
   `SYNAPSEONE_INTERNAL_SECRET` is set.
 
@@ -681,16 +779,16 @@ All errors use `{error, message}`; mapping errors may add `details`.
 
 | Status | `error` | Typical cause |
 |---|---|---|
-| 400 | `invalid_collection`, `invalid_name`, `invalid_description`, `invalid_mapping`, `invalid_tenant` | bad collection payload |
+| 400 | `invalid_collection`, `invalid_database`, `invalid_name`, `invalid_description`, `invalid_mapping`, `invalid_tenant` | bad collection/database payload or conflicting database scope |
 | 400 | `mapping_error` | missing/typed/unknown field, bad `data`/`object` combination |
 | 400 | `invalid_query` | bad filter/operator/orderBy/limit/cursor |
 | 400 | `invalid_document_id`, `invalid_view`, `invalid_version`, `invalid_field`, `invalid_unset`, `invalid_body` | bad request parameter |
 | 400 | `invalid_batch` | operations not 1..100 |
 | 400 | `invalid_since`, `invalid_limit`, `invalid_pagination` | bad change-feed/list paging |
 | 401 | `auth_required`, `unauthorized` | anonymous caller / missing internal secret |
-| 403 | `cross_tenant` | collection scope outside the caller |
-| 404 | `not_found` | collection or document missing |
-| 409 | `document_exists`, `collection_exists`, `version_conflict`, `ambiguous_collection` | conflict / stale version / ambiguous platform lookup |
+| 403 | `cross_tenant` | database/collection scope outside the caller |
+| 404 | `not_found`, `database_not_found` | collection, document or database missing |
+| 409 | `document_exists`, `collection_exists`, `database_exists`, `version_conflict`, `ambiguous_database`, `database_not_empty` | name conflict / stale version / ambiguous or non-empty database |
 | 413 | `collection_too_large`, `payload_too_large` | query scan limit / body too large |
 | 500 | `internal` | unexpected server error |
 

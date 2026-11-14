@@ -15,6 +15,10 @@ path = "src/lib.rs"
 name = "synapseone-ocs"
 path = "src/main.rs"
 
+[[bin]]
+name = "s3-backup"
+path = "src/bin/s3-backup.rs"
+
 [dependencies]
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }

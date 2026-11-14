@@ -128,6 +128,28 @@ describe('propagatePrincipal', () => {
     assert.equal(req.headers['x-synapseone-account'], 'a1');
     assert.equal(req.headers['x-synapseone-scopes'], 'x,y');
   });
+  it('stamps a verified user owner for user-bound apikeys only', () => {
+    // User-bound key (`user_id` from IAM): owner becomes the principal user,
+    // `kind` stays apikey, and the legacy mirror carries the same value.
+    const userBound: any = {
+      headers: { 'x-synapseone-user': 'mallory', 'x-synapsedx-user': 'mallory' },
+      principal: { type: 'apikey', org: 'o1', account: 'a1', scopes: ['x'], owner: 'user-42' },
+    };
+    propagatePrincipal(userBound);
+    assert.equal(userBound.headers['x-synapseone-kind'], 'apikey');
+    assert.equal(userBound.headers['x-synapseone-user'], 'user-42');
+    assert.equal(userBound.headers['x-synapsedx-user'], 'user-42');
+
+    // Account-level key: machine, forged user headers are removed.
+    const accountKey: any = {
+      headers: { 'x-synapseone-user': 'mallory', 'x-synapsedx-user': 'mallory' },
+      principal: { type: 'apikey', org: 'o1', account: 'a1', scopes: ['x'], owner: null },
+    };
+    propagatePrincipal(accountKey);
+    assert.equal(accountKey.headers['x-synapseone-kind'], 'apikey');
+    assert.equal(accountKey.headers['x-synapseone-user'], undefined);
+    assert.equal(accountKey.headers['x-synapsedx-user'], undefined);
+  });
   it('drops spoofed legacy headers, keeps legacy tenant and mirrors the verified principal', () => {
     const req: any = {
       headers: {
@@ -373,6 +395,85 @@ describe('per-route scope enforcement (#23)', () => {
       assert.equal(write.status, 403);
       const denied = await write.json();
       assert.equal(denied.error, 'scope_denied');
+    } finally {
+      await new Promise<void>((resolve) => gw.close(() => resolve()));
+      await new Promise<void>((resolve) => iam.close(() => resolve()));
+      await new Promise<void>((resolve) => upstream.close(() => resolve()));
+      for (const [k, v] of Object.entries(prev)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
+});
+
+describe('API-key owner propagation (real upstream)', () => {
+  it('sends the verified user_id for user-bound keys and keeps account keys machine-only', async () => {
+    const http = await import('node:http');
+    let received: Record<string, any> = {};
+    const iam = http.createServer((req, res) => {
+      res.setHeader('Content-Type', 'application/json');
+      if (req.url === '/v1/keys/verify') {
+        let raw = '';
+        req.on('data', (chunk) => { raw += chunk; });
+        req.on('end', () => {
+          const key = JSON.parse(raw || '{}').apiKey;
+          if (key === 'user-bound-key') {
+            res.end(JSON.stringify({ valid: true, id: 'k1', account_id: 'a1', org_id: 'o1', user_id: 'user-42', scopes: ['faststore:*'] }));
+          } else if (key === 'account-key') {
+            res.end(JSON.stringify({ valid: true, id: 'k2', account_id: 'a1', org_id: 'o1', user_id: null, scopes: ['faststore:*'] }));
+          } else {
+            res.statusCode = 401;
+            res.end(JSON.stringify({ valid: false }));
+          }
+        });
+        return;
+      }
+      res.end(JSON.stringify({ ok: true }));
+    });
+    const upstream = http.createServer((req, res) => {
+      received = req.headers;
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ ok: true, upstream: true }));
+    });
+    await new Promise<void>((resolve) => iam.listen(0, '127.0.0.1', resolve));
+    await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+    const port = (s: any) => (typeof s.address() === 'object' ? s.address().port : 0);
+    const prev = {
+      IAM_SERVICE_URL: process.env.IAM_SERVICE_URL,
+      FASTSTORE_SERVICE_URL: process.env.FASTSTORE_SERVICE_URL,
+    };
+    process.env.IAM_SERVICE_URL = `http://127.0.0.1:${port(iam)}`;
+    process.env.FASTSTORE_SERVICE_URL = `http://127.0.0.1:${port(upstream)}`;
+    const app = createApp();
+    const gw = await new Promise<Server>((resolve) => {
+      const s = app.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    const base = `http://127.0.0.1:${port(gw)}`;
+    try {
+      const userBound = await fetch(`${base}/v1/faststore/keys/a`, {
+        headers: {
+          'X-API-Key': 'user-bound-key',
+          'x-synapseone-user': 'mallory',
+          'x-synapseone-kind': 'user',
+          'x-synapseone-org': 'victim-org',
+          'x-synapsedx-user': 'mallory-legacy',
+        },
+      });
+      assert.equal(userBound.status, 200);
+      assert.equal(received['x-synapseone-kind'], 'apikey');
+      assert.equal(received['x-synapseone-user'], 'user-42');
+      assert.equal(received['x-synapsedx-user'], 'user-42');
+      assert.equal(received['x-synapseone-org'], 'o1');
+      assert.equal(received['x-synapseone-account'], 'a1');
+
+      const account = await fetch(`${base}/v1/faststore/keys/b`, {
+        headers: { 'X-API-Key': 'account-key', 'x-synapseone-user': 'mallory', 'x-synapsedx-user': 'mallory' },
+      });
+      assert.equal(account.status, 200);
+      assert.equal(received['x-synapseone-kind'], 'apikey');
+      assert.equal(received['x-synapseone-user'], undefined);
+      assert.equal(received['x-synapsedx-user'], undefined);
     } finally {
       await new Promise<void>((resolve) => gw.close(() => resolve()));
       await new Promise<void>((resolve) => iam.close(() => resolve()));

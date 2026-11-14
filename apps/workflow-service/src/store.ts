@@ -711,6 +711,9 @@ export interface StoredCredential {
   account_id: string;
   /** Owning org (P0-4/#5): null only for legacy/anonymous dev credentials. */
   org_id?: string | null;
+  /** Owning principal subject. Null on legacy rows; when set, only that subject
+   *  may resolve the credential. */
+  owner_sub?: string | null;
   name: string;
   kind: CredentialKind;
   /** AES-256-GCM envelope: {iv, tag, data} base64 (never the raw secret). */
@@ -769,6 +772,7 @@ function rowToCredential(r: typeof credentials.$inferSelect): StoredCredential {
     id: String(r.id),
     account_id: String(r.accountId || ''),
     org_id: r.orgId ? String(r.orgId) : null,
+    owner_sub: r.ownerSub ? String(r.ownerSub) : null,
     name: String(r.name || ''),
     kind: (['bearer', 'api-key', 'basic', 'hmac'].includes(r.kind) ? r.kind : 'bearer') as CredentialKind,
     secret_enc: String(r.secretEnc || ''),
@@ -779,12 +783,20 @@ function rowToCredential(r: typeof credentials.$inferSelect): StoredCredential {
 
 /** Public metadata shape — never includes secret material. */
 export function toPublicCredential(c: StoredCredential): any {
-  return { id: c.id, accountId: c.account_id, name: c.name, kind: c.kind, createdAt: c.created_at, updatedAt: c.updated_at };
+  return {
+    id: c.id,
+    accountId: c.account_id,
+    name: c.name,
+    kind: c.kind,
+    createdAt: c.created_at,
+    updatedAt: c.updated_at,
+    ...(c.owner_sub ? { owner: c.owner_sub } : {}),
+  };
 }
 
-export async function createCredentialRec(data: { account_id: string; org_id?: string | null; name: string; kind: CredentialKind; secret: string }): Promise<StoredCredential> {
+export async function createCredentialRec(data: { account_id: string; org_id?: string | null; owner_sub?: string | null; name: string; kind: CredentialKind; secret: string }): Promise<StoredCredential> {
   const rec: StoredCredential = {
-    id: randomUUID(), account_id: data.account_id, org_id: data.org_id ?? null, name: data.name, kind: data.kind,
+    id: randomUUID(), account_id: data.account_id, org_id: data.org_id ?? null, owner_sub: cleanTenant(data.owner_sub), name: data.name, kind: data.kind,
     secret_enc: encryptSecret(data.secret), created_at: nowIso(), updated_at: nowIso(),
   };
   if (db) {
@@ -794,6 +806,7 @@ export async function createCredentialRec(data: { account_id: string; org_id?: s
         id: rec.id,
         accountId: rec.account_id,
         orgId: rec.org_id,
+        ownerSub: rec.owner_sub,
         name: rec.name,
         kind: rec.kind,
         secretEnc: rec.secret_enc,

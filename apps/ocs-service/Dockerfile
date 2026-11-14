@@ -13,6 +13,7 @@ RUN apt-get update \
     && useradd --system --uid 10001 --create-home app
 
 COPY --from=builder /workspace/target/release/synapseone-ocs /usr/local/bin/synapseone-ocs
+COPY --from=builder /workspace/target/release/s3-backup /usr/local/bin/s3-backup
 
 ENV PORT=4010
 EXPOSE 4010

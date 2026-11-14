@@ -190,6 +190,7 @@ API-key traffic of one org share the `org:<id>` namespace and usage attribution 
 | `OPENROUTER_BASE_URL` / `OPENROUTER_API_KEY` / `OPENROUTER_MODEL` | OpenRouter defaults | LLM provider + model |
 | `OPENROUTER_TIMEOUT_MS` / `OPENROUTER_RETRIES` | 30000 / 2 | upstream call budget/retries |
 | `EMBEDDING_MODEL_NAME` / `DECISION_MODEL_NAME` | local models | self-hosted model ids |
+| `DECISION_BACKEND` | `local` | `local` Decision-2.0 or `openrouter` `/api/alpha/decisions` |
 | `IAM_SERVICE_URL` | `http://iam:4001` | usage/token metering target |
 | `INFERENCE_USAGE_REPORTING` | `true` | report prompt/completion tokens to IAM usage analytics |
 | `SYNAPSEONE_INTERNAL_SECRET` | — | required in production |

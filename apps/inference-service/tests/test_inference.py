@@ -12,11 +12,27 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.config import settings
+from src.decision import decision_engine
 from src.main import app
 
 client = TestClient(app)
 
 TEST_SECRET = "test-internal-secret-999"
+
+
+@pytest.fixture(autouse=True)
+def _local_decision_defaults(monkeypatch):
+    """Keep unit tests independent from the deployment .env (dotenv loads it)."""
+    monkeypatch.setattr(settings, "DECISION_BACKEND", "local")
+    monkeypatch.setattr(
+        settings, "DECISION_MODEL_NAME", "vllm-sr/Decision-2.0-Eos-0.8B"
+    )
+    monkeypatch.setattr(
+        decision_engine, "model_name", "vllm-sr/Decision-2.0-Eos-0.8B"
+    )
+    monkeypatch.setattr(decision_engine, "_is_loaded", False)
+    monkeypatch.setattr(decision_engine, "_model", None)
+    monkeypatch.setattr(decision_engine, "_load_error", None)
 
 
 def auth_headers():
@@ -306,6 +322,67 @@ def test_decision_uses_native_answers_mapping():
     assert response.results["urgency"]["score"] == 1.65
     assert response.results["urgency"]["legend"]["2"] == "Today"
     assert "answers" not in response.results
+
+
+def test_openrouter_decisions_url_derivation(monkeypatch):
+    from src.decision import DecisionEngine
+
+    monkeypatch.setattr(settings, "DECISION_BACKEND", "openrouter")
+    monkeypatch.setattr(settings, "OPENROUTER_API_KEY", "mock_key")
+    engine = DecisionEngine()
+
+    monkeypatch.setattr(
+        settings, "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
+    )
+    monkeypatch.setattr(settings, "OPENROUTER_DECISIONS_URL", "")
+    assert (
+        engine._openrouter_url() == "https://openrouter.ai/api/alpha/decisions"
+    )
+
+    monkeypatch.setattr(
+        settings, "OPENROUTER_DECISIONS_URL", "https://example.test/decisions"
+    )
+    assert engine._openrouter_url() == "https://example.test/decisions"
+
+
+def test_decision_openrouter_backend(monkeypatch):
+    """DECISION_BACKEND=openrouter skips the local model and normalises answers."""
+    from src.decision import DecisionEngine, DecisionQuestion
+
+    monkeypatch.setattr(settings, "DECISION_BACKEND", "openrouter")
+    monkeypatch.setattr(settings, "OPENROUTER_API_KEY", "mock_key")
+    engine = DecisionEngine()
+    monkeypatch.setattr(
+        engine,
+        "_evaluate_openrouter",
+        lambda state, questions: {
+            "route": {
+                "type": "choice",
+                "choice": "billing",
+                "probabilities": {"billing": 0.99, "tech": 0.01},
+                "confidence": 0.98,
+            }
+        },
+    )
+
+    response = engine.evaluate(
+        state="The customer wants a refund",
+        questions={
+            "route": DecisionQuestion(
+                type="choice",
+                instructions="Pick the team",
+                criteria={"billing": "refunds", "tech": "faults"},
+            )
+        },
+    )
+
+    assert engine._is_loaded is False
+    assert response.model == settings.DECISION_MODEL_NAME
+    assert response.results["route"]["best_choice"] == "billing"
+    assert response.results["route"]["choice"] == "billing"
+    assert response.results["route"]["probabilities"]["billing"] == 0.99
+    assert engine.status["backend"] == "openrouter"
+    assert engine.status["loaded"] is True
 
 
 def test_llm_model_candidates_use_fallback():

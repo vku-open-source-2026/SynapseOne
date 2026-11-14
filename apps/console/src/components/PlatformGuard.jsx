@@ -27,10 +27,15 @@ export default function PlatformGuard({ children }) {
         <PageTitle title="Platform administration" sub="Sign in with the platform organization" />
         <Card>
           <p className="text-sm text-normal-text">
-            Your current session belongs to a tenant organization. The platform console requires a sign-in
-            to <code className="font-mono">{platformCtx.slug}</code> plus a fresh MFA code.
+            Your current session belongs to a tenant organization. Platform administration is bound to the
+            platform organization account and requires its own sign-in plus a fresh MFA code. Sign in to{' '}
+            <code className="font-mono">{platformCtx.slug}</code> to continue.
           </p>
-          <Btn className="mt-4" onClick={() => { logout(); nav('/login', { replace: true, state: { prefillOrg: platformCtx.slug, platformContext: true } }); }}>
+          <Btn className="mt-4" onClick={() => {
+            try { sessionStorage.setItem('synapseone.login.prefillOrg', platformCtx.slug); } catch { /* storage blocked */ }
+            logout();
+            nav('/login', { replace: true, state: { prefillOrg: platformCtx.slug, platformContext: true } });
+          }}>
             Sign in with the platform organization
           </Btn>
           <Link to="/dashboard" className="block mt-3 text-sm text-main-blue">Return to the tenant console</Link>

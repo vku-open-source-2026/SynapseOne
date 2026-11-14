@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 VKU.VIC
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { usePlatformAuth } from '../../lib/platform-auth.jsx';
 import { Badge, Btn, Card, Empty, Err, Field, PageTitle, Skeleton, StatValue, Table } from '../../components/ui.jsx';
 
@@ -23,6 +23,7 @@ export default function AdminUsage() {
   const [err, setErr] = useState(null);
   const [loading, setLoading] = useState(true);
   const [loadingEvents, setLoadingEvents] = useState(true);
+  const seqRef = useRef(0);
 
   useEffect(() => {
     platform.request('/v1/platform/orgs?limit=200')
@@ -42,27 +43,32 @@ export default function AdminUsage() {
     return p.toString();
   }, [range, orgId, feature]);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (requestedOffset = offset) => {
+    const seq = ++seqRef.current;
     setErr(null);
     setLoading(true);
     setLoadingEvents(true);
-    try {
-      const [s, e] = await Promise.all([
-        platform.request(`/v1/platform/usage/summary?${windowQuery()}`),
-        platform.request(`/v1/platform/usage/events?${windowQuery({ limit: PAGE, offset })}`),
-      ]);
-      setSummary(s);
+    const [summaryRes, eventsRes] = await Promise.allSettled([
+      platform.request(`/v1/platform/usage/summary?${windowQuery()}`),
+      platform.request(`/v1/platform/usage/events?${windowQuery({ limit: PAGE, offset: requestedOffset })}`),
+    ]);
+    if (seq !== seqRef.current) return;
+    if (summaryRes.status === 'fulfilled') setSummary(summaryRes.value);
+    if (eventsRes.status === 'fulfilled') {
+      const e = eventsRes.value;
       setEvents({ items: Array.isArray(e.items) ? e.items : [], total: Number(e.total) || 0 });
-    } catch (ex) {
-      setErr(ex);
-    } finally {
-      setLoading(false);
-      setLoadingEvents(false);
     }
+    const failed = [summaryRes, eventsRes].find((r) => r.status === 'rejected');
+    if (failed && failed.status === 'rejected') setErr(failed.reason);
+    setLoading(false);
+    setLoadingEvents(false);
   }, [platform, windowQuery, offset]);
 
-  useEffect(() => { setOffset(0); }, [range, orgId, feature]);
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => { load(offset); }, [load]);
+
+  const changeRange = (r) => { setRange(r); setOffset(0); };
+  const changeOrg = (v) => { setOrgId(v); setOffset(0); };
+  const changeFeature = (v) => { setFeature(v); setOffset(0); };
 
   const totals = summary?.totals || {};
   const series = summary?.series || [];
@@ -78,8 +84,8 @@ export default function AdminUsage() {
         sub="Platform-wide request volume, error rate, latency and token usage"
         right={(
           <div className="flex flex-wrap gap-1.5 items-center">
-            {RANGES.map((r) => <button key={r.id} type="button" onClick={() => setRange(r)} className={`px-3 py-1.5 rounded-2xl text-xs ${range.id === r.id ? 'bg-main-blue text-white' : 'bg-white text-main-text shadow-sm'}`}>{r.label}</button>)}
-            <Btn kind="secondary" onClick={load} loading={loading}>Refresh</Btn>
+            {RANGES.map((r) => <button key={r.id} type="button" onClick={() => changeRange(r)} className={`px-3 py-1.5 rounded-2xl text-xs ${range.id === r.id ? 'bg-main-blue text-white' : 'bg-white text-main-text shadow-sm'}`}>{r.label}</button>)}
+            <Btn kind="secondary" onClick={() => load(offset)} loading={loading}>Refresh</Btn>
           </div>
         )}
       />
@@ -87,19 +93,19 @@ export default function AdminUsage() {
       <Card className="mb-4">
         <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
           <Field label="Organization filter">
-            <select value={orgId} onChange={(e) => setOrgId(e.target.value)} className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm bg-white">
+            <select value={orgId} onChange={(e) => changeOrg(e.target.value)} className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm bg-white">
               <option value="">All organizations</option>
               {orgs.map((o) => <option key={o.id} value={o.id}>{o.slug}</option>)}
             </select>
           </Field>
           <Field label="Feature filter">
-            <select value={feature} onChange={(e) => setFeature(e.target.value)} className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm bg-white">
+            <select value={feature} onChange={(e) => changeFeature(e.target.value)} className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm bg-white">
               <option value="">All features</option>
               {features.map((f) => <option key={f.feature} value={f.feature}>{f.feature}</option>)}
             </select>
           </Field>
           <div className="self-end mb-3">
-            <Btn kind="secondary" onClick={() => { setOrgId(''); setFeature(''); setOffset(0); }}>Clear filters</Btn>
+            <Btn kind="secondary" onClick={() => { if (!orgId && !feature && offset === 0) load(0); else { setOrgId(''); setFeature(''); setOffset(0); } }}>Clear filters</Btn>
           </div>
         </div>
       </Card>

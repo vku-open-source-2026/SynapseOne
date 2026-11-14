@@ -269,13 +269,18 @@ projector comments call the metadata `_core`).
 object↔data mapping, validation, queries, vector search, optimistic concurrency,
 atomic counters, batches and a change feed.
 
-**Files:** `src/index.ts` (routes/scope/limits), `src/mapping.ts` (mapping +
-validation), `src/query.ts` (filters/order/cursor/vector), `src/store.ts`
-(Postgres/memory), `src/schema.ts`, `drizzle/`.
+**Files:** Rust ships: `src/api.rs` (routes/scope/limits), `src/mapping.rs`
+(mapping + validation), `src/query.rs` (filters/order/cursor/vector),
+`src/store.rs` (Postgres/memory), `src/schema.ts` + `drizzle/` (schema
+reference/migrations). The TypeScript sources are the behavioural reference.
 
 **API:**
-- `GET/POST /v1/base/collections`, `GET/PATCH/DELETE
-  /v1/base/collections/:collection`, `GET .../stats`.
+- `GET/POST /v1/base/databases`, `GET/PATCH/DELETE
+  /v1/base/databases/:database` (delete is 409 unless `?cascade=true`).
+- Collections: `GET/POST /v1/base/collections`, `GET/PATCH/DELETE
+  /v1/base/collections/:collection`, `GET .../stats`. The same routes exist
+  under `/v1/base/databases/:database/collections/...`; flat routes target the
+  tenant `default` database or `?database=<name>`.
 - Documents: `POST .../documents`, `GET/PUT/PATCH/DELETE
   .../documents/:id`, `GET .../documents`, `POST .../query`,
   `POST .../vector-search`, `POST .../documents/:id/increment`,
@@ -312,12 +317,14 @@ validation), `src/query.ts` (filters/order/cursor/vector), `src/store.ts`
 - Limits: document ≤ `BASE_MAX_DOCUMENT_BYTES` (default 256 KB, max 4 MB),
   nesting ≤32, arrays ≤10k; prototype keys rejected.
 
-**Data:** `synapseone_base_collections` (scope + name unique, mapping),
-`synapseone_base_documents` (PK collection+id, JSONB, version, GIN index),
-`synapseone_base_vectors` (collection+document+field, embedding text,
-dimension). Memory backend for dev/tests.
+**Data:** `synapseone_base_databases` (scope + name unique),
+`synapseone_base_collections` (`database_id`, name unique per database,
+mapping), `synapseone_base_documents` (PK collection+id, JSONB, version, GIN
+index), `synapseone_base_vectors` (collection+document+field, embedding text,
+dimension). Memory backend for dev/tests. Migration `0008_base_databases`
+backfills existing collections into per-tenant `default` databases.
 
-**Rules:** collection visibility = platform all, org-bound same org,
+**Rules:** database/collection visibility = platform all, org-bound same org,
 account-bound same account. Production requires DB + internal secret.
 
 **Env:** `PORT`, `DATABASE_URL`, `BASE_MAX_DOCUMENT_BYTES`,
@@ -425,27 +432,30 @@ stays server-side. Output is validated against the catalog and fails closed
 
 ---
 
-## Warehouse — `apps/warehouse-service` (:4012, TypeScript)
+## Warehouse — `apps/warehouse-service` (:4012, Rust/Axum)
 
 **Purpose:** Tier-1 OLAP store behind the gateway's `/v1/warehouse` route.
 Tenant-scoped DuckDB databases hold datasets, SQL query results and ETL jobs.
 Batch jobs transform one dataset into another; stream jobs consume a
 SynapseStream topic and append event payloads to a dataset.
 
-**Files:** `src/index.ts` (Express + stream workers), `src/duck.ts` (tenant
-store and metadata), `src/sql.ts` (identifier/SQL safety), `src/types.ts`;
-tests in `src/index.test.ts`.
+**Files:** `src/main.rs` (boot/healthcheck), `src/api.rs` (routes),
+`src/store.rs` (tenant DuckDB store and metadata), `src/sql.rs`
+(identifier/SQL safety), `src/stream.rs`, `src/usage.rs`, `src/templates.rs`;
+tests in `src/tests.rs`.
 
-**API:** `GET /health`; datasets (`GET/POST /v1/warehouse/datasets`,
-`GET/DELETE /v1/warehouse/datasets/:id`, `POST .../rows`), read-only SQL
-(`POST /v1/warehouse/query`), ETL templates (`GET /v1/warehouse/templates`)
-and jobs (`GET/POST /v1/warehouse/jobs`, `POST .../:id/run|pause|resume`,
-`DELETE .../:id`).
+**API:** `GET /health`, `/ready`, `/metrics`; datasets
+(`GET/POST /v1/warehouse/datasets`, `GET/DELETE /v1/warehouse/datasets/:id`,
+`POST .../rows`), read-only SQL (`POST /v1/warehouse/query`), ETL templates
+(`GET /v1/warehouse/templates`) and jobs (`GET/POST /v1/warehouse/jobs`,
+`GET/DELETE .../:id`, `POST .../:id/run|pause|resume`), plus internal usage
+rollup/watermark/summary.
 
 **Invariants:** one DuckDB file per tenant (`WAREHOUSE_DATA_DIR`); every SQL
 statement is a single read-only `SELECT`/`WITH` with file/DDL functions denied;
 dataset ids are lower-case slugs and physical table names; stream jobs are
-single-writer (`replicas: 1`).
+single-writer (`replicas: 1`); deleting a dataset stops its stream workers
+before dropping its jobs/table.
 
 **Env:** `PORT`, `WAREHOUSE_DATA_DIR`, `WAREHOUSE_THREADS`,
 `STREAM_SERVICE_URL`, `SYNAPSEONE_INTERNAL_SECRET`, `CORS_ORIGIN`.
@@ -479,8 +489,9 @@ No auth beyond the internal secret.
 `OPENROUTER_MODEL`, `OPENROUTER_FALLBACK_MODEL`, `OPENROUTER_TIMEOUT_MS`,
 `OPENROUTER_RETRIES`, `EMBEDDING_MODEL_NAME`, `EMBEDDING_DIM`,
 `EMBEDDING_BACKEND`, `EMBEDDING_ONNX_PATH`, `EMBEDDING_ONNX_FILE`,
-`EMBEDDING_BATCH_SIZE`, `EMBEDDING_MAX_LENGTH`, `DECISION_MODEL_NAME`,
-`DECISION_ENABLED`, `DECISION_THREADS`, `DECISION_WARMUP`, `INFERENCE_DEVICE`,
+`EMBEDDING_BATCH_SIZE`, `EMBEDDING_MAX_LENGTH`, `DECISION_BACKEND`,
+`DECISION_MODEL_NAME`, `OPENROUTER_DECISIONS_URL`, `DECISION_ENABLED`,
+`DECISION_THREADS`, `DECISION_WARMUP`, `INFERENCE_DEVICE`,
 `INFERENCE_CPU_THREADS`, `INFERENCE_MODEL_DOWNLOAD`, `INFERENCE_WARMUP`,
 `MODEL_LOAD_RETRY_SECONDS`, `INFERENCE_MOCK_MODELS`,
 `SYNAPSEONE_INTERNAL_SECRET`.

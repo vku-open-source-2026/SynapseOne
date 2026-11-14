@@ -301,6 +301,42 @@ def test_base_collection_lifecycle_paths_and_bodies():
         srv.shutdown()
 
 
+def test_base_database_handle_scopes_collection_paths():
+    srv = _server()
+    try:
+        c = _client(srv)
+        analytics = c.base.database("analytics")
+        assert analytics.database_name == "analytics"
+        assert c.base.database_name is None
+
+        analytics.create_collection("users")
+        assert _seen["path"] == "/v1/base/databases/analytics/collections"
+        assert _seen["method"] == "POST"
+
+        c.base.create_collection("events", database="analytics")
+        assert _seen["path"] == "/v1/base/databases/analytics/collections"
+
+        analytics.get_collection("users")
+        assert _seen["path"] == "/v1/base/databases/analytics/collections/users"
+
+        analytics.create_document("users", data={"name": "Ada"}, id="u1")
+        assert (
+            _seen["path"]
+            == "/v1/base/databases/analytics/collections/users/documents"
+        )
+
+        typed = c.base.collection(
+            "users", model=None, mapping={"name": "profile.name"}, database="analytics"
+        )
+        assert isinstance(typed, BaseCollection)
+
+        c.base.delete_database("analytics", cascade=True)
+        assert _seen["path"] == "/v1/base/databases/analytics?cascade=true"
+        assert _seen["method"] == "DELETE"
+    finally:
+        srv.shutdown()
+
+
 def test_base_documents_data_and_object_are_exclusive():
     srv = _server()
     try:

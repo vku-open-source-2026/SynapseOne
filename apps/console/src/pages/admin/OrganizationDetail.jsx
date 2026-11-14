@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 VKU.VIC
-import React, { useCallback, useEffect, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { Link, useLocation, useParams } from 'react-router-dom';
 import { usePlatformAuth } from '../../lib/platform-auth.jsx';
 import AdminActionDialog from '../../components/AdminActionDialog.jsx';
 import { Badge, Btn, Card, Empty, Err, Field, Input, Modal, PageTitle, Skeleton, StatValue, Table } from '../../components/ui.jsx';
@@ -22,6 +22,8 @@ const fmt = (v) => v ? new Date(v).toLocaleString() : '–';
 
 export default function AdminOrganizationDetail() {
   const { orgId } = useParams();
+  const location = useLocation();
+  const userListFrom = `${location.pathname}${location.search}`;
   const platform = usePlatformAuth();
   const [data, setData] = useState(null);
   const [audit, setAudit] = useState([]);
@@ -39,17 +41,29 @@ export default function AdminOrganizationDetail() {
   const [roleForm, setRoleForm] = useState({ accountId: '', slug: '', description: '', code: '' });
   const [policyForm, setPolicyForm] = useState({ accountId: '', slug: '', description: '', document: '{\n  "Version": "2026-01-01",\n  "Statement": [\n    { "Effect": "Deny", "Action": ["*"], "Resource": ["*"] }\n  ]\n}', code: '' });
   const canWrite = platform.role === 'owner' || platform.role === 'operator';
+  const dataSeq = useRef(0);
+  const auditSeq = useRef(0);
 
   const load = useCallback(async () => {
+    const seq = ++dataSeq.current;
     setErr(null);
-    try { setData(await platform.request(`/v1/platform/orgs/${encodeURIComponent(orgId)}/resources`)); }
-    catch (e) { setErr(e); }
+    try {
+      const out = await platform.request(`/v1/platform/orgs/${encodeURIComponent(orgId)}/resources`);
+      if (seq === dataSeq.current) setData(out);
+    } catch (e) {
+      if (seq === dataSeq.current) setErr(e);
+    }
   }, [platform, orgId]);
 
   const loadAudit = useCallback(async () => {
+    const seq = ++auditSeq.current;
     setAuditErr(null);
-    try { setAudit(await platform.request(`/v1/platform/orgs/${encodeURIComponent(orgId)}/audit?limit=100`)); }
-    catch (e) { setAudit([]); setAuditErr(e); }
+    try {
+      const out = await platform.request(`/v1/platform/orgs/${encodeURIComponent(orgId)}/audit?limit=100`);
+      if (seq === auditSeq.current) setAudit(out);
+    } catch (e) {
+      if (seq === auditSeq.current) { setAudit([]); setAuditErr(e); }
+    }
   }, [platform, orgId]);
 
   // Route params can change without unmounting this component. Never show the
@@ -138,8 +152,8 @@ export default function AdminOrganizationDetail() {
       </>
     );
     if (tab === 'accounts') return <Card><div className="flex justify-between mb-3"><h3 className="font-semibold">Accounts</h3>{canWrite && <Btn kind="secondary" onClick={() => { setModalErr(null); setCreateAccountOpen(true); }}>+ New account</Btn>}</div>{data.accounts?.length ? <Table head={['Slug', 'Display name', 'ID']}>{data.accounts.map((a) => <tr key={a.id} className="border-t border-slate-100"><td className="py-2 pr-4 font-medium">{a.slug}</td><td className="py-2 pr-4">{a.display_name}</td><td className="py-2 pr-4 text-xs font-mono">{a.id?.slice(0, 8)}…</td></tr>)}</Table> : <Empty text="No accounts" />}</Card>;
-    if (tab === 'members') return <Card><h3 className="font-semibold mb-3">Members</h3>{data.users?.length ? <Table head={['Email', 'Name', 'Role', 'Status']}>{data.users.map((u) => <tr key={u.id} className="border-t border-slate-100"><td className="py-2 pr-4"><Link className="text-main-blue" to={`/admin/users/${u.id}`}>{u.email}</Link></td><td className="py-2 pr-4">{u.display_name || '–'}</td><td className="py-2 pr-4">{u.is_org_admin ? <Badge tone="blue">org admin</Badge> : 'member'}</td><td className="py-2 pr-4">{u.active === false ? <Badge tone="red">disabled</Badge> : <Badge tone="green">active</Badge>}</td></tr>)}</Table> : <Empty text="No members" />}</Card>;
-    if (tab === 'admins') return <Card><h3 className="font-semibold mb-3">Organization administrators</h3>{data.admins?.length ? <ul className="space-y-2 text-sm">{data.admins.map((u) => <li key={u.id}><Link className="text-main-blue" to={`/admin/users/${u.id}`}>{u.email}</Link> <span className="text-normal-text">({u.display_name || '–'})</span></li>)}</ul> : <Empty text="No organization administrator" />}</Card>;
+    if (tab === 'members') return <Card><h3 className="font-semibold mb-3">Members</h3>{data.users?.length ? <Table head={['Email', 'Name', 'Role', 'Status']}>{data.users.map((u) => <tr key={u.id} className="border-t border-slate-100"><td className="py-2 pr-4"><Link className="text-main-blue" to={`/admin/users/${u.id}`} state={{ from: userListFrom }}>{u.email}</Link></td><td className="py-2 pr-4">{u.display_name || '–'}</td><td className="py-2 pr-4">{u.is_org_admin ? <Badge tone="blue">org admin</Badge> : 'member'}</td><td className="py-2 pr-4">{u.active === false ? <Badge tone="red">disabled</Badge> : <Badge tone="green">active</Badge>}</td></tr>)}</Table> : <Empty text="No members" />}</Card>;
+    if (tab === 'admins') return <Card><h3 className="font-semibold mb-3">Organization administrators</h3>{data.admins?.length ? <ul className="space-y-2 text-sm">{data.admins.map((u) => <li key={u.id}><Link className="text-main-blue" to={`/admin/users/${u.id}`} state={{ from: userListFrom }}>{u.email}</Link> <span className="text-normal-text">({u.display_name || '–'})</span></li>)}</ul> : <Empty text="No organization administrator" />}</Card>;
     if (tab === 'roles') return <Card><div className="flex justify-between mb-3"><h3 className="font-semibold">Roles</h3>{canWrite && <Btn kind="secondary" onClick={() => { setModalErr(null); setCreateRoleOpen(true); }}>+ New role</Btn>}</div>{data.roles?.length ? <Table head={['Account', 'Slug', 'Description']}>{data.roles.map((r) => <tr key={r.id} className="border-t border-slate-100"><td className="py-2 pr-4">{r.account_slug}</td><td className="py-2 pr-4 font-mono">{r.slug}</td><td className="py-2 pr-4">{r.description || '–'}</td></tr>)}</Table> : <Empty text="No roles" />}</Card>;
     if (tab === 'policies') return <Card><div className="flex justify-between mb-3"><h3 className="font-semibold">Policies</h3>{canWrite && <Btn kind="secondary" onClick={() => { setModalErr(null); setCreatePolicyOpen(true); }}>+ New policy</Btn>}</div>{data.policies?.length ? <Table head={['Account', 'Slug', 'Description']}>{data.policies.map((p) => <tr key={p.id} className="border-t border-slate-100"><td className="py-2 pr-4">{p.account_slug}</td><td className="py-2 pr-4 font-mono">{p.slug}</td><td className="py-2 pr-4">{p.description || '–'}</td></tr>)}</Table> : <Empty text="No policies" />}</Card>;
     if (tab === 'keys') return <Card><h3 className="font-semibold mb-3">API keys</h3>{data.keys?.length ? <Table head={['Account', 'Name', 'Prefix', 'Scopes', 'Expires', 'Status', '']}>{data.keys.map((k) => <tr key={k.id} className="border-t border-slate-100"><td className="py-2 pr-4">{k.account_slug}</td><td className="py-2 pr-4">{k.name}</td><td className="py-2 pr-4 font-mono">{k.prefix}</td><td className="py-2 pr-4 text-xs">{k.scopes?.join(', ')}</td><td className="py-2 pr-4">{fmt(k.expires_at)}</td><td className="py-2 pr-4">{k.revoked_at ? <Badge tone="red">revoked</Badge> : <Badge tone="green">active</Badge>}</td><td>{canWrite && !k.revoked_at && <Btn kind="danger" onClick={() => setConfirm({ path: `/v1/platform/orgs/${orgId}/keys/${k.id}/revoke`, action: 'org:key:revoke', title: 'Revoke API key', message: `Revoke ${k.name}? This cannot be undone.`, requireReason: true, success: 'API key revoked.' })}>Revoke</Btn>}</td></tr>)}</Table> : <Empty text="No API keys" />}</Card>;

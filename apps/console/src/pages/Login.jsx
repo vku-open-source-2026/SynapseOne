@@ -16,7 +16,13 @@ import { landingPath } from '../lib/auth-routing.js';
 export default function Login() {
   const location = useLocation();
   const [email, setEmail] = useState('');
-  const [org, setOrg] = useState(location.state?.prefillOrg || '');
+  // Logout + navigate can race with the route guard's own /login redirect, so
+  // the platform/tenant prefill is also carried in sessionStorage. Keep it
+  // until a successful sign-in; an early remount must still see it.
+  const [org, setOrg] = useState(() => {
+    try { return sessionStorage.getItem('synapseone.login.prefillOrg') || location.state?.prefillOrg || ''; }
+    catch { return location.state?.prefillOrg || ''; }
+  });
   const [password, setPassword] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [mode, setMode] = useState('email');
@@ -33,6 +39,11 @@ export default function Login() {
   const t = m.login;
 
   useEffect(() => {
+    if (!auth) return;
+    try { sessionStorage.removeItem('synapseone.login.prefillOrg'); } catch { /* storage blocked */ }
+  }, [auth]);
+
+  useEffect(() => {
     let alive = true;
     api.oidcConfig()
       .then((cfg) => { if (alive) setSso(cfg); })
@@ -40,7 +51,7 @@ export default function Login() {
     return () => { alive = false; };
   }, []);
 
-  if (auth) return <Navigate to={landingPath(auth.currentContext)} replace />;
+  if (auth) return <Navigate to={landingPath(auth.currentContext, undefined, auth.preferredContext)} replace />;
 
   const orgSlug = org.trim().toLowerCase();
   const ssoAvailable = sso ? (sso.ssoAvailable ?? sso.issuerPublic) !== false : null;
@@ -80,7 +91,7 @@ export default function Login() {
         }
         setOrgError('');
         const result = await login(email, orgSlug, password);
-        nav(landingPath(result?.currentContext, location.state?.from), { replace: true });
+        nav(landingPath(result?.currentContext, location.state?.from, result?.preferredContext), { replace: true });
       }
       else {
         if (!apiKey) throw new Error(t.enterKey);
@@ -105,7 +116,7 @@ export default function Login() {
     try {
       const code = mfaCode.trim();
       const result = await completeMfa(mfa.token, useRecovery ? undefined : code, useRecovery ? code : undefined);
-      nav(landingPath(result?.currentContext, location.state?.from), { replace: true });
+      nav(landingPath(result?.currentContext, location.state?.from, result?.preferredContext), { replace: true });
     } catch (ex) {
       if (ex?.body?.error === 'invalid_mfa_token') setMfa(null);
       setErr(ex);
@@ -175,7 +186,11 @@ export default function Login() {
                     selected locale instead of the browser's generic tooltip. */}
                 <Input
                   value={org}
-                  onChange={(e) => { setOrg(e.target.value); if (orgError) setOrgError(''); }}
+                  onChange={(e) => {
+                    setOrg(e.target.value);
+                    if (orgError) setOrgError('');
+                    try { sessionStorage.removeItem('synapseone.login.prefillOrg'); } catch { /* storage blocked */ }
+                  }}
                   placeholder="your-org"
                   autoComplete="organization"
                   aria-invalid={orgError ? 'true' : undefined}

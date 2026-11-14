@@ -112,17 +112,21 @@ self-service unless `IAM_REGISTRATION_ALLOW_NEW_ORGS=false`.
 
 ### Delegated identity for Tier 2 (implemented)
 
-`POST /v1/auth/exchange` takes a service-account token or API key plus
+`POST /v1/auth/exchange` takes an **account-level** operator API key or a
+service-account token plus
 `{userId, accountId?, orgId?, scopes?, audience?, ttlSeconds?}` and returns a
-short-lived token for that user. It refuses cross-tenant targets and scope
-escalation and audits every exchange. Tier 2 must use this instead of forwarding a
-Tier-3 HMAC token plus one shared service key.
+short-lived token for that user. User-bound API keys cannot exchange; service
+accounts are rechecked for revocation, actual account binding and org status.
+It refuses inactive/suspended targets, cross-tenant targets and scope escalation
+and audits every exchange. Tier 2 must use this instead of forwarding a Tier-3
+HMAC token plus one shared service key.
 API keys: `scopes` are action patterns (`*`, `storage:*`, `workflow:Execute`). A key
 created with `userId` is **owner-bound** and inherits that user's permissions; without
-an owner it is an account-level key bounded by its scopes alone. Keys record
-`last_used_at` and can be rotated (`POST /v1/keys/:id/rotate {graceSeconds}` — the old
-secret stays valid for the grace window, 0 = revoked immediately). Users can list and
-revoke their own sessions (`GET/DELETE /v1/auth/sessions[/:id]`).
+an owner it is an account-level key bounded by its scopes alone. Owner-bound keys
+cannot be used for delegated exchange. Keys record `last_used_at` and can be rotated
+(`POST /v1/keys/:id/rotate {graceSeconds}` — the old secret stays valid for the grace
+window, 0 = revoked immediately). Users can list and revoke their own sessions
+(`GET/DELETE /v1/auth/sessions[/:id]`).
 
 ## Multi-factor authentication and sign-in lockout (implemented)
 

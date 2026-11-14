@@ -83,6 +83,16 @@ async function runClaimed(
     });
     return;
   }
+  // The graph was approved when this execution was queued. Editing the
+  // workflow while it waits must not cause the worker to run a different graph.
+  if (claimed.workflow_revision != null && claimed.workflow_revision !== wf.revision) {
+    await finishExecutionRec(claimed.id, {
+      status: 'error', output: null, node_runs: [],
+      error: 'workflow revision changed after this execution was queued; submit a new execution',
+      finishedAt: new Date().toISOString(), workerId: WORKER_ID, allowedStatuses: ['running'],
+    });
+    return;
+  }
   const executionId = claimed.id;
   const principal = (claimed.principal || null) as Principal | null;
   const runPrincipal = principal || {

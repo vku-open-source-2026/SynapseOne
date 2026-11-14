@@ -55,10 +55,19 @@ export class WorkflowService {
   }
   activateWorkflow(id: string) { return this.http.req(`/v1/workflows/${encodeURIComponent(id)}/activate`, { method: 'POST' }); }
   deactivateWorkflow(id: string) { return this.http.req(`/v1/workflows/${encodeURIComponent(id)}/deactivate`, { method: 'POST' }); }
-  executeWorkflow(id: string, payload: Record<string, unknown> = {}, opts: { wait?: boolean; timeoutMs?: number } = {}) {
-    const qs = opts.wait
-      ? `?wait=1&timeoutMs=${encodeURIComponent(Math.min(Math.max(Number(opts.timeoutMs) || 30000, 1000), 300000))}`
-      : '';
+  executeWorkflow(id: string, payload: Record<string, unknown> = {}, opts: { wait?: boolean; timeoutMs?: number; expectedRevision?: number } = {}) {
+    const params = new URLSearchParams();
+    if (opts.wait) {
+      params.set('wait', '1');
+      params.set('timeoutMs', String(Math.min(Math.max(Number(opts.timeoutMs) || 30000, 1000), 300000)));
+    }
+    if (opts.expectedRevision !== undefined) {
+      if (!Number.isSafeInteger(opts.expectedRevision) || opts.expectedRevision < 1 || opts.expectedRevision > 2147483647) {
+        throw new RangeError('expectedRevision must be a positive 32-bit integer');
+      }
+      params.set('expectedRevision', String(opts.expectedRevision));
+    }
+    const qs = params.size ? `?${params}` : '';
     return this.http.req(`/v1/workflows/${encodeURIComponent(id)}/execute${qs}`, { method: 'POST', body: JSON.stringify(payload) });
   }
 

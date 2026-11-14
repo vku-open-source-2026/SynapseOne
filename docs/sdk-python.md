@@ -641,6 +641,10 @@ Collections of JSON documents with a logical object↔data mapping, queries,
 optimistic concurrency, counters, batches and a change feed. Full guide:
 [synapsebase.md](synapsebase.md).
 
+Use `c.base.database("analytics")` to address a database namespace (or
+`c.base.collection("parks", database="analytics")` for typed use). Without it,
+calls use the legacy flat routes and the tenant `default` database.
+
 ```python
 from dataclasses import dataclass
 

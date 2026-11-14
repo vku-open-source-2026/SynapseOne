@@ -209,6 +209,20 @@ describe('platform organization lifecycle', () => {
     }, platformToken, { 'x-platform-step-up': policyStep });
     assert.equal(policy.status, 201, JSON.stringify(policy.json));
 
+    const detailUser = await call('GET', `/v1/platform/users/${tenantAdminId}`, undefined, platformToken);
+    assert.equal(detailUser.status, 200, JSON.stringify(detailUser.json));
+    assert.equal(detailUser.json.orgAdminCount, 1);
+
+    // The last active org admin cannot be disabled (mirrors the org-admin
+    // revoke guard). No step-up is consumed because this is denied first.
+    const disableStep = await stepUp('user:disable');
+    const lastDisable = await call('POST', `/v1/platform/users/${tenantAdminId}/disable`, {}, platformToken, { 'x-platform-step-up': disableStep });
+    assert.equal(lastDisable.status, 409, JSON.stringify(lastDisable.json));
+    assert.equal(lastDisable.json.error, 'last_admin');
+    const stillActive = await call('GET', `/v1/platform/users/${tenantAdminId}`, undefined, platformToken);
+    assert.equal(stillActive.status, 200, JSON.stringify(stillActive.json));
+    assert.equal(stillActive.json.user.active, true);
+
     const resources = await call('GET', `/v1/platform/orgs/${tenantOrgId}/resources`, undefined, platformToken);
     assert.equal(resources.status, 200, JSON.stringify(resources.json));
     assert.equal(resources.json.organization.status, 'active');

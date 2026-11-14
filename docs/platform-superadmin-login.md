@@ -73,10 +73,14 @@ used or modified.
 3. The Console asks for an authenticator code because MFA is enabled.
 4. Open the TOTP secret from the credentials file in Google Authenticator,
    1Password, Authy or any RFC 6238 client and enter the current 6-digit code.
-5. You land on the tenant Dashboard. Open `/admin` (or
-   `/admin/overview`) to start the platform session.
-6. Enter a **fresh** authenticator code (or a recovery code) when the platform
-   guard asks. This exchanges the normal user JWT for a short-lived
+5. The Console routes a recognized Platform Administrator to
+   `/admin/overview` even when the tenant organization was typed on the login
+   form. If the signed-in row is a tenant row, the guard shows the platform-org
+   sign-in prompt; use it to sign in to `synapseone-platform`. It never upgrades
+   a tenant row into the platform organization by email.
+6. Sign in to the platform organization and complete its own MFA challenge.
+   Enter a **fresh** authenticator code (or a recovery code) when the platform
+   guard asks. This exchanges the platform-org user JWT for a short-lived
    `kind=platform-admin` token.
 7. The Overview page opens. The top bar shows the `owner` role.
 

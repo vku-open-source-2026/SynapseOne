@@ -77,6 +77,7 @@ export const credentials = pgTable(
     id: text('id').primaryKey(),
     accountId: text('account_id').notNull(),
     orgId: text('org_id'),
+    ownerSub: text('owner_sub'),
     name: text('name').notNull(),
     kind: text('kind').notNull().default('bearer'),
     secretEnc: text('secret_enc').notNull(),

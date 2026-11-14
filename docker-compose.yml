@@ -565,7 +565,9 @@ services:
       EMBEDDING_ONNX_FILE: ${EMBEDDING_ONNX_FILE:-}
       EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-32}
       EMBEDDING_MAX_LENGTH: ${EMBEDDING_MAX_LENGTH:-256}
+      DECISION_BACKEND: ${DECISION_BACKEND:-local}
       DECISION_MODEL_NAME: ${DECISION_MODEL_NAME:-vllm-sr/Decision-2.0-Eos-0.8B}
+      OPENROUTER_DECISIONS_URL: ${OPENROUTER_DECISIONS_URL:-}
       DECISION_ENABLED: ${DECISION_ENABLED:-true}
       DECISION_THREADS: ${DECISION_THREADS:-0}
       DECISION_WARMUP: ${DECISION_WARMUP:-true}
@@ -657,7 +659,7 @@ services:
       context: ./apps/ocs-service
     image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-ocs:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
-    entrypoint: ["node", "/app/s3-backup.mjs"]
+    entrypoint: ["/usr/local/bin/s3-backup"]
     command: ["loop"]
     environment:
       STORAGE_S3_ENDPOINT: ${STORAGE_S3_ENDPOINT:-http://s3:9090}
@@ -670,7 +672,6 @@ services:
       BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
       BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-7}
     volumes:
-      - ./tools/backup/s3-backup.mjs:/app/s3-backup.mjs:ro
       - s3backups:/backups
     depends_on:
       s3:

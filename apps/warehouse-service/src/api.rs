@@ -494,6 +494,17 @@ async fn delete_dataset(
     Extension(tenant): Extension<Tenant>,
     Path(id): Path<String>,
 ) -> Result<Response, WarehouseError> {
+    // Stop stream workers before dropping the dataset/jobs so a detached task
+    // cannot keep polling and writing into a table that is being removed.
+    for job in state
+        .store
+        .list_jobs(tenant_of(&tenant))
+        .await?
+        .into_iter()
+        .filter(|job| job.target_dataset_id.as_str() == id.as_str() && job.mode == "stream")
+    {
+        state.stream.stop(&job.id);
+    }
     if state.store.delete_dataset(tenant_of(&tenant), &id).await? {
         Ok(Json(json!({ "ok": true, "deleted": true })).into_response())
     } else {

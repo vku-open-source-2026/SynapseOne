@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 VKU.VIC
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { usePlatformAuth } from '../../lib/platform-auth.jsx';
 import AdminActionDialog from '../../components/AdminActionDialog.jsx';
 import { Badge, Btn, Card, Empty, Err, Field, Input, Modal, PageTitle, Table, TableSkeleton } from '../../components/ui.jsx';
@@ -19,20 +19,25 @@ export default function AdminPlatformAdmins() {
   const [revoke, setRevoke] = useState(null);
   const [notice, setNotice] = useState(null);
   const [invite, setInvite] = useState(null);
+  const seqRef = useRef(0);
   const isOwner = platform.role === 'owner';
 
   const load = useCallback(async () => {
+    const seq = ++seqRef.current;
     setErr(null);
     setActionErr(null);
     setLoading(true);
     try {
       const out = await platform.request('/v1/platform/admins');
+      if (seq !== seqRef.current) return;
       setRows(Array.isArray(out.items) ? out.items : []);
     } catch (e) {
-      setErr(e);
+      if (seq === seqRef.current) setErr(e);
     } finally {
-      setLoading(false);
-      setLoaded(true);
+      if (seq === seqRef.current) {
+        setLoading(false);
+        setLoaded(true);
+      }
     }
   }, [platform]);
 

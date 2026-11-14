@@ -458,6 +458,11 @@ export function propagatePrincipal(req: express.Request): void {
     h['x-synapseone-kind'] = 'apikey';
     if ((p as any).org) h['x-synapseone-org'] = String((p as any).org);
     if ((p as any).account) h['x-synapseone-account'] = String((p as any).account);
+    // A user-bound API key (verified IAM `user_id`) acts for that user: stamp the
+    // owner so workflow/audit/owner-only policies see the real user while the
+    // credential keeps `kind=apikey`. Account-level keys have no owner and stay
+    // pure machines. Client-supplied user headers were deleted above.
+    if ((p as any).owner) h['x-synapseone-user'] = String((p as any).owner);
     if (Array.isArray((p as any).scopes) && (p as any).scopes.length) {
       h['x-synapseone-scopes'] = (p as any).scopes.join(',');
     }

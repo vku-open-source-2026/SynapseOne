@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 VKU.VIC
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { usePlatformAuth } from '../../lib/platform-auth.jsx';
 import { baseUrl } from '../../lib/api.js';
@@ -29,8 +29,10 @@ export default function AdminOverview() {
   const [healthLoading, setHealthLoading] = useState(true);
   const [updatedAt, setUpdatedAt] = useState(null);
   const [recentErr, setRecentErr] = useState(null);
+  const seqRef = useRef(0);
 
   const load = useCallback(async () => {
+    const seq = ++seqRef.current;
     setErr(null);
     setLoading(true);
     const w = windowFor(range);
@@ -39,6 +41,7 @@ export default function AdminOverview() {
       platform.request(`/v1/platform/usage/summary?from=${encodeURIComponent(w.from)}&to=${encodeURIComponent(w.to)}`),
       platform.request('/v1/platform/audit?limit=6'),
     ]);
+    if (seq !== seqRef.current) return;
     if (o.status === 'fulfilled') setOverview(o.value);
     if (u.status === 'fulfilled') setUsage(u.value);
     if (a.status === 'fulfilled') {

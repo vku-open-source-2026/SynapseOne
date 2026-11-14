@@ -54,15 +54,19 @@ tenant. Platform calls without a tenant fail with `400 tenant_required`.
 - `GET /v1/auth/sessions` (Bearer) → refresh-token sessions
 - `DELETE /v1/auth/sessions/:id` (Bearer) → revoke one session
 - `POST /v1/auth/exchange {userId, accountId?, orgId?, scopes?, audience?, ttlSeconds?}`
-  (service-account Bearer or API key) → `{accessToken (kind=delegated), expiresIn, ...}`.
-  Refuses cross-tenant targets (`403 cross_tenant`) and scope escalation; audited.
+  (**account-level** operator API key or service-account Bearer) → `{accessToken
+  (kind=delegated), expiresIn, ...}`. User-bound API keys are refused
+  (`403 exchange_requires_account_key`); service accounts are rechecked for
+  revocation, account binding and org status. Refuses inactive/suspended target
+  users or orgs, cross-tenant targets (`403 cross_tenant`) and scope escalation;
+  audited.
 - `POST /v1/auth/refresh {refreshToken}` → `{accessToken, refreshToken}` (rotation: the old token is revoked)
 - `POST /v1/auth/logout {refreshToken}` → `{ok}`
 - `POST /v1/auth/logout-all {refreshToken}` → `{ok, revoked}` (revokes all of your own sessions)
-- `GET /v1/auth/verify` (Bearer or X-API-Key) → `{valid, ...}`
+- `GET /v1/auth/verify` (Bearer or X-API-Key) → `{valid, ...}`; API-key responses include the verified owning `org_id`
 - `GET /v1/auth/me` (Bearer) → `{user, kind}` (`user.is_org_admin` tells whether the caller administers its org)
-- `GET /v1/auth/contexts` (Bearer) → `{current, contexts}` — tenant/platform contexts this email may enter; suspended organizations are omitted
-- `POST /v1/auth/contexts/switch {orgId}` (Bearer) → tenant token set after server-side membership revalidation. Platform context is never minted here; it returns `409 platform_context_login_required` and requires the platform-org login + MFA.
+- `GET /v1/auth/contexts` (Bearer) → `{current, contexts, preferred}` — the caller's own context is always included; other same-email contexts are included only after `email_verified` (password login alone does not verify). Suspended organizations are omitted.
+- `POST /v1/auth/contexts/switch {orgId, password}` (Bearer) → tenant token only after the **target row's own** password is verified (and its TOTP/recovery challenge completed, when enrolled). User-bound rows with no password return `403 target_login_required`; a suspended caller is refused. Platform context is never minted here; it returns `409 platform_context_login_required` and requires the platform-org login + MFA.
 - `GET /v1/auth/sessions` (user Bearer) → `[{id, created_at, expires_at}]` — your active sessions (one per live refresh token), newest first
 - `DELETE /v1/auth/sessions/:id` (user Bearer) → `{ok}` — revoke one session (its refresh token stops working); other users' ids → `404`
 - `GET /v1/auth/oidc/config` → `{issuer, clientId, redirectUri, codeExchange, ...}`
@@ -215,6 +219,14 @@ rest and NEVER returned: create/rotate accept a `secret` once; list/get return
 metadata only (`{id, name, kind, accountId, createdAt, updatedAt}`). Implemented
 `kind` values: `bearer|api-key|basic|hmac` (legacy alias `type` accepted).
 
+New credentials are bound to their creator's verified principal (`owner` in
+metadata). Listing, lookup, rotation, deletion and execution-time resolution
+require that owner as well as the account/organization boundary. A user-bound
+API key acts as its owning user, and cannot resolve an account machine's private
+credential. Existing credentials with no owner retain their prior sharing rules;
+create a new credential for a private service connector. Ownership is never
+accepted from request JSON.
+
 - `POST /v1/accounts/:accountId/credentials {name, kind|type, secret}` → metadata (201)
 - `GET /v1/accounts/:accountId/credentials` → `[metadata]`
 - `GET /v1/credentials/:id` → metadata
@@ -287,6 +299,17 @@ Deactivation sets `active:false`, revokes refresh tokens and API keys.
 
 ## Workflows (local built-in engine)
 
+`settings.access = {"mode":"owner-only"}` restricts a workflow to its stored
+creator inside its tenant. This policy covers list/get/update/delete, activation,
+manual and nested execution, execution history, linked human tasks, and custom
+runner jobs. Public webhooks cannot invoke an owner-only workflow; public MCP
+declarations do not override its policy. Only its creator may change the access
+mode. Missing access settings (or explicit `mode: "tenant"`) retain tenant
+sharing. An authenticated creator is required for owner-only mode. Capability
+services should create protected workflows and credentials using their own
+organization-bound technical identity, then enforce member roles before invoking
+them. A payload field claiming to be an actor does not grant Tier-1 permission.
+
 - `GET /v1/templates` / `GET /v1/templates/:name`
 - `GET /v1/workflows` (list: `[{id,name,active,nodes,connections,settings,orgId?,accountId?,owner?,runAs?,revision,createdAt,updatedAt}]`;
   gateway-authenticated callers see their org slice + legacy-global rows; `?orgId=` / `?accountId=` filter exactly)
@@ -301,6 +324,7 @@ Deactivation sets `active:false`, revokes refresh tokens and API keys.
   every create stamps `owner` from the caller)
 - `PUT /v1/workflows/:id {name?, definition?, settings?, orgId?, accountId?, runAs?}` (structural/SSRF/size/cycle-validated, ≤200KB, ≤50 nodes, every node needs a 1..128 char `name`; every update bumps `revision`)
 - `POST /v1/workflows/:id/execute {input}` (manual run — works for ANY trigger type, active or not; the body IS the input). With queue transport enabled (default when `QUEUE_SERVICE_URL` is set) this returns `202 {ok, queued:true, executionId, queue, runner}` after publishing a SynapseQueue job; add `?wait=1&timeoutMs=60000` for the old blocking shape `{ok, output, executionId, status}`. `500 {ok:false, error}` when a node fails. Records the caller principal + `actor: "workflow:<id> principal:<sub>"`.)
+  Optional `expectedRevision=<positive integer>` checks the revision of the exact definition being executed/enqueued. A mismatch returns `409 workflow_revision_conflict` without publishing a job; malformed values return `400 invalid_revision`. The precondition is a query parameter, separate from workflow input. Platform workers and custom runner claims also reject queued jobs if the definition revision changed while waiting, including resumed jobs. They finish those executions with an error and run no nodes; submit a new execution after reviewing the new definition. Existing queued jobs without revision metadata retain legacy behavior.
 - `POST /v1/workflows/test-run {definition, input, workflowId?}` (try a definition without saving; validates + executes inline in the sandbox; persisted as a `triggered_by=test` execution — pass `workflowId` to attach it to that workflow's history; returns `{ok, output, nodeRuns, executionId}`)
 - `GET /v1/executions` (`limit,offset,workflowId,status,triggeredBy,includeData`; `limit/offset` 0..9999, `offset=0` = first page; `status` is `queued|running|paused|success|error|cancelled`; `triggeredBy` is `manual|webhook|cron|test|human-task|workflow|mcp`; secret-looking keys in payloads are masked to `***`; always returns the envelope `{data: [...]}` — SDKs/Console/CLI unwrap `.data` and also accept a bare array) / `GET /v1/executions/:id` (`?includeData=true` for per-node input/output; also carries `principal`, `actor`, `queue`, `runner`, `workerId`, `attempt`, `leaseExpiresAt`, `workflowRevision`)
 - `GET/POST/DELETE /v1/credentials[?accountId=]` (account-scoped secrets, AES-256-GCM at rest via `SYNAPSEONE_CREDENTIAL_KEY`; list/create return metadata only, never secrets; duplicate names per account are `409`)
@@ -358,7 +382,7 @@ Node types: `webhook` (trigger, `parameters.path/httpMethod`), `cron` (trigger, 
 | `cron` | `rule.interval[]` (`{field: seconds\|minutes\|hours\|days, <field>Interval: N}`), or `cronExpression` (`"*/N * * * *"`, `"M H * * *"` wall-clock, `@hourly`, `@daily`), or `intervalMs`, plus optional `timezone` (wall-clock only) | Minimum 10s — faster schedules and other cron formats are rejected at save/activate; the editor shows the next run |
 | `manualTrigger` | — | Run from Console/CLI with any JSON input |
 | `mcpTrigger` | `toolName` (`[A-Za-z0-9_.-]{1,64}`), `description` (≤500), `inputSchema` (JSON Schema, ≤8KB), `public` (bool), `readOnly` (bool, default true; `public` requires readOnly) | Active workflow becomes an MCP tool; names unique among active workflows; `POST /mcp` JSON-RPC |
-| `httpRequest` | `url` (public `http(s)` or allowlisted self origin), `method`, `headers` (object), `body`/`jsonBody` (sent only when configured — the input is NOT auto-forwarded), `auth: {credentialId, header?}` (secret resolved server-side), `retry: {attempts 1–5, delayMs}`, `timeoutMs` (1–30s) | Redirects followed manually, max 5 hops, every hop re-checked against the SSRF blocklist; default 15s timeout; ≤200KB body, ≤500KB response |
+| `httpRequest` | `url` (public `http(s)` or allowlisted self origin), `method`, `headers` (object), `body`/`jsonBody` (sent only when configured — the input is NOT auto-forwarded), `auth: {credentialId, header?}` (secret resolved server-side), `retry: {attempts 1–5, delayMs}`, `timeoutMs` (1–30s), `includeInput` (optional; `true` returns `{statusCode, body, input}` where `input` is a clone of the incoming node value, and the same 500KB combined output limit applies) | Redirects followed manually, max 5 hops, every hop re-checked against the SSRF blocklist; default 15s timeout; ≤200KB body, ≤500KB response |
 | `code` | `code` (JS, ≤50KB, default 5s timeout), `timeoutMs` (1–15s), `retry` | `$input`/`$json`/`input` in scope, `$now` ISO time, `console.*` captured; bare expressions get an implicit `return (…)`; result `_logs` key is yours — console output then lands in `_consoleLogs` |
 | `set` | `values` (object), `assignments` (`[{name, value}]`), legacy `values.assignments`/`fields` | Values support `={{ $json.x }}` / `{{ … }}` / `=expr` templating against the incoming item; merged over the input |
 | `if` | `condition` (JS), or `value1` + `operation` + `value2` (`equals|notEquals|contains|notContains|startsWith|endsWith|larger|largerEqual|smaller|smallerEqual|isEmpty|isNotEmpty`), or n8n `conditions[]` | Output branch 0 = true, 1 = false; an unwired side stops the run there (the editor warns) |
@@ -538,9 +562,20 @@ Collections of JSON documents with server-side validation, a logical
 object↔data mapping, queries, optimistic concurrency, atomic counters, batch
 writes and a change feed. Full guide: [synapsebase.md](synapsebase.md).
 
-- `GET /v1/base/collections` (`?orgId` / `?accountId` narrow the list)
-- `POST /v1/base/collections {name, description?, mapping?, orgId?, accountId?}`
-  (201; name `[A-Za-z][A-Za-z0-9_-]{0,63}`, unique per tenant scope)
+Databases namespace collections: `tenant → database → collection → documents`.
+Every collection route below also works under
+`/v1/base/databases/:database/collections/...`; flat routes target the tenant's
+`default` database (or `?database=<name>`).
+
+- `GET /v1/base/databases` (`?orgId` / `?accountId` narrow the list) → database
+  namespaces with `stats: {collections, documents, bytes, lastUpdatedAt}`
+- `POST /v1/base/databases {name, description?, orgId?, accountId?}` (201)
+- `GET|PATCH|DELETE /v1/base/databases/:database` — `DELETE` requires
+  `?cascade=true` when the database still has collections
+- `GET /v1/base/databases/:database/stats`
+- `GET /v1/base/collections` (`?orgId` / `?accountId` / `?database` narrow the list)
+- `POST /v1/base/collections {name, description?, database?, mapping?, orgId?, accountId?}`
+  (201; name `[A-Za-z][A-Za-z0-9_-]{0,63}`, unique per database)
 - `GET /v1/base/collections/:collection` → collection + `stats`
 - `PATCH /v1/base/collections/:collection {name?, description?, mapping?}`
   (mapping replace is a view/validation change, not a data migration)
@@ -620,9 +655,10 @@ shorthand `{logical: "dot.path"}`. Types `string|number|boolean|date|array|objec
 `additional:false` rejects undeclared keys on object writes. Write `object` to store
 at mapped paths, read `?as=object` to get logical keys.
 
-Tenancy: org principal → org-bound collections; account-only → `org_id=null,
-account_id=<acct>`; platform callers see only unbound collections unless they pass
-`?orgId=`/`?accountId=` (ambiguous name → `409 ambiguous_collection`).
+Tenancy: org principal → org-bound databases/collections; account-only →
+`org_id=null, account_id=<acct>`; platform callers see only unbound namespaces
+unless they pass `?orgId=`/`?accountId=` (ambiguous database name →
+`409 ambiguous_database`).
 
 ## Faststore — cache, key/value and data structures (`faststore-service:4006`, gateway `/v1/faststore`)
 

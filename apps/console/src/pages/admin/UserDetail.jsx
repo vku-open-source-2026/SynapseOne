@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 VKU.VIC
 import React, { useCallback, useEffect, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useLocation, useParams } from 'react-router-dom';
 import { usePlatformAuth } from '../../lib/platform-auth.jsx';
 import AdminActionDialog from '../../components/AdminActionDialog.jsx';
 import { Badge, Btn, Card, Code, Empty, Err, Modal, PageTitle, Skeleton, Table } from '../../components/ui.jsx';
 
 export default function AdminUserDetail() {
   const { userId } = useParams();
+  const location = useLocation();
+  const backTo = typeof location.state?.from === 'string' && location.state.from.startsWith('/admin/') ? location.state.from : '/admin/users';
   const platform = usePlatformAuth();
   const [data, setData] = useState(null);
   const [err, setErr] = useState(null);
@@ -47,7 +49,7 @@ export default function AdminUserDetail() {
   if (err && !data) {
     return (
       <>
-        <PageTitle title="User" right={<Link to="/admin/users" className="text-sm text-main-blue hover:underline">Back</Link>} />
+        <PageTitle title="User" right={<Link to={backTo} className="text-sm text-main-blue hover:underline">Back</Link>} />
         <Err e={err} />
       </>
     );
@@ -55,7 +57,7 @@ export default function AdminUserDetail() {
   if (!data) {
     return (
       <>
-        <PageTitle title="User detail" right={<Link to="/admin/users" className="text-sm text-main-blue hover:underline">Back</Link>} />
+        <PageTitle title="User detail" right={<Link to={backTo} className="text-sm text-main-blue hover:underline">Back</Link>} />
         <Skeleton className="h-64 w-full" />
       </>
     );
@@ -64,11 +66,15 @@ export default function AdminUserDetail() {
   const u = data.user || {};
   const mfa = data.mfa || {};
   const active = u.active !== false;
+  const adminCount = Number(data.orgAdminCount);
+  const lastAdmin = u.is_org_admin && Number.isFinite(adminCount) && adminCount <= 1;
   const actions = [
     {
       kind: 'org-admin', action: 'user:org-admin', method: 'PUT',
       label: u.is_org_admin ? 'Revoke org admin' : 'Grant org admin',
       danger: !!u.is_org_admin, requireReason: true,
+      disabled: lastAdmin,
+      blockedReason: lastAdmin ? 'At least one active organization administrator is required.' : '',
       message: u.is_org_admin
         ? 'Revokes organization-administrator rights. The last active org admin cannot be removed.'
         : 'Grants organization-administrator rights for this organization.',
@@ -84,6 +90,8 @@ export default function AdminUserDetail() {
     {
       kind: active ? 'disable' : 'enable', action: active ? 'user:disable' : 'user:enable',
       label: active ? 'Disable user' : 'Enable user', danger: active,
+      disabled: active && lastAdmin,
+      blockedReason: active && lastAdmin ? 'Disabling the last active organization administrator would leave the tenant without an operator.' : '',
       message: active
         ? 'Deactivates the account and revokes its sessions and API keys.'
         : 'Reactivates the account. Previous sessions remain revoked.',
@@ -103,7 +111,7 @@ export default function AdminUserDetail() {
       <PageTitle
         title={u.email}
         sub={`${data.organization?.slug || '–'} · ${u.display_name || 'No display name'}`}
-        right={<Link to="/admin/users" className="text-sm text-main-blue hover:underline">Back</Link>}
+        right={<Link to={backTo} className="text-sm text-main-blue hover:underline">Back</Link>}
       />
       <Err e={err} />
       <div role="status" aria-live="polite">
@@ -141,11 +149,12 @@ export default function AdminUserDetail() {
           {canWrite ? (
             <div className="flex flex-wrap gap-2">
               {actions.map((a) => (
-                <Btn key={a.kind} kind={a.danger ? 'danger' : 'secondary'} onClick={() => setConfirm(a)}>{a.label}</Btn>
+                <Btn key={a.kind} kind={a.danger ? 'danger' : 'secondary'} disabled={a.disabled} title={a.blockedReason || ''} onClick={() => { if (!a.disabled) setConfirm(a); }}>{a.label}</Btn>
               ))}
             </div>
           ) : <Empty text="Read-only for the auditor role" />}
           <p className="text-xs text-normal-text mt-3">High-risk actions require a fresh authenticator code. Every action is audited.</p>
+          {lastAdmin && <p className="text-xs text-amber-600 mt-2">This is the last active organization administrator; revoke rights are blocked until another admin is active.</p>}
         </Card>
       </div>
 

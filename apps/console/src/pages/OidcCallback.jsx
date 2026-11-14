@@ -50,7 +50,7 @@ export default function OidcCallback() {
       return;
     }
     loginWithOidc(code, state).then(
-      (result) => nav(landingPath(result?.currentContext), { replace: true }),
+      (result) => nav(landingPath(result?.currentContext, undefined, result?.preferredContext), { replace: true }),
       (ex) => {
         if (ex?.status === 401 && ex.body?.error === 'mfa_required' && ex.body.mfaToken) {
           setMfa({ token: ex.body.mfaToken });
@@ -70,7 +70,7 @@ export default function OidcCallback() {
     try {
       const code = mfaCode.trim();
       const result = await completeMfa(mfa.token, useRecovery ? undefined : code, useRecovery ? code : undefined);
-      nav(landingPath(result?.currentContext), { replace: true });
+      nav(landingPath(result?.currentContext, undefined, result?.preferredContext), { replace: true });
     } catch (ex) {
       setErr(ex);
     } finally {

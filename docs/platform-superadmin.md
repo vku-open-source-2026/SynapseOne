@@ -31,10 +31,17 @@ and from the internal `SYNAPSEONE_INTERNAL_SECRET` platform caller.
 - Invited accounts (first tenant admin, additional platform admins, tenant
   users) are activated with a one-time code; email+org alone cannot claim an
   existing membership. Codes expire after 7 days by default.
-- A user with rows in several organizations can list those contexts. Tenant →
-  tenant switching issues a fresh session only after the server revalidates the
-  same-email membership; tenant → platform never mints a session and requires
-  the platform-org login plus MFA. There is no impersonation path.
+- A user with rows in several organizations can list those contexts only after
+  proving ownership of the email (`email_verified`); the caller's own context is
+  always visible. Password login does not imply verification, so a self-
+  registered row using a victim's email cannot enumerate the victim's other
+  organizations, user ids or platform-admin status. Tenant → tenant switching
+  additionally requires the target row's own password (and its MFA, when
+  enrolled). Tenant → platform never mints a session and requires the platform-
+  org login plus MFA. Even when the same email also has a platform admin row,
+  the platform session is bound to the platform-org user row: a tenant row's
+  password/TOTP never becomes platform proof. There is no email-only or
+  impersonation path.
 - Tenant organizations support `active`/`suspended` lifecycle. Suspension
   requires a reason and step-up, revokes sessions and API keys, and is enforced
   by IAM and the gateway. The reserved platform organization is protected from
@@ -146,8 +153,10 @@ email in the platform organization.
    available when configured.
 2. Open `/security` and enable TOTP MFA (10 recovery codes are shown once).
 3. After sign-in, platform administrators are routed to `/admin/overview`
-   automatically. Enter a fresh authenticator code for the separate platform
-   session.
+   automatically, including dual-role users who typed a tenant slug. If the
+   current row is a tenant row, the guard asks for the platform-organization
+   sign-in; it does not upgrade the tenant identity. Complete the platform-org
+   MFA, then enter a fresh authenticator code for the separate platform session.
 4. The Overview page loads platform-wide metadata. Platform-only accounts do
    not see tenant navigation; dual-role accounts can switch to a tenant context
    they genuinely belong to.

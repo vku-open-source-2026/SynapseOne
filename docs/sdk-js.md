@@ -509,11 +509,17 @@ Deactivates a workflow.
 
 #### `executeWorkflow(id, payload?, opts?)`
 ```ts
-executeWorkflow(id: string, payload?: Record<string, unknown>, opts?: { wait?: boolean; timeoutMs?: number }): Promise<any>
+executeWorkflow(id: string, payload?: Record<string, unknown>, opts?: { wait?: boolean; timeoutMs?: number; expectedRevision?: number }): Promise<any>
 ```
 Triggers a manual execution. Queue mode returns `202 {queued:true, executionId}`;
 pass `{ wait: true }` to block for the final result. `waitForExecution(id)`
 polls a queued/running execution.
+
+In the next SDK release, `expectedRevision` is a positive 32-bit integer
+precondition, sent separately from the payload. The service rejects a changed
+revision with `409 workflow_revision_conflict`; queued jobs also fail before
+execution if the definition changes while waiting. This option is not present
+in published SDK 0.9.0; release the updated SDK before using it in dependent tiers.
 
 ```ts
 const run = await c.executeWorkflow(wfId, { url: 'https://example.com/hook' }, { wait: true });
@@ -649,6 +655,10 @@ Management calls above still require a session or API key.
 Collections of JSON documents with a logical object↔data mapping, queries,
 optimistic concurrency, counters, batches and a change feed. Full guide:
 [synapsebase.md](synapsebase.md).
+
+Use `c.base.database('analytics')` to address a database namespace (or
+`c.base.collection('parks', { database: 'analytics' })` for typed use). Without
+it, calls use the legacy flat routes and the tenant `default` database.
 
 ```ts
 type Park = { name: string; capacity?: number };

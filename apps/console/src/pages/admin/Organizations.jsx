@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 VKU.VIC
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { usePlatformAuth } from '../../lib/platform-auth.jsx';
 import { Badge, Btn, Card, Empty, Err, Field, Input, Modal, PageTitle, Table, TableSkeleton } from '../../components/ui.jsx';
@@ -21,19 +21,24 @@ export default function AdminOrganizations() {
   const [formErr, setFormErr] = useState(null);
   const [created, setCreated] = useState(null);
   const [form, setForm] = useState({ slug: '', displayName: '', adminEmail: '', adminDisplayName: '', reason: '', code: '' });
+  const seqRef = useRef(0);
   const canWrite = platform.role === 'owner' || platform.role === 'operator';
 
   const load = useCallback(async (nextOffset = offset) => {
+    const seq = ++seqRef.current;
     setErr(null);
     setLoading(true);
     try {
       const out = await platform.request(`/v1/platform/orgs?q=${encodeURIComponent(query)}&limit=${PAGE}&offset=${nextOffset}`);
+      if (seq !== seqRef.current) return;
       setData({ items: Array.isArray(out.items) ? out.items : [], total: Number(out.total) || 0 });
     } catch (e) {
-      setErr(e);
+      if (seq === seqRef.current) setErr(e);
     } finally {
-      setLoading(false);
-      setLoaded(true);
+      if (seq === seqRef.current) {
+        setLoading(false);
+        setLoaded(true);
+      }
     }
   }, [platform, query, offset]);
 

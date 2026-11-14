@@ -1497,7 +1497,7 @@ export async function setOrganizationStatus(
   return org;
 }
 
-/** All user rows for one email across organizations (context switcher). */
+/** Identity metadata for context discovery. Load the full user separately to authenticate. */
 export async function listUserRowsByEmail(email: string): Promise<Array<User & { org_slug: string; org_name: string; org_kind: string; org_status: string }>> {
   const normalized = email.trim().toLowerCase();
   if (db) {
@@ -1532,7 +1532,7 @@ export async function listUserRowsByEmail(email: string): Promise<Array<User & {
     if (u.email.toLowerCase() !== normalized) continue;
     const org = mem.orgs.get(u.org_id);
     if (!org) continue;
-    out.push({ ...u, org_slug: org.slug, org_name: org.display_name, org_kind: org.kind || 'tenant', org_status: org.status || 'active' });
+    out.push({ ...publicUser(u), org_slug: org.slug, org_name: org.display_name, org_kind: org.kind || 'tenant', org_status: org.status || 'active' });
   }
   return out.sort((a, b) => a.org_slug.localeCompare(b.org_slug));
 }

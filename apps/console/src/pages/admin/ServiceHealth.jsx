@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 VKU.VIC
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { baseUrl } from '../../lib/api.js';
 import { Badge, Btn, Card, Empty, Err, PageTitle, Skeleton } from '../../components/ui.jsx';
 
@@ -9,8 +9,11 @@ export default function AdminServiceHealth() {
   const [err, setErr] = useState(null);
   const [loading, setLoading] = useState(true);
   const [last, setLast] = useState(null);
+  const inFlight = useRef(false);
 
   const load = useCallback(async () => {
+    if (inFlight.current) return;
+    inFlight.current = true;
     setErr(null);
     setLoading(true);
     try {
@@ -20,9 +23,11 @@ export default function AdminServiceHealth() {
       setLast(new Date());
       if (!r.ok && !body?.upstreams) setErr(new Error(`gateway /ready returned HTTP ${r.status}`));
     } catch (e) {
+      // Keep the last known readiness snapshot visible; the error banner tells
+      // the operator it is stale instead of blanking the whole page.
       setErr(e);
-      setReady(null);
     } finally {
+      inFlight.current = false;
       setLoading(false);
     }
   }, []);
@@ -48,6 +53,7 @@ export default function AdminServiceHealth() {
       <Card className="mb-4">
         <div className="flex flex-wrap items-center gap-3">
           <Badge tone={status === 'ready' ? 'green' : status === 'degraded' ? 'amber' : 'red'}>{status}</Badge>
+          {err && ready && <Badge tone="amber">stale</Badge>}
           <span className="text-sm text-main-text">{healthy}/{upstreams.length || '–'} dependencies healthy</span>
           <span className="text-xs text-normal-text">Auto-refresh every 30 seconds · endpoint <code>{baseUrl()}/ready</code></span>
         </div>

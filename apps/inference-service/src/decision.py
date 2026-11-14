@@ -7,6 +7,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Union
 
+import httpx
 from pydantic import BaseModel, Field
 
 from .config import Settings, settings
@@ -82,6 +83,75 @@ class DecisionEngine:
         self._lock = threading.Lock()
         self._load_lock = threading.Lock()
         self._retry_after = 0.0
+        if (
+            self._uses_openrouter()
+            and self.cfg.DECISION_ENABLED
+            and not self.cfg.OPENROUTER_API_KEY
+        ):
+            self._load_error = (
+                "OPENROUTER_API_KEY is not configured for the OpenRouter "
+                "decision backend"
+            )
+
+    def _uses_openrouter(self) -> bool:
+        return self.cfg.DECISION_BACKEND.lower() == "openrouter"
+
+    def _openrouter_url(self) -> str:
+        if self.cfg.OPENROUTER_DECISIONS_URL:
+            return self.cfg.OPENROUTER_DECISIONS_URL
+        base = self.cfg.OPENROUTER_BASE_URL.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[: -len("/v1")]
+        return f"{base}/alpha/decisions"
+
+    def _evaluate_openrouter(
+        self, state: str, questions: Dict[str, DecisionQuestion]
+    ) -> Dict[str, Any]:
+        """Call OpenRouter's decisions endpoint for decisions-only models.
+
+        The endpoint accepts the same ``state`` + ``questions`` shape as the
+        self-hosted Decision-2.0 runtime, but only exposes the answers mapping.
+        """
+        if not self.cfg.OPENROUTER_API_KEY:
+            raise RuntimeError(
+                "OPENROUTER_API_KEY is not configured for the OpenRouter "
+                "decision backend"
+            )
+
+        payload = {
+            "model": self.model_name,
+            "state": state,
+            "questions": {
+                question_id: question.model_dump(exclude_none=True)
+                for question_id, question in questions.items()
+            },
+        }
+        headers = {
+            "Authorization": f"Bearer {self.cfg.OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://synapseone.dev",
+            "X-Title": "SynapseOne Inference Engine",
+        }
+        timeout = self.cfg.OPENROUTER_TIMEOUT_MS / 1000.0
+        with httpx.Client(timeout=timeout) as client:
+            response = client.post(
+                self._openrouter_url(), headers=headers, json=payload
+            )
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"OpenRouter decisions upstream returned status "
+                f"{response.status_code} for {self.model_name}: "
+                f"{response.text[:1000]}"
+            )
+
+        data = response.json()
+        answers = data.get("answers") if isinstance(data, dict) else None
+        if not isinstance(answers, dict):
+            raise RuntimeError(
+                "OpenRouter decisions response is missing the 'answers' object"
+            )
+        return answers
 
     def _threads(self) -> int:
         configured = self.cfg.DECISION_THREADS or self.cfg.INFERENCE_CPU_THREADS
@@ -109,6 +179,8 @@ class DecisionEngine:
         """
         if self._is_loaded:
             return True
+        if self._uses_openrouter():
+            return False
         if self.cfg.INFERENCE_MOCK_MODELS:
             return False
         if not self.cfg.DECISION_ENABLED:
@@ -294,50 +366,61 @@ class DecisionEngine:
     ) -> DecisionResponse:
         t0 = time.time()
 
-        if not self._is_loaded and not self.cfg.INFERENCE_MOCK_MODELS:
-            self.load_model()
-
-        if self._is_loaded and self._model is not None:
+        if self._uses_openrouter() and self.cfg.DECISION_ENABLED:
             try:
-                # Model's native system_one interface
-                # format questions dict into model's expected format
-                q_dict = {
-                    k: v.model_dump(exclude_none=True) for k, v in questions.items()
-                }
-                with self._lock:
-                    if self._torch is not None:
-                        with self._torch.inference_mode():
+                results = self._normalize_answers(
+                    self._evaluate_openrouter(state, questions)
+                )
+                self._load_error = None
+            except Exception as e:
+                self._load_error = str(e)
+                logger.warning(
+                    "OpenRouter decision model unavailable, using deterministic "
+                    "fallback: %s",
+                    e,
+                )
+                results = self._fallback_system_one(state, questions)
+        else:
+            if not self._is_loaded and not self.cfg.INFERENCE_MOCK_MODELS:
+                self.load_model()
+
+            if self._is_loaded and self._model is not None:
+                try:
+                    # Model's native system_one interface
+                    # format questions dict into model's expected format
+                    q_dict = {
+                        k: v.model_dump(exclude_none=True)
+                        for k, v in questions.items()
+                    }
+                    with self._lock:
+                        if self._torch is not None:
+                            with self._torch.inference_mode():
+                                raw_out = self._model.system_one(
+                                    state=state, questions=q_dict
+                                )
+                        else:
                             raw_out = self._model.system_one(
                                 state=state, questions=q_dict
                             )
+
+                    # Decision 2.0 returns {"model", "answers", "usage"}; the
+                    # API contract exposes the per-question answers directly.
+                    if isinstance(raw_out, dict) and isinstance(
+                        raw_out.get("answers"), dict
+                    ):
+                        results = raw_out["answers"]
+                    elif isinstance(raw_out, dict):
+                        results = raw_out
                     else:
-                        raw_out = self._model.system_one(state=state, questions=q_dict)
+                        results = {"output": raw_out}
 
-                # Decision 2.0 returns {"model", "answers", "usage"}; the API
-                # contract exposes the per-question answers directly.
-                if isinstance(raw_out, dict) and isinstance(
-                    raw_out.get("answers"), dict
-                ):
-                    results = raw_out["answers"]
-                elif isinstance(raw_out, dict):
-                    results = raw_out
-                else:
-                    results = {"output": raw_out}
-
-                results = self._normalize_answers(results)
-
-                duration = round((time.time() - t0) * 1000.0, 2)
-                return DecisionResponse(
-                    model=self.model_name,
-                    results=results,
-                    duration_ms=duration,
-                )
-            except Exception as e:
-                self._load_error = str(e)
-                # Fallback on runtime failure
+                    results = self._normalize_answers(results)
+                except Exception as e:
+                    self._load_error = str(e)
+                    # Fallback on runtime failure
+                    results = self._fallback_system_one(state, questions)
+            else:
                 results = self._fallback_system_one(state, questions)
-        else:
-            results = self._fallback_system_one(state, questions)
 
         duration = round((time.time() - t0) * 1000.0, 2)
         return DecisionResponse(
@@ -382,15 +465,33 @@ class DecisionEngine:
 
     @property
     def status(self) -> Dict[str, Any]:
+        openrouter = self._uses_openrouter()
+        ready = self._is_loaded or (
+            self.cfg.DECISION_ENABLED
+            and openrouter
+            and bool(self.cfg.OPENROUTER_API_KEY)
+        )
         return {
             "model": self.model_name,
-            "architecture": "Qwen3.5-0.8B-hybrid-backbone",
-            "backend": "decision2-transformers" if self._is_loaded else "fallback",
+            "architecture": (
+                "openrouter-decisions"
+                if openrouter
+                else "Qwen3.5-0.8B-hybrid-backbone"
+            ),
+            "backend": (
+                "openrouter"
+                if openrouter
+                else ("decision2-transformers" if self._is_loaded else "fallback")
+            ),
             "enabled": self.cfg.DECISION_ENABLED,
-            "loaded": self._is_loaded,
-            "device": self._determine_device(),
-            "threads": self._threads(),
-            "mock_mode": self.cfg.INFERENCE_MOCK_MODELS or not self._is_loaded,
+            "loaded": ready,
+            "device": "remote" if openrouter else self._determine_device(),
+            "threads": 0 if openrouter else self._threads(),
+            "mock_mode": (
+                False
+                if openrouter
+                else (self.cfg.INFERENCE_MOCK_MODELS or not self._is_loaded)
+            ),
             "error": self._load_error,
         }
 

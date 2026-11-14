@@ -57,3 +57,6 @@ Desktop.ini
 
 # Rust build output
 **/target/
+
+# server-local database dumps must never be committed
+backups/

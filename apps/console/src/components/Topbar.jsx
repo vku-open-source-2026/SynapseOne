@@ -150,7 +150,7 @@ export default function Topbar({ servicesOpen = true, onToggleServices }) {
             </button>
           )}
 
-          {auth?.contexts?.filter((c) => c.type === 'platform').length > 0 && <ContextSwitcher />}
+          {(auth?.contexts?.length || 0) > 1 && <ContextSwitcher />}
 
           {/* User Pill */}
           <div className="relative">

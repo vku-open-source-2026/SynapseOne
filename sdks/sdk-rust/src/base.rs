@@ -13,15 +13,34 @@ use serde_json::{json, Value};
 #[derive(Clone)]
 pub struct BaseService {
     client: Client,
+    database: Option<String>,
 }
 
 impl BaseService {
     pub(crate) fn new(client: Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            database: None,
+        }
     }
 
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// Bind subsequent calls to `/v1/base/databases/{name}/...`.
+    ///
+    /// Without a database handle the legacy flat `/v1/base/collections`
+    /// routes continue to address the tenant's `default` database.
+    pub fn database(&self, name: impl Into<String>) -> Self {
+        Self {
+            client: self.client.clone(),
+            database: Some(name.into()),
+        }
+    }
+
+    pub fn database_name(&self) -> Option<&str> {
+        self.database.as_deref()
     }
 
     /// Bind a collection name for typed convenience methods.
@@ -32,8 +51,84 @@ impl BaseService {
         }
     }
 
-    fn collection_path(collection: &str) -> String {
-        format!("/v1/base/collections/{}", segment(collection))
+    fn collections_path(&self) -> String {
+        match &self.database {
+            Some(database) => format!("/v1/base/databases/{}/collections", segment(database)),
+            None => "/v1/base/collections".into(),
+        }
+    }
+
+    fn collection_path(&self, collection: &str) -> String {
+        format!("{}/{}", self.collections_path(), segment(collection))
+    }
+
+    // ---- databases -----------------------------------------------------
+
+    pub async fn list_databases(
+        &self,
+        org_id: Option<&str>,
+        account_id: Option<&str>,
+    ) -> Result<Value> {
+        let mut params = Vec::new();
+        if let Some(org_id) = org_id {
+            params.push(("orgId", org_id.to_string()));
+        }
+        if let Some(account_id) = account_id {
+            params.push(("accountId", account_id.to_string()));
+        }
+        let path = if params.is_empty() {
+            "/v1/base/databases".to_string()
+        } else {
+            format!("/v1/base/databases?{}", query_string(&params))
+        };
+        self.client.get(path).await
+    }
+
+    pub async fn create_database(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        org_id: Option<&str>,
+        account_id: Option<&str>,
+    ) -> Result<Value> {
+        let mut body = json!({ "name": name });
+        if let Some(description) = description {
+            body["description"] = json!(description);
+        }
+        if let Some(org_id) = org_id {
+            body["orgId"] = json!(org_id);
+        }
+        if let Some(account_id) = account_id {
+            body["accountId"] = json!(account_id);
+        }
+        self.client.post("/v1/base/databases", body).await
+    }
+
+    pub async fn get_database(&self, database: &str) -> Result<Value> {
+        self.client
+            .get(format!("/v1/base/databases/{}", segment(database)))
+            .await
+    }
+
+    pub async fn update_database(&self, database: &str, patch: Value) -> Result<Value> {
+        self.client
+            .patch(format!("/v1/base/databases/{}", segment(database)), patch)
+            .await
+    }
+
+    pub async fn delete_database(&self, database: &str, cascade: bool) -> Result<Value> {
+        let path = if cascade {
+            format!("/v1/base/databases/{}?cascade=true", segment(database))
+        } else {
+            format!("/v1/base/databases/{}", segment(database))
+        };
+        self.client.delete(path).await
+    }
+
+    pub async fn database_stats(&self, database: &str) -> Result<Value> {
+        self.client
+            .get(format!("/v1/base/databases/{}/stats", segment(database)))
+            .await
     }
 
     // ---- graph ---------------------------------------------------------
@@ -41,7 +136,7 @@ impl BaseService {
     pub async fn graph_upsert_nodes(&self, collection: &str, nodes: Value) -> Result<Value> {
         self.client
             .post(
-                format!("{}/graph/nodes", Self::collection_path(collection)),
+                format!("{}/graph/nodes", self.collection_path(collection)),
                 json!({ "nodes": nodes }),
             )
             .await
@@ -50,7 +145,7 @@ impl BaseService {
     pub async fn graph_upsert_edges(&self, collection: &str, edges: Value) -> Result<Value> {
         self.client
             .post(
-                format!("{}/graph/edges", Self::collection_path(collection)),
+                format!("{}/graph/edges", self.collection_path(collection)),
                 json!({ "edges": edges }),
             )
             .await
@@ -67,7 +162,7 @@ impl BaseService {
         self.client
             .get(format!(
                 "{}/graph/nodes/{}?{}",
-                Self::collection_path(collection),
+                self.collection_path(collection),
                 segment(node_id),
                 qs
             ))
@@ -88,7 +183,7 @@ impl BaseService {
         }
         self.client
             .post(
-                format!("{}/graph/query", Self::collection_path(collection)),
+                format!("{}/graph/query", self.collection_path(collection)),
                 body,
             )
             .await
@@ -96,7 +191,7 @@ impl BaseService {
 
     pub async fn graph_stats(&self, collection: &str) -> Result<Value> {
         self.client
-            .get(format!("{}/graph/stats", Self::collection_path(collection)))
+            .get(format!("{}/graph/stats", self.collection_path(collection)))
             .await
     }
 
@@ -104,7 +199,7 @@ impl BaseService {
         self.client
             .delete(format!(
                 "{}/graph/nodes/{}",
-                Self::collection_path(collection),
+                self.collection_path(collection),
                 segment(node_id)
             ))
             .await
@@ -115,7 +210,7 @@ impl BaseService {
     pub async fn geo_upsert(&self, collection: &str, features: Value) -> Result<Value> {
         self.client
             .post(
-                format!("{}/geo/features", Self::collection_path(collection)),
+                format!("{}/geo/features", self.collection_path(collection)),
                 json!({ "features": features }),
             )
             .await
@@ -135,7 +230,7 @@ impl BaseService {
         self.client
             .get(format!(
                 "{}/geo/features?{}",
-                Self::collection_path(collection),
+                self.collection_path(collection),
                 qs
             ))
             .await
@@ -151,7 +246,7 @@ impl BaseService {
     ) -> Result<Value> {
         self.client
             .post(
-                format!("{}/geo/near", Self::collection_path(collection)),
+                format!("{}/geo/near", self.collection_path(collection)),
                 json!({
                     "lat": lat,
                     "lng": lng,
@@ -165,7 +260,7 @@ impl BaseService {
     pub async fn geo_within(&self, collection: &str, geometry: Value, limit: u32) -> Result<Value> {
         self.client
             .post(
-                format!("{}/geo/within", Self::collection_path(collection)),
+                format!("{}/geo/within", self.collection_path(collection)),
                 json!({ "geometry": geometry, "limit": limit }),
             )
             .await
@@ -173,7 +268,7 @@ impl BaseService {
 
     pub async fn geo_stats(&self, collection: &str) -> Result<Value> {
         self.client
-            .get(format!("{}/geo/stats", Self::collection_path(collection)))
+            .get(format!("{}/geo/stats", self.collection_path(collection)))
             .await
     }
 
@@ -181,7 +276,7 @@ impl BaseService {
         self.client
             .delete(format!(
                 "{}/geo/features/{}",
-                Self::collection_path(collection),
+                self.collection_path(collection),
                 segment(feature_id)
             ))
             .await
@@ -202,9 +297,9 @@ impl BaseService {
             params.push(("accountId", account_id.to_string()));
         }
         let path = if params.is_empty() {
-            "/v1/base/collections".to_string()
+            self.collections_path()
         } else {
-            format!("/v1/base/collections?{}", query_string(&params))
+            format!("{}?{}", self.collections_path(), query_string(&params))
         };
         self.client.get(path).await
     }
@@ -230,11 +325,11 @@ impl BaseService {
         if let Some(account_id) = account_id {
             body["accountId"] = json!(account_id);
         }
-        self.client.post("/v1/base/collections", body).await
+        self.client.post(self.collections_path(), body).await
     }
 
     pub async fn get_collection(&self, collection: &str) -> Result<Value> {
-        self.client.get(Self::collection_path(collection)).await
+        self.client.get(self.collection_path(collection)).await
     }
 
     pub async fn update_collection(
@@ -255,17 +350,17 @@ impl BaseService {
             body.insert("mapping".to_string(), mapping);
         }
         self.client
-            .patch(Self::collection_path(collection), Value::Object(body))
+            .patch(self.collection_path(collection), Value::Object(body))
             .await
     }
 
     pub async fn delete_collection(&self, collection: &str) -> Result<Value> {
-        self.client.delete(Self::collection_path(collection)).await
+        self.client.delete(self.collection_path(collection)).await
     }
 
     pub async fn collection_stats(&self, collection: &str) -> Result<Value> {
         self.client
-            .get(format!("{}/stats", Self::collection_path(collection)))
+            .get(format!("{}/stats", self.collection_path(collection)))
             .await
     }
 
@@ -283,7 +378,7 @@ impl BaseService {
         }
         self.client
             .post(
-                format!("{}/documents", Self::collection_path(collection)),
+                format!("{}/documents", self.collection_path(collection)),
                 body,
             )
             .await
@@ -297,7 +392,7 @@ impl BaseService {
     ) -> Result<Value> {
         let path = format!(
             "{}/documents/{}",
-            Self::collection_path(collection),
+            self.collection_path(collection),
             segment(doc_id)
         );
         let path = if as_view == "data" {
@@ -327,7 +422,7 @@ impl BaseService {
             .put(
                 format!(
                     "{}/documents/{}",
-                    Self::collection_path(collection),
+                    self.collection_path(collection),
                     segment(doc_id)
                 ),
                 body,
@@ -357,7 +452,7 @@ impl BaseService {
             .patch(
                 format!(
                     "{}/documents/{}",
-                    Self::collection_path(collection),
+                    self.collection_path(collection),
                     segment(doc_id)
                 ),
                 Value::Object(body),
@@ -373,7 +468,7 @@ impl BaseService {
     ) -> Result<Value> {
         let mut path = format!(
             "{}/documents/{}",
-            Self::collection_path(collection),
+            self.collection_path(collection),
             segment(doc_id)
         );
         if let Some(if_version) = if_version {
@@ -392,7 +487,7 @@ impl BaseService {
         let body = serde_json::to_value(query)?;
         let value = self
             .client
-            .post(format!("{}/query", Self::collection_path(collection)), body)
+            .post(format!("{}/query", self.collection_path(collection)), body)
             .await?;
         Ok(serde_json::from_value(value)?)
     }
@@ -431,7 +526,7 @@ impl BaseService {
         let value = self
             .client
             .post(
-                format!("{}/vector-search", Self::collection_path(collection)),
+                format!("{}/vector-search", self.collection_path(collection)),
                 body,
             )
             .await?;
@@ -452,11 +547,11 @@ impl BaseService {
             params.push(("offset", offset.to_string()));
         }
         let path = if params.is_empty() {
-            format!("{}/documents", Self::collection_path(collection))
+            format!("{}/documents", self.collection_path(collection))
         } else {
             format!(
                 "{}/documents?{}",
-                Self::collection_path(collection),
+                self.collection_path(collection),
                 query_string(&params)
             )
         };
@@ -479,7 +574,7 @@ impl BaseService {
             .post(
                 format!(
                     "{}/documents/{}/increment",
-                    Self::collection_path(collection),
+                    self.collection_path(collection),
                     segment(doc_id)
                 ),
                 body,
@@ -495,7 +590,7 @@ impl BaseService {
     pub async fn batch_values(&self, collection: &str, operations: Value) -> Result<Value> {
         self.client
             .post(
-                format!("{}/documents:batch", Self::collection_path(collection)),
+                format!("{}/documents:batch", self.collection_path(collection)),
                 json!({ "operations": operations }),
             )
             .await
@@ -518,7 +613,7 @@ impl BaseService {
         self.client
             .get(format!(
                 "{}/changes?{}",
-                Self::collection_path(collection),
+                self.collection_path(collection),
                 query_string(&params)
             ))
             .await
@@ -677,8 +772,8 @@ impl Collection {
         Request::new(
             method,
             format!(
-                "/v1/base/collections/{}/documents{}",
-                segment(&self.name),
+                "{}/documents{}",
+                self.service.collection_path(&self.name),
                 suffix
             ),
         )

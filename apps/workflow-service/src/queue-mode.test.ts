@@ -12,7 +12,7 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import type { Server } from 'node:http';
 import { createApp, makeCredentialResolver, synapseoneCall } from './index';
-import { __clearMem } from './store';
+import { __clearMem, createExecutionRec, updateWorkflowRec } from './store';
 import { startPlatformWorker } from './worker';
 
 const INTERNAL = 'test-internal-secret';
@@ -267,6 +267,79 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
     assert.ok(exec.workerId);
   });
 
+  it('rejects stale and malformed execution revisions without publishing jobs', async () => {
+    const wf = await createWorkflow('custom', 'revision-guard');
+    const before = mock.published.length;
+    for (const revision of ['0', '-1', '1.5', 'bogus', '1&expectedRevision=2']) {
+      const response = await fetch(`${base}/v1/workflows/${wf.id}/execute?expectedRevision=${revision}`, {
+        method: 'POST', headers: USER, body: '{}',
+      });
+      assert.equal(response.status, 400, revision);
+    }
+    const updated = await updateWorkflowRec(wf.id, { name: 'edited since approval' });
+    const stale = await fetch(`${base}/v1/workflows/${wf.id}/execute?expectedRevision=${wf.revision}`, {
+      method: 'POST', headers: USER, body: '{}',
+    });
+    assert.equal(stale.status, 409);
+    assert.equal((await stale.json()).error, 'workflow_revision_conflict');
+    assert.equal(mock.published.length, before);
+    const accepted = await fetch(`${base}/v1/workflows/${wf.id}/execute?expectedRevision=${updated!.revision}`, {
+      method: 'POST', headers: USER, body: JSON.stringify({ value: 7 }),
+    });
+    assert.equal(accepted.status, 202);
+    assert.equal(mock.published.length, before + 1);
+  });
+
+  it('custom runner never receives a graph changed after enqueue', async () => {
+    const wf = await createWorkflow('custom', 'custom-revision-drift');
+    const created = await fetch(`${base}/v1/workflow-runners`, {
+      method: 'POST', headers: USER, body: JSON.stringify({ name: 'revision-runner', mode: 'custom' }),
+    });
+    assert.equal(created.status, 201);
+    const { runner } = await created.json();
+    const queued = await (await fetch(`${base}/v1/workflows/${wf.id}/execute?expectedRevision=${wf.revision}`, {
+      method: 'POST', headers: USER, body: '{}',
+    })).json();
+    await updateWorkflowRec(wf.id, { name: 'unreviewed change' });
+    const claim = await fetch(`${base}/v1/runner/jobs/${queued.executionId}/claim`, {
+      method: 'POST', headers: RUNNER_AUTH, body: JSON.stringify({ runnerId: runner.id }),
+    });
+    assert.equal(claim.status, 409);
+    const rejected = await claim.json();
+    assert.equal(rejected.error, 'workflow_revision_conflict');
+    assert.equal(rejected.workflow, undefined);
+    const result = await (await fetch(`${base}/v1/executions/${queued.executionId}?includeData=true`, { headers: USER })).json();
+    assert.equal(result.status, 'error');
+    assert.equal(result.nodeRuns.length, 0);
+  });
+
+  it('platform worker rejects an edited graph before executing any node', async () => {
+    const wf = await createWorkflow('platform', 'platform-revision-drift');
+    const execution = await createExecutionRec({
+      workflow_id: wf.id, workflow_name: wf.name, workflow_revision: wf.revision,
+      status: 'queued', input: { value: 20 }, output: null, node_runs: [],
+      triggered_by: 'manual', startedAt: new Date().toISOString(),
+      principal: { sub: 'operator@example.com', org: 'org-1', account: 'acc-1', kind: 'user' },
+      queue_name: 'synapseone-wf-platform', runner: 'platform',
+    });
+    await updateWorkflowRec(wf.id, { name: 'unreviewed platform edit' });
+    const messages = mock.queues.get('synapseone-wf-platform') || new Map();
+    messages.set(execution.id, {
+      id: execution.id, payload: { kind: 'workflow.run', executionId: execution.id, v: 1 },
+      availableAt: Date.now(), attempts: 0,
+    });
+    mock.queues.set('synapseone-wf-platform', messages);
+    const result = await waitFor(async () => {
+      const response = await fetch(`${base}/v1/executions/${execution.id}?includeData=true`, { headers: USER });
+      const body = await response.json();
+      return body.status === 'error' || body.status === 'success' ? body : null;
+    });
+    assert.ok(result, 'worker must finish the stale job');
+    assert.equal(result.status, 'error');
+    assert.match(result.error, /revision changed/);
+    assert.equal(result.nodeRuns.length, 0);
+  });
+
   it('webhooks queue instead of blocking the caller', async () => {
     const res = await fetch(`${base}/v1/workflows`, {
       method: 'POST', headers: USER,
@@ -299,6 +372,8 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
     const opts: any = await optsRes.json();
     assert.equal(opts.queues.custom, 'synapseone-wf-custom');
     assert.equal(opts.platformWorker.enabled, true);
+    assert.equal(opts.engineCapabilities.httpCredentialAllowedOrigins, true);
+    assert.equal(opts.engineCapabilities.httpCredentialDestinationProtection, 1);
 
     const res = await fetch(`${base}/v1/workflow-runners`, {
       method: 'POST', headers: USER,

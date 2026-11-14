@@ -161,6 +161,32 @@ func TestBaseCollections(t *testing.T) {
 	}
 }
 
+func TestBaseDatabaseScope(t *testing.T) {
+	seen := map[string]string{}
+	srv := serviceServer(t, seen)
+	defer srv.Close()
+	c := New(srv.URL).WithBaseDatabase("analytics")
+
+	if _, err := c.GetBaseCollection("users"); err != nil {
+		t.Fatal(err)
+	}
+	if seen["path"] != "/v1/base/databases/analytics/collections/users" {
+		t.Fatalf("scoped get: %v", seen)
+	}
+	if _, err := c.CreateBaseDatabase(map[string]any{"name": "analytics"}); err != nil {
+		t.Fatal(err)
+	}
+	if seen["path"] != "/v1/base/databases" || seen["method"] != "POST" {
+		t.Fatalf("create database: %v", seen)
+	}
+	if err := c.DeleteBaseDatabase("analytics", true); err != nil {
+		t.Fatal(err)
+	}
+	if seen["path"] != "/v1/base/databases/analytics?cascade=true" {
+		t.Fatalf("delete database: %v", seen)
+	}
+}
+
 func TestBaseDocuments(t *testing.T) {
 	seen := map[string]string{}
 	srv := serviceServer(t, seen)

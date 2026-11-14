@@ -650,6 +650,10 @@ Collections of JSON documents with a logical object↔data mapping, queries,
 optimistic concurrency, counters, batches and a change feed. Full guide:
 [synapsebase.md](synapsebase.md).
 
+Call `c.WithBaseDatabase("analytics")` (or `c.SetBaseDatabase("analytics")`) to
+scope base calls to a database namespace. Without it, calls use the legacy flat
+routes and the tenant `default` database.
+
 ```go
 type Park struct {
     Name     string `json:"name"`

@@ -70,6 +70,26 @@ async fn base_query_sends_filter_order_and_cursor() {
 }
 
 #[tokio::test]
+async fn base_database_handle_prefixes_collection_paths() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/base/databases/analytics/collections/features"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"id": "c1", "name": "features"})),
+        )
+        .mount(&server)
+        .await;
+
+    let value = client(&server)
+        .base()
+        .database("analytics")
+        .get_collection("features")
+        .await
+        .unwrap();
+    assert_eq!(value["name"], "features");
+}
+
+#[tokio::test]
 async fn retries_retryable_status_then_succeeds() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

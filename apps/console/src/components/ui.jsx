@@ -8,6 +8,7 @@ import React from 'react';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { createPortal } from 'react-dom';
 import { Spinner, TableSkeleton as TableSkeletonBase, ListSkeleton, InlineLoader } from './loading.jsx';
+import { useI18n } from '../lib/i18n-context.js';
 
 export { Spinner, InlineLoader, ListSkeleton, TableSkeletonBase as TableSkeleton };
 export { PageSkeleton, LoadingOverlay, RouteProgress, ScrollToTop, Dots } from './loading.jsx';
@@ -34,7 +35,7 @@ const BTN_VARIANTS = {
   danger: 'danger', success: 'success',
 };
 
-export function Btn({ children, onClick, kind, variant, type = 'button', disabled, loading = false, className = '' }) {
+export function Btn({ children, onClick, kind, variant, type = 'button', disabled, loading = false, className = '', title = '' }) {
   const resolved = kind || BTN_VARIANTS[variant] || 'primary';
   const styles =
     resolved === 'primary'
@@ -48,6 +49,7 @@ export function Btn({ children, onClick, kind, variant, type = 'button', disable
   return (
     <button
       type={type}
+      title={title || undefined}
       disabled={isDisabled}
       aria-busy={loading || undefined}
       onClick={onClick}
@@ -333,14 +335,41 @@ function defaultErrorCopy(e, code) {
   return { title: 'Không thực hiện được thao tác', message: code ? `Mã lỗi: ${code}` : 'Vui lòng thử lại.' };
 }
 
+const ERROR_COPY_EN = {
+  org_admin_required: { title: 'Organization administrator required', message: 'This view requires an active Organization Administrator for the current organization.' },
+  platform_admin_required: { title: 'Platform Administrator required', message: 'This account is not an active Platform Administrator. Ask a Platform Owner for access.' },
+  platform_admin_inactive: { title: 'Platform access revoked', message: 'Platform Administrator access for this account is no longer active.' },
+  platform_admin_org_required: { title: 'Wrong platform organization', message: 'Platform administrators must belong to the reserved platform organization.' },
+  platform_mfa_required: { title: 'MFA required', message: 'Enable TOTP MFA in Security before opening Platform Administration.' },
+  platform_role_required: { title: 'Platform role too low', message: 'This action requires the owner or operator role. Auditors are read-only.' },
+  platform_step_up_required: { title: 'Step-up verification required', message: 'Enter a fresh TOTP code. Step-up proofs are single-use and bound to one action.' },
+  scope_denied: { title: 'Credential scope denied', message: 'The API key or credential does not have the required scope for this action.' },
+  access_denied: { title: 'Access denied', message: 'The current role or policy does not allow this action.' },
+  last_admin: { title: 'Last organization administrator', message: 'Each organization must keep at least one active Organization Administrator.' },
+  last_owner: { title: 'Last platform owner', message: 'At least one active Platform Owner is required.' },
+  invite_required: { title: 'Activation required', message: 'This account was invited but has not been activated. Use the one-time code at /register.' },
+  invalid_mfa_code: { title: 'Invalid authenticator code', message: 'The code is incorrect, expired or already used. Wait for the next 30-second window.' },
+  account_locked: { title: 'Account temporarily locked', message: 'Too many failed verification attempts. Try again later or ask an administrator to unlock it.' },
+  invalid_token: { title: 'Session invalid', message: 'The session expired or was revoked. Sign in again.' },
+  forbidden: { title: 'Forbidden', message: 'This account is not allowed to access the resource.' },
+  not_found: { title: 'Not found', message: 'The resource does not exist or is outside your tenant scope.' },
+  invalid_invite_token: { title: 'Invalid activation code', message: 'The code expired or was already used. Ask an administrator for a new one.' },
+  mfa_required: { title: 'MFA required', message: 'Enter a code from your authenticator app to continue.' },
+  self_revoke_forbidden: { title: 'Cannot revoke your own owner access', message: 'Ask another Platform Owner to revoke your administrator rights.' },
+  platform_org_create_required: { title: 'Organization creation is managed by Platform', message: 'Organization creation is disabled here. Ask a Platform Administrator to create it and assign the first admin.' },
+};
+
 export function Err({ e }) {
   const [show, setShow] = React.useState(false);
   const [copied, setCopied] = React.useState(false);
+  const { lang } = useI18n();
   if (!e) return null;
   const code = errorCodeOf(e);
-  const copy = ERROR_COPY[code] || defaultErrorCopy(e, code);
   const full = e.message || String(e);
   const LIMIT = 220;
+  const copy = lang === 'en'
+    ? (ERROR_COPY_EN[code] || { title: 'Request failed', message: full.length > LIMIT ? `${full.slice(0, LIMIT)}…` : full })
+    : (ERROR_COPY[code] || defaultErrorCopy(e, code));
   const long = full.length > LIMIT;
   const copyTextNow = async () => {
     await copyText(full);

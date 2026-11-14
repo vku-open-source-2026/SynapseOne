@@ -11,6 +11,10 @@ Format based on Keep a Changelog; versioning follows SemVer.
   routes keep working, and databases support CRUD, stats and cascade delete.
   The console adds database selection plus create/rename/delete actions.
 
+### Fixed
+- Warehouse dataset deletion now stops every associated stream worker before
+  dropping the dataset table, ingest markers and jobs.
+
 ### Changed
 - Faststore, Queue, OCS, Warehouse, Base and the Tier-1 gateway now ship as
   Rust/Axum services. They keep the existing HTTP contracts, tenant/auth/audit
