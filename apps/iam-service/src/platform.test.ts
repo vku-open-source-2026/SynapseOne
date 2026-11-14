@@ -103,6 +103,26 @@ describe('platform super admin', () => {
             assert.equal(enable.status, 200);
             platformRecoveryCodes = enable.json.recoveryCodes;
             assert.equal(platformRecoveryCodes.length, 10);
+
+            // Sign in again with a fresh TOTP: the platform exchange can reuse
+            // that signed MFA proof without asking for a second code in a row.
+            const loginWithMfa = await call('POST', '/v1/auth/login', {
+              email: 'platform-owner@test.local',
+              password: 'PlatformOwnerTest!2345',
+              orgSlug: 'synapseone-platform',
+            });
+            assert.equal(loginWithMfa.status, 401);
+            assert.equal(loginWithMfa.json.error, 'mfa_required');
+            const verified = await call('POST', '/v1/auth/mfa/verify', {
+              mfaToken: loginWithMfa.json.mfaToken,
+              recoveryCode: platformRecoveryCodes[8],
+            });
+            assert.equal(verified.status, 200, JSON.stringify(verified.json));
+            const noSecondOtp = await call('POST', '/v1/platform/session', {}, verified.json.accessToken);
+            assert.equal(noSecondOtp.status, 200, JSON.stringify(noSecondOtp.json));
+            assert.equal(noSecondOtp.json.expiresIn, 604800);
+            assert.equal(noSecondOtp.json.role, 'owner');
+
             const session = await call('POST', '/v1/platform/session', { recoveryCode: platformRecoveryCodes[0] }, normalToken);
             assert.equal(session.status, 200, JSON.stringify(session.json));
             assert.equal(session.json.expiresIn, 604800);

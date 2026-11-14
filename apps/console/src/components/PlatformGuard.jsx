@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 VKU.VIC
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Link, Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../lib/auth.jsx';
 import { usePlatformAuth } from '../lib/platform-auth.jsx';
@@ -13,10 +13,34 @@ export default function PlatformGuard({ children }) {
   const nav = useNavigate();
   const [code, setCode] = useState('');
   const [localErr, setLocalErr] = useState(null);
+  const attemptedAutoExchange = useRef(false);
+
+  // A platform administrator who just completed password/TOTP login already
+  // has a fresh second factor. Try the exchange without a code first; only
+  // fall back to the code form when the backend asks for a new factor.
+  useEffect(() => {
+    if (!auth || platform.session || attemptedAutoExchange.current) return;
+    const contexts = Array.isArray(auth.contexts) ? auth.contexts : [];
+    const platformContext = contexts.find((context) => context.type === 'platform');
+    if (!platformContext || auth.currentContext?.type !== 'platform') return;
+    attemptedAutoExchange.current = true;
+    platform.exchange('').catch(() => undefined);
+  }, [auth, platform]);
 
   if (!auth) return <Navigate to="/login" state={{ from: loc.pathname }} replace />;
 
   if (platform.session) return children;
+
+  if (platform.busy && !platform.exchangeError) {
+    return (
+      <div className="mx-auto max-w-xl px-4 pt-24">
+        <PageTitle title="Platform Super Admin" sub="Opening your isolated administrator session" />
+        <Card>
+          <p className="text-sm text-normal-text">Verifying the MFA you just completed at sign-in…</p>
+        </Card>
+      </div>
+    );
+  }
 
   const contextsLoaded = Array.isArray(auth.contexts) && auth.contexts.length > 0;
   const platformCtx = (auth.contexts || []).find((c) => c.type === 'platform');
@@ -85,6 +109,8 @@ export default function PlatformGuard({ children }) {
 
   const error = localErr || platform.exchangeError;
   const errCode = error?.code;
+  const errorMessage = String(error?.body?.message || '');
+  const mfaNotEnabled = errCode === 'platform_mfa_required' && /enable TOTP/i.test(errorMessage);
   const knownState = ['platform_admin_required', 'platform_admin_inactive', 'platform_admin_org_required', 'platform_mfa_required', 'not_found'].includes(errCode);
 
   return (
@@ -101,7 +127,7 @@ export default function PlatformGuard({ children }) {
           <Badge tone="amber">MFA</Badge>
         </div>
         {error && !knownState && <div className="mt-4"><Err e={error} /></div>}
-        {errCode === 'platform_mfa_required' && (
+        {mfaNotEnabled && (
           <p className="mt-3 text-sm text-amber-600">
             TOTP MFA must be enabled on your account first. <Link to="/security" className="underline">Open Security</Link>.
           </p>

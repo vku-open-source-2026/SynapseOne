@@ -340,6 +340,22 @@ const PLATFORM_STEP_UP_ACTIONS = new Set([
   'admin:revoke',
 ]);
 
+/**
+ * A recent login that completed a second factor can open the platform console
+ * without asking for the same OTP twice in a row. The claim is signed by IAM
+ * and the window is intentionally short; anything older falls back to the
+ * explicit fresh-code exchange.
+ */
+function hasFreshLoginMfa(claims: any): boolean {
+  const raw = Number(process.env.PLATFORM_FRESH_MFA_SECONDS ?? 900);
+  const windowMs = Math.min(Math.max(Number.isFinite(raw) ? Math.floor(raw) : 900, 60), 3600) * 1000;
+  const amr = Array.isArray(claims?.amr) ? claims.amr.map(String) : [];
+  const authTime = Number(claims?.auth_time || 0) * 1000;
+  return amr.some((entry: string) => entry === 'totp' || entry === 'recovery' || entry === 'mfa')
+    && authTime > 0
+    && Date.now() - authTime <= windowMs;
+}
+
 async function currentPlatformAdmin(
   req: express.Request,
   res: express.Response,
@@ -663,8 +679,18 @@ export function exposesLifecycleTokens(): boolean {
 }
 
 /** Issue an access+refresh pair for a user (login/register/refresh). */
-async function issueSession(user: { id: string; email: string; org_id: string; auth_version?: number }): Promise<{ accessToken: string; expiresIn: number; refreshToken: string; user: unknown }> {
-  const { token, expiresIn } = signAccess({ sub: user.id, email: user.email, org: user.org_id, ver: Number(user.auth_version) || 0 });
+async function issueSession(
+  user: { id: string; email: string; org_id: string; auth_version?: number },
+  options: { amr?: string[]; authTime?: number } = {},
+): Promise<{ accessToken: string; expiresIn: number; refreshToken: string; user: unknown }> {
+  const { token, expiresIn } = signAccess({
+    sub: user.id,
+    email: user.email,
+    org: user.org_id,
+    ver: Number(user.auth_version) || 0,
+    ...(options.amr && options.amr.length ? { amr: options.amr } : {}),
+    ...(options.authTime ? { auth_time: options.authTime } : {}),
+  });
   const rt = newRefreshToken();
   await storeRefresh(user.id, rt.hash, refreshExpiry());
   return { accessToken: token, expiresIn, refreshToken: rt.value, user: publicUser(user as User) };
@@ -1855,7 +1881,10 @@ async function auditMutation(req: express.Request, action: string, resource: str
       return res.status(401).json({ error: 'invalid_mfa_code', message: 'The verification code is incorrect' });
     }
     await clearLoginFailures(user.id);
-    const session = await sessionWithContexts(await issueSession(user), user);
+    const session = await sessionWithContexts(await issueSession(user, {
+      amr: ['pwd', result.method === 'recovery' ? 'recovery' : 'totp'],
+      authTime: Math.floor(Date.now() / 1000),
+    }), user);
     await logAudit({
       actor_type: 'user', actor_id: user.id, action: 'iam:auth:login', resource: `org:${user.org_id}`,
       decision: true, context: { method: challenge.amr[0] || 'pwd', mfa: result.method, org: user.org_id, recoveryCodesRemaining: result.remainingRecovery },
@@ -3623,15 +3652,16 @@ async function auditMutation(req: express.Request, action: string, resource: str
       await auditPlatformDenied(req, user.id, user.org_id, 'platform:session:exchange', 'mfa_not_enabled');
       return res.status(403).json({ error: 'platform_mfa_required', message: 'enable TOTP MFA on the platform organization account before using the platform console' });
     }
-    // Proof of a fresh second factor for THIS session: do not treat
-    // user_mfa.enabled as evidence that the current login completed MFA.
-    if (requireMfa) {
+    const parsed = z.object({
+      code: z.string().trim().max(16).nullish(),
+      recoveryCode: z.string().trim().max(32).nullish(),
+    }).safeParse(req.body);
+    // The login flow already completed MFA moments ago in the common case.
+    // Reuse that signed proof instead of asking for a second consecutive OTP.
+    const freshLoginMfa = requireMfa && hasFreshLoginMfa(claims);
+    if (requireMfa && !freshLoginMfa) {
       const locked = await lockRemaining(user.id);
       if (locked > 0) return res.status(429).json({ error: 'account_locked', message: 'too many failed verification attempts', retryAfter: locked });
-      const parsed = z.object({
-        code: z.string().trim().max(16).nullish(),
-        recoveryCode: z.string().trim().max(32).nullish(),
-      }).safeParse(req.body);
       if (!parsed.success || (!parsed.data.code && !parsed.data.recoveryCode)) {
         await auditPlatformDenied(req, user.id, user.org_id, 'platform:session:exchange', 'fresh_mfa_required');
         return res.status(403).json({ error: 'platform_mfa_required', message: 'enter a fresh authenticator code to open the platform console' });
@@ -3648,7 +3678,10 @@ async function auditMutation(req: express.Request, action: string, resource: str
       }
     }
     const session = signPlatformAccess({ userId: user.id, role: identity.admin.role, ver: Number(user.auth_version) || 0 });
-    await auditPlatformAction(req, user.id, 'platform:session:exchange', identity.org.id, { role: identity.admin.role });
+    await auditPlatformAction(req, user.id, 'platform:session:exchange', identity.org.id, {
+      role: identity.admin.role,
+      mfa: freshLoginMfa ? 'fresh_login' : requireMfa ? 'code' : 'disabled',
+    });
     noStore(res);
     return res.json({
       accessToken: session.token,
