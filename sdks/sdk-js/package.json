@@ -1,6 +1,6 @@
 {
   "name": "@synapseone/sdk",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "license": "Apache-2.0",
   "description": "synapseone SDK for JavaScript/TypeScript",
   "homepage": "https://synapseone.space",
