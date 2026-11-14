@@ -53,6 +53,10 @@ pub struct Config {
     pub audit_enabled: bool,
     pub audit_ingest_url_override: Option<String>,
     pub iam_service_url: String,
+    /// Collection-name prefixes reserved for operator/machine credentials
+    /// (for example `synapsedx_` for the Tier-2 service account). Empty by
+    /// default: a general PaaS deployment keeps every collection tenant-scoped.
+    pub machine_collection_prefixes: Vec<String>,
 }
 
 impl Config {
@@ -117,6 +121,10 @@ impl Config {
             iam_service_url: util::env_string("IAM_SERVICE_URL", "http://iam:4001")
                 .trim_end_matches('/')
                 .to_string(),
+            machine_collection_prefixes: util::parse_collection_prefixes(&util::env_string(
+                "SYNAPSEONE_BASE_MACHINE_COLLECTION_PREFIXES",
+                "",
+            )),
         }
     }
 
@@ -142,6 +150,7 @@ impl Config {
             audit_enabled: true,
             audit_ingest_url_override: None,
             iam_service_url: "http://iam:4001".into(),
+            machine_collection_prefixes: Vec::new(),
         }
     }
 
@@ -287,6 +296,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !config.is_prod && config.cors_origins.is_empty() {
         tracing::warn!(
             "[base][security] CORS_ORIGIN not set — allowing all origins (dev default)."
+        );
+    }
+    if !config.machine_collection_prefixes.is_empty() {
+        tracing::info!(
+            "[base][security] machine-only collection prefixes: {}",
+            config.machine_collection_prefixes.join(",")
         );
     }
     let store = store::Store::connect_with_direct(

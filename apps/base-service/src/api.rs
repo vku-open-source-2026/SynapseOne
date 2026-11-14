@@ -31,12 +31,13 @@ use crate::query::{
     AsView, QuerySpec,
 };
 use crate::store::{
-    CollectionPatch, CollectionScope, CreateCollectionInput, ListDocumentsOptions,
-    SetDocumentOptions, StoredCollection, StoredDocument,
+    CollectionPatch, CollectionScope, CreateCollectionInput, CreateDatabaseInput, DatabasePatch,
+    DatabaseStats, ListDocumentsOptions, SetDocumentOptions, StoredCollection, StoredDatabase,
+    StoredDocument,
 };
 use crate::util::{
-    header, js_number, js_number_string, js_string, now_iso, parse_js_date, request_id,
-    sanitize_request_id,
+    header, is_reserved_collection, js_number, js_number_string, js_string, now_iso, parse_js_date,
+    request_id, sanitize_request_id,
 };
 use crate::{AppState, Config, VERSION};
 
@@ -211,19 +212,139 @@ fn resolve_caller(headers: &HeaderMap) -> Caller {
     }
 }
 
-fn can_access_collection(collection: &StoredCollection, caller: &Caller) -> bool {
+fn can_access_tenant(org_id: Option<&str>, account_id: Option<&str>, caller: &Caller) -> bool {
     match caller {
         Caller::Platform => true,
         Caller::Anon => false,
         Caller::Principal(principal) => {
-            if let Some(org_id) = &collection.org_id {
-                principal.org.as_deref() == Some(org_id.as_str())
-            } else if let Some(account_id) = &collection.account_id {
-                principal.account.as_deref() == Some(account_id.as_str())
+            if let Some(org_id) = org_id {
+                principal.org.as_deref() == Some(org_id)
+            } else if let Some(account_id) = account_id {
+                principal.account.as_deref() == Some(account_id)
             } else {
                 false
             }
         }
+    }
+}
+
+fn can_access_collection(collection: &StoredCollection, caller: &Caller) -> bool {
+    can_access_tenant(
+        collection.org_id.as_deref(),
+        collection.account_id.as_deref(),
+        caller,
+    )
+}
+
+/// True only for operator/machine credentials. Used to gate collections whose
+/// name matches `SYNAPSEONE_BASE_MACHINE_COLLECTION_PREFIXES`.
+///
+/// A gateway-verified **account-level API key** presents `x-synapseone-kind:
+/// apikey`, an account binding and **no** `x-synapseone-user`. A *user-bound*
+/// key (self-minted by a member) additionally carries the verified owner in
+/// `x-synapseone-user`, so it must never count as machine. Service-account JWTs
+/// are account-bound and only minted through a Tier-1 sensitive mutation; the
+/// gateway stamps the service account id as the user, so they are accepted
+/// explicitly. End-user JWTs and workflow runAs principals are not machine.
+fn is_machine_caller(headers: &HeaderMap) -> bool {
+    match resolve_caller(headers) {
+        // Header-less internal callers are gated by the shared internal secret
+        // (see internal_gate) and act as operator context, never a tenant.
+        Caller::Platform => true,
+        Caller::Anon => false,
+        Caller::Principal(principal) => {
+            let kind = header(headers, "x-synapseone-kind").to_ascii_lowercase();
+            let user = header(headers, "x-synapseone-user");
+            match kind.as_str() {
+                "apikey" => principal.account.is_some() && user.is_empty(),
+                "service-account" => principal.account.is_some(),
+                _ => false,
+            }
+        }
+    }
+}
+
+/// A reserved collection hidden from a non-machine caller. Returns the same
+/// "not found" shape as a missing collection so names never leak existence.
+fn reserved_collection_denied(state: &AppState, headers: &HeaderMap, name: &str) -> bool {
+    is_reserved_collection(name, &state.config.machine_collection_prefixes)
+        && !is_machine_caller(headers)
+}
+
+fn can_access_database(database: &StoredDatabase, caller: &Caller) -> bool {
+    can_access_tenant(
+        database.org_id.as_deref(),
+        database.account_id.as_deref(),
+        caller,
+    )
+}
+
+fn path_param(params: &Params, key: &str) -> Result<String, ApiError> {
+    params
+        .get(key)
+        .cloned()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(ApiError::internal)
+}
+
+/// Resolve the optional database from the nested path and the legacy
+/// `?database=` query parameter. Both may not disagree: that would make the
+/// request address two different databases.
+fn requested_database(path: &Params, query: &Params) -> Result<Option<String>, ApiError> {
+    let from_path = path
+        .get("database")
+        .cloned()
+        .filter(|value| !value.is_empty());
+    let from_query = query
+        .get("database")
+        .cloned()
+        .filter(|value| !value.is_empty());
+    match (from_path, from_query) {
+        (Some(path), Some(query)) if path != query => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_database",
+            "database path and query parameter must match",
+        )),
+        (Some(path), _) => Ok(Some(path)),
+        (None, query) => Ok(query),
+    }
+}
+
+async fn load_database(
+    state: &AppState,
+    headers: &HeaderMap,
+    params: &Params,
+    name: &str,
+) -> Result<StoredDatabase, ApiError> {
+    let caller = resolve_caller(headers);
+    if matches!(caller, Caller::Anon) {
+        return Err(ApiError::auth_required());
+    }
+    let name = clean_name(Some(&Value::String(name.to_string()))).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_database",
+            "database must match [A-Za-z][A-Za-z0-9_-]{0,63}",
+        )
+    })?;
+    let database = state
+        .store
+        .find_database(&name, &collection_scope(&caller, params))
+        .await
+        .map_err(|error| {
+            if error.code == StoreErrorCode::Conflict {
+                ApiError::new(StatusCode::CONFLICT, "ambiguous_database", error.message)
+            } else {
+                ApiError::from(crate::error::InternalError(error.message))
+            }
+        })?;
+    match database {
+        Some(database) if can_access_database(&database, &caller) => Ok(database),
+        _ => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "database_not_found",
+            format!("database '{name}' not found"),
+        )),
     }
 }
 
@@ -261,6 +382,7 @@ async fn load_collection(
     headers: &HeaderMap,
     params: &Params,
     name: &str,
+    database: Option<&str>,
 ) -> Result<StoredCollection, ApiError> {
     let caller = resolve_caller(headers);
     if matches!(caller, Caller::Anon) {
@@ -273,13 +395,21 @@ async fn load_collection(
             "collection must match [A-Za-z][A-Za-z0-9_-]{0,63}",
         )
     })?;
+    if reserved_collection_denied(state, headers, &name) {
+        return Err(ApiError::not_found(format!(
+            "collection '{name}' not found"
+        )));
+    }
+    if let Some(database) = database {
+        load_database(state, headers, params, database).await?;
+    }
     let collection = state
         .store
-        .find_collection(&name, &collection_scope(&caller, params))
+        .find_collection(&name, &collection_scope(&caller, params), database)
         .await
         .map_err(|error| {
             if error.code == StoreErrorCode::Conflict {
-                ApiError::new(StatusCode::CONFLICT, "ambiguous_collection", error.message)
+                ApiError::new(StatusCode::CONFLICT, "ambiguous_database", error.message)
             } else {
                 ApiError::from(crate::error::InternalError(error.message))
             }
@@ -373,9 +503,45 @@ fn invalid_mapping_error(error: MappingError) -> ApiError {
         .with_details_opt(error.details.map(|details| *details))
 }
 
+fn to_api_database(database: &StoredDatabase) -> Value {
+    let mut out = Map::new();
+    out.insert("id".into(), Value::String(database.id.clone()));
+    out.insert("name".into(), Value::String(database.name.clone()));
+    if let Some(description) = &database.description {
+        out.insert("description".into(), Value::String(description.clone()));
+    }
+    if let Some(org_id) = &database.org_id {
+        out.insert("orgId".into(), Value::String(org_id.clone()));
+    }
+    if let Some(account_id) = &database.account_id {
+        out.insert("accountId".into(), Value::String(account_id.clone()));
+    }
+    out.insert(
+        "createdAt".into(),
+        Value::String(database.created_at.clone()),
+    );
+    out.insert(
+        "updatedAt".into(),
+        Value::String(database.updated_at.clone()),
+    );
+    Value::Object(out)
+}
+
 fn to_api_collection(collection: &StoredCollection) -> Value {
     let mut out = Map::new();
     out.insert("id".into(), Value::String(collection.id.clone()));
+    if !collection.database_id.is_empty() {
+        out.insert(
+            "databaseId".into(),
+            Value::String(collection.database_id.clone()),
+        );
+    }
+    if !collection.database_name.is_empty() {
+        out.insert(
+            "database".into(),
+            Value::String(collection.database_name.clone()),
+        );
+    }
     out.insert("name".into(), Value::String(collection.name.clone()));
     if let Some(description) = &collection.description {
         out.insert("description".into(), Value::String(description.clone()));
@@ -426,6 +592,12 @@ fn document_response(document: &StoredDocument, collection: &StoredCollection) -
     let mut value = to_api_document(document, AsView::Data, Some(&collection.mapping));
     if let Some(object) = value.as_object_mut() {
         object.insert("collection".into(), Value::String(collection.name.clone()));
+        if !collection.database_name.is_empty() {
+            object.insert(
+                "database".into(),
+                Value::String(collection.database_name.clone()),
+            );
+        }
     }
     value
 }
@@ -452,6 +624,12 @@ async fn health(State(state): State<AppState>) -> Response {
         .await
         .map(|items| items.len())
         .unwrap_or(0);
+    let databases = state
+        .store
+        .list_databases()
+        .await
+        .map(|items| items.len())
+        .unwrap_or(0);
     json_response(
         StatusCode::OK,
         json!({
@@ -459,6 +637,7 @@ async fn health(State(state): State<AppState>) -> Response {
             "service": "base",
             "version": VERSION,
             "db": if state.store.uses_postgres() { "postgres" } else { "memory" },
+            "databases": databases,
             "collections": collections,
             "time": now_iso(),
         }),
@@ -483,6 +662,14 @@ async fn metrics(State(state): State<AppState>) -> Response {
             "synapseone_base_http_requests_total{{key=\"{}\"}} {}",
             key.replace('"', "\\\""),
             value
+        ));
+    }
+    if let Ok(databases) = state.store.list_databases().await {
+        lines.push("# HELP synapseone_base_databases_total Database count.".into());
+        lines.push("# TYPE synapseone_base_databases_total gauge".into());
+        lines.push(format!(
+            "synapseone_base_databases_total {}",
+            databases.len()
         ));
     }
     if let Ok(collections) = state.store.list_collections().await {
@@ -553,6 +740,7 @@ fn search_scope(headers: &HeaderMap) -> Result<crate::search::SearchScope, ApiEr
         )),
         Caller::Platform => Ok(crate::search::SearchScope {
             platform: true,
+            machine: true,
             ..Default::default()
         }),
         Caller::Principal(principal) => Ok(crate::search::SearchScope {
@@ -560,6 +748,7 @@ fn search_scope(headers: &HeaderMap) -> Result<crate::search::SearchScope, ApiEr
             org_id: principal.org,
             account_id: principal.account,
             subject: Some(principal.sub),
+            machine: is_machine_caller(headers),
         }),
     }
 }
@@ -702,13 +891,18 @@ async fn search_reindex(
         .filter(|value| *value != 0.0 && value.is_finite())
         .unwrap_or(50_000.0) as i64;
     let max_per_collection = max_per_collection.clamp(1, 200_000);
+    let machine = is_machine_caller(&headers);
+    let prefixes = state.config.machine_collection_prefixes.clone();
     let mut collections: Vec<StoredCollection> = state
         .store
         .list_collections()
         .await
         .map_err(|error| ApiError::from(crate::error::InternalError(error.message)))?
         .into_iter()
-        .filter(|collection| can_access_collection(collection, &caller))
+        .filter(|collection| {
+            can_access_collection(collection, &caller)
+                && (machine || !is_reserved_collection(&collection.name, &prefixes))
+        })
         .collect();
     if let Some(wanted) = &wanted {
         collections.retain(|collection| {
@@ -764,9 +958,65 @@ async fn search_status(
     ))
 }
 
-// ---------- collections ----------
+// ---------- databases ----------
 
-async fn list_collections(
+fn database_stats_json(stats: &DatabaseStats) -> Value {
+    json!({
+        "collections": stats.collections,
+        "documents": stats.documents,
+        "bytes": stats.bytes,
+        "lastUpdatedAt": stats.last_updated_at,
+    })
+}
+
+fn resolve_create_scope(
+    caller: &Caller,
+    body_org: Option<String>,
+    body_account: Option<String>,
+    entity: &str,
+) -> Result<(Option<String>, Option<String>), ApiError> {
+    let principal = match caller {
+        Caller::Principal(principal) => Some(principal),
+        _ => None,
+    };
+    if let Some(org) = principal.and_then(|principal| principal.org.as_ref()) {
+        if let Some(body_org) = &body_org {
+            if body_org != org {
+                return Err(ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "cross_tenant",
+                    format!("cannot create a {entity} outside your own org"),
+                ));
+            }
+        }
+        Ok((
+            Some(org.clone()),
+            body_account.or_else(|| principal.and_then(|principal| principal.account.clone())),
+        ))
+    } else if let Some(principal) = principal {
+        if body_org.is_some() {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "cross_tenant",
+                format!("account-scoped principals cannot create org-bound {entity}s"),
+            ));
+        }
+        if let Some(body_account) = &body_account {
+            if Some(body_account) != principal.account.as_ref() {
+                return Err(ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "cross_tenant",
+                    format!("cannot create a {entity} outside your own account"),
+                ));
+            }
+        }
+        Ok((None, principal.account.clone()))
+    } else {
+        Ok((body_org, body_account))
+    }
+}
+
+async fn list_databases(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<Params>,
@@ -775,50 +1025,40 @@ async fn list_collections(
     if matches!(caller, Caller::Anon) {
         return Err(ApiError::auth_required());
     }
-    let mut collections: Vec<StoredCollection> = state
+    let mut databases: Vec<StoredDatabase> = state
         .store
-        .list_collections()
+        .list_databases()
         .await
         .map_err(|error| ApiError::from(crate::error::InternalError(error.message)))?
         .into_iter()
-        .filter(|collection| can_access_collection(collection, &caller))
+        .filter(|database| can_access_database(database, &caller))
         .collect();
     if let Some(org_id) = params.get("orgId").filter(|value| !value.is_empty()) {
-        collections.retain(|collection| collection.org_id.as_deref() == Some(org_id.as_str()));
+        databases.retain(|database| database.org_id.as_deref() == Some(org_id.as_str()));
     }
     if let Some(account_id) = params.get("accountId").filter(|value| !value.is_empty()) {
-        collections
-            .retain(|collection| collection.account_id.as_deref() == Some(account_id.as_str()));
+        databases.retain(|database| database.account_id.as_deref() == Some(account_id.as_str()));
     }
-    Ok(json_response(
-        StatusCode::OK,
-        Value::Array(collections.iter().map(to_api_collection).collect()),
-    ))
+    let mut items = Vec::with_capacity(databases.len());
+    for database in &databases {
+        let stats = state
+            .store
+            .database_stats(&database.id)
+            .await
+            .unwrap_or_default();
+        let mut value = to_api_database(database);
+        if let Some(object) = value.as_object_mut() {
+            object.insert("stats".into(), database_stats_json(&stats));
+        }
+        items.push(value);
+    }
+    Ok(json_response(StatusCode::OK, Value::Array(items)))
 }
 
-fn optional_tenant(body: &Map<String, Value>, key: &str) -> Result<Option<String>, ApiError> {
-    let Some(value) = body.get(key) else {
-        return Ok(None);
-    };
-    let raw = js_string(value);
-    let cleaned = if !value.is_null() && !raw.is_empty() {
-        clean_tenant(&raw)
-    } else {
-        None
-    };
-    if !raw.is_empty() && cleaned.is_none() {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "invalid_tenant",
-            "orgId/accountId must be 1..128 chars",
-        ));
-    }
-    Ok(cleaned)
-}
-
-async fn create_collection(
+async fn create_database(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(params): Query<Params>,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
     let caller = resolve_caller(&headers);
@@ -848,56 +1088,406 @@ async fn create_collection(
             Some(description)
         }
     };
+    let body_org = merge_platform_tenant(
+        &caller,
+        optional_tenant(&object, "orgId")?,
+        query_tenant(&params, "orgId")?,
+    )?;
+    let body_account = merge_platform_tenant(
+        &caller,
+        optional_tenant(&object, "accountId")?,
+        query_tenant(&params, "accountId")?,
+    )?;
+    let (org_id, account_id) = resolve_create_scope(&caller, body_org, body_account, "database")?;
+    let database = state
+        .store
+        .create_database(CreateDatabaseInput {
+            name,
+            description,
+            org_id,
+            account_id,
+            created_by: match &caller {
+                Caller::Principal(principal) => Some(principal.sub.clone()),
+                _ => None,
+            },
+        })
+        .await
+        .map_err(|error| match error.code {
+            StoreErrorCode::Conflict => {
+                ApiError::new(StatusCode::CONFLICT, "database_exists", error.message)
+            }
+            _ => ApiError::from(crate::error::InternalError(error.message)),
+        })?;
+    Ok(json_response(
+        StatusCode::CREATED,
+        to_api_database(&database),
+    ))
+}
+
+async fn get_database(
+    State(state): State<AppState>,
+    Path(path): Path<Params>,
+    Query(params): Query<Params>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let database_name = path_param(&path, "database")?;
+    let database = load_database(&state, &headers, &params, &database_name).await?;
+    let stats = state
+        .store
+        .database_stats(&database.id)
+        .await
+        .map_err(|error| ApiError::from(crate::error::InternalError(error.message)))?;
+    let mut value = to_api_database(&database);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("stats".into(), database_stats_json(&stats));
+    }
+    Ok(json_response(StatusCode::OK, value))
+}
+
+async fn patch_database(
+    State(state): State<AppState>,
+    Path(path): Path<Params>,
+    Query(params): Query<Params>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Response, ApiError> {
+    let database_name = path_param(&path, "database")?;
+    let database = load_database(&state, &headers, &params, &database_name).await?;
+    let body = parse_body(body)?;
+    let object = body_object(&body);
+    let mut patch = DatabasePatch::default();
+    if object.contains_key("name") {
+        let name = clean_name(object.get("name")).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_name",
+                "name must match [A-Za-z][A-Za-z0-9_-]{0,63}",
+            )
+        })?;
+        patch.name = Some(name);
+    }
+    if let Some(value) = object.get("description") {
+        if value.is_null() {
+            patch.description = Some(None);
+        } else {
+            let description = js_string(value);
+            if description.chars().count() > 500 {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_description",
+                    "description ≤500 chars",
+                ));
+            }
+            patch.description = Some(Some(description));
+        }
+    }
+    if patch.name.is_none() && patch.description.is_none() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_body",
+            "no updatable fields provided",
+        ));
+    }
+    let updated = state
+        .store
+        .update_database(&database.id, patch)
+        .await
+        .map_err(|error| match error.code {
+            StoreErrorCode::Conflict => {
+                ApiError::new(StatusCode::CONFLICT, "database_exists", error.message)
+            }
+            _ => ApiError::from(crate::error::InternalError(error.message)),
+        })?
+        .ok_or_else(ApiError::internal)?;
+    Ok(json_response(StatusCode::OK, to_api_database(&updated)))
+}
+
+async fn delete_database(
+    State(state): State<AppState>,
+    Path(path): Path<Params>,
+    Query(params): Query<Params>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let database_name = path_param(&path, "database")?;
+    let database = load_database(&state, &headers, &params, &database_name).await?;
+    let stats = state
+        .store
+        .database_stats(&database.id)
+        .await
+        .map_err(|error| ApiError::from(crate::error::InternalError(error.message)))?;
+    let cascade = params
+        .get("cascade")
+        .map(|value| value == "1" || value == "true")
+        .unwrap_or(false);
+    if stats.collections > 0 && !cascade {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "database_not_empty",
+            "database contains collections; pass ?cascade=true to delete them",
+        ));
+    }
+    state
+        .store
+        .delete_database(&database.id)
+        .await
+        .map_err(|error| ApiError::from(crate::error::InternalError(error.message)))?;
+    Ok(json_response(
+        StatusCode::OK,
+        json!({
+            "ok": true,
+            "id": database.id,
+            "name": database.name,
+            "deletedCollections": stats.collections,
+        }),
+    ))
+}
+
+async fn database_stats(
+    State(state): State<AppState>,
+    Path(path): Path<Params>,
+    Query(params): Query<Params>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let database_name = path_param(&path, "database")?;
+    let database = load_database(&state, &headers, &params, &database_name).await?;
+    let stats = state
+        .store
+        .database_stats(&database.id)
+        .await
+        .map_err(|error| ApiError::from(crate::error::InternalError(error.message)))?;
+    Ok(json_response(
+        StatusCode::OK,
+        json!({
+            "id": database.id,
+            "name": database.name,
+            "collections": stats.collections,
+            "documents": stats.documents,
+            "bytes": stats.bytes,
+            "lastUpdatedAt": stats.last_updated_at,
+        }),
+    ))
+}
+
+// ---------- collections ----------
+
+async fn list_collections(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    path: Option<Path<Params>>,
+    Query(params): Query<Params>,
+) -> Result<Response, ApiError> {
+    let caller = resolve_caller(&headers);
+    if matches!(caller, Caller::Anon) {
+        return Err(ApiError::auth_required());
+    }
+    let path = path.map(|Path(params)| params).unwrap_or_default();
+    let database = requested_database(&path, &params)?;
+    let machine = is_machine_caller(&headers);
+    let prefixes = state.config.machine_collection_prefixes.clone();
+    let mut collections: Vec<StoredCollection> = state
+        .store
+        .list_collections()
+        .await
+        .map_err(|error| ApiError::from(crate::error::InternalError(error.message)))?
+        .into_iter()
+        .filter(|collection| {
+            can_access_collection(collection, &caller)
+                && (machine || !is_reserved_collection(&collection.name, &prefixes))
+        })
+        .collect();
+    if let Some(database) = database {
+        load_database(&state, &headers, &params, &database).await?;
+        collections.retain(|collection| collection.database_name == database);
+    }
+    if let Some(org_id) = params.get("orgId").filter(|value| !value.is_empty()) {
+        collections.retain(|collection| collection.org_id.as_deref() == Some(org_id.as_str()));
+    }
+    if let Some(account_id) = params.get("accountId").filter(|value| !value.is_empty()) {
+        collections
+            .retain(|collection| collection.account_id.as_deref() == Some(account_id.as_str()));
+    }
+    Ok(json_response(
+        StatusCode::OK,
+        Value::Array(collections.iter().map(to_api_collection).collect()),
+    ))
+}
+
+fn query_tenant(params: &Params, key: &str) -> Result<Option<String>, ApiError> {
+    match params.get(key).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some(value) => clean_tenant(value).map(Some).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_tenant",
+                "orgId/accountId must be 1..128 chars",
+            )
+        }),
+    }
+}
+
+fn merge_platform_tenant(
+    caller: &Caller,
+    body: Option<String>,
+    query: Option<String>,
+) -> Result<Option<String>, ApiError> {
+    if !matches!(caller, Caller::Platform) {
+        return Ok(body);
+    }
+    match (body, query) {
+        (Some(body), Some(query)) if body != query => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_tenant",
+            "orgId/accountId body and query must match",
+        )),
+        (Some(body), _) => Ok(Some(body)),
+        (None, query) => Ok(query),
+    }
+}
+
+fn optional_tenant(body: &Map<String, Value>, key: &str) -> Result<Option<String>, ApiError> {
+    let Some(value) = body.get(key) else {
+        return Ok(None);
+    };
+    let raw = js_string(value);
+    let cleaned = if !value.is_null() && !raw.is_empty() {
+        clean_tenant(&raw)
+    } else {
+        None
+    };
+    if !raw.is_empty() && cleaned.is_none() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_tenant",
+            "orgId/accountId must be 1..128 chars",
+        ));
+    }
+    Ok(cleaned)
+}
+
+async fn create_collection(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    path: Option<Path<Params>>,
+    Query(params): Query<Params>,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Response, ApiError> {
+    let caller = resolve_caller(&headers);
+    if matches!(caller, Caller::Anon) {
+        return Err(ApiError::auth_required());
+    }
+    let body = parse_body(body)?;
+    let object = body_object(&body);
+    let name = clean_name(object.get("name")).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_name",
+            "name must match [A-Za-z][A-Za-z0-9_-]{0,63}",
+        )
+    })?;
+    let description = match object.get("description") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let description = js_string(value);
+            if description.chars().count() > 500 {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_description",
+                    "description ≤500 chars",
+                ));
+            }
+            Some(description)
+        }
+    };
+    if reserved_collection_denied(&state, &headers, &name) {
+        // Same shape as "already exists"/"not found" so the reserved prefix is
+        // not confirmed to a tenant caller.
+        return Err(ApiError::not_found(format!(
+            "collection '{name}' not found"
+        )));
+    }
     let mapping = normalize_mapping(object.get("mapping")).map_err(invalid_mapping_error)?;
-    let body_org = optional_tenant(&object, "orgId")?;
-    let body_account = optional_tenant(&object, "accountId")?;
+    let body_org = merge_platform_tenant(
+        &caller,
+        optional_tenant(&object, "orgId")?,
+        query_tenant(&params, "orgId")?,
+    )?;
+    let body_account = merge_platform_tenant(
+        &caller,
+        optional_tenant(&object, "accountId")?,
+        query_tenant(&params, "accountId")?,
+    )?;
     let principal = match &caller {
         Caller::Principal(principal) => Some(principal),
         _ => None,
     };
-    let (request_org, request_account) = if let Some(org) = principal.and_then(|p| p.org.as_ref()) {
-        if let Some(body_org) = &body_org {
-            if body_org != org {
-                return Err(ApiError::new(
-                    StatusCode::FORBIDDEN,
-                    "cross_tenant",
-                    "cannot create a collection outside your own org",
-                ));
-            }
-        }
-        (
-            Some(org.clone()),
-            body_account.or_else(|| principal.and_then(|p| p.account.clone())),
-        )
-    } else if let Some(principal) = principal {
-        if body_org.is_some() {
+    let (request_org, request_account) =
+        resolve_create_scope(&caller, body_org, body_account, "collection")?;
+    let path = path.map(|Path(params)| params).unwrap_or_default();
+    let requested = requested_database(&path, &params)?;
+    let body_database = match object.get("database") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(clean_name(Some(value)).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_database",
+                "database must match [A-Za-z][A-Za-z0-9_-]{0,63}",
+            )
+        })?),
+    };
+    let database_name = match (requested, body_database) {
+        (Some(path), Some(body)) if path != body => {
             return Err(ApiError::new(
-                StatusCode::FORBIDDEN,
-                "cross_tenant",
-                "account-scoped principals cannot create org-bound collections",
-            ));
+                StatusCode::BAD_REQUEST,
+                "invalid_database",
+                "database path, query and body must match",
+            ))
         }
-        if let Some(body_account) = &body_account {
-            if Some(body_account) != principal.account.as_ref() {
-                return Err(ApiError::new(
-                    StatusCode::FORBIDDEN,
-                    "cross_tenant",
-                    "cannot create a collection outside your own account",
-                ));
-            }
-        }
-        (None, principal.account.clone())
+        (Some(path), _) => path,
+        (None, Some(body)) => body,
+        (None, None) => "default".into(),
+    };
+    let platform =
+        matches!(caller, Caller::Platform) && request_org.is_none() && request_account.is_none();
+    let scope = CollectionScope {
+        org_id: request_org,
+        account_id: request_account,
+        platform,
+    };
+    let database = if database_name == "default" {
+        state
+            .store
+            .ensure_default_database(&scope)
+            .await
+            .map_err(|error| ApiError::from(crate::error::InternalError(error.message)))?
     } else {
-        (body_org, body_account)
+        state
+            .store
+            .find_database(&database_name, &scope)
+            .await
+            .map_err(|error| match error.code {
+                StoreErrorCode::Conflict => {
+                    ApiError::new(StatusCode::CONFLICT, "ambiguous_database", error.message)
+                }
+                _ => ApiError::from(crate::error::InternalError(error.message)),
+            })?
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "database_not_found",
+                    format!("database '{database_name}' not found"),
+                )
+            })?
     };
     let collection = state
         .store
         .create_collection(CreateCollectionInput {
+            database_id: database.id,
+            database_name: database.name,
             name,
             description,
             mapping,
-            org_id: request_org,
-            account_id: request_account,
+            org_id: database.org_id,
+            account_id: database.account_id,
             created_by: principal.map(|principal| principal.sub.clone()),
         })
         .await
@@ -915,11 +1505,20 @@ async fn create_collection(
 
 async fn get_collection(
     State(state): State<AppState>,
-    Path(collection_name): Path<String>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
     let stats = state
         .store
         .document_stats(&collection.id)
@@ -942,12 +1541,21 @@ fn stats_json(stats: &crate::store::DocumentStats) -> Value {
 
 async fn patch_collection(
     State(state): State<AppState>,
-    Path(collection_name): Path<String>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
     let body = parse_body(body)?;
     let object = body_object(&body);
     let mut patch = CollectionPatch::default();
@@ -1002,11 +1610,20 @@ async fn patch_collection(
 
 async fn delete_collection(
     State(state): State<AppState>,
-    Path(collection_name): Path<String>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
     state
         .store
         .delete_collection(&collection.id)
@@ -1020,11 +1637,20 @@ async fn delete_collection(
 
 async fn collection_stats(
     State(state): State<AppState>,
-    Path(collection_name): Path<String>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
     let stats = state
         .store
         .document_stats(&collection.id)
@@ -1046,12 +1672,21 @@ async fn collection_stats(
 
 async fn create_document(
     State(state): State<AppState>,
-    Path(collection_name): Path<String>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
     let body = parse_body(body)?;
     let object = body_object(&body);
     let id = match object.get("id") {
@@ -1098,11 +1733,21 @@ async fn create_document(
 
 async fn get_document(
     State(state): State<AppState>,
-    Path((collection_name, id)): Path<(String, String)>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
+    let id = path_param(&path, "id")?;
     let id = clean_doc_id(Some(&Value::String(id)))
         .ok_or_else(|| ApiError::code(StatusCode::BAD_REQUEST, "invalid_document_id"))?;
     let view = match params.get("as") {
@@ -1146,12 +1791,22 @@ async fn get_document(
 
 async fn put_document(
     State(state): State<AppState>,
-    Path((collection_name, id)): Path<(String, String)>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
+    let id = path_param(&path, "id")?;
     let id = clean_doc_id(Some(&Value::String(id)))
         .ok_or_else(|| ApiError::code(StatusCode::BAD_REQUEST, "invalid_document_id"))?;
     let body = parse_body(body)?;
@@ -1203,12 +1858,22 @@ fn valid_unset_path(path: &str) -> bool {
 
 async fn patch_document(
     State(state): State<AppState>,
-    Path((collection_name, id)): Path<(String, String)>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
+    let id = path_param(&path, "id")?;
     let id = clean_doc_id(Some(&Value::String(id)))
         .ok_or_else(|| ApiError::code(StatusCode::BAD_REQUEST, "invalid_document_id"))?;
     let body = parse_body(body)?;
@@ -1299,12 +1964,22 @@ async fn patch_document(
 
 async fn delete_document(
     State(state): State<AppState>,
-    Path((collection_name, id)): Path<(String, String)>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
+    let id = path_param(&path, "id")?;
     let id = clean_doc_id(Some(&Value::String(id)))
         .ok_or_else(|| ApiError::code(StatusCode::BAD_REQUEST, "invalid_document_id"))?;
     let body = parse_body(body)?;
@@ -1355,12 +2030,22 @@ async fn delete_document(
 
 async fn increment_document(
     State(state): State<AppState>,
-    Path((collection_name, id)): Path<(String, String)>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
+    let id = path_param(&path, "id")?;
     let id = clean_doc_id(Some(&Value::String(id)))
         .ok_or_else(|| ApiError::code(StatusCode::BAD_REQUEST, "invalid_document_id"))?;
     let body = parse_body(body)?;
@@ -1423,12 +2108,21 @@ async fn increment_document(
 
 async fn query_documents(
     State(state): State<AppState>,
-    Path(collection_name): Path<String>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
     let body = parse_body(body)?;
     let spec: QuerySpec = parse_query_spec(&body, Some(&collection.mapping))
         .map_err(|error: QueryError| ApiError::from(error))?;
@@ -1478,12 +2172,21 @@ async fn query_documents(
 
 async fn vector_search(
     State(state): State<AppState>,
-    Path(collection_name): Path<String>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
     let body = parse_body(body)?;
     let spec = parse_vector_search_spec(&body, Some(&collection.mapping))
         .map_err(|error: QueryError| ApiError::from(error))?;
@@ -1504,12 +2207,21 @@ async fn vector_search(
 
 async fn batch_documents(
     State(state): State<AppState>,
-    Path(collection_name): Path<String>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
     let body = parse_body(body)?;
     let object = body_object(&body);
     let operations = object.get("operations").and_then(Value::as_array).cloned();
@@ -1746,11 +2458,20 @@ fn store_code(error: &StoreError) -> String {
 
 async fn changes(
     State(state): State<AppState>,
-    Path(collection_name): Path<String>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
     let since = params.get("since").cloned().unwrap_or_default();
     if since.is_empty() || parse_js_date(&since).is_none() {
         return Err(ApiError::new(
@@ -1845,11 +2566,20 @@ async fn changes(
 
 async fn list_documents(
     State(state): State<AppState>,
-    Path(collection_name): Path<String>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
     let limit = match params.get("limit") {
         None => 100.0,
         Some(value) => js_number_string(value).ok_or_else(|| {
@@ -1937,12 +2667,21 @@ async fn list_documents(
 
 async fn graph_upsert_nodes(
     State(state): State<AppState>,
-    Path(collection_name): Path<String>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
     let body = parse_body(body)?;
     let input = body.get("nodes").cloned().unwrap_or_else(|| body.clone());
     match crate::graph::upsert_nodes(&state.store, &collection.id, &input).await {
@@ -1957,12 +2696,21 @@ async fn graph_upsert_nodes(
 
 async fn graph_upsert_edges(
     State(state): State<AppState>,
-    Path(collection_name): Path<String>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
     let body = parse_body(body)?;
     let input = body.get("edges").cloned().unwrap_or_else(|| body.clone());
     match crate::graph::upsert_edges(&state.store, &collection.id, &input).await {
@@ -1986,11 +2734,21 @@ fn number_param(params: &Params, key: &str, fallback: f64) -> f64 {
 
 async fn graph_node(
     State(state): State<AppState>,
-    Path((collection_name, id)): Path<(String, String)>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
+    let id = path_param(&path, "id")?;
     let id = clean_doc_id(Some(&Value::String(id)))
         .ok_or_else(|| ApiError::code(StatusCode::BAD_REQUEST, "invalid_node_id"))?;
     let depth = number_param(&params, "depth", 1.0);
@@ -2024,12 +2782,21 @@ async fn graph_node(
 
 async fn graph_query(
     State(state): State<AppState>,
-    Path(collection_name): Path<String>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
     let body = parse_body(body)?;
     let object = body_object(&body);
     let start: Vec<String> = match object.get("start").and_then(Value::as_array) {
@@ -2082,11 +2849,20 @@ async fn graph_query(
 
 async fn graph_stats(
     State(state): State<AppState>,
-    Path(collection_name): Path<String>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
     let stats = crate::graph::graph_stats(&state.store, &collection.id)
         .await
         .map_err(|message| ApiError::new(StatusCode::BAD_REQUEST, "invalid_graph", message))?;
@@ -2095,11 +2871,21 @@ async fn graph_stats(
 
 async fn graph_delete_node(
     State(state): State<AppState>,
-    Path((collection_name, id)): Path<(String, String)>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
+    let id = path_param(&path, "id")?;
     let id = clean_doc_id(Some(&Value::String(id)))
         .ok_or_else(|| ApiError::code(StatusCode::BAD_REQUEST, "invalid_node_id"))?;
     let ok = crate::graph::delete_node(&state.store, &collection.id, &id)
@@ -2115,12 +2901,21 @@ async fn graph_delete_node(
 
 async fn geo_upsert(
     State(state): State<AppState>,
-    Path(collection_name): Path<String>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
     let body = parse_body(body)?;
     let input = body
         .get("features")
@@ -2141,11 +2936,20 @@ async fn geo_upsert(
 
 async fn geo_list(
     State(state): State<AppState>,
-    Path(collection_name): Path<String>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
     let limit = number_param(&params, "limit", 200.0);
     let bbox = params.get("bbox").map(String::as_str);
     match crate::gis::list_features(&state.store, &collection.id, bbox, limit).await {
@@ -2163,12 +2967,21 @@ async fn geo_list(
 
 async fn geo_near(
     State(state): State<AppState>,
-    Path(collection_name): Path<String>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
     let body = parse_body(body)?;
     let object = body_object(&body);
     let lat = object.get("lat").and_then(js_number).unwrap_or(f64::NAN);
@@ -2199,12 +3012,21 @@ async fn geo_near(
 
 async fn geo_within(
     State(state): State<AppState>,
-    Path(collection_name): Path<String>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
     let body = parse_body(body)?;
     let object = body_object(&body);
     let geometry = object.get("geometry").cloned().unwrap_or(Value::Null);
@@ -2228,11 +3050,20 @@ async fn geo_within(
 
 async fn geo_stats(
     State(state): State<AppState>,
-    Path(collection_name): Path<String>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
     let stats = crate::gis::geo_stats(&state.store, &collection.id)
         .await
         .map_err(|message| ApiError::new(StatusCode::BAD_REQUEST, "invalid_geo", message))?;
@@ -2241,11 +3072,21 @@ async fn geo_stats(
 
 async fn geo_delete_feature(
     State(state): State<AppState>,
-    Path((collection_name, id)): Path<(String, String)>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
+    let id = path_param(&path, "id")?;
     let id = clean_doc_id(Some(&Value::String(id)))
         .ok_or_else(|| ApiError::code(StatusCode::BAD_REQUEST, "invalid_feature_id"))?;
     let ok = crate::gis::delete_feature(&state.store, &collection.id, &id)
@@ -2261,12 +3102,21 @@ async fn geo_delete_feature(
 
 async fn backfill(
     State(state): State<AppState>,
-    Path(collection_name): Path<String>,
+    Path(path): Path<Params>,
     Query(params): Query<Params>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    let collection = load_collection(&state, &headers, &params, &collection_name).await?;
+    let database = requested_database(&path, &params)?;
+    let collection_name = path_param(&path, "collection")?;
+    let collection = load_collection(
+        &state,
+        &headers,
+        &params,
+        &collection_name,
+        database.as_deref(),
+    )
+    .await?;
     let body = parse_body(body)?;
     let object = body_object(&body);
     let limit = object
@@ -2359,108 +3209,57 @@ async fn request_id_middleware(mut request: Request, next: Next) -> Response {
 /// Route template for the known table. Axum's `MatchedPath` is only visible
 /// inside the routed service; audit/metrics run outside the internal gate so
 /// rejected `/v1` requests are still observed, and use this stable template.
+fn collection_route_pattern(base: &str, rest: &[&str]) -> Option<String> {
+    let Some((_collection, tail)) = rest.split_first() else {
+        return Some(base.to_string());
+    };
+    let suffix = match tail {
+        [] => "",
+        ["stats"] => "/stats",
+        ["documents"] => "/documents",
+        ["documents:batch"] => "/documents:batch",
+        ["documents", _] => "/documents/:id",
+        ["documents", _, "increment"] => "/documents/:id/increment",
+        ["query"] => "/query",
+        ["vector-search"] => "/vector-search",
+        ["changes"] => "/changes",
+        ["graph", "nodes"] => "/graph/nodes",
+        ["graph", "edges"] => "/graph/edges",
+        ["graph", "nodes", _] => "/graph/nodes/:id",
+        ["graph", "query"] => "/graph/query",
+        ["graph", "stats"] => "/graph/stats",
+        ["geo", "features"] => "/geo/features",
+        ["geo", "features", _] => "/geo/features/:id",
+        ["geo", "near"] => "/geo/near",
+        ["geo", "within"] => "/geo/within",
+        ["geo", "stats"] => "/geo/stats",
+        _ => return None,
+    };
+    Some(format!("{base}/:collection{suffix}"))
+}
+
 pub fn route_pattern(path: &str) -> String {
     let segments: Vec<&str> = path
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect();
-    let joined = |pattern: &[&str]| -> String {
-        format!("/{}", pattern.join("/")).replace(":collection", ":collection")
-    };
     match segments.as_slice() {
         ["v1", "search"] => "/v1/search".into(),
         ["v1", "search", "reindex"] => "/v1/search/reindex".into(),
         ["v1", "search", "status"] => "/v1/search/status".into(),
-        ["v1", "base", "collections"] => "/v1/base/collections".into(),
-        ["v1", "base", "collections", _] => joined(&["v1", "base", "collections", ":collection"]),
-        ["v1", "base", "collections", _, "stats"] => {
-            joined(&["v1", "base", "collections", ":collection", "stats"])
+        ["v1", "base", "databases"] => "/v1/base/databases".into(),
+        ["v1", "base", "databases", _] => "/v1/base/databases/:database".into(),
+        ["v1", "base", "databases", _, "stats"] => "/v1/base/databases/:database/stats".into(),
+        ["v1", "base", "databases", _, "collections", rest @ ..] => {
+            collection_route_pattern("/v1/base/databases/:database/collections", rest)
+                .unwrap_or_else(|| path.to_string())
         }
-        ["v1", "base", "collections", _, "documents"] => {
-            joined(&["v1", "base", "collections", ":collection", "documents"])
-        }
-        ["v1", "base", "collections", _, "documents:batch"] => joined(&[
-            "v1",
-            "base",
-            "collections",
-            ":collection",
-            "documents:batch",
-        ]),
-        ["v1", "base", "collections", _, "documents", _] => joined(&[
-            "v1",
-            "base",
-            "collections",
-            ":collection",
-            "documents",
-            ":id",
-        ]),
-        ["v1", "base", "collections", _, "documents", _, "increment"] => joined(&[
-            "v1",
-            "base",
-            "collections",
-            ":collection",
-            "documents",
-            ":id",
-            "increment",
-        ]),
-        ["v1", "base", "collections", _, "query"] => {
-            joined(&["v1", "base", "collections", ":collection", "query"])
-        }
-        ["v1", "base", "collections", _, "vector-search"] => {
-            joined(&["v1", "base", "collections", ":collection", "vector-search"])
-        }
-        ["v1", "base", "collections", _, "changes"] => {
-            joined(&["v1", "base", "collections", ":collection", "changes"])
-        }
-        ["v1", "base", "collections", _, "graph", "nodes"] => {
-            joined(&["v1", "base", "collections", ":collection", "graph", "nodes"])
-        }
-        ["v1", "base", "collections", _, "graph", "edges"] => {
-            joined(&["v1", "base", "collections", ":collection", "graph", "edges"])
-        }
-        ["v1", "base", "collections", _, "graph", "nodes", _] => joined(&[
-            "v1",
-            "base",
-            "collections",
-            ":collection",
-            "graph",
-            "nodes",
-            ":id",
-        ]),
-        ["v1", "base", "collections", _, "graph", "query"] => {
-            joined(&["v1", "base", "collections", ":collection", "graph", "query"])
-        }
-        ["v1", "base", "collections", _, "graph", "stats"] => {
-            joined(&["v1", "base", "collections", ":collection", "graph", "stats"])
-        }
-        ["v1", "base", "collections", _, "geo", "features"] => joined(&[
-            "v1",
-            "base",
-            "collections",
-            ":collection",
-            "geo",
-            "features",
-        ]),
-        ["v1", "base", "collections", _, "geo", "features", _] => joined(&[
-            "v1",
-            "base",
-            "collections",
-            ":collection",
-            "geo",
-            "features",
-            ":id",
-        ]),
-        ["v1", "base", "collections", _, "geo", "near"] => {
-            joined(&["v1", "base", "collections", ":collection", "geo", "near"])
-        }
-        ["v1", "base", "collections", _, "geo", "within"] => {
-            joined(&["v1", "base", "collections", ":collection", "geo", "within"])
-        }
-        ["v1", "base", "collections", _, "geo", "stats"] => {
-            joined(&["v1", "base", "collections", ":collection", "geo", "stats"])
+        ["v1", "base", "collections", rest @ ..] => {
+            collection_route_pattern("/v1/base/collections", rest)
+                .unwrap_or_else(|| path.to_string())
         }
         ["internal", "base", "collections", _, "backfill"] => {
-            joined(&["internal", "base", "collections", ":collection", "backfill"])
+            "/internal/base/collections/:collection/backfill".into()
         }
         _ => path.to_string(),
     }
@@ -2596,87 +3395,86 @@ fn cors_layer(config: &Config) -> CorsLayer {
     }
 }
 
-pub fn build_app(state: AppState) -> Router {
-    let v1 = Router::new()
+fn collection_routes() -> Router<AppState> {
+    Router::new()
         .route(
-            "/v1/base/collections",
+            "/collections",
             get(list_collections).post(create_collection),
         )
         .route(
-            "/v1/base/collections/{collection}",
+            "/collections/{collection}",
             get(get_collection)
                 .patch(patch_collection)
                 .delete(delete_collection),
         )
+        .route("/collections/{collection}/stats", get(collection_stats))
         .route(
-            "/v1/base/collections/{collection}/stats",
-            get(collection_stats),
-        )
-        .route(
-            "/v1/base/collections/{collection}/documents",
+            "/collections/{collection}/documents",
             get(list_documents).post(create_document),
         )
         .route(
-            "/v1/base/collections/{collection}/documents:batch",
+            "/collections/{collection}/documents:batch",
             post(batch_documents),
         )
         .route(
-            "/v1/base/collections/{collection}/documents/{id}",
+            "/collections/{collection}/documents/{id}",
             get(get_document)
                 .put(put_document)
                 .patch(patch_document)
                 .delete(delete_document),
         )
         .route(
-            "/v1/base/collections/{collection}/documents/{id}/increment",
+            "/collections/{collection}/documents/{id}/increment",
             post(increment_document),
         )
+        .route("/collections/{collection}/query", post(query_documents))
         .route(
-            "/v1/base/collections/{collection}/query",
-            post(query_documents),
-        )
-        .route(
-            "/v1/base/collections/{collection}/vector-search",
+            "/collections/{collection}/vector-search",
             post(vector_search),
         )
-        .route("/v1/base/collections/{collection}/changes", get(changes))
+        .route("/collections/{collection}/changes", get(changes))
         .route(
-            "/v1/base/collections/{collection}/graph/nodes",
+            "/collections/{collection}/graph/nodes",
             post(graph_upsert_nodes),
         )
         .route(
-            "/v1/base/collections/{collection}/graph/edges",
+            "/collections/{collection}/graph/edges",
             post(graph_upsert_edges),
         )
         .route(
-            "/v1/base/collections/{collection}/graph/nodes/{id}",
+            "/collections/{collection}/graph/nodes/{id}",
             get(graph_node).delete(graph_delete_node),
         )
+        .route("/collections/{collection}/graph/query", post(graph_query))
+        .route("/collections/{collection}/graph/stats", get(graph_stats))
         .route(
-            "/v1/base/collections/{collection}/graph/query",
-            post(graph_query),
-        )
-        .route(
-            "/v1/base/collections/{collection}/graph/stats",
-            get(graph_stats),
-        )
-        .route(
-            "/v1/base/collections/{collection}/geo/features",
+            "/collections/{collection}/geo/features",
             get(geo_list).post(geo_upsert),
         )
-        .route("/v1/base/collections/{collection}/geo/near", post(geo_near))
+        .route("/collections/{collection}/geo/near", post(geo_near))
+        .route("/collections/{collection}/geo/within", post(geo_within))
+        .route("/collections/{collection}/geo/stats", get(geo_stats))
         .route(
-            "/v1/base/collections/{collection}/geo/within",
-            post(geo_within),
-        )
-        .route(
-            "/v1/base/collections/{collection}/geo/stats",
-            get(geo_stats),
-        )
-        .route(
-            "/v1/base/collections/{collection}/geo/features/{id}",
+            "/collections/{collection}/geo/features/{id}",
             delete(geo_delete_feature),
         )
+}
+
+pub fn build_app(state: AppState) -> Router {
+    let v1 = Router::new()
+        .nest("/v1/base", collection_routes())
+        .nest("/v1/base/databases/{database}", collection_routes())
+        .route(
+            "/v1/base/databases",
+            get(list_databases).post(create_database),
+        )
+        .route(
+            "/v1/base/databases/{database}",
+            get(get_database)
+                .patch(patch_database)
+                .delete(delete_database),
+        )
+        .route("/v1/base/databases/{database}/stats", get(database_stats))
         .route("/v1/search", get(search_get).post(search_post))
         .route("/v1/search/reindex", post(search_reindex))
         .route("/v1/search/status", get(search_status));

@@ -30,7 +30,7 @@ import {
 } from './mapping';
 import { parseQuerySpec, applyQuery, parseVectorSearchSpec, QueryError } from './query';
 import { auditMiddleware } from './audit';
-import { searchRecords, indexStatus, replaceCollectionIndex, upsertDocumentIndex, removeDocumentIndex, dropCollectionIndex } from './search';
+import { searchRecords, indexStatus, replaceCollectionIndex, upsertDocumentIndex, removeDocumentIndex, dropCollectionIndex, isReservedCollection } from './search';
 import { upsertNodes, upsertEdges, getNode, subgraph, deleteNode, graphStats } from './graph';
 import { upsertFeatures, listFeatures, near, within, deleteFeature, geoStats } from './gis';
 import {
@@ -122,6 +122,8 @@ function cleanTenant(v: unknown): string | null {
 function toApiCollection(c: StoredCollection): any {
   return {
     id: c.id,
+    databaseId: c.database_id || undefined,
+    database: c.database_name || undefined,
     name: c.name,
     description: c.description ?? undefined,
     mapping: c.mapping,
@@ -149,6 +151,30 @@ function canAccessCollection(c: StoredCollection, caller: Caller): boolean {
   const p = caller.principal!;
   if (c.org_id) return !!p.org && p.org === c.org_id;
   if (c.account_id) return !!p.account && p.account === c.account_id;
+  return false;
+}
+
+/**
+ * Operator/machine caller. A gateway-verified account-level API key presents
+ * `kind=apikey` + account and no `x-synapseone-user`; a user-bound key adds the
+ * verified owner as user and must not count as machine. Service-account JWTs are
+ * account-bound and only minted through a Tier-1 sensitive mutation (the gateway
+ * stamps the service account id as user). Header-less internal callers are
+ * already gated by the shared internal secret and act as operator context.
+ */
+function isMachineCaller(req: express.Request): boolean {
+  const caller = resolveCaller(req);
+  if (caller.kind === 'platform') return true;
+  if (caller.kind !== 'principal') return false;
+  const raw = (name: string): string => {
+    const legacy = name.startsWith('x-synapseone-') ? name.replace('x-synapseone-', 'x-synapsedx-') : name;
+    const value = (req.headers as any)[name] ?? (req.headers as any)[legacy];
+    return String(Array.isArray(value) ? value[0] || '' : value || '').trim();
+  };
+  const kind = raw('x-synapseone-kind').toLowerCase();
+  const user = raw('x-synapseone-user');
+  if (kind === 'apikey') return !!caller.principal?.account && !user;
+  if (kind === 'service-account') return !!caller.principal?.account;
   return false;
 }
 
@@ -446,6 +472,7 @@ export function createApp(): express.Express {
       orgId: caller.principal?.org || null,
       accountId: caller.principal?.account || null,
       subject: caller.principal?.sub || null,
+      machine: isMachineCaller(req),
     };
   }
 
@@ -491,7 +518,8 @@ export function createApp(): express.Express {
     const caller = resolveCaller(req);
     const b = (req.body || {}) as any;
     const wanted = Array.isArray(b.collections) ? new Set(b.collections.map(String)) : null;
-    let collections = (await listCollectionRecs()).filter((c) => canAccessCollection(c, caller));
+    const machine = isMachineCaller(req);
+    let collections = (await listCollectionRecs()).filter((c) => canAccessCollection(c, caller) && (machine || !isReservedCollection(c.name)));
     if (wanted) collections = collections.filter((c) => wanted.has(c.name) || wanted.has(c.id));
     let indexed = 0;
     const details: Array<{ collection: string; indexed: number }> = [];
@@ -531,6 +559,11 @@ export function createApp(): express.Express {
       res.status(400).json({ error: 'invalid_collection', message: 'collection must match [A-Za-z][A-Za-z0-9_-]{0,63}' });
       return null;
     }
+    if (isReservedCollection(name) && !isMachineCaller(req)) {
+      // Same shape as a missing collection: reserved names never leak.
+      res.status(404).json({ error: 'not_found', message: `collection '${name}' not found` });
+      return null;
+    }
     let collection: StoredCollection | null;
     try {
       collection = await findCollectionRec(name, collectionScope(caller, req));
@@ -553,7 +586,8 @@ export function createApp(): express.Express {
     const caller = resolveCaller(req);
     if (caller.kind === 'anon') return res.status(401).json({ error: 'auth_required', message: 'SynapseBase requires an authenticated caller' });
     const q = req.query as any;
-    let cols = (await listCollectionRecs()).filter((c) => canAccessCollection(c, caller));
+    const machine = isMachineCaller(req);
+    let cols = (await listCollectionRecs()).filter((c) => canAccessCollection(c, caller) && (machine || !isReservedCollection(c.name)));
     if (typeof q.orgId === 'string' && q.orgId) cols = cols.filter((c) => (c.org_id || '') === q.orgId);
     if (typeof q.accountId === 'string' && q.accountId) cols = cols.filter((c) => (c.account_id || '') === q.accountId);
     res.json(cols.map(toApiCollection));
@@ -566,6 +600,9 @@ export function createApp(): express.Express {
     const b = (req.body || {}) as any;
     const name = cleanName(b.name);
     if (!name) return res.status(400).json({ error: 'invalid_name', message: 'name must match [A-Za-z][A-Za-z0-9_-]{0,63}' });
+    if (isReservedCollection(name) && !isMachineCaller(req)) {
+      return res.status(404).json({ error: 'not_found', message: `collection '${name}' not found` });
+    }
     if (b.description !== undefined && b.description !== null && String(b.description).length > 500) {
       return res.status(400).json({ error: 'invalid_description', message: 'description ≤500 chars' });
     }

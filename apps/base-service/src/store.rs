@@ -14,15 +14,29 @@ use sqlx::postgres::{PgArguments, PgPoolOptions, PgRow};
 use sqlx::{PgPool, Postgres, Row};
 use tokio::sync::{Mutex, MutexGuard, OnceCell};
 
-use crate::error::StoreError;
+use crate::error::{StoreError, StoreErrorCode};
 use crate::mapping::{deep_merge, get_path_opt, set_path, BaseMapping};
 use crate::pg_query::{compile_query, SqlParam};
 use crate::query::{format_query_page, QuerySpec};
 use crate::util::{iso, now_iso, parse_js_date};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredDatabase {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub org_id: Option<String>,
+    pub account_id: Option<String>,
+    pub created_by: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredCollection {
     pub id: String,
+    pub database_id: String,
+    pub database_name: String,
     pub name: String,
     pub description: Option<String>,
     pub mapping: BaseMapping,
@@ -114,6 +128,7 @@ pub struct MemoryOutbox {
 
 #[derive(Default)]
 pub struct MemoryState {
+    pub databases: HashMap<String, StoredDatabase>,
     pub collections: HashMap<String, StoredCollection>,
     pub documents: HashMap<(String, String), StoredDocument>,
     pub outbox: Vec<MemoryOutbox>,
@@ -145,7 +160,24 @@ pub struct CollectionScope {
 }
 
 #[derive(Debug, Clone)]
+pub struct CreateDatabaseInput {
+    pub name: String,
+    pub description: Option<String>,
+    pub org_id: Option<String>,
+    pub account_id: Option<String>,
+    pub created_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DatabasePatch {
+    pub name: Option<String>,
+    pub description: Option<Option<String>>,
+}
+
+#[derive(Debug, Clone)]
 pub struct CreateCollectionInput {
+    pub database_id: String,
+    pub database_name: String,
     pub name: String,
     pub description: Option<String>,
     pub mapping: BaseMapping,
@@ -182,6 +214,14 @@ pub struct SetDocumentResult {
 
 #[derive(Debug, Clone, Default)]
 pub struct DocumentStats {
+    pub documents: i64,
+    pub bytes: i64,
+    pub last_updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DatabaseStats {
+    pub collections: i64,
     pub documents: i64,
     pub bytes: i64,
     pub last_updated_at: Option<String>,
@@ -226,6 +266,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (
         1_796_000_000_002,
         include_str!("../drizzle/0007_tricky_maelstrom.sql"),
+    ),
+    (
+        1_797_000_000_000,
+        include_str!("../drizzle/0008_base_databases.sql"),
     ),
 ];
 
@@ -280,6 +324,20 @@ async fn migrate_pool(pool: &PgPool) -> Result<(), String> {
         .await
         .map_err(|error| format!("migration bookkeeping: {error}"))?;
         for (when, sql) in MIGRATIONS {
+            // Drizzle's journal is authoritative. Re-running a historical
+            // migration can recreate indexes that a later migration removed
+            // (0000 still knows the old collection-name index), so skip any
+            // migration already recorded for this database.
+            let applied: i64 = sqlx::query_scalar(
+                r#"SELECT count(*) FROM "__drizzle_migrations_base" WHERE created_at = $1"#,
+            )
+            .bind(*when)
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|error| format!("migration bookkeeping check: {error}"))?;
+            if applied > 0 {
+                continue;
+            }
             let body = if *when == 1_796_000_000_002 {
                 MIGRATION_OUTBOX_IDEMPOTENT
             } else {
@@ -388,6 +446,512 @@ impl Store {
         }
     }
 
+    // ---------- databases ----------
+
+    pub async fn create_database(
+        &self,
+        input: CreateDatabaseInput,
+    ) -> Result<StoredDatabase, StoreError> {
+        let id = crate::util::random_id();
+        if let Some(pool) = self.pool() {
+            let row = sqlx::query(
+                r#"INSERT INTO synapseone_base_databases
+                     (id, name, description, org_id, account_id, created_by)
+                   VALUES ($1,$2,$3,$4,$5,$6)
+                   ON CONFLICT DO NOTHING
+                   RETURNING id, name, description, org_id, account_id, created_by, created_at, updated_at"#,
+            )
+            .bind(&id)
+            .bind(&input.name)
+            .bind(&input.description)
+            .bind(&input.org_id)
+            .bind(&input.account_id)
+            .bind(&input.created_by)
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| StoreError::invalid(error.to_string()))?;
+            let Some(row) = row else {
+                return Err(StoreError::conflict(format!(
+                    "database '{}' already exists in this scope",
+                    input.name
+                )));
+            };
+            return database_from_row(&row);
+        }
+        let mut memory = self.memory().await.expect("memory store");
+        if memory.databases.values().any(|database| {
+            database.name == input.name
+                && same_scope(
+                    database.org_id.as_deref(),
+                    database.account_id.as_deref(),
+                    input.org_id.as_deref(),
+                    input.account_id.as_deref(),
+                )
+        }) {
+            return Err(StoreError::conflict(format!(
+                "database '{}' already exists in this scope",
+                input.name
+            )));
+        }
+        let now = now_iso();
+        let record = StoredDatabase {
+            id,
+            name: input.name,
+            description: input.description,
+            org_id: input.org_id,
+            account_id: input.account_id,
+            created_by: input.created_by,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        memory.databases.insert(record.id.clone(), record.clone());
+        Ok(record)
+    }
+
+    pub async fn find_database(
+        &self,
+        name: &str,
+        scope: &CollectionScope,
+    ) -> Result<Option<StoredDatabase>, StoreError> {
+        if let Some(pool) = self.pool() {
+            let row = if scope.platform && scope.org_id.is_none() && scope.account_id.is_none() {
+                sqlx::query(
+                    r#"SELECT id, name, description, org_id, account_id, created_by, created_at, updated_at
+                       FROM synapseone_base_databases
+                       WHERE name = $1 AND org_id IS NULL AND account_id IS NULL
+                       ORDER BY created_at ASC LIMIT 1"#,
+                )
+                .bind(name)
+                .fetch_optional(pool)
+                .await
+                .map_err(|error| StoreError::invalid(error.to_string()))?
+            } else if let Some(org_id) = &scope.org_id {
+                if let Some(account_id) = &scope.account_id {
+                    let exact = sqlx::query(
+                        r#"SELECT id, name, description, org_id, account_id, created_by, created_at, updated_at
+                           FROM synapseone_base_databases
+                           WHERE name = $1 AND org_id = $2 AND account_id = $3
+                           ORDER BY created_at ASC LIMIT 1"#,
+                    )
+                    .bind(name)
+                    .bind(org_id)
+                    .bind(account_id)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|error| StoreError::invalid(error.to_string()))?;
+                    if exact.is_some() {
+                        exact
+                    } else {
+                        let org_wide = sqlx::query(
+                            r#"SELECT id, name, description, org_id, account_id, created_by, created_at, updated_at
+                               FROM synapseone_base_databases
+                               WHERE name = $1 AND org_id = $2 AND account_id IS NULL
+                               ORDER BY created_at ASC LIMIT 1"#,
+                        )
+                        .bind(name)
+                        .bind(org_id)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(|error| StoreError::invalid(error.to_string()))?;
+                        if org_wide.is_some() {
+                            org_wide
+                        } else {
+                            let rows = sqlx::query(
+                                r#"SELECT id, name, description, org_id, account_id, created_by, created_at, updated_at
+                                   FROM synapseone_base_databases
+                                   WHERE name = $1 AND org_id = $2
+                                   ORDER BY created_at ASC LIMIT 2"#,
+                            )
+                            .bind(name)
+                            .bind(org_id)
+                            .fetch_all(pool)
+                            .await
+                            .map_err(|error| StoreError::invalid(error.to_string()))?;
+                            if rows.len() > 1 {
+                                return Err(StoreError::conflict(format!(
+                                    "database '{name}' is ambiguous in this org; add accountId to disambiguate"
+                                )));
+                            }
+                            rows.into_iter().next()
+                        }
+                    }
+                } else {
+                    sqlx::query(
+                        r#"SELECT id, name, description, org_id, account_id, created_by, created_at, updated_at
+                           FROM synapseone_base_databases
+                           WHERE name = $1 AND org_id = $2 AND account_id IS NULL
+                           ORDER BY created_at ASC LIMIT 1"#,
+                    )
+                    .bind(name)
+                    .bind(org_id)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|error| StoreError::invalid(error.to_string()))?
+                }
+            } else {
+                sqlx::query(
+                    r#"SELECT id, name, description, org_id, account_id, created_by, created_at, updated_at
+                       FROM synapseone_base_databases
+                       WHERE name = $1 AND org_id IS NULL AND account_id = $2
+                       ORDER BY created_at ASC LIMIT 1"#,
+                )
+                .bind(name)
+                .bind(scope.account_id.clone().unwrap_or_default())
+                .fetch_optional(pool)
+                .await
+                .map_err(|error| StoreError::invalid(error.to_string()))?
+            };
+            return row.as_ref().map(database_from_row).transpose();
+        }
+        let memory = self.memory().await.expect("memory store");
+        let candidates: Vec<&StoredDatabase> = memory
+            .databases
+            .values()
+            .filter(|database| database.name == name)
+            .collect();
+        if scope.platform && scope.org_id.is_none() && scope.account_id.is_none() {
+            return Ok(candidates
+                .into_iter()
+                .find(|database| database.org_id.is_none() && database.account_id.is_none())
+                .cloned());
+        }
+        if let Some(org_id) = &scope.org_id {
+            if let Some(account_id) = &scope.account_id {
+                if let Some(exact) = candidates.iter().find(|database| {
+                    database.org_id.as_deref() == Some(org_id.as_str())
+                        && database.account_id.as_deref() == Some(account_id.as_str())
+                }) {
+                    return Ok(Some((*exact).clone()));
+                }
+                if let Some(org_wide) = candidates.iter().find(|database| {
+                    database.org_id.as_deref() == Some(org_id.as_str())
+                        && database.account_id.is_none()
+                }) {
+                    return Ok(Some((*org_wide).clone()));
+                }
+            } else if let Some(org_wide) = candidates.iter().find(|database| {
+                database.org_id.as_deref() == Some(org_id.as_str()) && database.account_id.is_none()
+            }) {
+                return Ok(Some((*org_wide).clone()));
+            }
+            let org_matches: Vec<&StoredDatabase> = candidates
+                .into_iter()
+                .filter(|database| database.org_id.as_deref() == Some(org_id.as_str()))
+                .collect();
+            if org_matches.len() > 1 {
+                return Err(StoreError::conflict(format!(
+                    "database '{name}' is ambiguous in this org; add accountId to disambiguate"
+                )));
+            }
+            return Ok(org_matches.first().map(|database| (*database).clone()));
+        }
+        Ok(candidates
+            .into_iter()
+            .find(|database| {
+                database.org_id.is_none()
+                    && database.account_id.as_deref()
+                        == Some(scope.account_id.as_deref().unwrap_or(""))
+            })
+            .cloned())
+    }
+
+    pub async fn find_default_database(
+        &self,
+        scope: &CollectionScope,
+    ) -> Result<Option<StoredDatabase>, StoreError> {
+        self.find_database("default", scope).await
+    }
+
+    /// Exact `(org, account)` lookup. Unlike [`find_database`], this never
+    /// falls back to another account's database in the same org; it is used
+    /// when creating the per-scope `default` database.
+    pub async fn find_database_exact(
+        &self,
+        name: &str,
+        org_id: Option<&str>,
+        account_id: Option<&str>,
+    ) -> Result<Option<StoredDatabase>, StoreError> {
+        if let Some(pool) = self.pool() {
+            let row = sqlx::query(
+                r#"SELECT id, name, description, org_id, account_id, created_by, created_at, updated_at
+                   FROM synapseone_base_databases
+                   WHERE name = $1
+                     AND org_id IS NOT DISTINCT FROM $2
+                     AND account_id IS NOT DISTINCT FROM $3
+                   ORDER BY created_at ASC LIMIT 1"#,
+            )
+            .bind(name)
+            .bind(org_id)
+            .bind(account_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| StoreError::invalid(error.to_string()))?;
+            return row.as_ref().map(database_from_row).transpose();
+        }
+        let memory = self.memory().await.expect("memory store");
+        Ok(memory
+            .databases
+            .values()
+            .find(|database| {
+                database.name == name
+                    && database.org_id.as_deref() == org_id
+                    && database.account_id.as_deref() == account_id
+            })
+            .cloned())
+    }
+
+    /// Return the tenant's `default` database, creating it on first use. Legacy
+    /// `/v1/base/collections` routes call this so the pre-namespace API keeps
+    /// working without an explicit database.
+    pub async fn ensure_default_database(
+        &self,
+        scope: &CollectionScope,
+    ) -> Result<StoredDatabase, StoreError> {
+        let (org_id, account_id) =
+            if scope.platform && scope.org_id.is_none() && scope.account_id.is_none() {
+                (None, None)
+            } else if let Some(org_id) = &scope.org_id {
+                (Some(org_id.clone()), scope.account_id.clone())
+            } else {
+                (None, scope.account_id.clone())
+            };
+        if let Some(database) = self
+            .find_database_exact("default", org_id.as_deref(), account_id.as_deref())
+            .await?
+        {
+            return Ok(database);
+        }
+        match self
+            .create_database(CreateDatabaseInput {
+                name: "default".into(),
+                description: None,
+                org_id: org_id.clone(),
+                account_id: account_id.clone(),
+                created_by: None,
+            })
+            .await
+        {
+            Ok(database) => Ok(database),
+            Err(error) if error.code == StoreErrorCode::Conflict => self
+                .find_database_exact("default", org_id.as_deref(), account_id.as_deref())
+                .await?
+                .ok_or(error),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn get_database(&self, id: &str) -> Result<Option<StoredDatabase>, StoreError> {
+        if let Some(pool) = self.pool() {
+            let row = sqlx::query(
+                r#"SELECT id, name, description, org_id, account_id, created_by, created_at, updated_at
+                   FROM synapseone_base_databases WHERE id = $1 LIMIT 1"#,
+            )
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| StoreError::invalid(error.to_string()))?;
+            return row.as_ref().map(database_from_row).transpose();
+        }
+        let memory = self.memory().await.expect("memory store");
+        Ok(memory.databases.get(id).cloned())
+    }
+
+    pub async fn list_databases(&self) -> Result<Vec<StoredDatabase>, StoreError> {
+        if let Some(pool) = self.pool() {
+            let rows = sqlx::query(
+                r#"SELECT id, name, description, org_id, account_id, created_by, created_at, updated_at
+                   FROM synapseone_base_databases
+                   ORDER BY name ASC, created_at ASC"#,
+            )
+            .fetch_all(pool)
+            .await
+            .map_err(|error| StoreError::invalid(error.to_string()))?;
+            return rows.iter().map(database_from_row).collect();
+        }
+        let memory = self.memory().await.expect("memory store");
+        let mut databases: Vec<StoredDatabase> = memory.databases.values().cloned().collect();
+        databases.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(databases)
+    }
+
+    pub async fn update_database(
+        &self,
+        id: &str,
+        patch: DatabasePatch,
+    ) -> Result<Option<StoredDatabase>, StoreError> {
+        if let Some(pool) = self.pool() {
+            let row = sqlx::query(
+                r#"UPDATE synapseone_base_databases SET
+                     name = CASE WHEN $2::boolean THEN $3::text ELSE name END,
+                     description = CASE WHEN $4::boolean THEN $5::text ELSE description END,
+                     updated_at = now()
+                   WHERE id = $1
+                   RETURNING id, name, description, org_id, account_id, created_by, created_at, updated_at"#,
+            )
+            .bind(id)
+            .bind(patch.name.is_some())
+            .bind(&patch.name)
+            .bind(patch.description.is_some())
+            .bind(patch.description.clone().flatten())
+            .fetch_optional(pool)
+            .await;
+            return match row {
+                Ok(row) => row.as_ref().map(database_from_row).transpose(),
+                Err(error) if is_unique_violation(&error) => Err(StoreError::conflict(
+                    "database name already exists in this scope",
+                )),
+                Err(error) => Err(StoreError::invalid(error.to_string())),
+            };
+        }
+        let mut memory = self.memory().await.expect("memory store");
+        let Some(current) = memory.databases.get(id).cloned() else {
+            return Ok(None);
+        };
+        if let Some(name) = &patch.name {
+            if name != &current.name
+                && memory.databases.values().any(|database| {
+                    database.id != id
+                        && database.name == *name
+                        && same_scope(
+                            database.org_id.as_deref(),
+                            database.account_id.as_deref(),
+                            current.org_id.as_deref(),
+                            current.account_id.as_deref(),
+                        )
+                })
+            {
+                return Err(StoreError::conflict(
+                    "database name already exists in this scope",
+                ));
+            }
+        }
+        let mut next = current;
+        if let Some(name) = patch.name {
+            next.name = name;
+        }
+        if let Some(description) = patch.description {
+            next.description = description;
+        }
+        next.updated_at = now_iso();
+        memory.databases.insert(id.to_string(), next.clone());
+        for collection in memory.collections.values_mut() {
+            if collection.database_id == id {
+                collection.database_name = next.name.clone();
+            }
+        }
+        Ok(Some(next))
+    }
+
+    pub async fn delete_database(&self, id: &str) -> Result<bool, StoreError> {
+        if let Some(pool) = self.pool() {
+            sqlx::query(
+                r#"DELETE FROM synapseone_search_index
+                   WHERE collection_id IN (
+                     SELECT id FROM synapseone_base_collections WHERE database_id = $1
+                   )"#,
+            )
+            .bind(id)
+            .execute(pool)
+            .await
+            .map_err(|error| StoreError::invalid(error.to_string()))?;
+            let result = sqlx::query("DELETE FROM synapseone_base_databases WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .map_err(|error| StoreError::invalid(error.to_string()))?;
+            return Ok(result.rows_affected() > 0);
+        }
+        let mut memory = self.memory().await.expect("memory store");
+        let collection_ids: Vec<String> = memory
+            .collections
+            .values()
+            .filter(|collection| collection.database_id == id)
+            .map(|collection| collection.id.clone())
+            .collect();
+        for collection_id in &collection_ids {
+            memory
+                .documents
+                .retain(|(current, _), _| current != collection_id);
+            memory
+                .graph_nodes
+                .retain(|(current, _), _| current != collection_id);
+            memory
+                .graph_edges
+                .retain(|(current, _), _| current != collection_id);
+            memory
+                .geo_features
+                .retain(|(current, _), _| current != collection_id);
+            memory
+                .search
+                .retain(|_, record| record.collection_id != *collection_id);
+            memory.collections.remove(collection_id);
+        }
+        Ok(memory.databases.remove(id).is_some())
+    }
+
+    pub async fn database_stats(&self, id: &str) -> Result<DatabaseStats, StoreError> {
+        if let Some(pool) = self.pool() {
+            let row = sqlx::query(
+                r#"SELECT
+                     (SELECT count(*) FROM synapseone_base_collections WHERE database_id = $1)::bigint AS collections,
+                     count(d.id)::bigint AS documents,
+                     coalesce(sum(octet_length(d.data::text)), 0)::bigint AS bytes,
+                     max(d.updated_at) AS last_updated_at
+                   FROM synapseone_base_documents d
+                   JOIN synapseone_base_collections c ON c.id = d.collection_id
+                   WHERE c.database_id = $1"#,
+            )
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .map_err(|error| StoreError::invalid(error.to_string()))?;
+            let last_updated_at = row
+                .try_get::<Option<DateTime<Utc>>, _>("last_updated_at")
+                .ok()
+                .flatten()
+                .map(|value| iso(&value));
+            return Ok(DatabaseStats {
+                collections: row.try_get("collections").unwrap_or(0),
+                documents: row.try_get("documents").unwrap_or(0),
+                bytes: row.try_get("bytes").unwrap_or(0),
+                last_updated_at,
+            });
+        }
+        let memory = self.memory().await.expect("memory store");
+        let collection_ids: Vec<&str> = memory
+            .collections
+            .values()
+            .filter(|collection| collection.database_id == id)
+            .map(|collection| collection.id.as_str())
+            .collect();
+        let mut documents = 0_i64;
+        let mut bytes = 0_i64;
+        let mut last_updated_at: Option<String> = None;
+        for ((collection_id, _), document) in &memory.documents {
+            if collection_ids.contains(&collection_id.as_str()) {
+                documents += 1;
+                bytes += serde_json::to_string(&document.data)
+                    .map(|value| value.len() as i64)
+                    .unwrap_or(0);
+                last_updated_at = Some(match last_updated_at {
+                    Some(current) if current >= document.updated_at => current,
+                    _ => document.updated_at.clone(),
+                });
+            }
+        }
+        Ok(DatabaseStats {
+            collections: collection_ids.len() as i64,
+            documents,
+            bytes,
+            last_updated_at,
+        })
+    }
+
     // ---------- collections ----------
 
     pub async fn create_collection(
@@ -398,12 +962,13 @@ impl Store {
         if let Some(pool) = self.pool() {
             let row = sqlx::query(
                 r#"INSERT INTO synapseone_base_collections
-                     (id, name, description, mapping, org_id, account_id, created_by)
-                   VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7)
+                     (id, database_id, name, description, mapping, org_id, account_id, created_by)
+                   VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8)
                    ON CONFLICT DO NOTHING
-                   RETURNING id, name, description, mapping, org_id, account_id, created_by, created_at, updated_at"#,
+                   RETURNING id, database_id, name, description, mapping, org_id, account_id, created_by, created_at, updated_at"#,
             )
             .bind(&id)
+            .bind(&input.database_id)
             .bind(&input.name)
             .bind(&input.description)
             .bind(input.mapping.to_value())
@@ -415,30 +980,34 @@ impl Store {
             .map_err(|error| StoreError::invalid(error.to_string()))?;
             let Some(row) = row else {
                 return Err(StoreError::conflict(format!(
-                    "collection '{}' already exists in this scope",
+                    "collection '{}' already exists in this database",
                     input.name
                 )));
             };
-            return collection_from_row(&row);
+            let mut collection = collection_from_row(&row)?;
+            collection.database_name = input.database_name;
+            return Ok(collection);
         }
         let mut memory = self.memory().await.expect("memory store");
+        if !memory.databases.contains_key(&input.database_id) {
+            return Err(StoreError::invalid(format!(
+                "database '{}' not found",
+                input.database_name
+            )));
+        }
         if memory.collections.values().any(|collection| {
-            collection.name == input.name
-                && same_scope(
-                    collection.org_id.as_deref(),
-                    collection.account_id.as_deref(),
-                    input.org_id.as_deref(),
-                    input.account_id.as_deref(),
-                )
+            collection.database_id == input.database_id && collection.name == input.name
         }) {
             return Err(StoreError::conflict(format!(
-                "collection '{}' already exists in this scope",
+                "collection '{}' already exists in this database",
                 input.name
             )));
         }
         let now = now_iso();
         let record = StoredCollection {
             id,
+            database_id: input.database_id,
+            database_name: input.database_name,
             name: input.name,
             description: input.description,
             mapping: input.mapping,
@@ -456,84 +1025,48 @@ impl Store {
         &self,
         name: &str,
         scope: &CollectionScope,
+        database: Option<&str>,
     ) -> Result<Option<StoredCollection>, StoreError> {
+        let Some(database) = (match database {
+            Some(database) => self.find_database(database, scope).await?,
+            None => self.find_default_database(scope).await?,
+        }) else {
+            return Ok(None);
+        };
         if let Some(pool) = self.pool() {
-            let rows = if scope.platform
-                && scope.org_id.is_none()
-                && scope.account_id.is_none()
-            {
-                sqlx::query(
-                    r#"SELECT id, name, description, mapping, org_id, account_id, created_by, created_at, updated_at
-                       FROM synapseone_base_collections
-                       WHERE name = $1 AND org_id IS NULL AND account_id IS NULL
-                       ORDER BY created_at ASC LIMIT 2"#,
-                )
-                .bind(name)
-                .fetch_all(pool)
-                .await
-            } else if let Some(org_id) = &scope.org_id {
-                sqlx::query(
-                    r#"SELECT id, name, description, mapping, org_id, account_id, created_by, created_at, updated_at
-                       FROM synapseone_base_collections
-                       WHERE name = $1 AND org_id = $2
-                       ORDER BY created_at ASC LIMIT 2"#,
-                )
-                .bind(name)
-                .bind(org_id)
-                .fetch_all(pool)
-                .await
-            } else {
-                sqlx::query(
-                    r#"SELECT id, name, description, mapping, org_id, account_id, created_by, created_at, updated_at
-                       FROM synapseone_base_collections
-                       WHERE name = $1 AND org_id IS NULL AND account_id = $2
-                       ORDER BY created_at ASC LIMIT 2"#,
-                )
-                .bind(name)
-                .bind(scope.account_id.clone().unwrap_or_default())
-                .fetch_all(pool)
-                .await
-            }
+            let row = sqlx::query(
+                r#"SELECT c.id, c.database_id, c.name, c.description, c.mapping, c.org_id,
+                          c.account_id, c.created_by, c.created_at, c.updated_at,
+                          d.name AS database_name
+                   FROM synapseone_base_collections c
+                   JOIN synapseone_base_databases d ON d.id = c.database_id
+                   WHERE c.database_id = $1 AND c.name = $2
+                   LIMIT 1"#,
+            )
+            .bind(&database.id)
+            .bind(name)
+            .fetch_optional(pool)
+            .await
             .map_err(|error| StoreError::invalid(error.to_string()))?;
-            if rows.len() > 1 {
-                return Err(StoreError::conflict(format!(
-                    "collection '{name}' is ambiguous in this org; add accountId to disambiguate"
-                )));
-            }
-            return rows.first().map(collection_from_row).transpose();
+            return row.as_ref().map(collection_from_row).transpose();
         }
         let memory = self.memory().await.expect("memory store");
-        let candidates: Vec<&StoredCollection> = memory
+        Ok(memory
             .collections
             .values()
-            .filter(|collection| {
-                if collection.name != name {
-                    return false;
-                }
-                if scope.platform && scope.org_id.is_none() && scope.account_id.is_none() {
-                    return collection.org_id.is_none() && collection.account_id.is_none();
-                }
-                if let Some(org_id) = &scope.org_id {
-                    return collection.org_id.as_deref() == Some(org_id.as_str());
-                }
-                collection.org_id.is_none()
-                    && collection.account_id.as_deref()
-                        == Some(scope.account_id.as_deref().unwrap_or(""))
-            })
-            .collect();
-        if candidates.len() > 1 {
-            return Err(StoreError::conflict(format!(
-                "collection '{name}' is ambiguous in this org; add accountId to disambiguate"
-            )));
-        }
-        Ok(candidates.first().map(|collection| (*collection).clone()))
+            .find(|collection| collection.database_id == database.id && collection.name == name)
+            .cloned())
     }
 
     pub async fn get_collection(&self, id: &str) -> Result<Option<StoredCollection>, StoreError> {
         if let Some(pool) = self.pool() {
             let row = sqlx::query(
-                r#"SELECT id, name, description, mapping, org_id, account_id, created_by, created_at, updated_at
-                   FROM synapseone_base_collections WHERE id = $1 LIMIT 1"#,
+                r#"SELECT c.id, c.database_id, c.name, c.description, c.mapping, c.org_id,
+                          c.account_id, c.created_by, c.created_at, c.updated_at,
+                          d.name AS database_name
+                   FROM synapseone_base_collections c
+                   JOIN synapseone_base_databases d ON d.id = c.database_id
+                   WHERE c.id = $1 LIMIT 1"#,
             )
             .bind(id)
             .fetch_optional(pool)
@@ -548,9 +1081,12 @@ impl Store {
     pub async fn list_collections(&self) -> Result<Vec<StoredCollection>, StoreError> {
         if let Some(pool) = self.pool() {
             let rows = sqlx::query(
-                r#"SELECT id, name, description, mapping, org_id, account_id, created_by, created_at, updated_at
-                   FROM synapseone_base_collections
-                   ORDER BY name ASC, created_at ASC"#,
+                r#"SELECT c.id, c.database_id, c.name, c.description, c.mapping, c.org_id,
+                          c.account_id, c.created_by, c.created_at, c.updated_at,
+                          d.name AS database_name
+                   FROM synapseone_base_collections c
+                   JOIN synapseone_base_databases d ON d.id = c.database_id
+                   ORDER BY d.name ASC, c.name ASC, c.created_at ASC"#,
             )
             .fetch_all(pool)
             .await
@@ -560,8 +1096,9 @@ impl Store {
         let memory = self.memory().await.expect("memory store");
         let mut collections: Vec<StoredCollection> = memory.collections.values().cloned().collect();
         collections.sort_by(|left, right| {
-            left.name
-                .cmp(&right.name)
+            left.database_name
+                .cmp(&right.database_name)
+                .then_with(|| left.name.cmp(&right.name))
                 .then_with(|| left.created_at.cmp(&right.created_at))
                 .then_with(|| left.id.cmp(&right.id))
         });
@@ -582,7 +1119,7 @@ impl Store {
                      mapping = CASE WHEN $6::boolean THEN $7::jsonb ELSE mapping END,
                      updated_at = now()
                    WHERE id = $1
-                   RETURNING id, name, description, mapping, org_id, account_id, created_by, created_at, updated_at"#,
+                   RETURNING id, database_id, name, description, mapping, org_id, account_id, created_by, created_at, updated_at"#,
             )
             .bind(id)
             .bind(patch.name.is_some())
@@ -594,9 +1131,16 @@ impl Store {
             .fetch_optional(pool)
             .await;
             return match row {
-                Ok(row) => row.as_ref().map(collection_from_row).transpose(),
+                Ok(Some(row)) => {
+                    let mut collection = collection_from_row(&row)?;
+                    if let Some(database) = self.get_database(&collection.database_id).await? {
+                        collection.database_name = database.name;
+                    }
+                    Ok(Some(collection))
+                }
+                Ok(None) => Ok(None),
                 Err(error) if is_unique_violation(&error) => Err(StoreError::conflict(
-                    "collection name already exists in this scope",
+                    "collection name already exists in this database",
                 )),
                 Err(error) => Err(StoreError::invalid(error.to_string())),
             };
@@ -609,17 +1153,12 @@ impl Store {
             if name != &current.name
                 && memory.collections.values().any(|collection| {
                     collection.id != id
+                        && collection.database_id == current.database_id
                         && collection.name == *name
-                        && same_scope(
-                            collection.org_id.as_deref(),
-                            collection.account_id.as_deref(),
-                            current.org_id.as_deref(),
-                            current.account_id.as_deref(),
-                        )
                 })
             {
                 return Err(StoreError::conflict(
-                    "collection name already exists in this scope",
+                    "collection name already exists in this database",
                 ));
             }
         }
@@ -640,6 +1179,11 @@ impl Store {
 
     pub async fn delete_collection(&self, id: &str) -> Result<bool, StoreError> {
         if let Some(pool) = self.pool() {
+            sqlx::query("DELETE FROM synapseone_search_index WHERE collection_id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .map_err(|error| StoreError::invalid(error.to_string()))?;
             let result = sqlx::query("DELETE FROM synapseone_base_collections WHERE id = $1")
                 .bind(id)
                 .execute(pool)
@@ -651,6 +1195,16 @@ impl Store {
         memory
             .documents
             .retain(|(collection_id, _), _| collection_id != id);
+        memory
+            .graph_nodes
+            .retain(|(collection_id, _), _| collection_id != id);
+        memory
+            .graph_edges
+            .retain(|(collection_id, _), _| collection_id != id);
+        memory
+            .geo_features
+            .retain(|(collection_id, _), _| collection_id != id);
+        memory.search.retain(|_, record| record.collection_id != id);
         Ok(memory.collections.remove(id).is_some())
     }
 
@@ -1798,6 +2352,25 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
         .unwrap_or(false)
 }
 
+fn database_from_row(row: &PgRow) -> Result<StoredDatabase, StoreError> {
+    let created_at: DateTime<Utc> = row
+        .try_get("created_at")
+        .map_err(|error| StoreError::invalid(error.to_string()))?;
+    let updated_at: DateTime<Utc> = row
+        .try_get("updated_at")
+        .map_err(|error| StoreError::invalid(error.to_string()))?;
+    Ok(StoredDatabase {
+        id: row.try_get("id").unwrap_or_default(),
+        name: row.try_get("name").unwrap_or_default(),
+        description: row.try_get("description").ok().flatten(),
+        org_id: row.try_get("org_id").ok().flatten(),
+        account_id: row.try_get("account_id").ok().flatten(),
+        created_by: row.try_get("created_by").ok().flatten(),
+        created_at: iso(&created_at),
+        updated_at: iso(&updated_at),
+    })
+}
+
 fn collection_from_row(row: &PgRow) -> Result<StoredCollection, StoreError> {
     let mapping: Value = row
         .try_get("mapping")
@@ -1810,6 +2383,8 @@ fn collection_from_row(row: &PgRow) -> Result<StoredCollection, StoreError> {
         .map_err(|error| StoreError::invalid(error.to_string()))?;
     Ok(StoredCollection {
         id: row.try_get("id").unwrap_or_default(),
+        database_id: row.try_get("database_id").unwrap_or_default(),
+        database_name: row.try_get("database_name").unwrap_or_default(),
         name: row.try_get("name").unwrap_or_default(),
         description: row.try_get("description").ok().flatten(),
         mapping: BaseMapping::from_value(&mapping),
@@ -1873,6 +2448,18 @@ fn outbox_payload(
             .unwrap_or(Value::Null),
     );
     payload.insert(
+        "database_id".into(),
+        collection
+            .map(|collection| Value::String(collection.database_id.clone()))
+            .unwrap_or(Value::Null),
+    );
+    payload.insert(
+        "database_name".into(),
+        collection
+            .map(|collection| Value::String(collection.database_name.clone()))
+            .unwrap_or(Value::Null),
+    );
+    payload.insert(
         "collection_id".into(),
         Value::String(document.collection_id.clone()),
     );
@@ -1928,8 +2515,12 @@ async fn enqueue_outbox_tx(
     event_id: Option<String>,
 ) -> Result<(), StoreError> {
     let collection_row = sqlx::query(
-        "SELECT id, name, description, mapping, org_id, account_id, created_by, created_at, updated_at
-         FROM synapseone_base_collections WHERE id = $1 LIMIT 1",
+        "SELECT c.id, c.database_id, c.name, c.description, c.mapping, c.org_id,
+                c.account_id, c.created_by, c.created_at, c.updated_at,
+                d.name AS database_name
+         FROM synapseone_base_collections c
+         JOIN synapseone_base_databases d ON d.id = c.database_id
+         WHERE c.id = $1 LIMIT 1",
     )
     .bind(collection_id)
     .fetch_optional(&mut **transaction)

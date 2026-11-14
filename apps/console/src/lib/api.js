@@ -75,11 +75,9 @@ async function req(path, { method = 'GET', body, token, apiKey, _retried } = {})
   }
   // Silent refresh: expired access token + live refresh token → rotate once,
   // persist via the store, and retry the original call. Never loops (one retry).
-  // Skipped only for the token-minting endpoints themselves (login/refresh/
-  // logout/callback) — /v1/auth/me and /v1/auth/verify DO retry.
-  // NOTE: NO_RETRY matches exact paths; endpoints WITH query strings (audit,
-  // executions, oidc/start) intentionally fall through to refresh+retry —
-  // they are authenticated data calls (or tokenless), never token minters.
+  // Credential challenges also return 401 for wrong passwords/MFA codes.
+  // Replaying them would consume two lockout attempts for one user action.
+  // /v1/auth/me and /v1/auth/verify remain eligible for session rotation.
   // Cross-tab race: refresh tokens are single-use, so a sibling tab may have
   // already rotated while this call was in flight. The store reads localStorage
   // (shared across tabs) — if it already holds a newer access token, retry with
@@ -88,8 +86,9 @@ async function req(path, { method = 'GET', body, token, apiKey, _retried } = {})
   const NO_RETRY = new Set([
     '/v1/auth/login', '/v1/auth/refresh', '/v1/auth/logout',
     '/v1/auth/logout-all', '/v1/auth/oidc/callback',
+    '/v1/auth/contexts/switch', '/v1/platform/session', '/v1/auth/mfa/verify',
   ]);
-  if (r.status === 401 && !_retried && token && !NO_RETRY.has(path)) {
+  if (r.status === 401 && !_retried && token && !NO_RETRY.has(path.split(/[?#]/, 1)[0])) {
     const stored = authStore.get()?.token;
     if (stored && stored !== token) {
       return req(path, { method, body, token: stored, apiKey, _retried: true });
@@ -141,6 +140,18 @@ function ocsObjectPath(bucket, key) {
   return `/v1/ocs/buckets/${encodedBucket}/objects/${encodedKey}`;
 }
 
+function baseCollectionsPath(db) {
+  return db
+    ? `/v1/base/databases/${encodeURIComponent(db)}/collections`
+    : '/v1/base/collections';
+}
+
+function baseCollectionPath(col, db) {
+  return db
+    ? `${baseCollectionsPath(db)}/${encodeURIComponent(col)}`
+    : `/v1/base/collections/${encodeURIComponent(col)}`;
+}
+
 export const api = {
   call,
   login: (email, orgSlug, password) => post('/v1/auth/login', {
@@ -170,7 +181,7 @@ export const api = {
     post('/v1/auth/logout', { refreshToken }).catch(() => ({ ok: false })),
   me: (a) => get('/v1/auth/me', a),
   authContexts: (a) => get('/v1/auth/contexts', a),
-  switchContext: (orgId, a) => post('/v1/auth/contexts/switch', { orgId }, a),
+  switchContext: (orgId, password, a) => post('/v1/auth/contexts/switch', { orgId, password }, a),
   orgs: (a) => get('/v1/orgs', a),
   createOrg: (slug, displayName, a) => post('/v1/orgs', { slug, displayName }, a),
   accounts: (orgId, a) => get(`/v1/orgs/${encodeURIComponent(orgId)}/accounts`, a),
@@ -296,42 +307,49 @@ export const api = {
   ldsEntity: (id, entityId, a) => get(`/v1/lds/datasources/${encodeURIComponent(id)}/entities/${encodeURIComponent(entityId)}`, a),
   ldsStats: (id, a) => get(`/v1/lds/datasources/${encodeURIComponent(id)}/stats`, a),
   // ---- SynapseBase (document database) ----
-  baseCollections: (a) => get('/v1/base/collections', a),
-  baseCreateCollection: (body, a) => post('/v1/base/collections', body, a),
-  baseCollection: (col, a) => get(`/v1/base/collections/${encodeURIComponent(col)}`, a),
-  baseUpdateCollection: (col, body, a) => patch(`/v1/base/collections/${encodeURIComponent(col)}`, body, a),
-  baseDeleteCollection: (col, a) => del(`/v1/base/collections/${encodeURIComponent(col)}`, a),
-  baseCollectionStats: (col, a) => get(`/v1/base/collections/${encodeURIComponent(col)}/stats`, a),
-  baseDocuments: (col, params, a) => {
+  baseDatabases: (a) => get('/v1/base/databases', a),
+  baseCreateDatabase: (body, a) => post('/v1/base/databases', body, a),
+  baseDatabase: (db, a) => get(`/v1/base/databases/${encodeURIComponent(db)}`, a),
+  baseUpdateDatabase: (db, body, a) =>
+    patch(`/v1/base/databases/${encodeURIComponent(db)}`, body, a),
+  baseDeleteDatabase: (db, a) =>
+    del(`/v1/base/databases/${encodeURIComponent(db)}?cascade=true`, a),
+  baseCollections: (a, db) => get(baseCollectionsPath(db), a),
+  baseCreateCollection: (body, a, db) => post(baseCollectionsPath(db), body, a),
+  baseCollection: (col, a, db) => get(baseCollectionPath(col, db), a),
+  baseUpdateCollection: (col, body, a, db) => patch(baseCollectionPath(col, db), body, a),
+  baseDeleteCollection: (col, a, db) => del(baseCollectionPath(col, db), a),
+  baseCollectionStats: (col, a, db) => get(`${baseCollectionPath(col, db)}/stats`, a),
+  baseDocuments: (col, params, a, db) => {
     const qs = new URLSearchParams();
     const merged = { withTotal: '1', ...(params || {}) };
     for (const [k, v] of Object.entries(merged)) {
       if (v !== undefined && v !== null && String(v) !== '') qs.set(k, String(v));
     }
     const s = qs.toString();
-    return get(`/v1/base/collections/${encodeURIComponent(col)}/documents${s ? `?${s}` : ''}`, a);
+    return get(`${baseCollectionPath(col, db)}/documents${s ? `?${s}` : ''}`, a);
   },
-  baseDocument: (col, id, as, a) =>
-    get(`/v1/base/collections/${encodeURIComponent(col)}/documents/${encodeURIComponent(id)}${as ? `?as=${encodeURIComponent(as)}` : ''}`, a),
-  baseCreateDocument: (col, body, a) =>
-    post(`/v1/base/collections/${encodeURIComponent(col)}/documents`, body, a),
-  baseUpdateDocument: (col, id, body, a) =>
-    put(`/v1/base/collections/${encodeURIComponent(col)}/documents/${encodeURIComponent(id)}`, body, a),
-  basePatchDocument: (col, id, body, a) =>
-    patch(`/v1/base/collections/${encodeURIComponent(col)}/documents/${encodeURIComponent(id)}`, body, a),
-  baseDeleteDocument: (col, id, a) =>
-    del(`/v1/base/collections/${encodeURIComponent(col)}/documents/${encodeURIComponent(id)}`, a),
-  baseQuery: (col, body, a) =>
-    post(`/v1/base/collections/${encodeURIComponent(col)}/query`, body, a),
-  baseIncrement: (col, id, body, a) =>
-    post(`/v1/base/collections/${encodeURIComponent(col)}/documents/${encodeURIComponent(id)}/increment`, body, a),
-  baseChanges: (col, params, a) => {
+  baseDocument: (col, id, as, a, db) =>
+    get(`${baseCollectionPath(col, db)}/documents/${encodeURIComponent(id)}${as ? `?as=${encodeURIComponent(as)}` : ''}`, a),
+  baseCreateDocument: (col, body, a, db) =>
+    post(`${baseCollectionPath(col, db)}/documents`, body, a),
+  baseUpdateDocument: (col, id, body, a, db) =>
+    put(`${baseCollectionPath(col, db)}/documents/${encodeURIComponent(id)}`, body, a),
+  basePatchDocument: (col, id, body, a, db) =>
+    patch(`${baseCollectionPath(col, db)}/documents/${encodeURIComponent(id)}`, body, a),
+  baseDeleteDocument: (col, id, a, db) =>
+    del(`${baseCollectionPath(col, db)}/documents/${encodeURIComponent(id)}`, a),
+  baseQuery: (col, body, a, db) =>
+    post(`${baseCollectionPath(col, db)}/query`, body, a),
+  baseIncrement: (col, id, body, a, db) =>
+    post(`${baseCollectionPath(col, db)}/documents/${encodeURIComponent(id)}/increment`, body, a),
+  baseChanges: (col, params, a, db) => {
     const qs = new URLSearchParams();
     for (const [k, v] of Object.entries(params || {})) {
       if (v !== undefined && v !== null && String(v) !== '') qs.set(k, String(v));
     }
     const s = qs.toString();
-    return get(`/v1/base/collections/${encodeURIComponent(col)}/changes${s ? `?${s}` : ''}`, a);
+    return get(`${baseCollectionPath(col, db)}/changes${s ? `?${s}` : ''}`, a);
   },
   // ---- SynapseQueue (messaging) ----
   queueList: (a) => get('/v1/queue/queues', a),

@@ -235,11 +235,38 @@ export async function removeDocumentIndex(collectionId: string, documentId: stri
   if (useDb()) await pgQuery('DELETE FROM synapseone_search_index WHERE id = $1', [id]);
 }
 
+/**
+ * Collection-name prefixes reserved for operator/machine credentials
+ * (`SYNAPSEONE_BASE_MACHINE_COLLECTION_PREFIXES`, default empty). Memoised per
+ * process; invalid entries are ignored rather than widening access.
+ */
+let cachedMachinePrefixes: string[] | null = null;
+export function machineCollectionPrefixes(): string[] {
+  if (cachedMachinePrefixes === null) {
+    cachedMachinePrefixes = String(process.env.SYNAPSEONE_BASE_MACHINE_COLLECTION_PREFIXES || '')
+      .split(',')
+      .map((value) => value.trim().replace(/\*+$/, '').trim().toLowerCase())
+      .filter((value) => value.length > 0 && value.length <= 40 && /^[a-z0-9_-]+$/.test(value))
+      .filter((value, index, all) => all.indexOf(value) === index);
+  }
+  return cachedMachinePrefixes;
+}
+
+/** Machine-only collection names (prefix match, case-insensitive). */
+export function isReservedCollection(name: string): boolean {
+  const prefixes = machineCollectionPrefixes();
+  if (!prefixes.length) return false;
+  const lower = String(name || '').toLowerCase();
+  return prefixes.some((prefix) => lower.startsWith(prefix));
+}
+
 export interface SearchScope {
   platform: boolean;
   orgId?: string | null;
   accountId?: string | null;
   subject?: string | null;
+  /** Operator/machine caller; reserved collections stay visible only to it. */
+  machine?: boolean;
 }
 
 export interface SearchOptions {
@@ -383,6 +410,7 @@ export async function searchRecords(scope: SearchScope, query: string, opts: Sea
   }
   let rows = await loadRecords(scope);
   rows = rows.filter((r) => aclAllows(r, scope));
+  if (!scope.machine) rows = rows.filter((r) => !isReservedCollection(r.collection_name));
   if (opts.collection) rows = rows.filter((r) => r.collection_name === opts.collection || r.collection_id === opts.collection);
   if (Array.isArray(opts.collections) && opts.collections.length) {
     const wanted = new Set(opts.collections);

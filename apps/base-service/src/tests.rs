@@ -100,6 +100,30 @@ async fn create_collection(app: &Router, headers: &[(String, String)], body: Val
     value
 }
 
+async fn create_database(app: &Router, headers: &[(String, String)], body: Value) -> Value {
+    let (status, _, value) = call(app, "POST", "/v1/base/databases", headers, Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+    value
+}
+
+async fn create_collection_in(
+    app: &Router,
+    headers: &[(String, String)],
+    database: &str,
+    body: Value,
+) -> Value {
+    let (status, _, value) = call(
+        app,
+        "POST",
+        &format!("/v1/base/databases/{database}/collections"),
+        headers,
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+    value
+}
+
 async fn create_doc(
     app: &Router,
     headers: &[(String, String)],
@@ -116,6 +140,45 @@ async fn create_doc(
     .await;
     assert_eq!(status, StatusCode::CREATED, "{value}");
     value
+}
+
+async fn create_doc_in(
+    app: &Router,
+    headers: &[(String, String)],
+    database: &str,
+    collection: &str,
+    body: Value,
+) -> Value {
+    let (status, _, value) = call(
+        app,
+        "POST",
+        &format!("/v1/base/databases/{database}/collections/{collection}/documents"),
+        headers,
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+    value
+}
+
+#[test]
+fn route_patterns_collapse_database_and_collection_ids() {
+    assert_eq!(
+        crate::api::route_pattern("/v1/base/databases/analytics/collections/users"),
+        "/v1/base/databases/:database/collections/:collection"
+    );
+    assert_eq!(
+        crate::api::route_pattern("/v1/base/databases/analytics/collections/users/documents/u1"),
+        "/v1/base/databases/:database/collections/:collection/documents/:id"
+    );
+    assert_eq!(
+        crate::api::route_pattern("/v1/base/collections/users/documents/u1"),
+        "/v1/base/collections/:collection/documents/:id"
+    );
+    assert_eq!(
+        crate::api::route_pattern("/v1/base/databases/analytics/stats"),
+        "/v1/base/databases/:database/stats"
+    );
 }
 
 #[tokio::test]
@@ -208,6 +271,414 @@ async fn collection_crud_and_tenant_isolation() {
     assert_eq!(status, StatusCode::OK);
     let (status, _, _) = call(&app, "GET", "/v1/base/collections/users", &headers, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn database_namespace_keeps_collection_names_unique_per_database() {
+    let state = test_state().await;
+    let app = build_app(state);
+    let headers = user_headers("tenant-a", "user-1");
+
+    let analytics = create_database(
+        &app,
+        &headers,
+        json!({"name": "analytics", "description": "Analytics workspace"}),
+    )
+    .await;
+    assert_eq!(analytics["name"], "analytics");
+    assert!(analytics.get("id").is_some());
+
+    let billing = create_database(&app, &headers, json!({"name": "billing"})).await;
+    assert_eq!(billing["orgId"], "tenant-a");
+
+    // The same collection name is allowed in independent databases.
+    let analytics_users =
+        create_collection_in(&app, &headers, "analytics", json!({"name": "users"})).await;
+    assert_eq!(analytics_users["database"], "analytics");
+    let billing_users =
+        create_collection_in(&app, &headers, "billing", json!({"name": "users"})).await;
+    assert_eq!(billing_users["database"], "billing");
+
+    // ...but not twice in one database.
+    let (status, _, _) = call(
+        &app,
+        "POST",
+        "/v1/base/databases/analytics/collections",
+        &headers,
+        Some(json!({"name": "users"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Documents are isolated by collection id even though the names match.
+    let analytics_doc = create_doc_in(
+        &app,
+        &headers,
+        "analytics",
+        "users",
+        json!({"id": "a-1", "data": {"scope": "analytics"}}),
+    )
+    .await;
+    assert_eq!(analytics_doc["data"]["scope"], "analytics");
+    assert_eq!(analytics_doc["database"], "analytics");
+    let billing_doc = create_doc_in(
+        &app,
+        &headers,
+        "billing",
+        "users",
+        json!({"id": "b-1", "data": {"scope": "billing"}}),
+    )
+    .await;
+    assert_eq!(billing_doc["data"]["scope"], "billing");
+
+    let (status, _, value) = call(&app, "GET", "/v1/base/collections/users", &headers, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
+
+    let (status, _, value) = call(
+        &app,
+        "GET",
+        "/v1/base/databases/analytics/collections/users",
+        &headers,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["databaseId"], analytics["id"]);
+    assert_eq!(value["stats"]["documents"], 1);
+
+    let (status, _, value) = call(
+        &app,
+        "GET",
+        "/v1/base/databases/analytics/collections/users/documents/a-1",
+        &headers,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["data"]["scope"], "analytics");
+
+    // Flat legacy routes can opt into a database with ?database=.
+    let (status, _, value) = call(
+        &app,
+        "GET",
+        "/v1/base/collections/users?database=billing",
+        &headers,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["database"], "billing");
+
+    // A default database still backs the old flat API.
+    let default_collection = create_collection(&app, &headers, json!({"name": "users"})).await;
+    assert_eq!(default_collection["database"], "default");
+    let default_doc = create_doc(
+        &app,
+        &headers,
+        "users",
+        json!({"id": "d-1", "data": {"scope": "default"}}),
+    )
+    .await;
+    assert_eq!(default_doc["database"], "default");
+
+    let (_, _, namespaced) = call(
+        &app,
+        "GET",
+        "/v1/base/collections?database=analytics",
+        &headers,
+        None,
+    )
+    .await;
+    let names: Vec<&str> = namespaced
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["users"]);
+
+    let (_, _, databases) = call(&app, "GET", "/v1/base/databases", &headers, None).await;
+    let names: Vec<&str> = databases
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["analytics", "billing", "default"]);
+    let analytics_stats = databases
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "analytics")
+        .unwrap();
+    assert_eq!(analytics_stats["stats"]["collections"], 1);
+    assert_eq!(analytics_stats["stats"]["documents"], 1);
+}
+
+#[tokio::test]
+async fn database_rename_updates_collection_listing() {
+    let state = test_state().await;
+    let app = build_app(state);
+    let headers = user_headers("tenant-a", "user-1");
+
+    create_database(&app, &headers, json!({"name": "app"})).await;
+    create_collection_in(&app, &headers, "app", json!({"name": "users"})).await;
+
+    let (status, _, value) = call(
+        &app,
+        "PATCH",
+        "/v1/base/databases/app",
+        &headers,
+        Some(json!({"name": "portal"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["name"], "portal");
+
+    let (status, _, value) = call(
+        &app,
+        "GET",
+        "/v1/base/databases/portal/collections/users",
+        &headers,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["database"], "portal");
+
+    let (_, _, listed) = call(
+        &app,
+        "GET",
+        "/v1/base/collections?database=portal",
+        &headers,
+        None,
+    )
+    .await;
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["database"], "portal");
+}
+
+#[tokio::test]
+async fn default_databases_are_isolated_per_org_account() {
+    let state = test_state().await;
+    let app = build_app(state);
+    let account_one = with_header(
+        user_headers("tenant-a", "user-1"),
+        "x-synapseone-account",
+        "acc-1",
+    );
+    let account_two = with_header(
+        user_headers("tenant-a", "user-2"),
+        "x-synapseone-account",
+        "acc-2",
+    );
+    let org_wide = user_headers("tenant-a", "user-3");
+
+    create_collection(&app, &account_one, json!({"name": "users"})).await;
+    create_collection(&app, &account_two, json!({"name": "users"})).await;
+    create_collection(&app, &org_wide, json!({"name": "users"})).await;
+
+    let (status, _, value) = call(
+        &app,
+        "GET",
+        "/v1/base/collections/users",
+        &account_one,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["accountId"], "acc-1");
+
+    let (status, _, value) = call(
+        &app,
+        "GET",
+        "/v1/base/collections/users",
+        &account_two,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["accountId"], "acc-2");
+
+    let (status, _, value) = call(&app, "GET", "/v1/base/collections/users", &org_wide, None).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert!(value.get("accountId").is_none());
+
+    let (_, _, databases) = call(&app, "GET", "/v1/base/databases", &org_wide, None).await;
+    assert_eq!(databases.as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn platform_callers_can_create_in_a_query_scope() {
+    let state = test_state().await;
+    let app = build_app(state);
+
+    let (status, _, value) = call(
+        &app,
+        "POST",
+        "/v1/base/databases?orgId=tenant-a",
+        &[],
+        Some(json!({"name": "scoped"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+    assert_eq!(value["orgId"], "tenant-a");
+    assert!(value.get("accountId").is_none());
+
+    let (status, _, value) = call(
+        &app,
+        "POST",
+        "/v1/base/databases/scoped/collections?orgId=tenant-a",
+        &[],
+        Some(json!({"name": "users"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{value}");
+    assert_eq!(value["database"], "scoped");
+    assert_eq!(value["orgId"], "tenant-a");
+
+    let tenant = user_headers("tenant-a", "user-1");
+    let (status, _, value) = call(
+        &app,
+        "GET",
+        "/v1/base/databases/scoped/collections/users",
+        &tenant,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+
+    let (status, _, value) = call(
+        &app,
+        "POST",
+        "/v1/base/databases?orgId=tenant-a",
+        &[],
+        Some(json!({"name": "conflict", "orgId": "tenant-b"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    assert_eq!(value["error"], "invalid_tenant");
+}
+
+#[tokio::test]
+async fn database_delete_requires_cascade_and_removes_children() {
+    let state = test_state().await;
+    let app = build_app(state);
+    let headers = user_headers("tenant-a", "user-1");
+
+    create_database(&app, &headers, json!({"name": "app"})).await;
+    create_collection_in(&app, &headers, "app", json!({"name": "notes"})).await;
+
+    let (status, _, value) = call(&app, "DELETE", "/v1/base/databases/app", &headers, None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{value}");
+    assert_eq!(value["error"], "database_not_empty");
+
+    let (status, _, value) = call(
+        &app,
+        "DELETE",
+        "/v1/base/databases/app?cascade=true",
+        &headers,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["deletedCollections"], 1);
+
+    let (status, _, _) = call(&app, "GET", "/v1/base/databases/app", &headers, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _, _) = call(
+        &app,
+        "GET",
+        "/v1/base/databases/app/collections/notes",
+        &headers,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn database_routes_are_tenant_scoped_and_reject_ambiguous_scope() {
+    let state = test_state().await;
+    let app = build_app(state);
+    let owner = user_headers("tenant-a", "user-1");
+    let outsider = user_headers("tenant-b", "user-2");
+
+    create_database(&app, &owner, json!({"name": "private"})).await;
+
+    let (status, _, value) = call(&app, "GET", "/v1/base/databases/private", &outsider, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
+
+    let (status, _, _) = call(
+        &app,
+        "POST",
+        "/v1/base/databases/private/collections",
+        &outsider,
+        Some(json!({"name": "leak"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A platform caller must name the tenant scope.
+    let (status, _, value) = call(&app, "GET", "/v1/base/databases/private", &[], None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
+    let (status, _, value) = call(
+        &app,
+        "GET",
+        "/v1/base/databases/private?orgId=tenant-a",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["orgId"], "tenant-a");
+
+    // Path and query scope must agree.
+    let (status, _, value) = call(
+        &app,
+        "GET",
+        "/v1/base/databases/private/collections?database=other",
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    assert_eq!(value["error"], "invalid_database");
+
+    let (status, _, value) = call(
+        &app,
+        "POST",
+        "/v1/base/databases/private/collections",
+        &owner,
+        Some(json!({"name": "users", "database": "other"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    assert_eq!(value["error"], "invalid_database");
+
+    // Creating in a missing database is a 404, not an accidental auto-create.
+    let (status, _, value) = call(
+        &app,
+        "POST",
+        "/v1/base/databases/missing/collections",
+        &owner,
+        Some(json!({"name": "users"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
+    assert_eq!(value["error"], "database_not_found");
+
+    let (status, _, value) = call(
+        &app,
+        "GET",
+        "/v1/base/databases/missing/collections",
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
+    assert_eq!(value["error"], "database_not_found");
 }
 
 #[tokio::test]
@@ -876,6 +1347,262 @@ async fn backfill_is_idempotent_and_replayable() {
 }
 
 #[tokio::test]
+async fn machine_only_collection_prefixes_gate_tenants_but_not_machine_keys() {
+    let store = Store::connect(None).await.unwrap();
+    let mut config = Config::for_test();
+    config.machine_collection_prefixes = crate::util::parse_collection_prefixes("synapsedx_");
+    let state = AppState::new(store, config);
+    state.audit.clear().await;
+    let app = build_app(state);
+
+    // Gateway-stamped principals: account key (machine), org member (user),
+    // member-minted user-bound key (kind=apikey + owner header), and a
+    // service-account JWT (kind=service-account + sub as user).
+    let machine = with_header(key_headers("acct-a"), "x-synapseone-org", "org-a");
+    let user = user_headers("org-a", "user-1");
+    let user_bound = with_header(
+        with_header(key_headers("acct-a"), "x-synapseone-org", "org-a"),
+        "x-synapseone-user",
+        "owner-1",
+    );
+    let service = vec![
+        ("content-type".into(), "application/json".into()),
+        ("x-synapseone-kind".into(), "service-account".into()),
+        ("x-synapseone-account".into(), "acct-a".into()),
+        ("x-synapseone-org".into(), "org-a".into()),
+        ("x-synapseone-user".into(), "sa-1".into()),
+    ];
+
+    // Machine creates and writes the reserved collection.
+    create_collection(
+        &app,
+        &machine,
+        json!({"name": "synapsedx_capability_audit"}),
+    )
+    .await;
+    create_doc(
+        &app,
+        &machine,
+        "synapsedx_capability_audit",
+        json!({"id": "audit-1", "data": {"title": "bridge audit"}}),
+    )
+    .await;
+    // A normal tenant collection for contrast (and search).
+    create_collection(&app, &user, json!({"name": "assets"})).await;
+    create_doc(
+        &app,
+        &user,
+        "assets",
+        json!({"id": "asset-1", "data": {"title": "bridge asset"}}),
+    )
+    .await;
+
+    // A tenant user cannot read, write or create reserved collections.
+    let (status, _, _) = call(
+        &app,
+        "GET",
+        "/v1/base/collections/synapsedx_capability_audit/documents/audit-1",
+        &user,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = call(
+        &app,
+        "DELETE",
+        "/v1/base/collections/synapsedx_capability_audit/documents/audit-1",
+        &user,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = call(
+        &app,
+        "POST",
+        "/v1/base/collections",
+        &user,
+        Some(json!({"name": "synapsedx_shadow"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = call(
+        &app,
+        "POST",
+        "/v1/base/collections/synapsedx_capability_audit/query",
+        &user,
+        Some(json!({"limit": 10})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The reserved name never appears in the tenant listing.
+    let (status, _, listed) = call(&app, "GET", "/v1/base/collections", &user, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let names: Vec<String> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|collection| collection["name"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert!(names.contains(&"assets".to_string()), "{names:?}");
+    assert!(
+        !names.iter().any(|name| name.starts_with("synapsedx_")),
+        "machine-only names leaked into a tenant listing: {names:?}"
+    );
+
+    // A user-bound key is NOT machine (kind=apikey but the owner header is set).
+    let (status, _, _) = call(
+        &app,
+        "GET",
+        "/v1/base/collections/synapsedx_capability_audit/documents/audit-1",
+        &user_bound,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = call(
+        &app,
+        "POST",
+        "/v1/base/collections",
+        &user_bound,
+        Some(json!({"name": "synapsedx_userkey"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Account-level machine and service-account credentials keep access.
+    let (status, _, _) = call(
+        &app,
+        "GET",
+        "/v1/base/collections/synapsedx_capability_audit/documents/audit-1",
+        &machine,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = call(
+        &app,
+        "GET",
+        "/v1/base/collections/synapsedx_capability_audit/documents/audit-1",
+        &service,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = call(
+        &app,
+        "POST",
+        "/v1/base/collections",
+        &service,
+        Some(json!({"name": "synapsedx_service_created"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Database-qualified paths share the same gate.
+    create_database(&app, &machine, json!({"name": "ops"})).await;
+    create_collection_in(&app, &machine, "ops", json!({"name": "synapsedx_ops_data"})).await;
+    create_doc_in(
+        &app,
+        &machine,
+        "ops",
+        "synapsedx_ops_data",
+        json!({"id": "d1", "data": {"title": "ops"}}),
+    )
+    .await;
+    let (status, _, _) = call(
+        &app,
+        "GET",
+        "/v1/base/databases/ops/collections/synapsedx_ops_data/documents/d1",
+        &user,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = call(
+        &app,
+        "GET",
+        "/v1/base/databases/ops/collections/synapsedx_ops_data/documents/d1",
+        &machine,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Search never returns reserved rows/names to a tenant caller.
+    let (status, _, _) = call(&app, "POST", "/v1/search/reindex", &user, Some(json!({}))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, results) = call(
+        &app,
+        "POST",
+        "/v1/search",
+        &user,
+        Some(json!({"query": "bridge"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{results}");
+    let hits = results["items"].as_array().unwrap();
+    assert!(
+        !hits.is_empty(),
+        "normal collection must still be searchable"
+    );
+    for hit in hits {
+        let collection = hit
+            .get("metadata")
+            .and_then(|metadata| metadata.get("collection"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert_ne!(collection, "synapsedx_capability_audit", "{results}");
+        assert!(!collection.starts_with("synapsedx_"), "{results}");
+    }
+    // The machine caller still sees the reserved row.
+    let (status, _, machine_results) = call(
+        &app,
+        "POST",
+        "/v1/search/reindex",
+        &machine,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{machine_results}");
+    let (status, _, machine_hits) = call(
+        &app,
+        "POST",
+        "/v1/search",
+        &machine,
+        Some(json!({"query": "bridge"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        machine_hits["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hit| hit["metadata"]["collection"] == "synapsedx_capability_audit"),
+        "{machine_hits}"
+    );
+}
+
+#[tokio::test]
+async fn machine_only_prefixes_default_to_disabled() {
+    // Default config (no prefixes) keeps the general PaaS behaviour.
+    let state = test_state().await;
+    let app = build_app(state);
+    let headers = user_headers("tenant-a", "user-1");
+    create_collection(&app, &headers, json!({"name": "SynapseDX_legacy"})).await;
+    let (status, _, document) = call(
+        &app,
+        "GET",
+        "/v1/base/collections/SynapseDX_legacy",
+        &headers,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{document}");
+}
+
+#[tokio::test]
 async fn anonymous_callers_are_rejected() {
     let state = test_state().await;
     let app = build_app(state);
@@ -1190,9 +1917,20 @@ async fn document_listing_exposes_total_and_cursor_envelope() {
 #[tokio::test]
 async fn large_collections_are_scanned_in_batches() {
     let state = test_state().await;
+    let database = state
+        .store
+        .ensure_default_database(&crate::store::CollectionScope {
+            org_id: Some("bulk-org".into()),
+            account_id: None,
+            platform: false,
+        })
+        .await
+        .unwrap();
     let collection = state
         .store
         .create_collection(crate::store::CreateCollectionInput {
+            database_id: database.id,
+            database_name: database.name,
             name: "bulk".into(),
             description: None,
             mapping: Default::default(),
@@ -1360,6 +2098,10 @@ async fn internal_secret_gate_protects_v1_and_internal_routes() {
     let headers = user_headers("tenant-a", "user-1");
 
     let (status, _, _) = call(&app, "GET", "/health", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    // Prometheus scrapes /metrics without a credential (static scrape config);
+    // it is a diagnostic endpoint and stays exempt like health.
+    let (status, _, _) = call(&app, "GET", "/metrics", &[], None).await;
     assert_eq!(status, StatusCode::OK);
     let (status, _, _) = call(&app, "GET", "/v1/base/collections", &headers, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -2506,6 +3248,113 @@ async fn query_cursor_round_trip() {
     assert_eq!(spec.offset, 42);
     let bad = crate::query::parse_query_spec(&json!({"cursor": "%%%"}), None);
     assert!(bad.is_err());
+}
+
+/// Optional live-Postgres coverage for the database namespace and its
+/// migration. Skipped unless `BASE_TEST_DATABASE_URL` is set.
+#[tokio::test]
+async fn postgres_database_namespace_when_configured() {
+    let Ok(url) = std::env::var("BASE_TEST_DATABASE_URL") else {
+        return;
+    };
+    if url.trim().is_empty() {
+        return;
+    }
+    let store = Store::connect_with_direct(Some(&url), Some(&url))
+        .await
+        .expect("postgres connect");
+    let mut config = Config::for_test();
+    config.database_url = url;
+    let app = build_app(AppState::new(store, config));
+    let headers = user_headers("live-db-org", "live-db-user");
+    let suffix: String = crate::util::random_id().chars().take(8).collect();
+    let database_name = format!("app_{suffix}");
+    let database = create_database(&app, &headers, json!({"name": database_name})).await;
+
+    let collection =
+        create_collection_in(&app, &headers, &database_name, json!({"name": "users"})).await;
+    assert_eq!(collection["database"], database_name);
+    create_doc_in(
+        &app,
+        &headers,
+        &database_name,
+        "users",
+        json!({"id": "u1", "data": {"name": "Ada"}}),
+    )
+    .await;
+
+    // A same-named collection in the legacy default database must not collide.
+    let default_collection_name = format!("users_{suffix}");
+    create_collection(&app, &headers, json!({"name": default_collection_name})).await;
+    create_doc(
+        &app,
+        &headers,
+        &default_collection_name,
+        json!({"id": "u1", "data": {"name": "Default"}}),
+    )
+    .await;
+
+    let (status, _, value) = call(
+        &app,
+        "GET",
+        &format!("/v1/base/databases/{database_name}/collections/users/documents/u1"),
+        &headers,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["data"]["name"], "Ada");
+
+    let (status, _, value) = call(
+        &app,
+        "GET",
+        &format!("/v1/base/collections/{default_collection_name}/documents/u1"),
+        &headers,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["data"]["name"], "Default");
+    let (status, _, _) = call(
+        &app,
+        "DELETE",
+        &format!("/v1/base/collections/{default_collection_name}"),
+        &headers,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _, _) = call(
+        &app,
+        "DELETE",
+        &format!("/v1/base/databases/{database_name}"),
+        &headers,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _, value) = call(
+        &app,
+        "DELETE",
+        &format!("/v1/base/databases/{database_name}?cascade=true"),
+        &headers,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["deletedCollections"], 1);
+
+    let (status, _, _) = call(
+        &app,
+        "GET",
+        &format!("/v1/base/databases/{database_name}"),
+        &headers,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(database["name"], database_name);
 }
 
 /// Optional live-Postgres coverage. CI runs it when `BASE_TEST_DATABASE_URL`

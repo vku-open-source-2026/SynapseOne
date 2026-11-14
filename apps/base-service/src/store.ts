@@ -14,12 +14,14 @@ import { and, asc, eq, gt, isNull, sql } from 'drizzle-orm';
 import { drizzle, type NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { BaseMapping, cloneJson, deepMerge, getPath, setPath } from './mapping';
-import { baseCollections, baseDocuments, baseOutbox, baseVectors, searchIndex } from './schema';
+import { baseCollections, baseDatabases, baseDocuments, baseOutbox, baseVectors, searchIndex } from './schema';
 import { QuerySpec, QueryResult, VectorSearchSpec, VectorSearchResult, applyVectorSearch, formatQueryPage } from './query';
 import { compileQuery } from './pg-query';
 
 export interface StoredCollection {
   id: string;
+  database_id: string;
+  database_name?: string;
   name: string;
   description: string | null;
   mapping: BaseMapping;
@@ -59,7 +61,9 @@ let db: NodePgDatabase<typeof import('./schema')> | null = null;
 if (DATABASE_URL) {
   pool = new Pool({ connectionString: DATABASE_URL });
   pool.on('error', (e) => console.error('[base][db] pool error', e.message));
-  db = drizzle(pool, { schema: { baseCollections, baseDocuments, baseOutbox, baseVectors, searchIndex } });
+  db = drizzle(pool, {
+    schema: { baseCollections, baseDatabases, baseDocuments, baseOutbox, baseVectors, searchIndex },
+  });
 }
 function getDirectPool(): Pool | null {
   if (!DIRECT_DATABASE_URL) return null;
@@ -123,6 +127,7 @@ function iso(v: Date | string | null | undefined): string {
 function rowToCollection(r: typeof baseCollections.$inferSelect): StoredCollection {
   return {
     id: String(r.id),
+    database_id: String(r.databaseId || ''),
     name: String(r.name || ''),
     description: r.description != null ? String(r.description) : null,
     mapping: r.mapping && typeof r.mapping === 'object' ? (r.mapping as BaseMapping) : { fields: {} },
@@ -162,6 +167,7 @@ function isUniqueViolation(e: any): boolean {
 }
 
 // ---- in-memory fallback ----
+const memDatabases = new Map<string, { id: string; name: string }>();
 const memCollections = new Map<string, StoredCollection>();
 const memDocuments = new Map<string, Map<string, StoredDocument>>();
 const memOutbox: Array<Record<string, any>> = []; // collectionId -> id -> doc
@@ -172,6 +178,39 @@ function sameScope(a: { org_id?: string | null; account_id?: string | null }, b:
   return (a.org_id || '') === (b.org_id || '') && (a.account_id || '') === (b.account_id || '');
 }
 
+/** TypeScript reference backend: every legacy flat collection lives in the
+ *  tenant `default` database, matching the Rust service contract. */
+async function ensureDefaultDatabaseRec(
+  org_id: string | null | undefined,
+  account_id: string | null | undefined,
+): Promise<{ id: string; name: string }> {
+  if (db) {
+    await ensureTables();
+    const scope = and(
+      eq(baseDatabases.name, 'default'),
+      org_id ? eq(baseDatabases.orgId, org_id) : isNull(baseDatabases.orgId),
+      account_id ? eq(baseDatabases.accountId, account_id) : isNull(baseDatabases.accountId),
+    );
+    const existing = await db.select().from(baseDatabases).where(scope).limit(1);
+    if (existing[0]) return { id: existing[0].id, name: existing[0].name };
+    const id = randomUUID();
+    await db
+      .insert(baseDatabases)
+      .values({ id, name: 'default', orgId: org_id ?? null, accountId: account_id ?? null })
+      .onConflictDoNothing();
+    const again = await db.select().from(baseDatabases).where(scope).limit(1);
+    if (again[0]) return { id: again[0].id, name: again[0].name };
+    throw new StoreError('invalid', 'default database could not be created');
+  }
+  const key = `${org_id || ''}/${account_id || ''}`;
+  let record = memDatabases.get(key);
+  if (!record) {
+    record = { id: randomUUID(), name: 'default' };
+    memDatabases.set(key, record);
+  }
+  return record;
+}
+
 export async function createCollectionRec(input: {
   name: string;
   description?: string | null;
@@ -180,8 +219,11 @@ export async function createCollectionRec(input: {
   account_id?: string | null;
   created_by?: string | null;
 }): Promise<StoredCollection> {
+  const database = await ensureDefaultDatabaseRec(input.org_id, input.account_id);
   const rec: StoredCollection = {
     id: randomUUID(),
+    database_id: database.id,
+    database_name: database.name,
     name: input.name,
     description: input.description ?? null,
     mapping: input.mapping,
@@ -195,6 +237,7 @@ export async function createCollectionRec(input: {
     await ensureTables();
     const rows = await db.insert(baseCollections).values({
       id: rec.id,
+      databaseId: rec.database_id,
       name: rec.name,
       description: rec.description,
       mapping: rec.mapping,

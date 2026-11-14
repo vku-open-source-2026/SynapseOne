@@ -87,6 +87,22 @@ describe('console silent refresh', () => {
     assert.equal(sessions.refreshCalls, 0);
   });
 
+  it('does not replay password/MFA challenges or rotate sessions on credential errors', async () => {
+    const seen = [];
+    authStore.get = () => ({ token: 'newer-stored-token', refreshToken: 'refresh-still-live' });
+    globalThis.fetch = async (url, init = {}) => {
+      seen.push({ path: new URL(url).pathname, body: JSON.parse(init.body) });
+      return { status: 401, ok: false, text: async () => JSON.stringify({ error: 'invalid_credentials' }) };
+    };
+    await assert.rejects(() => api.switchContext('target-org', 'target-password', { token: 'current-token' }), /401/);
+    for (const path of ['/v1/platform/session', '/v1/platform/session?challenge=1', '/v1/auth/mfa/verify']) {
+      await assert.rejects(() => api.call('POST', path, { code: 'invalid-test-code' }, { token: 'current-token' }), /401/);
+    }
+    assert.equal(seen.length, 4, 'exactly one HTTP request per credential attempt');
+    assert.deepEqual(seen[0], { path: '/v1/auth/contexts/switch', body: { orgId: 'target-org', password: 'target-password' } });
+    assert.equal(seen.some((call) => call.path === '/v1/auth/refresh'), false);
+  });
+
   it('generic call() rotates silently and preserves error status', async () => {
     const sessions = { refreshCalls: 0, validAccess: new Set(['good-tok']), validRefresh: new Map([['rt-1', 'tok-2']]) };
     stubFetch(sessions);

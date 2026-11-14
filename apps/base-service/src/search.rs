@@ -34,6 +34,10 @@ pub struct SearchScope {
     pub org_id: Option<String>,
     pub account_id: Option<String>,
     pub subject: Option<String>,
+    /// Operator/machine caller (account-level key or service account). When
+    /// false, collections matching the deployment's machine-only prefixes are
+    /// excluded from results so reserved names and snippets never leak.
+    pub machine: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -246,6 +250,7 @@ pub fn project_document(
     let body = text_of(&document.data);
     let title = title_of(document);
     let metadata = json!({
+        "database": &collection.database_name,
         "type": document
             .data
             .get("type")
@@ -731,6 +736,14 @@ pub async fn search_records(
     }
     let mut rows = load_records(store, scope).await?;
     rows.retain(|record| acl_allows(record, scope));
+    if !scope.machine {
+        rows.retain(|record| {
+            !crate::util::is_reserved_collection(
+                &record.collection_name,
+                &config.machine_collection_prefixes,
+            )
+        });
+    }
     if let Some(collection) = &options.collection {
         rows.retain(|record| {
             &record.collection_name == collection || &record.collection_id == collection

@@ -37,6 +37,49 @@ pub fn valid_header_value(value: &str) -> bool {
     value.len() <= 128 && !value.chars().any(|c| c.is_control())
 }
 
+/// Parse `SYNAPSEONE_BASE_MACHINE_COLLECTION_PREFIXES` (comma-separated,
+/// case-insensitive prefixes such as `synapsedx_`). A trailing `*` is accepted
+/// for readability. Invalid entries are dropped (and logged) rather than
+/// silently widening or narrowing access.
+pub fn parse_collection_prefixes(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in raw.split(',') {
+        let value = entry
+            .trim()
+            .trim_end_matches('*')
+            .trim()
+            .to_ascii_lowercase();
+        if value.is_empty() {
+            continue;
+        }
+        if value.len() > 40
+            || !value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            tracing::warn!(
+                "[base][security] ignoring invalid machine collection prefix '{}' (want [A-Za-z0-9_-]{{1,40}})",
+                entry.trim()
+            );
+            continue;
+        }
+        if !out.iter().any(|existing| existing == &value) {
+            out.push(value);
+        }
+    }
+    out
+}
+
+/// Collection names matching a machine-only prefix are reserved for operator
+/// credentials: they never belong to an end-user tenant session.
+pub fn is_reserved_collection(name: &str, prefixes: &[String]) -> bool {
+    if prefixes.is_empty() {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    prefixes.iter().any(|prefix| lower.starts_with(prefix))
+}
+
 /// Forward only tenant scope headers; returns None when the caller has none.
 pub fn tenant_headers(headers: &HeaderMap) -> Option<Vec<(String, String)>> {
     let mut out: Vec<(String, String)> = Vec::new();

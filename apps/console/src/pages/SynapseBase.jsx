@@ -65,6 +65,8 @@ const SAMPLE_DOC = JSON.stringify(
 export default function SynapseBase() {
   const { headers } = useAuth();
   const [collections, setCollections] = useState([]);
+  const [databases, setDatabases] = useState([]);
+  const [selectedDb, setSelectedDb] = useState('');
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState(null);
   const [selectedCol, setSelectedCol] = useState(null);
@@ -115,17 +117,27 @@ export default function SynapseBase() {
 
   const loadSeq = useRef(0);
 
+  const loadDatabases = async () => {
+    try {
+      const res = await api.baseDatabases(headers);
+      setDatabases(Array.isArray(res) ? res : []);
+    } catch (e) {
+      setErr(e);
+    }
+  };
+
   const loadCollections = async () => {
     const seq = ++loadSeq.current;
     setLoading(true);
     setErr(null);
     try {
-      const res = await api.baseCollections(headers);
+      const res = await api.baseCollections(headers, selectedDb || undefined);
       if (seq === loadSeq.current) {
         const list = Array.isArray(res) ? res : [];
         setCollections(list);
         if (list.length > 0 && !selectedCol) {
           setSelectedCol(list[0].name);
+          setSelectedDb(list[0].database || '');
         } else if (list.length === 0) {
           setSelectedCol(null);
         }
@@ -138,10 +150,26 @@ export default function SynapseBase() {
   };
 
   useEffect(() => {
+    loadDatabases();
     loadCollections();
   }, [headers]);
 
-  const currentCollection = collections.find((c) => c.name === selectedCol);
+  useEffect(() => {
+    loadCollections();
+  }, [selectedDb]);
+
+  const currentCollection = collections.find(
+    (c) => c.name === selectedCol && (!selectedDb || c.database === selectedDb),
+  );
+  const currentDatabase = databases.find((database) => database.name === selectedDb);
+  // The default database is created lazily by the legacy flat route; do not
+  // address it under /databases/default until it exists.
+  const dbArg =
+    selectedDb &&
+    (selectedDb !== 'default' ||
+      databases.some((database) => database.name === 'default'))
+      ? selectedDb
+      : undefined;
 
   // Sync mapping draft when collection changes
   useEffect(() => {
@@ -156,12 +184,12 @@ export default function SynapseBase() {
     setDocsLoading(true);
     try {
       if (viewMode === 'object') {
-        const qRes = await api.baseQuery(selectedCol, { as: 'object', limit: 50 }, headers);
+        const qRes = await api.baseQuery(selectedCol, { as: 'object', limit: 50 }, headers, dbArg);
         const items = qRes?.items || [];
         setDocs(items);
         setDocsTotal(qRes?.total ?? items.length);
       } else {
-        const res = await api.baseDocuments(selectedCol, { limit: 50 }, headers);
+        const res = await api.baseDocuments(selectedCol, { limit: 50 }, headers, dbArg);
         const items = Array.isArray(res) ? res : (res?.items || []);
         setDocs(items);
         setDocsTotal(res?.total ?? items.length);
@@ -178,14 +206,14 @@ export default function SynapseBase() {
       loadDocs();
       if (activeTab === 'changes') loadChanges();
     }
-  }, [selectedCol, viewMode, activeTab]);
+  }, [selectedCol, selectedDb, dbArg, viewMode, activeTab]);
 
   const loadChanges = async () => {
     if (!selectedCol) return;
     setChangesLoading(true);
     try {
       const past = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
-      const res = await api.baseChanges(selectedCol, { since: past, limit: 30 }, headers);
+      const res = await api.baseChanges(selectedCol, { since: past, limit: 30 }, headers, dbArg);
       setChanges(res?.changes || []);
     } catch (e) {
       setErr(e);
@@ -209,8 +237,10 @@ export default function SynapseBase() {
           name: newColName.trim(),
           description: newColDesc.trim() || undefined,
           mapping,
+          ...(dbArg ? { database: dbArg } : {}),
         },
         headers,
+        dbArg,
       );
       setCreateColOpen(false);
       setNewColName('');
@@ -224,11 +254,14 @@ export default function SynapseBase() {
     }
   };
 
-  const handleDeleteCollection = async (name) => {
+  const handleDeleteCollection = async (name, database) => {
     if (!window.confirm(`Delete collection "${name}" and all its documents?`)) return;
     try {
-      await api.baseDeleteCollection(name, headers);
-      if (selectedCol === name) setSelectedCol(null);
+      const targetDb = database || dbArg;
+      await api.baseDeleteCollection(name, headers, targetDb);
+      if (selectedCol === name && (!selectedDb || selectedDb === targetDb)) {
+        setSelectedCol(null);
+      }
       await loadCollections();
     } catch (e) {
       setErr(e);
@@ -244,9 +277,9 @@ export default function SynapseBase() {
       const parsed = JSON.parse(docPayload);
       const body = { [docMode]: parsed };
       if (editingDocId) {
-        await api.baseUpdateDocument(selectedCol, editingDocId, body, headers);
+        await api.baseUpdateDocument(selectedCol, editingDocId, body, headers, dbArg);
       } else {
-        await api.baseCreateDocument(selectedCol, body, headers);
+        await api.baseCreateDocument(selectedCol, body, headers, dbArg);
       }
       setDocModalOpen(false);
       setEditingDocId('');
@@ -261,7 +294,7 @@ export default function SynapseBase() {
   const handleDeleteDoc = async (id) => {
     if (!window.confirm(`Delete document "${id}"?`)) return;
     try {
-      await api.baseDeleteDocument(selectedCol, id, headers);
+      await api.baseDeleteDocument(selectedCol, id, headers, dbArg);
       await loadDocs();
     } catch (e) {
       setErr(e);
@@ -274,7 +307,7 @@ export default function SynapseBase() {
     setIncrSubmitting(true);
     setErr(null);
     try {
-      await api.baseIncrement(selectedCol, incrDocId, { field: incrField, by: Number(incrBy) }, headers);
+      await api.baseIncrement(selectedCol, incrDocId, { field: incrField, by: Number(incrBy) }, headers, dbArg);
       setIncrModalOpen(false);
       await loadDocs();
     } catch (e) {
@@ -290,7 +323,7 @@ export default function SynapseBase() {
     setMappingMsg(null);
     try {
       const parsed = JSON.parse(mappingDraft);
-      await api.baseUpdateCollection(selectedCol, { mapping: parsed }, headers);
+      await api.baseUpdateCollection(selectedCol, { mapping: parsed }, headers, dbArg);
       setMappingMsg({ type: 'success', text: 'Mapping updated successfully.' });
       await loadCollections();
     } catch (e) {
@@ -315,12 +348,58 @@ export default function SynapseBase() {
           limit: 30,
         },
         headers,
+        dbArg,
       );
       setQueryResult(res);
     } catch (e) {
       setQueryResult({ error: e.message || String(e) });
     } finally {
       setQueryRunning(false);
+    }
+  };
+
+  const handleCreateDatabase = async () => {
+    const name = window.prompt('New database name (letters, numbers, _ or -):');
+    if (!name || !name.trim()) return;
+    try {
+      await api.baseCreateDatabase({ name: name.trim() }, headers);
+      await loadDatabases();
+      setSelectedCol(null);
+      setSelectedDb(name.trim());
+    } catch (e) {
+      setErr(e);
+    }
+  };
+
+  const handleRenameDatabase = async () => {
+    if (!selectedDb) return;
+    const nextName = window.prompt('Database name', selectedDb);
+    if (!nextName || !nextName.trim() || nextName.trim() === selectedDb) return;
+    try {
+      await api.baseUpdateDatabase(selectedDb, { name: nextName.trim() }, headers);
+      await loadDatabases();
+      setSelectedDb(nextName.trim());
+      await loadCollections();
+    } catch (e) {
+      setErr(e);
+    }
+  };
+
+  const handleDeleteDatabase = async () => {
+    if (!selectedDb) return;
+    const stats = currentDatabase?.stats;
+    const warning = stats?.collections
+      ? `Database "${selectedDb}" contains ${stats.collections} collection(s). Delete the database AND all its collections/documents?`
+      : `Delete database "${selectedDb}"?`;
+    if (!window.confirm(warning)) return;
+    try {
+      await api.baseDeleteDatabase(selectedDb, headers);
+      setSelectedDb('');
+      setSelectedCol(null);
+      await loadDatabases();
+      await loadCollections();
+    } catch (e) {
+      setErr(e);
     }
   };
 
@@ -357,6 +436,53 @@ export default function SynapseBase() {
         {/* Left column: Collections list */}
         <Card className="lg:col-span-1 p-4 flex flex-col h-[75vh]">
           <div className="mb-3">
+            <div className="flex items-center gap-2 mb-2">
+              <select
+                value={selectedDb}
+                onChange={(e) => {
+                  setSelectedDb(e.target.value);
+                  setSelectedCol(null);
+                }}
+                className="min-w-0 flex-1 px-2 py-1.5 rounded-xl border border-slate-200 text-xs text-main-text outline-none focus:border-main-blue bg-white"
+                title="Database namespace"
+              >
+                <option value="">All databases</option>
+                {databases.map((database) => (
+                  <option key={database.id || database.name} value={database.name}>
+                    {database.name} ({database.stats?.collections ?? 0})
+                  </option>
+                ))}
+              </select>
+              <button
+                onClick={handleCreateDatabase}
+                title="New database"
+                className="px-2 py-1.5 rounded-xl border border-slate-200 text-xs text-main-blue hover:bg-main-blue/10"
+              >
+                <FontAwesomeIcon icon={faPlus} />
+              </button>
+              <button
+                onClick={handleRenameDatabase}
+                disabled={!selectedDb}
+                title="Rename database"
+                className="px-2 py-1.5 rounded-xl border border-slate-200 text-xs text-main-blue hover:bg-main-blue/10 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <FontAwesomeIcon icon={faPen} />
+              </button>
+              <button
+                onClick={handleDeleteDatabase}
+                disabled={!selectedDb}
+                title="Delete database"
+                className="px-2 py-1.5 rounded-xl border border-slate-200 text-xs text-red-500 hover:bg-red-50 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <FontAwesomeIcon icon={faTrash} />
+              </button>
+            </div>
+            {currentDatabase && (
+              <p className="mb-2 text-[11px] text-normal-text">
+                {currentDatabase.stats?.collections ?? 0} collections ·{' '}
+                {currentDatabase.stats?.documents ?? 0} documents
+              </p>
+            )}
             <h3 className="font-semibold text-sm text-main-text mb-2 flex items-center justify-between">
               <span>Collections</span>
               <Badge tone="blue">{collections.length}</Badge>
@@ -383,11 +509,16 @@ export default function SynapseBase() {
               <p className="text-xs text-normal-text text-center py-6">No collections found.</p>
             ) : (
               filteredCollections.map((col) => {
-                const isSelected = col.name === selectedCol;
+                const isSelected =
+                  col.name === selectedCol &&
+                  (!selectedDb || col.database === selectedDb);
                 return (
                   <div
-                    key={col.name}
-                    onClick={() => setSelectedCol(col.name)}
+                    key={`${col.database || 'default'}/${col.name}`}
+                    onClick={() => {
+                      setSelectedCol(col.name);
+                      if (col.database) setSelectedDb(col.database);
+                    }}
                     className={`p-3 rounded-2xl cursor-pointer transition-all border text-left flex items-start justify-between group ${
                       isSelected
                         ? 'border-main-blue bg-main-blue/10 text-main-blue font-medium shadow-sm'
@@ -403,6 +534,7 @@ export default function SynapseBase() {
                         <p className="text-xs text-normal-text truncate mt-0.5">{col.description}</p>
                       )}
                       <div className="mt-1 flex items-center gap-2 text-[11px] text-normal-text">
+                        {col.database && <span>· {col.database}</span>}
                         <span>{col.stats?.documentCount ?? 0} docs</span>
                         {col.mapping?.fields && <span>· mapped</span>}
                       </div>
@@ -410,7 +542,7 @@ export default function SynapseBase() {
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        handleDeleteCollection(col.name);
+                        handleDeleteCollection(col.name, col.database);
                       }}
                       title="Delete collection"
                       className="opacity-0 group-hover:opacity-100 p-1 text-normal-text hover:text-red-500 transition-opacity"
