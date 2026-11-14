@@ -9,6 +9,7 @@ export default function AdminPlatformAdmins() {
   const platform = usePlatformAuth();
   const [rows, setRows] = useState([]);
   const [err, setErr] = useState(null);
+  const [actionErr, setActionErr] = useState(null);
   const [loaded, setLoaded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [open, setOpen] = useState(false);
@@ -22,6 +23,7 @@ export default function AdminPlatformAdmins() {
 
   const load = useCallback(async () => {
     setErr(null);
+    setActionErr(null);
     setLoading(true);
     try {
       const out = await platform.request('/v1/platform/admins');
@@ -87,6 +89,7 @@ export default function AdminPlatformAdmins() {
         right={<div className="flex gap-2"><Btn kind="secondary" onClick={load} loading={loading}>Refresh</Btn><Btn onClick={() => { setOpen(true); setFormErr(null); setForm({ email: '', role: 'operator', reason: '', code: '' }); }}>+ Grant administrator</Btn></div>}
       />
       <Err e={err} />
+      <Err e={actionErr} />
       <div role="status" aria-live="polite">
         {notice && <div className="mb-4 px-4 py-2.5 rounded-2xl bg-emerald-500/10 text-emerald-700 text-sm">{notice}</div>}
       </div>
@@ -107,7 +110,7 @@ export default function AdminPlatformAdmins() {
                 <td className="py-2 pr-4 text-xs text-normal-text max-w-48 truncate" title={a.reason || ''}>{a.reason || '–'}</td>
                 <td className="py-2 text-right">
                   {!a.revoked_at && (
-                    <button type="button" onClick={() => { if (a.user_id === platform.user?.id) { setErr(Object.assign(new Error('You cannot revoke your own platform administrator access. Ask another owner.'), { code: 'self_revoke_forbidden' })); return; } setRevoke(a); }} className="text-xs text-red-500 hover:underline">Revoke</button>
+                    <button type="button" onClick={() => { if (a.user_id === platform.user?.id) { setActionErr(Object.assign(new Error('You cannot revoke your own platform administrator access. Ask another owner.'), { code: 'self_revoke_forbidden' })); return; } setRevoke(a); }} className="text-xs text-red-500 hover:underline">Revoke</button>
                   )}
                 </td>
               </tr>
