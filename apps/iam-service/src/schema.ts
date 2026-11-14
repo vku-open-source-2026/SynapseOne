@@ -174,6 +174,37 @@ export const apiKeys = pgTable(
   ],
 );
 
+/**
+ * Platform runner keys are system compute credentials. Unlike tenant API keys
+ * they have no account/user owner: they authenticate a SynapseOne-owned runner
+ * that any platform owner manages and that can claim work for every tenant.
+ * The plaintext value is returned once; only the hash is stored.
+ */
+export const platformRunnerKeys = pgTable(
+  'platform_runner_keys',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    /** Workflow runner registration id this key is bound to. */
+    runnerId: text('runner_id').notNull(),
+    name: text('name').notNull().default(''),
+    keyPrefix: text('key_prefix').notNull(),
+    keyHash: text('key_hash').notNull(),
+    scopes: text('scopes').array().notNull().default(sql`'{}'::text[]`),
+    createdBy: uuid('created_by'),
+    expiresAt: timestamp('expires_at', { withTimezone: true }),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('platform_runner_keys_key_hash_key').on(t.keyHash),
+    index('idx_platform_runner_keys_runner').on(t.runnerId),
+    index('idx_platform_runner_keys_expiry')
+      .on(t.expiresAt)
+      .where(sql`${t.revokedAt} is null`),
+  ],
+);
+
 export const serviceAccounts = pgTable(
   'service_accounts',
   {

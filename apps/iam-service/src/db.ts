@@ -112,6 +112,7 @@ const mem = {
   rolePolicies: new Map<string, Set<string>>(), // roleId -> policyIds
   userRoles: new Map<string, Set<string>>(), // userId -> roleIds
   apiKeys: new Map<string, any>(), // hash -> record
+  platformRunnerKeys: new Map<string, any>(), // hash -> record
   refresh: new Map<string, any>(),
   serviceAccounts: new Map<string, any>(),
   passwordResets: new Map<string, any>(), // hash -> { user_id, purpose, expires_at, used_at }
