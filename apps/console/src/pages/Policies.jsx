@@ -31,6 +31,7 @@ export default function Policies() {
   const [loaded, setLoaded] = useState(false);
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [formErr, setFormErr] = useState(null);
   const [view, setView] = useState(null);
   const [slug, setSlug] = useState('');
   const [doc, setDoc] = useState(SAMPLE);
@@ -87,7 +88,7 @@ export default function Policies() {
       setSlug('');
       load();
     } catch (ex) {
-      setErr(ex);
+      setFormErr(ex);
     } finally {
       setBusy(false);
     }
@@ -105,7 +106,7 @@ export default function Policies() {
 
   return (
     <>
-      <PageTitle title="Policies" sub="AWS-style JSON: Allow/Deny + Action/Resource + Condition" right={canAdmin ? <Btn onClick={() => setOpen(true)}>+ New</Btn> : undefined} />
+      <PageTitle title="Policies" sub="AWS-style JSON: Allow/Deny + Action/Resource + Condition" right={canAdmin ? <Btn onClick={() => { setFormErr(null); setOpen(true); }}>+ New</Btn> : undefined} />
       <Err e={err} />
       <ScopeBar scope={scope} />
       <Card>
@@ -131,8 +132,8 @@ export default function Policies() {
         )}
       </Card>
       {open && (
-        <Modal title="New policy" onClose={() => setOpen(false)}>
-          <form onSubmit={create}>
+        <Modal title="New policy" onClose={() => { setOpen(false); setFormErr(null); }}>
+          <form onSubmit={create}><Err e={formErr} />
             {managed.length > 0 && (
               <Field label="Start from an AWS-style managed policy (optional)">
                 <select defaultValue="" onChange={(e) => pickManaged(e.target.value)} className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm outline-none focus:border-main-blue">

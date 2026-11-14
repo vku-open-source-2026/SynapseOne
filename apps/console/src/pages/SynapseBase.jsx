@@ -88,7 +88,7 @@ export default function SynapseBase() {
   const [docModalOpen, setDocModalOpen] = useState(false);
   const [editingDocId, setEditingDocId] = useState('');
   const [docPayload, setDocPayload] = useState(SAMPLE_DOC);
-  const [docMode, setDocMode] = useState('object');
+  const [docMode, setDocMode] = useState('data');
   const [docSubmitting, setDocSubmitting] = useState(false);
 
   const [incrModalOpen, setIncrModalOpen] = useState(false);
@@ -157,12 +157,14 @@ export default function SynapseBase() {
     try {
       if (viewMode === 'object') {
         const qRes = await api.baseQuery(selectedCol, { as: 'object', limit: 50 }, headers);
-        setDocs(qRes?.items || []);
-        setDocsTotal(qRes?.total ?? (qRes?.items?.length || 0));
+        const items = qRes?.items || [];
+        setDocs(items);
+        setDocsTotal(qRes?.total ?? items.length);
       } else {
         const res = await api.baseDocuments(selectedCol, { limit: 50 }, headers);
-        setDocs(res?.items || []);
-        setDocsTotal(res?.total ?? (res?.items?.length || 0));
+        const items = Array.isArray(res) ? res : (res?.items || []);
+        setDocs(items);
+        setDocsTotal(res?.total ?? items.length);
       }
     } catch (e) {
       setErr(e);
@@ -349,7 +351,7 @@ export default function SynapseBase() {
         }
       />
 
-      {err && <Err err={err} className="mb-6" />}
+      {err && <Err e={err} />}
 
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
         {/* Left column: Collections list */}
@@ -475,6 +477,8 @@ export default function SynapseBase() {
                       onClick={() => {
                         setEditingDocId('');
                         setDocPayload(SAMPLE_DOC);
+                        const mapping = currentCollection?.mapping;
+                        setDocMode(mapping && typeof mapping === 'object' && Object.keys(mapping).length ? 'object' : 'data');
                         setDocModalOpen(true);
                       }}
                     >

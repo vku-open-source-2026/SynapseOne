@@ -106,11 +106,12 @@ export default function SynapseFaststore() {
       );
       if (seq === loadSeq.current) {
         const list = res?.keys || [];
-        setKeys(list);
+        setKeys((prev) => (c ? [...prev, ...list] : list));
         setCursor(res?.cursor || null);
         setHasMore(!!res?.truncated);
         if (list.length > 0 && !selectedKey) {
-          inspectKey(list[0].key || list[0]);
+          const first = list[0];
+          inspectKey(first.key || first, typeof first === 'object' ? first.type : 'string');
         }
       }
     } catch (e) {
@@ -125,20 +126,26 @@ export default function SynapseFaststore() {
     loadKeys();
   }, [headers]);
 
-  const inspectKey = async (keyName) => {
+  const inspectKey = async (keyName, keyType = 'string') => {
     setSelectedKey(keyName);
     setDetailLoading(true);
     try {
+      const reader = keyType === 'hash' ? api.faststoreHashGet(keyName, headers)
+        : keyType === 'list' ? api.faststoreListGet(keyName, { start: 0, stop: -1 }, headers)
+        : keyType === 'set' ? api.faststoreSetGet(keyName, headers)
+        : keyType === 'zset' ? api.faststoreZsetGet(keyName, { start: 0, stop: -1 }, headers)
+        : api.faststoreGet(keyName, headers);
       const [val, ttlRes] = await Promise.all([
-        api.faststoreGet(keyName, headers),
+        reader,
         api.faststoreTtl(keyName, headers).catch(() => ({ ttlSeconds: -1 })),
       ]);
       setKeyDetail({
         ...val,
+        type: keyType,
         ttlSeconds: ttlRes?.ttlSeconds ?? val?.ttlSeconds ?? -1,
       });
     } catch (e) {
-      setKeyDetail({ key: keyName, error: e.message || String(e) });
+      setKeyDetail({ key: keyName, type: keyType, error: e.message || String(e) });
     } finally {
       setDetailLoading(false);
     }
@@ -162,7 +169,8 @@ export default function SynapseFaststore() {
       if (newType === 'string') {
         await api.faststoreSet(newKey.trim(), { value: parsedValue, ttlSeconds: ttl }, headers);
       } else if (newType === 'hash') {
-        await api.faststoreHashSet(newKey.trim(), typeof parsedValue === 'object' ? parsedValue : { val: parsedValue }, headers);
+        const hash = (parsedValue && typeof parsedValue === 'object' && !Array.isArray(parsedValue)) ? parsedValue : { val: parsedValue };
+        await api.faststoreHashSet(newKey.trim(), { values: hash }, headers);
       } else if (newType === 'list') {
         const arr = Array.isArray(parsedValue) ? parsedValue : [parsedValue];
         await api.faststoreListPush(newKey.trim(), { values: arr, side: 'right' }, headers);
@@ -284,7 +292,7 @@ export default function SynapseFaststore() {
         }
       />
 
-      {err && <Err err={err} className="mb-6" />}
+      {err && <Err e={err} />}
 
       {/* Top summary cards */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
@@ -392,7 +400,7 @@ export default function SynapseFaststore() {
                   return (
                     <div
                       key={keyName}
-                      onClick={() => inspectKey(keyName)}
+                      onClick={() => inspectKey(keyName, keyType)}
                       className={`p-2.5 rounded-2xl cursor-pointer transition-all border text-left flex items-center justify-between group ${
                         isSelected
                           ? 'border-main-blue bg-main-blue/10 text-main-blue font-medium'
@@ -416,6 +424,16 @@ export default function SynapseFaststore() {
                     </div>
                   );
                 })
+              )}
+              {hasMore && (
+                <button
+                  type="button"
+                  onClick={() => loadKeys(cursor)}
+                  disabled={keysLoading}
+                  className="w-full mt-2 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-xs font-medium text-main-text disabled:opacity-60"
+                >
+                  {keysLoading ? 'Loading…' : 'Load more keys'}
+                </button>
               )}
             </div>
           </Card>

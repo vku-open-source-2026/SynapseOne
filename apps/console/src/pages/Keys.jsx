@@ -28,8 +28,9 @@ export default function Keys() {
   const [err, setErr] = useState(null);
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [formErr, setFormErr] = useState(null);
   const [name, setName] = useState('console');
-  const [scopes, setScopes] = useState('*');
+  const [scopes, setScopes] = useState('*:read');
   const [bindToMe, setBindToMe] = useState(true);
   const [created, setCreated] = useState(null);
   const [revoking, setRevoking] = useState(null);
@@ -89,7 +90,7 @@ export default function Keys() {
       setOpen(false);
       load();
     } catch (ex) {
-      setErr(ex);
+      setFormErr(ex);
     } finally {
       setBusy(false);
     }
@@ -147,7 +148,7 @@ export default function Keys() {
 
   return (
     <>
-      <PageTitle title="API Keys & Sessions" sub="Scoped, owner-bound, rotatable credentials, secrets are shown only once" right={<Btn onClick={() => setOpen(true)}>+ New key</Btn>} />
+      <PageTitle title="API Keys & Sessions" sub="Scoped, owner-bound, rotatable credentials, secrets are shown only once" right={<Btn onClick={() => { setFormErr(null); setOpen(true); }}>+ New key</Btn>} />
       <Err e={err} />
       <ScopeBar scope={scope} />
       <Card>
@@ -233,8 +234,8 @@ export default function Keys() {
         </Modal>
       )}
       {open && (
-        <Modal title="New API key" onClose={() => setOpen(false)}>
-          <form onSubmit={create}>
+        <Modal title="New API key" onClose={() => { setOpen(false); setFormErr(null); }}>
+          <form onSubmit={create}><Err e={formErr} />
             <Field label="Key name">
               <Input value={name} onChange={(e) => setName(e.target.value)} />
             </Field>

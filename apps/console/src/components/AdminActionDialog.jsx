@@ -15,6 +15,7 @@ export default function AdminActionDialog({
   action,
   confirmLabel = 'Confirm',
   requireReason = false,
+  minReasonLength = 1,
   requireStepUp = true,
   danger = true,
   onClose,
@@ -36,12 +37,17 @@ export default function AdminActionDialog({
 
   if (!open) return null;
   const needsCode = requireStepUp && platform.stepUpRequired;
+  const reasonTooShort = requireReason && reason.trim().length < minReasonLength;
 
   const submit = async (e) => {
     e.preventDefault();
     setErr(null);
     setBusy(true);
     try {
+      if (reasonTooShort) {
+        setErr(new Error(`Reason must be at least ${minReasonLength} characters.`));
+        return;
+      }
       const step = needsCode ? await platform.stepUp(code.trim(), action) : null;
       await onConfirm({ reason: reason.trim(), stepUpToken: step?.token, action });
       onClose();
@@ -69,7 +75,7 @@ export default function AdminActionDialog({
           </Field>
         )}
         {requireReason && (
-          <Field label="Reason (recorded in the audit log)">
+          <Field label={`Reason (recorded in the audit log${minReasonLength > 1 ? `, min ${minReasonLength} chars` : ''})`}>
             <Input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Why is this action needed?" />
           </Field>
         )}
@@ -78,7 +84,7 @@ export default function AdminActionDialog({
             type="submit"
             kind={danger ? 'danger' : 'primary'}
             loading={busy}
-            disabled={busy || (needsCode && !code.trim()) || (requireReason && !reason.trim())}
+            disabled={busy || (needsCode && !code.trim()) || reasonTooShort}
           >
             {confirmLabel}
           </Btn>

@@ -347,7 +347,7 @@ export default function SynapseQueue() {
         }
       />
 
-      {err && <Err err={err} className="mb-6" />}
+      {err && <Err e={err} />}
 
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
         {/* Left column: Queues list */}
@@ -453,7 +453,7 @@ export default function SynapseQueue() {
                 <Card className="p-4 text-center">
                   <span className="text-xs text-normal-text block">Total Delivered</span>
                   <span className="text-2xl font-bold text-emerald-600 mt-1 block">
-                    {stats?.delivered ?? stats?.ackCount ?? 0}
+                    {stats?.acked ?? 0}
                   </span>
                 </Card>
               </div>
@@ -525,13 +525,13 @@ export default function SynapseQueue() {
                             <Badge tone={m.attempts > 1 ? 'amber' : 'gray'}>{m.attempts}x</Badge>
                           </td>
                           <td className="py-2.5 pr-3 text-xs text-normal-text">
-                            {m.delayRemaining ? `${Math.round(m.delayRemaining)}s delay` : 'Ready'}
+                            {m.availableAt && new Date(m.availableAt).getTime() > Date.now() ? `${Math.max(1, Math.round((new Date(m.availableAt).getTime() - Date.now()) / 1000))}s delay` : 'Ready'}
                           </td>
                           <td className="py-2.5 pr-3 font-mono text-xs text-normal-text max-w-sm truncate">
                             {JSON.stringify(m.payload)}
                           </td>
                           <td className="py-2.5 pr-3 text-xs text-normal-text whitespace-nowrap">
-                            {m.createdAt ? new Date(m.createdAt).toLocaleTimeString() : 'now'}
+                            {m.publishedAt ? new Date(m.publishedAt).toLocaleTimeString() : '–'}
                           </td>
                         </tr>
                       ))}
@@ -652,7 +652,7 @@ export default function SynapseQueue() {
                         <tr key={d.id} className="border-b border-slate-100 hover:bg-slate-50/50">
                           <td className="py-2.5 pr-3 font-mono text-xs font-semibold text-red-500">{d.id}</td>
                           <td className="py-2.5 pr-3 text-xs text-red-600 max-w-xs truncate">
-                            {d.error || 'Max attempts reached'}
+                            {d.lastError || 'Max attempts reached'}
                           </td>
                           <td className="py-2.5 pr-3 text-xs">
                             <Badge tone="red">{d.attempts}x</Badge>

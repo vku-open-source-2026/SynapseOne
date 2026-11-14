@@ -26,6 +26,7 @@ export default function AdminUserDetail() {
     }
   }, [platform, userId]);
 
+  useEffect(() => { setData(null); setErr(null); setNotice(null); setInvite(null); setConfirm(null); }, [userId]);
   useEffect(() => { load(); }, [load]);
 
   const run = async ({ reason, stepUpToken }) => {
@@ -43,7 +44,7 @@ export default function AdminUserDetail() {
     await load();
   };
 
-  if (err) {
+  if (err && !data) {
     return (
       <>
         <PageTitle title="User" right={<Link to="/admin/users" className="text-sm text-main-blue hover:underline">Back</Link>} />
@@ -68,22 +69,32 @@ export default function AdminUserDetail() {
       kind: 'org-admin', action: 'user:org-admin', method: 'PUT',
       label: u.is_org_admin ? 'Revoke org admin' : 'Grant org admin',
       danger: !!u.is_org_admin, requireReason: true,
+      message: u.is_org_admin
+        ? 'Revokes organization-administrator rights. The last active org admin cannot be removed.'
+        : 'Grants organization-administrator rights for this organization.',
     },
     ...(mfa.enabled ? [{
       kind: 'reset-mfa', action: 'user:reset-mfa', label: 'Reset MFA', danger: true,
+      message: 'Removes TOTP MFA and revokes all refresh sessions and API keys for this user.',
     }] : []),
     {
       kind: 'revoke-sessions', action: 'user:revoke-sessions', label: 'Revoke sessions', danger: true,
+      message: 'Revokes refresh sessions and user-owned API keys. The user must sign in again.',
     },
     {
       kind: active ? 'disable' : 'enable', action: active ? 'user:disable' : 'user:enable',
       label: active ? 'Disable user' : 'Enable user', danger: active,
+      message: active
+        ? 'Deactivates the account and revokes its sessions and API keys.'
+        : 'Reactivates the account. Previous sessions remain revoked.',
     },
     ...(data.lockedForSeconds > 0 ? [{
       kind: 'unlock', action: 'user:unlock', label: 'Unlock sign-in', danger: false,
+      message: 'Clears the sign-in failure lockout for this user.',
     }] : []),
-    ...(!u.passwordSet ? [{
+    ...(!u.passwordSet && active ? [{
       kind: 'invite', action: 'user:invite', label: 'Issue activation code', danger: false,
+      message: 'Creates a one-time activation code for this passwordless user.',
     }] : []),
   ];
 
@@ -94,6 +105,7 @@ export default function AdminUserDetail() {
         sub={`${data.organization?.slug || '–'} · ${u.display_name || 'No display name'}`}
         right={<Link to="/admin/users" className="text-sm text-main-blue hover:underline">Back</Link>}
       />
+      <Err e={err} />
       <div role="status" aria-live="polite">
         {notice && <div className="mb-4 px-4 py-2.5 rounded-2xl bg-emerald-500/10 text-emerald-700 text-sm">{notice}</div>}
       </div>
@@ -112,7 +124,7 @@ export default function AdminUserDetail() {
             <div className="flex justify-between gap-2"><dt className="text-normal-text">Status</dt><dd><Badge tone={active ? 'green' : 'gray'}>{active ? 'active' : 'inactive'}</Badge></dd></div>
             <div className="flex justify-between gap-2"><dt className="text-normal-text">Org admin</dt><dd><Badge tone={u.is_org_admin ? 'blue' : 'gray'}>{u.is_org_admin ? 'yes' : 'no'}</Badge></dd></div>
             <div className="flex justify-between gap-2"><dt className="text-normal-text">Password</dt><dd><Badge tone={u.passwordSet ? 'green' : 'amber'}>{u.passwordSet ? 'set' : 'activation pending'}</Badge></dd></div>
-            <div className="flex justify-between gap-2"><dt className="text-normal-text">MFA</dt><dd><Badge tone={mfa.enabled ? 'green' : 'amber'}>{mfa.enabled ? `${mfa.recoveryCodesRemaining} recovery codes` : 'not enabled'}</Badge></dd></div>
+            <div className="flex justify-between gap-2"><dt className="text-normal-text">MFA</dt><dd><Badge tone={mfa.enabled ? 'green' : 'amber'}>{mfa.enabled ? `${mfa.recoveryCodesRemaining ?? 0} recovery codes` : 'not enabled'}</Badge></dd></div>
             {data.lockedForSeconds > 0 && (
               <div className="flex justify-between gap-2"><dt className="text-normal-text">Sign-in lock</dt><dd><Badge tone="red">{data.lockedForSeconds}s</Badge></dd></div>
             )}
@@ -171,7 +183,7 @@ export default function AdminUserDetail() {
       <AdminActionDialog
         open={!!confirm}
         title={confirm ? `${confirm.label}?` : ''}
-        message={confirm ? `This affects ${u.email}.` : ''}
+        message={confirm ? (confirm.message || `This affects ${u.email}.`) : ''}
         action={confirm?.action}
         confirmLabel={confirm?.label || 'Confirm'}
         requireReason={confirm?.requireReason}

@@ -288,8 +288,12 @@ export default function Dashboard() {
     setReadyLoading(true);
     try {
       const r = await fetch(`${baseUrl()}/ready`);
-      if (!r.ok) throw new Error(`gateway /ready → HTTP ${r.status}`);
-      setReady(await r.json());
+      // A degraded stack returns HTTP 503 with a valid readiness body. Parse it
+      // before deciding whether the gateway is unreachable.
+      const body = await r.json().catch(() => null);
+      if (!body) throw new Error(`gateway /ready → HTTP ${r.status}`);
+      setReady(body);
+      if (!r.ok && !Array.isArray(body.upstreams)) throw new Error(`gateway /ready → HTTP ${r.status}`);
     } catch (e) {
       setReady(null);
       setReadyErr(e);

@@ -19,6 +19,7 @@ export default function Accounts() {
   const [loaded, setLoaded] = useState(false);
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [formErr, setFormErr] = useState(null);
   const [slug, setSlug] = useState('');
   const [name, setName] = useState('');
 
@@ -47,6 +48,7 @@ export default function Accounts() {
     e.preventDefault();
     if (busy) return;
     setBusy(true);
+    setFormErr(null);
     setErr(null);
     try {
       await api.createAccount(scope.orgId, slug, name, headers);
@@ -55,7 +57,7 @@ export default function Accounts() {
       setName('');
       load();
     } catch (ex) {
-      setErr(ex);
+      setFormErr(ex);
     } finally {
       setBusy(false);
     }
@@ -63,7 +65,7 @@ export default function Accounts() {
 
   return (
     <>
-      <PageTitle title="Accounts" sub="Environments in an org: prod, staging… (like AWS Accounts)" right={canAdmin ? <Btn onClick={() => setOpen(true)}>+ New</Btn> : undefined} />
+      <PageTitle title="Accounts" sub="Environments in an org: prod, staging… (like AWS Accounts)" right={canAdmin && scope.orgId ? <Btn onClick={() => { setFormErr(null); setOpen(true); }}>+ New</Btn> : undefined} />
       <Err e={err} />
       <ScopeBar scope={scope} showAccount={false} />
       <Card>
@@ -84,8 +86,8 @@ export default function Accounts() {
         )}
       </Card>
       {open && (
-        <Modal title="New account" onClose={() => setOpen(false)}>
-          <form onSubmit={create}>
+        <Modal title="New account" onClose={() => { setOpen(false); setFormErr(null); }}>
+          <form onSubmit={create}><Err e={formErr} />
             <Field label="Slug (unique in the org)">
               <Input value={slug} onChange={(e) => setSlug(e.target.value)} placeholder="prod" />
             </Field>

@@ -17,6 +17,7 @@ export default function Orgs() {
   const [loaded, setLoaded] = useState(false);
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [formErr, setFormErr] = useState(null);
   const [slug, setSlug] = useState('');
   const [name, setName] = useState('');
 
@@ -30,6 +31,7 @@ export default function Orgs() {
     e.preventDefault();
     if (busy) return;
     setBusy(true);
+    setFormErr(null);
     setErr(null);
     try {
       await api.createOrg(slug, name, headers);
@@ -38,7 +40,7 @@ export default function Orgs() {
       setName('');
       load();
     } catch (ex) {
-      setErr(ex);
+      setFormErr(ex);
     } finally {
       setBusy(false);
     }
@@ -46,7 +48,7 @@ export default function Orgs() {
 
   return (
     <>
-      <PageTitle title="Organizations" sub="Root tenants, like AWS Organizations" right={canAdmin ? <Btn onClick={() => setOpen(true)}>+ New</Btn> : undefined} />
+      <PageTitle title="Organizations" sub="Root tenants, like AWS Organizations" right={canAdmin ? <Btn onClick={() => { setFormErr(null); setOpen(true); }}>+ New</Btn> : undefined} />
       <Err e={err} />
       <Card>
         {!loaded ? (
@@ -69,8 +71,8 @@ export default function Orgs() {
         <Badge>Tip</Badge> Pick an org on the Accounts page to see its accounts.
       </p>
       {open && (
-        <Modal title="New organization" onClose={() => setOpen(false)}>
-          <form onSubmit={create}>
+        <Modal title="New organization" onClose={() => { setOpen(false); setFormErr(null); }}>
+          <form onSubmit={create}><Err e={formErr} />
             <Field label="Slug (unique)">
               <Input value={slug} onChange={(e) => setSlug(e.target.value)} placeholder="acme" />
             </Field>

@@ -82,6 +82,10 @@ const IS_PROD = (() => {
   return env === 'production' || env === 'prod';
 })();
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function isUniqueViolation(e: any): boolean {
+  return e?.code === '23505' || e?.cause?.code === '23505' || /duplicate key value/i.test(String(e?.message || ''));
+}
+
 function isUuid(s: string): boolean { return UUID_RE.test(s || ''); }
 /** Linear-time email sanity check (avoids CodeQL's polynomial-regex alert). */
 function validScimEmail(value: string): boolean {
@@ -2395,7 +2399,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       if (e?.code === 'reserved_org_slug' || e?.status === 403) {
         return res.status(403).json({ error: 'reserved_org_slug', message: 'This organization slug is reserved for platform administration.' });
       }
-      if (e?.code === '23505' || e?.status === 409) {
+      if (isUniqueViolation(e) || e?.status === 409) {
         return res.status(409).json({ error: 'conflict', message: 'organization slug exists' });
       }
       res.status(400).json({ error: 'invalid_body', message: e.message });
@@ -2433,7 +2437,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       res.status(201).json(created);
     } catch (e: any) {
       if (e?.code === 'audit_write_failed' || e?.status === 503) throw e;
-      if (e?.code === '23505' || e?.status === 409) {
+      if (isUniqueViolation(e) || e?.status === 409) {
         return res.status(409).json({ error: 'conflict', message: 'account slug exists' });
       }
       res.status(400).json({ error: 'invalid_body', message: e.message });
@@ -3651,7 +3655,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       res.status(201).json(account);
     } catch (e: any) {
       if (e?.code === 'audit_write_failed' || e?.status === 503) throw e;
-      if (e?.code === '23505' || e?.status === 409) return res.status(409).json({ error: 'conflict', message: 'account slug exists' });
+      if (isUniqueViolation(e) || e?.status === 409) return res.status(409).json({ error: 'conflict', message: 'account slug exists' });
       return res.status(400).json({ error: 'invalid_body', message: e.message });
     }
   });
@@ -3795,10 +3799,11 @@ async function auditMutation(req: express.Request, action: string, resource: str
     const account = await getAccountById(key.account_id);
     if (!account || account.org_id !== req.params.orgId) return res.status(404).json({ error: 'key_not_found' });
     if (key.revoked_at) return res.status(409).json({ error: 'key_already_revoked' });
+    const reason = typeof (req.body || {}).reason === 'string' ? String((req.body || {}).reason).trim().slice(0, 500) : '';
     if (!(await requirePlatformStepUp(req, res, ctx, 'org:key:revoke'))) return;
     const ok = await withTransaction(async () => {
       const revoked = await revokeApiKey(req.params.keyId);
-      await auditPlatformAction(req, ctx.user.id, 'platform:org:key:revoke', req.params.orgId, { keyId: req.params.keyId, accountId: account.id });
+      await auditPlatformAction(req, ctx.user.id, 'platform:org:key:revoke', req.params.orgId, { keyId: req.params.keyId, accountId: account.id, ...(reason ? { reason } : {}) });
       return revoked;
     });
     if (!ok) return res.status(409).json({ error: 'key_already_revoked' });
@@ -3814,10 +3819,11 @@ async function auditMutation(req: express.Request, action: string, resource: str
     const account = await getAccountById(sa.account_id);
     if (!account || account.org_id !== req.params.orgId) return res.status(404).json({ error: 'service_account_not_found' });
     if (sa.revoked_at) return res.status(409).json({ error: 'service_account_already_revoked' });
+    const reason = typeof (req.body || {}).reason === 'string' ? String((req.body || {}).reason).trim().slice(0, 500) : '';
     if (!(await requirePlatformStepUp(req, res, ctx, 'org:service-account:revoke'))) return;
     const ok = await withTransaction(async () => {
       const revoked = await revokeServiceAccount(sa.id);
-      await auditPlatformAction(req, ctx.user.id, 'platform:org:service-account:revoke', req.params.orgId, { serviceAccountId: sa.id, accountId: account.id });
+      await auditPlatformAction(req, ctx.user.id, 'platform:org:service-account:revoke', req.params.orgId, { serviceAccountId: sa.id, accountId: account.id, ...(reason ? { reason } : {}) });
       return revoked;
     });
     if (!ok) return res.status(409).json({ error: 'service_account_already_revoked' });
@@ -4255,11 +4261,11 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (err?.code === 'audit_write_failed') {
       return res.status(503).json({ error: 'audit_write_failed', message: 'The administrative audit record could not be persisted; the request was not acknowledged.' });
     }
-    if (err?.code === '23505' || err?.status === 409) {
+    if (isUniqueViolation(err) || err?.status === 409) {
       return res.status(409).json({ error: 'conflict', message: 'duplicate slug' });
     }
     // Malformed UUID in Postgres (invalid_text_representation): 400, not 500.
-    if (err?.code === '22P02' || /invalid_text_representation|invalid input syntax for.*uuid/i.test(err?.message || '')) {
+    if (err?.code === '22P02' || err?.cause?.code === '22P02' || /invalid_text_representation|invalid input syntax for.*uuid/i.test(err?.message || '')) {
       return res.status(400).json({ error: 'invalid_id', message: 'malformed UUID' });
     }
     // Race check-then-insert (id bị xóa giữa chừng) → FK violation → 404, không 500.

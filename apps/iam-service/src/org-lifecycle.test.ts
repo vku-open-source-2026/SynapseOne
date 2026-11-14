@@ -160,6 +160,12 @@ describe('platform organization lifecycle', () => {
             }, tenantToken);
             assert.equal(acc.status, 201, JSON.stringify(acc.json));
             accountId = acc.json.id;
+            const duplicate = await call('POST', `/v1/orgs/${tenantOrgId}/accounts`, {
+              slug: 'production',
+              displayName: 'Production duplicate',
+            }, tenantToken);
+            assert.equal(duplicate.status, 409, JSON.stringify(duplicate.json));
+            assert.equal(duplicate.json.error, 'conflict');
 
             // A second organization/account proves the cross-org guard without
             // spending another platform step-up.
@@ -256,7 +262,7 @@ describe('platform organization lifecycle', () => {
     assert.equal(saBefore.status, 200, JSON.stringify(saBefore.json));
 
     const keyStep = await stepUp('org:key:revoke');
-    const revokedKey = await call('POST', `/v1/platform/orgs/${tenantOrgId}/keys/${keyId}/revoke`, {}, platformToken, {
+    const revokedKey = await call('POST', `/v1/platform/orgs/${tenantOrgId}/keys/${keyId}/revoke`, { reason: 'key compromise' }, platformToken, {
       'x-platform-step-up': keyStep,
     });
     assert.equal(revokedKey.status, 200, JSON.stringify(revokedKey.json));
@@ -283,6 +289,8 @@ describe('platform organization lifecycle', () => {
     const saAgain = await call('POST', `/v1/platform/orgs/${tenantOrgId}/service-accounts/${saId}/revoke`, {}, platformToken);
     assert.equal(saAgain.status, 409);
     assert.equal(saAgain.json.error, 'service_account_already_revoked');
+    const keyAudit = await queryAudit({ limit: 50, action: 'platform:org:key:revoke' });
+    assert.ok(keyAudit.some((e: any) => e.decision === true && e.context?.reason === 'key compromise'));
 
     // Keep a live machine identity for the suspension assertions.
     const sa2 = await call('POST', `/v1/accounts/${accountId}/service-accounts`, { slug: 'lifecycle-sa-2' }, tenantToken);

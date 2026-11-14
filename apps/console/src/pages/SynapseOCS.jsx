@@ -137,8 +137,10 @@ export default function SynapseOCS() {
     if (!file || !selected) return;
     setBusy(true);
     try {
-      const key = `${prefix}${file.name}`.replace(/^\/+/, '');
+      const base = prefix.trim();
+      const key = `${base}${base && !base.endsWith('/') ? '/' : ''}${file.name}`.replace(/^\/+/, '');
       await api.ocsPutObject(selected, key, file, file.type || 'application/octet-stream', headers);
+      await loadBuckets();
       await loadObjects(selected, prefix);
     } catch (error) {
       alert(`Upload failed: ${error.message || error}`);
@@ -161,6 +163,7 @@ export default function SynapseOCS() {
     if (!confirm(`Delete '${object.key}'?`)) return;
     try {
       await api.ocsDeleteObject(selected, object.key, headers);
+      await loadBuckets();
       await loadObjects(selected, prefix);
     } catch (error) {
       alert(`Delete failed: ${error.message || error}`);
@@ -200,36 +203,40 @@ export default function SynapseOCS() {
           ) : (
             <div className="space-y-2">
               {buckets.map((bucket) => (
-                <button
+                <div
                   key={bucket.name}
-                  type="button"
-                  onClick={() => { setSelected(bucket.name); setPrefix(''); }}
-                  className={`w-full text-left rounded-2xl border px-3 py-3 transition ${
+                  className={`relative rounded-2xl border transition ${
                     selected === bucket.name
                       ? 'border-main-blue bg-main-blue/5'
                       : 'border-slate-100 hover:border-slate-200 hover:bg-slate-50'
                   }`}
                 >
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-medium text-sm text-main-text truncate">{bucket.name}</span>
-                    <FontAwesomeIcon icon={faFolderOpen} className="text-main-blue" />
-                  </div>
-                  <div className="mt-1 flex items-center gap-3 text-xs text-normal-text">
-                    <span>{bucket.objects ?? 0} objects</span>
-                    <span>{formatBytes(bucket.bytes)}</span>
-                  </div>
-                  <div className="mt-2 flex items-center justify-between">
-                    <span className="text-[11px] text-normal-text">{bucket.quotaBytes ? `quota ${formatBytes(bucket.quotaBytes)}` : 'tenant quota'}</span>
-                    <button
-                      type="button"
-                      onClick={(event) => { event.stopPropagation(); deleteBucket(bucket); }}
-                      className="text-red-500 hover:text-red-600"
-                      aria-label={`Delete ${bucket.name}`}
-                    >
-                      <FontAwesomeIcon icon={faTrash} />
-                    </button>
-                  </div>
-                </button>
+                  <button
+                    type="button"
+                    onClick={() => { setSelected(bucket.name); setPrefix(''); }}
+                    className="w-full text-left px-3 py-3 pr-10"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-medium text-sm text-main-text truncate">{bucket.name}</span>
+                      <FontAwesomeIcon icon={faFolderOpen} className="text-main-blue" />
+                    </div>
+                    <div className="mt-1 flex items-center gap-3 text-xs text-normal-text">
+                      <span>{bucket.objects ?? 0} objects</span>
+                      <span>{formatBytes(bucket.bytes)}</span>
+                    </div>
+                    <div className="mt-2 flex items-center justify-between">
+                      <span className="text-[11px] text-normal-text">{bucket.quotaBytes ? `quota ${formatBytes(bucket.quotaBytes)}` : 'tenant quota'}</span>
+                    </div>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => deleteBucket(bucket)}
+                    className="absolute right-3 bottom-3 text-red-500 hover:text-red-600"
+                    aria-label={`Delete ${bucket.name}`}
+                  >
+                    <FontAwesomeIcon icon={faTrash} />
+                  </button>
+                </div>
               ))}
             </div>
           )}

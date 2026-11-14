@@ -50,6 +50,7 @@ const Audit = React.lazy(() => import('./pages/Audit.jsx'));
 const Security = React.lazy(() => import('./pages/Security.jsx'));
 const ApiDocs = React.lazy(() => import('./pages/ApiDocs.jsx'));
 const Docs = React.lazy(() => import('./pages/Docs.jsx'));
+const NotFound = React.lazy(() => import('./pages/NotFound.jsx'));
 const AdminOverview = React.lazy(() => import('./pages/admin/Overview.jsx'));
 const AdminOrganizations = React.lazy(() => import('./pages/admin/Organizations.jsx'));
 const AdminAccounts = React.lazy(() => import('./pages/admin/Accounts.jsx'));
@@ -210,7 +211,7 @@ function AppRoutes() {
           <Route path="/admin/audit" element={<PlatformGuard><AdminLayout><AdminAudit /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/access" element={<PlatformGuard><AdminLayout><AdminPlatformAdmins /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/*" element={<PlatformGuard><AdminLayout><AdminNotFound /></AdminLayout></PlatformGuard>} />
-          <Route path="*" element={<Landing />} />
+          <Route path="*" element={<NotFound />} />
         </Routes>
       </Suspense>
     </ResettingBoundary>

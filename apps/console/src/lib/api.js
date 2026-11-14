@@ -203,7 +203,7 @@ export const api = {
   createKey: (accountId, name, a, opts = {}) =>
     post(`/v1/accounts/${encodeURIComponent(accountId)}/keys`, {
       name,
-      scopes: opts.scopes && opts.scopes.length ? opts.scopes : ['*'],
+      scopes: opts.scopes && opts.scopes.length ? opts.scopes : ['*:read'],
       ...(opts.userId ? { userId: opts.userId } : {}),
     }, a),
   rotateKey: (id, graceSeconds, a) => post(`/v1/keys/${encodeURIComponent(id)}/rotate`, { graceSeconds: graceSeconds || 0 }, a),
@@ -304,7 +304,8 @@ export const api = {
   baseCollectionStats: (col, a) => get(`/v1/base/collections/${encodeURIComponent(col)}/stats`, a),
   baseDocuments: (col, params, a) => {
     const qs = new URLSearchParams();
-    for (const [k, v] of Object.entries(params || {})) {
+    const merged = { withTotal: '1', ...(params || {}) };
+    for (const [k, v] of Object.entries(merged)) {
       if (v !== undefined && v !== null && String(v) !== '') qs.set(k, String(v));
     }
     const s = qs.toString();

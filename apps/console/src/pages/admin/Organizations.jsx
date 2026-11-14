@@ -23,11 +23,11 @@ export default function AdminOrganizations() {
   const [form, setForm] = useState({ slug: '', displayName: '', adminEmail: '', adminDisplayName: '', reason: '', code: '' });
   const canWrite = platform.role === 'owner' || platform.role === 'operator';
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (nextOffset = offset) => {
     setErr(null);
     setLoading(true);
     try {
-      const out = await platform.request(`/v1/platform/orgs?q=${encodeURIComponent(query)}&limit=${PAGE}&offset=${offset}`);
+      const out = await platform.request(`/v1/platform/orgs?q=${encodeURIComponent(query)}&limit=${PAGE}&offset=${nextOffset}`);
       setData({ items: Array.isArray(out.items) ? out.items : [], total: Number(out.total) || 0 });
     } catch (e) {
       setErr(e);
@@ -43,7 +43,7 @@ export default function AdminOrganizations() {
     e.preventDefault();
     setOffset(0);
     setQuery(q.trim());
-    if (q.trim() === query) load();
+    if (q.trim() === query && offset === 0) load(0);
   };
 
   const create = async (e) => {
@@ -68,7 +68,7 @@ export default function AdminOrganizations() {
       setOpen(false);
       setForm({ slug: '', displayName: '', adminEmail: '', adminDisplayName: '', reason: '', code: '' });
       setOffset(0);
-      load();
+      if (offset === 0) load(0);
     } catch (ex) {
       setFormErr(ex);
     } finally {
@@ -86,7 +86,7 @@ export default function AdminOrganizations() {
         sub="All tenant organizations on this SynapseOne deployment"
         right={(
           <div className="flex gap-2">
-            <Btn kind="secondary" onClick={load} loading={loading}>Refresh</Btn>
+            <Btn kind="secondary" onClick={() => load()} loading={loading}>Refresh</Btn>
             {canWrite && <Btn onClick={() => { setOpen(true); setCreated(null); setFormErr(null); }}>+ New organization</Btn>}
           </div>
         )}

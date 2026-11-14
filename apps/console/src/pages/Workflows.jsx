@@ -7,7 +7,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../lib/auth.jsx';
-import { api } from '../lib/api.js';
+import { api, baseUrl } from '../lib/api.js';
 import { Badge, Btn, Card, Code, Empty, Err, Field, Input, ListSkeleton, Modal, PageTitle, Spinner, Table, TableSkeleton } from '../components/ui.jsx';
 import WorkflowEditor from '../components/WorkflowEditor.jsx';
 import { uid, webhookPathOf, describeCron, isWebhookType, isCronType } from '../lib/workflow-graph.js';
@@ -744,7 +744,7 @@ function WebhookPing({ path, method, onDone }) {
     try {
       // Same-origin /webhook/* only works when the edge proxies it (dev vite
       // does not by default), the catch block says exactly where to curl.
-      const r = await fetch(`/webhook/${path}`, {
+      const r = await fetch(`${baseUrl()}/webhook/${path}`, {
         method: method === 'GET' ? 'GET' : 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: method === 'GET' ? undefined : JSON.stringify({ ping: true }),

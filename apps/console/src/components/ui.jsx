@@ -5,6 +5,7 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
 import React from 'react';
+import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { createPortal } from 'react-dom';
 import { Spinner, TableSkeleton as TableSkeletonBase, ListSkeleton, InlineLoader } from './loading.jsx';
 
@@ -15,25 +16,34 @@ export function Card({ className = '', children }) {
   return <div className={`bg-white rounded-3xl shadow-md p-6 ${className}`}>{children}</div>;
 }
 
-export function PageTitle({ title, sub, right }) {
+export function PageTitle({ title, sub, desc, subtitle: subtitleProp, right }) {
+  const subtitle = sub || desc || subtitleProp;
   return (
     <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-6">
       <div className="min-w-0">
         <h1 className="text-xl sm:text-2xl font-semibold text-main-text truncate">{title}</h1>
-        {sub && <p className="text-normal-text text-sm mt-1">{sub}</p>}
+        {subtitle && <p className="text-normal-text text-sm mt-1">{subtitle}</p>}
       </div>
       {right && <div className="flex flex-wrap items-center justify-end gap-2 shrink-0">{right}</div>}
     </div>
   );
 }
 
-export function Btn({ children, onClick, kind = 'primary', type = 'button', disabled, loading = false, className = '' }) {
+const BTN_VARIANTS = {
+  primary: 'primary', secondary: 'secondary', outline: 'secondary', ghost: 'secondary',
+  danger: 'danger', success: 'success',
+};
+
+export function Btn({ children, onClick, kind, variant, type = 'button', disabled, loading = false, className = '' }) {
+  const resolved = kind || BTN_VARIANTS[variant] || 'primary';
   const styles =
-    kind === 'primary'
+    resolved === 'primary'
       ? 'bg-gradient-to-b from-main-start to-main-end text-white'
-      : kind === 'danger'
+      : resolved === 'danger'
         ? 'bg-red-500 text-white'
-        : 'bg-slate-100 text-main-text';
+        : resolved === 'success'
+          ? 'bg-emerald-600 text-white'
+          : 'bg-slate-100 text-main-text';
   const isDisabled = disabled || loading;
   return (
     <button
@@ -49,10 +59,11 @@ export function Btn({ children, onClick, kind = 'primary', type = 'button', disa
   );
 }
 
-export function Field({ label, children }) {
+export function Field({ label, desc, children }) {
   return (
     <label className="block mb-3">
       <span className="block text-xs font-medium text-normal-text mb-1">{label}</span>
+      {desc && <span className="block text-[11px] text-normal-text/80 mb-1.5">{desc}</span>}
       {children}
     </label>
   );
@@ -73,8 +84,8 @@ export function Table({ head, children }) {
       <table className="w-full text-sm">
         <thead>
           <tr className="text-left text-normal-text">
-            {head.map((h) => (
-              <th key={h} className="py-2 pr-4 font-medium whitespace-nowrap">
+            {head.map((h, i) => (
+              <th key={`${h}-${i}`} className="py-2 pr-4 font-medium whitespace-nowrap">
                 {h}
               </th>
             ))}
@@ -86,7 +97,10 @@ export function Table({ head, children }) {
   );
 }
 
-export function Badge({ tone = 'gray', children }) {
+const BADGE_VARIANTS = { neutral: 'gray', success: 'green', info: 'blue', warning: 'amber', danger: 'red' };
+
+export function Badge({ tone, variant, children }) {
+  const resolved = tone || BADGE_VARIANTS[variant] || 'gray';
   const tones = {
     gray: 'bg-slate-100 text-main-text',
     green: 'bg-emerald-500/10 text-emerald-600',
@@ -95,16 +109,19 @@ export function Badge({ tone = 'gray', children }) {
     amber: 'bg-amber-400/15 text-amber-500',
   };
   return (
-    <span className={`inline-block px-2.5 py-0.5 rounded-full text-xs font-medium ${tones[tone] || tones.gray}`}>
+    <span className={`inline-block px-2.5 py-0.5 rounded-full text-xs font-medium ${tones[resolved] || tones.gray}`}>
       {children}
     </span>
   );
 }
 
-export function Empty({ text = 'No data yet', action }) {
+export function Empty({ text = 'No data yet', title, sub, icon, action }) {
+  const heading = title || text;
   return (
     <div className="py-6 text-center">
-      <p className="text-normal-text text-sm">{text}</p>
+      {icon && <div className="flex justify-center mb-2">{React.isValidElement(icon) ? icon : <FontAwesomeIcon icon={icon} className="text-2xl text-main-blue" />}</div>}
+      <p className="text-main-text text-sm font-medium">{heading}</p>
+      {sub && <p className="text-normal-text text-xs mt-1 max-w-xl mx-auto">{sub}</p>}
       {action && <div className="mt-3 flex justify-center">{action}</div>}
     </div>
   );
@@ -120,6 +137,14 @@ export function StatValue({ loading, value }) {
 }
 
 const ERROR_COPY = {
+  self_revoke_forbidden: {
+    title: 'Không thể tự thu hồi quyền owner',
+    message: 'Bạn không thể thu hồi quyền Platform Administrator của chính mình. Hãy nhờ một owner khác thực hiện.',
+  },
+  platform_org_create_required: {
+    title: 'Tạo tổ chức do Platform quản lý',
+    message: 'Tạo organization đã bị tắt trên deployment này. Liên hệ Platform Administrator để tạo tổ chức và cấp quyền admin ban đầu.',
+  },
   org_admin_required: {
     title: 'Cần quyền quản trị tổ chức',
     message: 'Tài khoản của bạn vẫn dùng được các tính năng tenant, nhưng Audit yêu cầu quyền Organization Administrator. Hãy liên hệ admin của tổ chức hoặc đăng nhập bằng tài khoản admin.',

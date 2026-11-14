@@ -43,7 +43,10 @@ export function ScopeProvider({ children }) {
 
   const setOrgId = (id) => {
     writeStored(ORG_KEY, id);
+    writeStored(ACC_KEY, '');
     setOrgIdRaw(id);
+    setAccounts([]);
+    setAccountIdRaw('');
   };
   const setAccountId = (id) => {
     writeStored(ACC_KEY, id);
@@ -56,7 +59,7 @@ export function ScopeProvider({ children }) {
     api
       .orgs(headers)
       .then((v) => {
-        if (live) setOrgs(Array.isArray(v) ? v : []);
+        if (live) { setOrgs(Array.isArray(v) ? v : []); setScopeErr(null); }
       })
       .catch((e) => {
         if (live) {
@@ -79,7 +82,7 @@ export function ScopeProvider({ children }) {
     api
       .accounts(orgId, headers)
       .then((v) => {
-        if (live && seq.current === my) setAccounts(Array.isArray(v) ? v : []);
+        if (live && seq.current === my) { setAccounts(Array.isArray(v) ? v : []); setScopeErr(null); }
       })
       .catch((e) => {
         if (live && seq.current === my) {
@@ -97,7 +100,11 @@ export function ScopeProvider({ children }) {
     if (orgs.length && !orgs.find((o) => o.id === orgId)) setOrgId(orgs[0].id);
   }, [orgs]);
   useEffect(() => {
-    if (accounts.length && !accounts.find((a) => a.id === accountId)) setAccountId(accounts[0].id);
+    if (!accounts.length) {
+      if (accountId) setAccountId('');
+      return;
+    }
+    if (!accounts.find((a) => a.id === accountId)) setAccountId(accounts[0].id);
   }, [accounts]);
 
   return (
@@ -117,7 +124,7 @@ export function ScopeBar({ scope, showAccount = true }) {
   const sel = 'px-3 py-2 rounded-2xl border border-slate-200 text-sm bg-white outline-none';
   return (
     <div className="flex flex-wrap gap-2 mb-4">
-      <select value={scope.orgId} onChange={(e) => scope.setOrgId(e.target.value)} className={sel}>
+      <select aria-label="Organization" value={scope.orgId} onChange={(e) => scope.setOrgId(e.target.value)} className={sel}>
         <option value="">Organization</option>
         {scope.orgs.map((o) => (
           <option key={o.id} value={o.id}>
@@ -126,7 +133,7 @@ export function ScopeBar({ scope, showAccount = true }) {
         ))}
       </select>
       {showAccount && (
-        <select value={scope.accountId} onChange={(e) => scope.setAccountId(e.target.value)} className={sel}>
+        <select aria-label="Account" value={scope.accountId} onChange={(e) => scope.setAccountId(e.target.value)} className={sel}>
           <option value="">Account</option>
           {scope.accounts.map((a) => (
             <option key={a.id} value={a.id}>

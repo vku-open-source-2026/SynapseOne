@@ -19,7 +19,25 @@ export default function PlatformGuard({ children }) {
   if (platform.session) return children;
 
   const contextsLoaded = Array.isArray(auth.contexts) && auth.contexts.length > 0;
-  const hasPlatformContext = (auth.contexts || []).some((c) => c.type === 'platform');
+  const platformCtx = (auth.contexts || []).find((c) => c.type === 'platform');
+  const hasPlatformContext = !!platformCtx;
+  if (contextsLoaded && hasPlatformContext && auth.currentContext?.type !== 'platform') {
+    return (
+      <div className="mx-auto max-w-xl px-4 pt-24">
+        <PageTitle title="Platform administration" sub="Sign in with the platform organization" />
+        <Card>
+          <p className="text-sm text-normal-text">
+            Your current session belongs to a tenant organization. The platform console requires a sign-in
+            to <code className="font-mono">{platformCtx.slug}</code> plus a fresh MFA code.
+          </p>
+          <Btn className="mt-4" onClick={() => { logout(); nav('/login', { replace: true, state: { prefillOrg: platformCtx.slug, platformContext: true } }); }}>
+            Sign in with the platform organization
+          </Btn>
+          <Link to="/dashboard" className="block mt-3 text-sm text-main-blue">Return to the tenant console</Link>
+        </Card>
+      </div>
+    );
+  }
   if (contextsLoaded && !hasPlatformContext) {
     return (
       <div className="mx-auto max-w-xl px-4 pt-24">

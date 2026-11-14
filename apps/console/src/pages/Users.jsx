@@ -19,6 +19,7 @@ export default function Users() {
   const [loaded, setLoaded] = useState(false);
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [formErr, setFormErr] = useState(null);
   const [email, setEmail] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [invite, setInvite] = useState(null);
@@ -51,6 +52,7 @@ export default function Users() {
     e.preventDefault();
     if (busy) return;
     setBusy(true);
+    setFormErr(null);
     setErr(null);
     try {
       const created = await api.createUser(scope.orgId, email, displayName || undefined, headers);
@@ -62,7 +64,7 @@ export default function Users() {
       }
       api.users(scope.orgId, headers).then((v) => setRows(Array.isArray(v) ? v : [])).catch(setErr);
     } catch (ex) {
-      setErr(ex);
+      setFormErr(ex);
     } finally {
       setBusy(false);
     }
@@ -96,7 +98,7 @@ export default function Users() {
 
   return (
     <>
-      <PageTitle title="Users" sub="Shadow users federated from Authentik/Keycloak (email + OIDC sub)" right={canAdmin ? <Btn onClick={() => setOpen(true)}>+ New</Btn> : undefined} />
+      <PageTitle title="Users" sub="Shadow users federated from Authentik/Keycloak (email + OIDC sub)" right={canAdmin ? <Btn onClick={() => { setFormErr(null); setOpen(true); }}>+ New</Btn> : undefined} />
       <Err e={err} />
       <ScopeBar scope={scope} showAccount={false} />
       {canAdmin && scope.accountId && rows.length > 0 && roles.length > 0 && (
@@ -149,8 +151,8 @@ export default function Users() {
         </Modal>
       )}
       {open && (
-        <Modal title="New user" onClose={() => setOpen(false)}>
-          <form onSubmit={create}>
+        <Modal title="New user" onClose={() => { setOpen(false); setFormErr(null); }}>
+          <form onSubmit={create}><Err e={formErr} />
             <Field label="Email">
               <Input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="a@acme.local" />
             </Field>

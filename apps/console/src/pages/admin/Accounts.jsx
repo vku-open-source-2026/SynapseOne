@@ -15,29 +15,32 @@ export default function AdminAccounts() {
   const [err, setErr] = useState(null);
   const PAGE = 50;
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (nextOffset = offset) => {
     setErr(null); setLoading(true);
     try {
-      const p = new URLSearchParams({ limit: String(PAGE), offset: String(offset) });
+      const p = new URLSearchParams({ limit: String(PAGE), offset: String(nextOffset) });
       if (query) p.set('q', query);
-      setData(await platform.request(`/v1/platform/accounts?${p}`));
+      const out = await platform.request(`/v1/platform/accounts?${p}`);
+      setData({ items: Array.isArray(out.items) ? out.items : [], total: Number(out.total) || 0 });
     } catch (e) { setErr(e); } finally { setLoading(false); }
   }, [platform, query, offset]);
   useEffect(() => { load(); }, [load]);
 
   return (
     <>
-      <PageTitle title="Accounts" sub="Tenant accounts across all organizations" right={<Btn kind="secondary" onClick={load} loading={loading}>Refresh</Btn>} />
+      <PageTitle title="Accounts" sub="Tenant accounts across all organizations" right={<Btn kind="secondary" onClick={() => load()} loading={loading}>Refresh</Btn>} />
       <Err e={err} />
       <Card className="mb-4">
-        <form onSubmit={(e) => { e.preventDefault(); setOffset(0); setQuery(q.trim()); }} className="flex flex-wrap items-end gap-2">
+        <form onSubmit={(e) => { e.preventDefault(); const next = q.trim(); setOffset(0); setQuery(next); if (next === query && offset === 0) load(0); }} className="flex flex-wrap items-end gap-2">
           <Field label="Slug or display name"><Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="production" /></Field>
           <Btn type="submit" kind="secondary" className="mb-3">Search</Btn>
-          <Btn type="button" kind="secondary" className="mb-3" onClick={() => { setQ(''); setQuery(''); setOffset(0); }}>Clear</Btn>
+          <Btn type="button" kind="secondary" className="mb-3" onClick={() => { setQ(''); setQuery(''); setOffset(0); if (!query && offset === 0) load(0); }}>Clear</Btn>
         </form>
       </Card>
       <Card>
-        {loading ? <TableSkeleton rows={6} cols={5} /> : data.items?.length ? (
+        {loading ? <TableSkeleton rows={6} cols={4} /> : err ? (
+          <div className="py-6 text-center"><Btn kind="secondary" onClick={() => load()}>Retry</Btn></div>
+        ) : data.items?.length ? (
           <Table head={['Organization', 'Account', 'Display name', 'ID']}>
             {data.items.map((a) => (
               <tr key={a.id} className="border-t border-slate-100">

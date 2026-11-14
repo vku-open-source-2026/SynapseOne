@@ -58,6 +58,17 @@ describe('console silent refresh', () => {
     assert.equal(stored.token, 'tok-2');
   });
 
+  it('createKey defaults to read-only scope, never wildcard', async () => {
+    let seenBody = null;
+    globalThis.fetch = async (url, init = {}) => {
+      seenBody = JSON.parse(init.body);
+      return { status: 201, ok: true, text: async () => JSON.stringify({ id: 'k1', apiKey: 'synapseone_test', prefix: 'synapseone_' }), headers: new Map() };
+    };
+    authStore.get = () => null;
+    await api.createKey('acct-1', 'qa', { token: 'tok' }, { scopes: [] });
+    assert.deepEqual(seenBody.scopes, ['*:read']);
+  });
+
   it('dead refresh clears the session and surfaces 401', async () => {
     const sessions = { refreshCalls: 0, validAccess: new Set(), validRefresh: new Map() };
     stubFetch(sessions);
@@ -208,7 +219,7 @@ describe('console silent refresh', () => {
     assert.deepEqual(seen, [
       'GET /v1/base/collections',
       'POST /v1/base/collections',
-      'GET /v1/base/collections/c1/documents?limit=10',
+      'GET /v1/base/collections/c1/documents?withTotal=1&limit=10',
       'POST /v1/base/collections/c1/documents',
       'POST /v1/base/collections/c1/query',
       'POST /v1/base/collections/c1/documents/d1/increment',

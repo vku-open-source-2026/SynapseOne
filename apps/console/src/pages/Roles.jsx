@@ -19,6 +19,7 @@ export default function Roles() {
   const [loaded, setLoaded] = useState(false);
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [formErr, setFormErr] = useState(null);
   const [deleting, setDeleting] = useState(null);
   const [slug, setSlug] = useState('');
 
@@ -52,6 +53,7 @@ export default function Roles() {
     e.preventDefault();
     if (busy) return;
     setBusy(true);
+    setFormErr(null);
     setErr(null);
     try {
       await api.createRole(scope.accountId, slug, headers);
@@ -59,7 +61,7 @@ export default function Roles() {
       setSlug('');
       load();
     } catch (ex) {
-      setErr(ex);
+      setFormErr(ex);
     } finally {
       setBusy(false);
     }
@@ -162,7 +164,7 @@ export default function Roles() {
 
   return (
     <>
-      <PageTitle title="Roles" sub="Assigned to users, policies attached (like AWS IAM roles)" right={canAdmin ? <Btn onClick={() => setOpen(true)}>+ New</Btn> : undefined} />
+      <PageTitle title="Roles" sub="Assigned to users, policies attached (like AWS IAM roles)" right={canAdmin ? <Btn onClick={() => { setFormErr(null); setOpen(true); }}>+ New</Btn> : undefined} />
       <Err e={err} />
       <ScopeBar scope={scope} />
       {scope.accountId && rows.length > 0 && policies.length > 0 && (
@@ -241,8 +243,8 @@ export default function Roles() {
         )}
       </Card>
       {open && (
-        <Modal title="New role" onClose={() => setOpen(false)}>
-          <form onSubmit={create}>
+        <Modal title="New role" onClose={() => { setOpen(false); setFormErr(null); }}>
+          <form onSubmit={create}><Err e={formErr} />
             <Field label="Slug">
               <Input value={slug} onChange={(e) => setSlug(e.target.value)} placeholder="etl-runner" />
             </Field>

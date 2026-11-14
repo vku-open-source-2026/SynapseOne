@@ -34,7 +34,7 @@ export default function AdminPlatformAdmins() {
     }
   }, [platform]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => { if (!isOwner) { setLoading(false); setLoaded(true); return; } load(); }, [isOwner, load]);
 
   const grant = async (e) => {
     e.preventDefault();
@@ -84,14 +84,14 @@ export default function AdminPlatformAdmins() {
       <PageTitle
         title="Platform Administrators"
         sub="Owner-only management of the cross-tenant control plane"
-        right={<div className="flex gap-2"><Btn kind="secondary" onClick={load} loading={loading}>Refresh</Btn><Btn onClick={() => { setOpen(true); setFormErr(null); }}>+ Grant administrator</Btn></div>}
+        right={<div className="flex gap-2"><Btn kind="secondary" onClick={load} loading={loading}>Refresh</Btn><Btn onClick={() => { setOpen(true); setFormErr(null); setForm({ email: '', role: 'operator', reason: '', code: '' }); }}>+ Grant administrator</Btn></div>}
       />
       <Err e={err} />
       <div role="status" aria-live="polite">
         {notice && <div className="mb-4 px-4 py-2.5 rounded-2xl bg-emerald-500/10 text-emerald-700 text-sm">{notice}</div>}
       </div>
       <Card>
-        {!loaded ? <TableSkeleton rows={4} cols={5} /> : err ? (
+        {!loaded ? <TableSkeleton rows={4} cols={6} /> : err ? (
           <div className="py-6 text-center"><Btn kind="secondary" onClick={load}>Retry</Btn></div>
         ) : rows.length ? (
           <Table head={['Email', 'Role', 'Granted', 'Status', 'Reason', '']}>
@@ -103,11 +103,11 @@ export default function AdminPlatformAdmins() {
                 </td>
                 <td className="py-2 pr-4"><Badge tone={a.role === 'owner' ? 'blue' : a.role === 'operator' ? 'green' : 'gray'}>{a.role}</Badge></td>
                 <td className="py-2 pr-4 text-xs text-normal-text">{a.granted_at ? new Date(a.granted_at).toLocaleDateString() : '–'}</td>
-                <td className="py-2 pr-4"><Badge tone={a.revoked_at ? 'gray' : 'green'}>{a.revoked_at ? 'revoked' : 'active'}</Badge></td>
+                <td className="py-2 pr-4"><Badge tone={a.revoked_at || a.active === false ? 'gray' : 'green'}>{a.revoked_at ? 'revoked' : a.active === false ? 'inactive' : 'active'}</Badge></td>
                 <td className="py-2 pr-4 text-xs text-normal-text max-w-48 truncate" title={a.reason || ''}>{a.reason || '–'}</td>
                 <td className="py-2 text-right">
                   {!a.revoked_at && (
-                    <button type="button" onClick={() => setRevoke(a)} className="text-xs text-red-500 hover:underline">Revoke</button>
+                    <button type="button" onClick={() => { if (a.user_id === platform.user?.id) { setErr(Object.assign(new Error('You cannot revoke your own platform administrator access. Ask another owner.'), { code: 'self_revoke_forbidden' })); return; } setRevoke(a); }} className="text-xs text-red-500 hover:underline">Revoke</button>
                   )}
                 </td>
               </tr>
