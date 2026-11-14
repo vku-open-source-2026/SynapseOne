@@ -65,6 +65,13 @@ and from the internal `SYNAPSEONE_INTERNAL_SECRET` platform caller.
 
 ## Configuration
 
+A platform administrator who has just completed password + TOTP login can open
+the platform console without entering the same factor twice: the signed
+`amr`/`auth_time` claims are reused within `PLATFORM_FRESH_MFA_SECONDS`. Older
+sessions, refreshes without a fresh factor and non-MFA credentials still receive
+the explicit fresh-code exchange. Sensitive platform actions always require a
+separate step-up proof.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `PLATFORM_ADMIN_ENABLED` | `true` in dev, `false` in prod unless set | enables `/v1/platform/*` |
@@ -72,6 +79,7 @@ and from the internal `SYNAPSEONE_INTERNAL_SECRET` platform caller.
 | `PLATFORM_ADMIN_REQUIRE_STEP_UP` | `true` | requires step-up for destructive actions |
 | `PLATFORM_ORG_SLUG` | `synapseone-platform` | reserved platform staff organization |
 | `PLATFORM_SESSION_TTL_SECONDS` | `900` | platform console session TTL (60s–30 days); a longer session remains revocable via `auth_version` |
+| `PLATFORM_FRESH_MFA_SECONDS` | `900` | reuse a successful login MFA for this window instead of asking for a second OTP (60–3600s) |
 | `PLATFORM_STEP_UP_TTL_SECONDS` | `300` | step-up proof TTL (60–900s) |
 | `IAM_INVITE_TOKEN_TTL_SECONDS` | `604800` | invited-account activation code TTL (5 min–30 days) |
 | `PLATFORM_BOOTSTRAP_SECRET` | empty | one-time first-owner bootstrap; empty disables it; production requires 32+ chars |
