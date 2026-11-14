@@ -71,6 +71,7 @@ and from the internal `SYNAPSEONE_INTERNAL_SECRET` platform caller.
 | `PLATFORM_ADMIN_REQUIRE_MFA` | `true` | requires an enrolled TOTP factor and a fresh code at session exchange |
 | `PLATFORM_ADMIN_REQUIRE_STEP_UP` | `true` | requires step-up for destructive actions |
 | `PLATFORM_ORG_SLUG` | `synapseone-platform` | reserved platform staff organization |
+| `PLATFORM_SESSION_TTL_SECONDS` | `900` | platform console session TTL (60s–30 days); a longer session remains revocable via `auth_version` |
 | `PLATFORM_STEP_UP_TTL_SECONDS` | `300` | step-up proof TTL (60–900s) |
 | `IAM_INVITE_TOKEN_TTL_SECONDS` | `604800` | invited-account activation code TTL (5 min–30 days) |
 | `PLATFORM_BOOTSTRAP_SECRET` | empty | one-time first-owner bootstrap; empty disables it; production requires 32+ chars |
@@ -89,6 +90,8 @@ IAM_ALLOW_DIRECT_ORG_CREATE=false
 PLATFORM_ADMIN_ENABLED=true
 PLATFORM_ADMIN_REQUIRE_MFA=true
 PLATFORM_ADMIN_REQUIRE_STEP_UP=true
+# 7-day console session; raise/lower as needed (max 30 days).
+PLATFORM_SESSION_TTL_SECONDS=604800
 PLATFORM_STEP_UP_TTL_SECONDS=300
 PLATFORM_BOOTSTRAP_SECRET=<random 32+ chars>
 PLATFORM_RECOVERY_SECRET=<random 32+ chars>

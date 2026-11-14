@@ -9,7 +9,7 @@ import jwt from 'jsonwebtoken';
 import { randomBytes, randomUUID } from 'crypto';
 import { and, desc, eq, gt, isNull, or, sql } from 'drizzle-orm';
 import { ensureTables, getDb, useDb, __mem, hashSecret, hashCandidates, bumpAuthVersion } from './db';
-import { apiKeys, refreshTokens } from './schema';
+import { apiKeys, platformRunnerKeys, refreshTokens } from './schema';
 
 /** Fail fast on weak/default JWT secrets in production; warn loudly in dev. */
 function jwtSecret(): string {
@@ -129,16 +129,28 @@ export function verifyAccess(token: string): AccessClaims {
 export const PLATFORM_AUDIENCE = 'synapseone-platform-admin';
 export const PLATFORM_STEP_UP_AUDIENCE = 'synapseone-platform-step-up';
 
-/** Issue a short-lived token for the dedicated platform control plane. It has
- *  no org/account claims and a distinct audience so it cannot be used as a
- *  normal tenant token. */
+/**
+ * Platform-session lifetime. Defaults to 15 minutes; operators can raise it
+ * for a long-lived admin console session (clamped to 30 days). The token still
+ * carries the user's auth_version so a revoked session can be rejected before
+ * its natural expiry.
+ */
+export function platformSessionTtl(): number {
+  const raw = Number(process.env.PLATFORM_SESSION_TTL_SECONDS ?? 900);
+  if (!Number.isFinite(raw)) return 900;
+  return Math.min(Math.max(Math.floor(raw), 60), 30 * 86_400);
+}
+
+/** Issue a token for the dedicated platform control plane. It has no
+ *  org/account claims and a distinct audience so it cannot be used as a normal
+ *  tenant token. */
 export function signPlatformAccess(input: {
   userId: string;
   role: 'owner' | 'operator' | 'auditor';
   ttlSeconds?: number;
   ver?: number;
 }): { token: string; expiresIn: number; jti: string } {
-  const expiresIn = Math.min(Math.max(Math.floor(input.ttlSeconds ?? 900), 60), 3600);
+  const expiresIn = Math.min(Math.max(Math.floor(input.ttlSeconds ?? platformSessionTtl()), 60), 30 * 86_400);
   const scopes = input.role === 'owner'
     ? ['platform:read', 'platform:write', 'platform:admin']
     : input.role === 'operator'
@@ -653,5 +665,220 @@ async function verifyApiKeyByHash(hash: string): Promise<VerifiedApiKey | null> 
   if (rec.expires_at && new Date(rec.expires_at).getTime() < Date.now()) return null;
   rec.last_used_at = new Date().toISOString();
   return { id: rec.id, account_id: rec.account_id, user_id: rec.user_id || null, scopes: rec.scopes || [] };
+}
+
+// ---------- platform (owner-scoped) runner keys ----------
+//
+// A platform runner is system compute, not a tenant credential. Its key has no
+// account/user binding and is restricted to runner/queue/inference scopes; the
+// gateway refuses it on every tenant data API. Workflow-service binds it to one
+// runner registration and only that runner may claim system-queue jobs.
+
+/** Scope families a platform runner key may hold. Never `*` or data-plane
+ *  services: a system key must not become a cross-tenant master key. */
+const PLATFORM_RUNNER_SCOPE_FAMILIES = new Set(['workflow', 'queue', 'inference']);
+const PLATFORM_RUNNER_SCOPE_RE = /^(workflow|queue|inference):[A-Za-z][A-Za-z0-9*-]{0,63}$/;
+export const PLATFORM_RUNNER_DEFAULT_SCOPES = [
+  'workflow:*',
+  'queue:consume',
+  'queue:ack',
+  'queue:nack',
+  'queue:heartbeat',
+  'inference:*',
+];
+
+/** Normalize/validate owner-supplied runner scopes. Returns null when any
+ *  scope is outside the three runner families or malformed. */
+export function normalizePlatformRunnerScopes(input: unknown): string[] | null {
+  if (input === undefined || input === null) return PLATFORM_RUNNER_DEFAULT_SCOPES.slice();
+  if (!Array.isArray(input)) return null;
+  const out: string[] = [];
+  for (const raw of input) {
+    const scope = String(raw || '').trim();
+    if (!scope || scope.length > 80 || !PLATFORM_RUNNER_SCOPE_RE.test(scope)) return null;
+    if (!PLATFORM_RUNNER_SCOPE_FAMILIES.has(scope.split(':')[0])) return null;
+    if (!out.includes(scope)) out.push(scope);
+  }
+  return out.length ? out : null;
+}
+
+export interface PlatformRunnerKeyInfo {
+  id: string;
+  runner_id: string;
+  name: string;
+  prefix: string;
+  scopes: string[];
+  created_by: string | null;
+  expires_at: string | null;
+  revoked_at: string | null;
+  last_used_at: string | null;
+  created_at: string | null;
+}
+
+export interface VerifiedPlatformRunnerKey {
+  id: string;
+  runner_id: string;
+  name: string;
+  scopes: string[];
+}
+
+export async function createPlatformRunnerKey(input: {
+  runnerId: string;
+  name: string;
+  scopes: string[];
+  createdBy?: string | null;
+  expiresAt?: Date | null;
+}): Promise<{ id: string; value: string; prefix: string }> {
+  const raw = 'synapseone_pr_' + randomBytes(32).toString('base64url');
+  const prefix = raw.slice(0, 16);
+  const hash = hashSecret(raw);
+  if (useDb()) {
+    const db = getDb()!;
+    await ensureTables();
+    const rows = await db.insert(platformRunnerKeys).values({
+      runnerId: input.runnerId,
+      name: input.name,
+      keyPrefix: prefix,
+      keyHash: hash,
+      scopes: input.scopes,
+      createdBy: input.createdBy || null,
+      expiresAt: input.expiresAt || null,
+    }).returning({ id: platformRunnerKeys.id });
+    return { id: rows[0].id, value: raw, prefix };
+  }
+  const id = randomUUID();
+  __mem.platformRunnerKeys.set(hash, {
+    id,
+    runner_id: input.runnerId,
+    name: input.name,
+    key_prefix: prefix,
+    scopes: input.scopes,
+    created_by: input.createdBy || null,
+    expires_at: input.expiresAt?.toISOString() || null,
+    revoked_at: null,
+    last_used_at: null,
+    created_at: new Date().toISOString(),
+  });
+  return { id, value: raw, prefix };
+}
+
+export async function verifyPlatformRunnerKey(raw: string): Promise<VerifiedPlatformRunnerKey | null> {
+  if (!raw || typeof raw !== 'string' || raw.length > 512) return null;
+  for (const hash of hashCandidates(raw)) {
+    const hit = await verifyPlatformRunnerKeyByHash(hash);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+async function verifyPlatformRunnerKeyByHash(hash: string): Promise<VerifiedPlatformRunnerKey | null> {
+  if (useDb()) {
+    const db = getDb()!;
+    await ensureTables();
+    const rows = await db.select({
+      id: platformRunnerKeys.id,
+      runnerId: platformRunnerKeys.runnerId,
+      name: platformRunnerKeys.name,
+      scopes: platformRunnerKeys.scopes,
+      expiresAt: platformRunnerKeys.expiresAt,
+      revokedAt: platformRunnerKeys.revokedAt,
+      lastUsedAt: platformRunnerKeys.lastUsedAt,
+    }).from(platformRunnerKeys).where(eq(platformRunnerKeys.keyHash, hash)).limit(1);
+    const row = rows[0];
+    if (!row || row.revokedAt) return null;
+    if (row.expiresAt && new Date(row.expiresAt).getTime() < Date.now()) return null;
+    if (!row.lastUsedAt || Date.now() - new Date(row.lastUsedAt).getTime() > LAST_USED_THROTTLE_MS) {
+      db.update(platformRunnerKeys).set({ lastUsedAt: sql`now()` })
+        .where(and(
+          eq(platformRunnerKeys.id, row.id),
+          or(isNull(platformRunnerKeys.lastUsedAt), sql`${platformRunnerKeys.lastUsedAt} < now() - interval '60 seconds'`),
+        ))
+        .catch(() => undefined);
+    }
+    return { id: row.id, runner_id: row.runnerId, name: row.name, scopes: row.scopes || [] };
+  }
+  const rec = __mem.platformRunnerKeys.get(hash);
+  if (!rec || rec.revoked_at) return null;
+  if (rec.expires_at && new Date(rec.expires_at).getTime() < Date.now()) return null;
+  rec.last_used_at = new Date().toISOString();
+  return { id: rec.id, runner_id: rec.runner_id, name: rec.name, scopes: rec.scopes || [] };
+}
+
+export async function revokePlatformRunnerKey(id: string): Promise<boolean> {
+  if (useDb()) {
+    const db = getDb()!;
+    await ensureTables();
+    const rows = await db.update(platformRunnerKeys)
+      .set({ revokedAt: sql`now()` })
+      .where(and(eq(platformRunnerKeys.id, id), isNull(platformRunnerKeys.revokedAt)))
+      .returning({ id: platformRunnerKeys.id });
+    return rows.length > 0;
+  }
+  for (const rec of __mem.platformRunnerKeys.values()) {
+    if (rec.id === id && !rec.revoked_at) {
+      rec.revoked_at = new Date().toISOString();
+      return true;
+    }
+  }
+  return false;
+}
+
+export async function revokePlatformRunnerKeysForRunner(runnerId: string): Promise<number> {
+  if (useDb()) {
+    const db = getDb()!;
+    await ensureTables();
+    const rows = await db.update(platformRunnerKeys)
+      .set({ revokedAt: sql`now()` })
+      .where(and(eq(platformRunnerKeys.runnerId, runnerId), isNull(platformRunnerKeys.revokedAt)))
+      .returning({ id: platformRunnerKeys.id });
+    return rows.length;
+  }
+  let revoked = 0;
+  for (const rec of __mem.platformRunnerKeys.values()) {
+    if (rec.runner_id === runnerId && !rec.revoked_at) {
+      rec.revoked_at = new Date().toISOString();
+      revoked += 1;
+    }
+  }
+  return revoked;
+}
+
+export async function listPlatformRunnerKeys(runnerId?: string): Promise<PlatformRunnerKeyInfo[]> {
+  if (useDb()) {
+    const db = getDb()!;
+    await ensureTables();
+    const rows = await db.select().from(platformRunnerKeys)
+      .where(runnerId ? eq(platformRunnerKeys.runnerId, runnerId) : undefined)
+      .orderBy(desc(platformRunnerKeys.createdAt))
+      .limit(500);
+    return rows.map((r) => ({
+      id: r.id,
+      runner_id: r.runnerId,
+      name: r.name,
+      prefix: r.keyPrefix,
+      scopes: r.scopes || [],
+      created_by: r.createdBy ?? null,
+      expires_at: iso(r.expiresAt),
+      revoked_at: iso(r.revokedAt),
+      last_used_at: iso(r.lastUsedAt),
+      created_at: iso(r.createdAt),
+    }));
+  }
+  return [...__mem.platformRunnerKeys.values()]
+    .filter((rec) => !runnerId || rec.runner_id === runnerId)
+    .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
+    .slice(0, 500)
+    .map((rec) => ({
+      id: rec.id,
+      runner_id: rec.runner_id,
+      name: rec.name,
+      prefix: rec.key_prefix,
+      scopes: rec.scopes || [],
+      created_by: rec.created_by || null,
+      expires_at: rec.expires_at || null,
+      revoked_at: rec.revoked_at || null,
+      last_used_at: rec.last_used_at || null,
+      created_at: rec.created_at || null,
+    }));
 }
 

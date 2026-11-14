@@ -42,6 +42,9 @@ import {
   verifyApiKey, verifyAccess, listApiKeys, findApiKeyById, signDelegated,
   listRefreshSessions, revokeRefreshById, revokeApiKeysForUser, rotateApiKey,
   signPlatformAccess, verifyPlatformAccess, signPlatformStepUp, verifyPlatformStepUp,
+  createPlatformRunnerKey, verifyPlatformRunnerKey, revokePlatformRunnerKey,
+  revokePlatformRunnerKeysForRunner, listPlatformRunnerKeys, normalizePlatformRunnerScopes,
+  PLATFORM_RUNNER_DEFAULT_SCOPES,
 } from './tokens';
 import {
   beginTotpEnrolment, checkSecondFactor, clearLoginFailures, enableTotp, getMfa, lockRemaining, mfaEnabled,
@@ -369,6 +372,13 @@ async function currentPlatformAdmin(
   if (!user || user.active === false) {
     await auditPlatformDenied(req, String(claims.sub || ''), user?.org_id || null, 'platform:access', 'account_inactive');
     res.status(403).json({ error: 'platform_admin_inactive', message: 'platform administrator account is inactive' });
+    return null;
+  }
+  // Long platform sessions remain revocable: revoking sessions/passwords bumps
+  // users.auth_version, so an older token is rejected before its natural expiry.
+  if (Number(claims.ver || 0) !== Number(user.auth_version || 0)) {
+    await auditPlatformDenied(req, user.id, user.org_id, 'platform:access', 'session_revoked');
+    res.status(403).json({ error: 'platform_session_revoked', message: 'the platform session is no longer valid; sign in again' });
     return null;
   }
   const org = await getOrgById(user.org_id);
@@ -2476,13 +2486,27 @@ async function auditMutation(req: express.Request, action: string, resource: str
     }
     if (apiKey) {
       const rec = await verifyApiKey(apiKey);
-      if (!rec) return res.status(401).json({ valid: false });
-      const acc = rec.account_id ? await getAccountById(rec.account_id) : null;
-      const keyOrg = acc ? await getOrgById(acc.org_id) : null;
-      if (!acc || !keyOrg || keyOrg.status === 'suspended') {
-        return res.status(403).json({ valid: false, error: 'org_suspended' });
+      if (rec) {
+        const acc = rec.account_id ? await getAccountById(rec.account_id) : null;
+        const keyOrg = acc ? await getOrgById(acc.org_id) : null;
+        if (!acc || !keyOrg || keyOrg.status === 'suspended') {
+          return res.status(403).json({ valid: false, error: 'org_suspended' });
+        }
+        return res.json({ valid: true, type: 'apikey', ...rec, org_id: keyOrg.id });
       }
-      return res.json({ valid: true, type: 'apikey', ...rec, org_id: keyOrg.id });
+      const runnerKey = await verifyPlatformRunnerKey(apiKey);
+      if (runnerKey) {
+        return res.json({
+          valid: true,
+          type: 'platform-runner-key',
+          kind: 'platform-runner',
+          id: runnerKey.id,
+          runner_id: runnerKey.runner_id,
+          name: runnerKey.name,
+          scopes: runnerKey.scopes,
+        });
+      }
+      return res.status(401).json({ valid: false });
     }
     return res.status(400).json({ error: 'credential_required', message: 'provide Bearer or X-API-Key' });
   });
@@ -3085,15 +3109,30 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (hasEndUserCredential(req)) {
       return res.status(403).json({ error: 'forbidden', message: 'internal endpoint: end-user credentials are not accepted' });
     }
-    const rec = await verifyApiKey((req.body || {}).apiKey || '');
-    if (!rec) return res.status(401).json({ valid: false });
-    // Include the owning org: the gateway uses this for usage attribution (#28).
-    const acc = rec.account_id ? await getAccountById(rec.account_id) : null;
-    const keyOrg = acc ? await getOrgById(acc.org_id) : null;
-    if (!acc || !keyOrg || keyOrg.status === 'suspended') {
-      return res.status(403).json({ valid: false, error: 'org_suspended' });
+    const presented = String((req.body || {}).apiKey || '');
+    const rec = await verifyApiKey(presented);
+    if (rec) {
+      // Include the owning org: the gateway uses this for usage attribution (#28).
+      const acc = rec.account_id ? await getAccountById(rec.account_id) : null;
+      const keyOrg = acc ? await getOrgById(acc.org_id) : null;
+      if (!acc || !keyOrg || keyOrg.status === 'suspended') {
+        return res.status(403).json({ valid: false, error: 'org_suspended' });
+      }
+      return res.json({ valid: true, ...rec, ...(acc?.org_id ? { org_id: acc.org_id } : {}) });
     }
-    res.json({ valid: true, ...rec, ...(acc?.org_id ? { org_id: acc.org_id } : {}) });
+    // Platform (owner-scoped) runner key: no tenant binding. The gateway stamps
+    // kind=platform-runner and the bound runner id; workflow-service only
+    // accepts it on the runner protocol and queue paths.
+    const runnerKey = await verifyPlatformRunnerKey(presented);
+    if (!runnerKey) return res.status(401).json({ valid: false });
+    res.json({
+      valid: true,
+      kind: 'platform-runner',
+      id: runnerKey.id,
+      runner_id: runnerKey.runner_id,
+      name: runnerKey.name,
+      scopes: runnerKey.scopes,
+    });
   });
 
   app.delete('/v1/keys/:id', async (req, res) => {
@@ -4317,6 +4356,177 @@ async function auditMutation(req: express.Request, action: string, resource: str
   // One-time bootstrap, called directly over the internal network. No gateway
   // route exists. Requires PLATFORM_BOOTSTRAP_SECRET and an empty platform
   // administrator set.
+  // ---------- internal: platform (owner-scoped) runners ----------
+  // Workflow-service is the only caller (internal secret + no public gateway
+  // route). It has already authorized a platform owner before minting a key or
+  // requesting a per-execution delegation.
+  const RUNNER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+
+  app.post('/internal/platform-runners/keys', async (req, res) => {
+    const parsed = z.object({
+      runnerId: z.string().trim().min(1).max(128),
+      name: z.string().trim().max(100).optional(),
+      scopes: z.array(z.string().min(1).max(80)).max(100).optional(),
+      createdBy: z.string().uuid().nullish(),
+      expiresAt: z.string().datetime().nullish(),
+    }).safeParse(req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    const { runnerId, name, scopes: rawScopes, createdBy, expiresAt } = parsed.data;
+    if (!RUNNER_ID_RE.test(runnerId)) return res.status(400).json({ error: 'invalid_runner', message: 'runnerId must be 1..128 printable chars' });
+    const scopes = normalizePlatformRunnerScopes(rawScopes ?? PLATFORM_RUNNER_DEFAULT_SCOPES);
+    if (!scopes) {
+      return res.status(400).json({ error: 'invalid_scopes', message: 'platform runner keys may only hold workflow/queue/inference scopes' });
+    }
+    let expiry: Date | null = null;
+    if (expiresAt) {
+      expiry = new Date(expiresAt);
+      if (Number.isNaN(expiry.getTime()) || expiry.getTime() <= Date.now()) {
+        return res.status(400).json({ error: 'invalid_expiry', message: 'expiresAt must be a future timestamp' });
+      }
+    }
+    const key = await createPlatformRunnerKey({
+      runnerId,
+      name: String(name || `platform-runner-${runnerId}`).slice(0, 100),
+      scopes,
+      createdBy: createdBy || null,
+      expiresAt: expiry,
+    });
+    await writeAuditStrict({
+      actor_type: 'platform-admin',
+      actor_id: createdBy || 'platform-runner-service',
+      action: 'platform:runner-key:create',
+      resource: `runner:${runnerId}`,
+      decision: true,
+      context: { keyId: key.id, prefix: key.prefix, scopes, expiresAt: expiry?.toISOString() || null },
+    }).catch(() => undefined);
+    noStore(res);
+    res.status(201).json({
+      id: key.id,
+      apiKey: key.value,
+      prefix: key.prefix,
+      runnerId,
+      scopes,
+      expiresAt: expiry?.toISOString() || null,
+    });
+  });
+
+  app.delete('/internal/platform-runners/keys/:id', async (req, res) => {
+    if (!isUuid(req.params.id)) return res.status(400).json({ error: 'invalid_id', message: 'key id must be a UUID' });
+    const revoked = await revokePlatformRunnerKey(req.params.id);
+    await writeAuditStrict({
+      actor_type: 'platform-admin',
+      actor_id: 'platform-runner-service',
+      action: 'platform:runner-key:revoke',
+      resource: `runner-key:${req.params.id}`,
+      decision: true,
+      context: { revoked },
+    }).catch(() => undefined);
+    res.json({ ok: true, id: req.params.id, revoked });
+  });
+
+  app.delete('/internal/platform-runners/keys/runner/:runnerId', async (req, res) => {
+    const runnerId = String(req.params.runnerId || '');
+    if (!RUNNER_ID_RE.test(runnerId)) return res.status(400).json({ error: 'invalid_runner' });
+    const revoked = await revokePlatformRunnerKeysForRunner(runnerId);
+    await writeAuditStrict({
+      actor_type: 'platform-admin',
+      actor_id: 'platform-runner-service',
+      action: 'platform:runner-key:revoke-all',
+      resource: `runner:${runnerId}`,
+      decision: true,
+      context: { revoked },
+    }).catch(() => undefined);
+    res.json({ ok: true, runnerId, revoked });
+  });
+
+  app.get('/internal/platform-runners/keys', async (req, res) => {
+    const runnerId = typeof req.query.runnerId === 'string' ? req.query.runnerId : undefined;
+    if (runnerId && !RUNNER_ID_RE.test(runnerId)) return res.status(400).json({ error: 'invalid_runner' });
+    res.json({ items: await listPlatformRunnerKeys(runnerId) });
+  });
+
+  /** Mint the short-lived user delegation used by a platform runner for one
+   *  claimed execution. The runner's own key is system-scoped and has no
+   *  tenant; this token carries the execution principal's tenant/scopes so
+   *  data-plane nodes stay tenant-correct and auditable (`act` = runner). */
+  app.post('/internal/platform-runners/delegate', async (req, res) => {
+    const parsed = z.object({
+      userId: z.string().uuid(),
+      runnerId: z.string().trim().min(1).max(128),
+      executionId: z.string().trim().min(1).max(128),
+      accountId: z.string().uuid().nullish(),
+      scopes: z.array(z.string().min(1).max(200)).max(100).nullish(),
+      ttlSeconds: z.number().int().min(60).max(3600).optional(),
+    }).safeParse(req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    const { userId, runnerId, executionId, accountId, scopes: requested, ttlSeconds } = parsed.data;
+    if (!RUNNER_ID_RE.test(runnerId) || !RUNNER_ID_RE.test(executionId)) {
+      return res.status(400).json({ error: 'invalid_id' });
+    }
+    // Never let a system runner acquire platform-control authority.
+    const scopes = (requested === undefined || requested === null ? ['*'] : requested)
+      .map((s) => String(s))
+      .filter((s) => !/^platform:/i.test(s));
+    if (requested !== undefined && requested !== null && scopes.length !== requested.length) {
+      return res.status(403).json({ error: 'platform_scope_forbidden' });
+    }
+    const user = await getUserById(userId);
+    if (!user) return res.status(404).json({ error: 'user_not_found' });
+    if (user.active === false) return res.status(403).json({ error: 'account_deactivated' });
+    const org = await getOrgById(user.org_id);
+    if (!org || org.status === 'suspended') {
+      return res.status(403).json({ error: 'org_suspended', message: 'The target organization is suspended or missing' });
+    }
+    let account = accountId ? await getAccountById(accountId) : null;
+    if (account && account.org_id !== user.org_id) {
+      return res.status(403).json({ error: 'cross_tenant', message: 'account does not belong to the target user organization' });
+    }
+    if (!account) {
+      const accounts = await listAccounts(user.org_id);
+      account = accounts[0] || null;
+    }
+    const ttl = Math.min(Math.max(Number(ttlSeconds) || 900, 60), 3600);
+    const session = signAccess({
+      sub: user.id,
+      email: user.email,
+      org: user.org_id,
+      ...(account ? { account: account.id } : {}),
+      scopes,
+      kind: 'delegated',
+      ver: Number(user.auth_version) || 0,
+      delegated: true,
+      act: { sub: `platform-runner:${runnerId}`, kind: 'platform-runner' },
+    }, { expiresIn: ttl });
+    await writeAuditStrict({
+      actor_type: 'platform-runner',
+      actor_id: `platform-runner:${runnerId}`,
+      action: 'iam:token:platform-runner-delegate',
+      resource: `execution:${executionId}`,
+      decision: true,
+      org_id: user.org_id,
+      context: {
+        userId: user.id,
+        account: account?.id || null,
+        executionId,
+        scopes,
+        ttlSeconds: session.expiresIn,
+      },
+    }).catch(() => undefined);
+    noStore(res);
+    res.json({
+      accessToken: session.token,
+      expiresIn: session.expiresIn,
+      tokenType: 'Bearer',
+      delegated: true,
+      userId: user.id,
+      orgId: user.org_id,
+      accountId: account?.id || null,
+      runnerId,
+      executionId,
+      scopes,
+    });
+  });
+
   app.post('/internal/platform/bootstrap', async (req, res) => {
     const secret = process.env.PLATFORM_BOOTSTRAP_SECRET || '';
     if (!secret) return res.status(503).json({ error: 'bootstrap_disabled' });

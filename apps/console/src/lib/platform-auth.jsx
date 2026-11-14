@@ -22,6 +22,7 @@ const SESSION_INVALID = new Set([
   'platform_admin_inactive',
   'platform_admin_org_required',
   'platform_session_requires_user',
+  'platform_session_revoked',
 ]);
 
 export class PlatformError extends Error {

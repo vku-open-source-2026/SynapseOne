@@ -50,7 +50,8 @@ describe('platform super admin', () => {
     () =>
       new Promise<void>((resolve, reject) => {
         for (const k of ['NODE_ENV', 'DATABASE_URL', 'SYNAPSEONE_INTERNAL_SECRET', 'IAM_ALLOW_DEV_LOGIN',
-          'PLATFORM_ADMIN_ENABLED', 'PLATFORM_ADMIN_REQUIRE_MFA', 'PLATFORM_BOOTSTRAP_SECRET', 'PLATFORM_ORG_SLUG']) {
+          'PLATFORM_ADMIN_ENABLED', 'PLATFORM_ADMIN_REQUIRE_MFA', 'PLATFORM_BOOTSTRAP_SECRET', 'PLATFORM_ORG_SLUG',
+          'PLATFORM_SESSION_TTL_SECONDS']) {
           saved[k] = process.env[k];
         }
         delete process.env.NODE_ENV;
@@ -61,6 +62,7 @@ describe('platform super admin', () => {
         process.env.PLATFORM_ADMIN_REQUIRE_MFA = 'true';
         process.env.PLATFORM_BOOTSTRAP_SECRET = BOOTSTRAP;
         process.env.PLATFORM_ORG_SLUG = 'synapseone-platform';
+        process.env.PLATFORM_SESSION_TTL_SECONDS = '604800';
         const app = createApp();
         server = app.listen(0, '127.0.0.1', async () => {
           try {
@@ -103,6 +105,7 @@ describe('platform super admin', () => {
             assert.equal(platformRecoveryCodes.length, 10);
             const session = await call('POST', '/v1/platform/session', { recoveryCode: platformRecoveryCodes[0] }, normalToken);
             assert.equal(session.status, 200, JSON.stringify(session.json));
+            assert.equal(session.json.expiresIn, 604800);
             platformToken = session.json.accessToken;
             resolve();
           } catch (e) {
