@@ -411,6 +411,9 @@ services:
       BASE_CACHE_TIMEOUT_MS: ${BASE_CACHE_TIMEOUT_MS:-250}
       BASE_OUTBOX_STREAM_TOPIC: ${BASE_OUTBOX_STREAM_TOPIC:-base-changes}
       BASE_OUTBOX_RELAY_MS: ${BASE_OUTBOX_RELAY_MS:-1000}
+      # Capability collections are reachable only by account-level machine
+      # credentials. Tenant users and workflow runAs principals get 404.
+      SYNAPSEONE_BASE_MACHINE_COLLECTION_PREFIXES: ${SYNAPSEONE_BASE_MACHINE_COLLECTION_PREFIXES:-synapsedx_}
       AUDIT_TRAIL: ${AUDIT_TRAIL:-true}
       AUDIT_INGEST_URL: ${AUDIT_INGEST_URL:-}
       INFERENCE_SERVICE_URL: ${INFERENCE_SERVICE_URL:-http://inference:4008}
