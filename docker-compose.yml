@@ -670,6 +670,9 @@ services:
     user: "0:0"
     entrypoint: ["/usr/local/bin/s3-backup"]
     command: ["loop"]
+    # The inherited OCS HTTP healthcheck does not apply to this loop sidecar.
+    healthcheck:
+      disable: true
     environment:
       STORAGE_S3_ENDPOINT: ${STORAGE_S3_ENDPOINT:-http://s3:9090}
       STORAGE_S3_BUCKET: ${STORAGE_S3_BUCKET:-${S3_BUCKET:-synapseone-core}}
