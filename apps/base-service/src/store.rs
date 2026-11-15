@@ -227,6 +227,12 @@ pub struct DatabaseStats {
     pub last_updated_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DeleteDatabaseResult {
+    pub deleted: bool,
+    pub collections: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChangesPage {
     pub events: Vec<Value>,
@@ -234,7 +240,7 @@ pub struct ChangesPage {
     pub next_after: Option<String>,
 }
 
-const MIGRATIONS: &[(i64, &str)] = &[
+pub(crate) const MIGRATIONS: &[(i64, &str)] = &[
     (
         1_792_553_614_991,
         include_str!("../drizzle/0000_productive_gorgon.sql"),
@@ -270,6 +276,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (
         1_797_000_000_000,
         include_str!("../drizzle/0008_base_databases.sql"),
+    ),
+    (
+        1_797_000_000_001,
+        include_str!("../drizzle/0009_base_multidb_runtime_repair.sql"),
     ),
 ];
 
@@ -513,146 +523,56 @@ impl Store {
         name: &str,
         scope: &CollectionScope,
     ) -> Result<Option<StoredDatabase>, StoreError> {
-        if let Some(pool) = self.pool() {
-            let row = if scope.platform && scope.org_id.is_none() && scope.account_id.is_none() {
+        let mut candidates: Vec<StoredDatabase> = if let Some(pool) = self.pool() {
+            let rows = if scope.platform && scope.org_id.is_none() && scope.account_id.is_none() {
                 sqlx::query(
                     r#"SELECT id, name, description, org_id, account_id, created_by, created_at, updated_at
                        FROM synapseone_base_databases
-                       WHERE name = $1 AND org_id IS NULL AND account_id IS NULL
-                       ORDER BY created_at ASC LIMIT 1"#,
+                       WHERE name = $1 AND org_id IS NULL AND account_id IS NULL"#,
                 )
                 .bind(name)
-                .fetch_optional(pool)
+                .fetch_all(pool)
                 .await
-                .map_err(|error| StoreError::invalid(error.to_string()))?
             } else if let Some(org_id) = &scope.org_id {
-                if let Some(account_id) = &scope.account_id {
-                    let exact = sqlx::query(
-                        r#"SELECT id, name, description, org_id, account_id, created_by, created_at, updated_at
-                           FROM synapseone_base_databases
-                           WHERE name = $1 AND org_id = $2 AND account_id = $3
-                           ORDER BY created_at ASC LIMIT 1"#,
-                    )
-                    .bind(name)
-                    .bind(org_id)
-                    .bind(account_id)
-                    .fetch_optional(pool)
-                    .await
-                    .map_err(|error| StoreError::invalid(error.to_string()))?;
-                    if exact.is_some() {
-                        exact
-                    } else {
-                        let org_wide = sqlx::query(
-                            r#"SELECT id, name, description, org_id, account_id, created_by, created_at, updated_at
-                               FROM synapseone_base_databases
-                               WHERE name = $1 AND org_id = $2 AND account_id IS NULL
-                               ORDER BY created_at ASC LIMIT 1"#,
-                        )
-                        .bind(name)
-                        .bind(org_id)
-                        .fetch_optional(pool)
-                        .await
-                        .map_err(|error| StoreError::invalid(error.to_string()))?;
-                        if org_wide.is_some() {
-                            org_wide
-                        } else {
-                            let rows = sqlx::query(
-                                r#"SELECT id, name, description, org_id, account_id, created_by, created_at, updated_at
-                                   FROM synapseone_base_databases
-                                   WHERE name = $1 AND org_id = $2
-                                   ORDER BY created_at ASC LIMIT 2"#,
-                            )
-                            .bind(name)
-                            .bind(org_id)
-                            .fetch_all(pool)
-                            .await
-                            .map_err(|error| StoreError::invalid(error.to_string()))?;
-                            if rows.len() > 1 {
-                                return Err(StoreError::conflict(format!(
-                                    "database '{name}' is ambiguous in this org; add accountId to disambiguate"
-                                )));
-                            }
-                            rows.into_iter().next()
-                        }
-                    }
-                } else {
-                    sqlx::query(
-                        r#"SELECT id, name, description, org_id, account_id, created_by, created_at, updated_at
-                           FROM synapseone_base_databases
-                           WHERE name = $1 AND org_id = $2 AND account_id IS NULL
-                           ORDER BY created_at ASC LIMIT 1"#,
-                    )
-                    .bind(name)
-                    .bind(org_id)
-                    .fetch_optional(pool)
-                    .await
-                    .map_err(|error| StoreError::invalid(error.to_string()))?
-                }
+                sqlx::query(
+                    r#"SELECT id, name, description, org_id, account_id, created_by, created_at, updated_at
+                       FROM synapseone_base_databases
+                       WHERE name = $1 AND org_id = $2"#,
+                )
+                .bind(name)
+                .bind(org_id)
+                .fetch_all(pool)
+                .await
             } else {
                 sqlx::query(
                     r#"SELECT id, name, description, org_id, account_id, created_by, created_at, updated_at
                        FROM synapseone_base_databases
-                       WHERE name = $1 AND org_id IS NULL AND account_id = $2
-                       ORDER BY created_at ASC LIMIT 1"#,
+                       WHERE name = $1 AND org_id IS NULL AND account_id = $2"#,
                 )
                 .bind(name)
-                .bind(scope.account_id.clone().unwrap_or_default())
-                .fetch_optional(pool)
+                .bind(scope.account_id.as_deref())
+                .fetch_all(pool)
                 .await
-                .map_err(|error| StoreError::invalid(error.to_string()))?
-            };
-            return row.as_ref().map(database_from_row).transpose();
-        }
-        let memory = self.memory().await.expect("memory store");
-        let candidates: Vec<&StoredDatabase> = memory
-            .databases
-            .values()
-            .filter(|database| database.name == name)
-            .collect();
-        if scope.platform && scope.org_id.is_none() && scope.account_id.is_none() {
-            return Ok(candidates
-                .into_iter()
-                .find(|database| database.org_id.is_none() && database.account_id.is_none())
-                .cloned());
-        }
-        if let Some(org_id) = &scope.org_id {
-            if let Some(account_id) = &scope.account_id {
-                if let Some(exact) = candidates.iter().find(|database| {
-                    database.org_id.as_deref() == Some(org_id.as_str())
-                        && database.account_id.as_deref() == Some(account_id.as_str())
-                }) {
-                    return Ok(Some((*exact).clone()));
-                }
-                if let Some(org_wide) = candidates.iter().find(|database| {
-                    database.org_id.as_deref() == Some(org_id.as_str())
-                        && database.account_id.is_none()
-                }) {
-                    return Ok(Some((*org_wide).clone()));
-                }
-            } else if let Some(org_wide) = candidates.iter().find(|database| {
-                database.org_id.as_deref() == Some(org_id.as_str()) && database.account_id.is_none()
-            }) {
-                return Ok(Some((*org_wide).clone()));
             }
-            let org_matches: Vec<&StoredDatabase> = candidates
-                .into_iter()
-                .filter(|database| database.org_id.as_deref() == Some(org_id.as_str()))
-                .collect();
-            if org_matches.len() > 1 {
-                return Err(StoreError::conflict(format!(
-                    "database '{name}' is ambiguous in this org; add accountId to disambiguate"
-                )));
-            }
-            return Ok(org_matches.first().map(|database| (*database).clone()));
-        }
-        Ok(candidates
-            .into_iter()
-            .find(|database| {
-                database.org_id.is_none()
-                    && database.account_id.as_deref()
-                        == Some(scope.account_id.as_deref().unwrap_or(""))
-            })
-            .cloned())
+            .map_err(|error| StoreError::invalid(error.to_string()))?;
+            rows.iter()
+                .map(database_from_row)
+                .collect::<Result<_, _>>()?
+        } else {
+            let memory = self.memory().await.expect("memory store");
+            memory
+                .databases
+                .values()
+                .filter(|database| database.name == name)
+                .cloned()
+                .collect()
+        };
+        candidates.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        resolve_database_candidates(name, scope, candidates)
     }
 
     pub async fn find_default_database(
@@ -703,20 +623,17 @@ impl Store {
     /// Return the tenant's `default` database, creating it on first use. Legacy
     /// `/v1/base/collections` routes call this so the pre-namespace API keeps
     /// working without an explicit database.
+    ///
+    /// Reuse order for writes is deliberately narrower than read resolution:
+    /// exact scope, then the org-wide default. A write never adopts another
+    /// account's database in the same org.
     pub async fn ensure_default_database(
         &self,
         scope: &CollectionScope,
     ) -> Result<StoredDatabase, StoreError> {
-        let (org_id, account_id) =
-            if scope.platform && scope.org_id.is_none() && scope.account_id.is_none() {
-                (None, None)
-            } else if let Some(org_id) = &scope.org_id {
-                (Some(org_id.clone()), scope.account_id.clone())
-            } else {
-                (None, scope.account_id.clone())
-            };
+        let (org_id, account_id) = exact_database_scope(scope);
         if let Some(database) = self
-            .find_database_exact("default", org_id.as_deref(), account_id.as_deref())
+            .find_reusable_default(org_id.as_deref(), account_id.as_deref())
             .await?
         {
             return Ok(database);
@@ -732,12 +649,33 @@ impl Store {
             .await
         {
             Ok(database) => Ok(database),
+            // Another request created a reusable default concurrently. Re-run
+            // the same reuse ladder rather than assuming our exact row won.
             Err(error) if error.code == StoreErrorCode::Conflict => self
-                .find_database_exact("default", org_id.as_deref(), account_id.as_deref())
+                .find_reusable_default(org_id.as_deref(), account_id.as_deref())
                 .await?
                 .ok_or(error),
             Err(error) => Err(error),
         }
+    }
+
+    async fn find_reusable_default(
+        &self,
+        org_id: Option<&str>,
+        account_id: Option<&str>,
+    ) -> Result<Option<StoredDatabase>, StoreError> {
+        if let Some(database) = self
+            .find_database_exact("default", org_id, account_id)
+            .await?
+        {
+            return Ok(Some(database));
+        }
+        if account_id.is_some() {
+            if let Some(database) = self.find_database_exact("default", org_id, None).await? {
+                return Ok(Some(database));
+            }
+        }
+        Ok(None)
     }
 
     pub async fn get_database(&self, id: &str) -> Result<Option<StoredDatabase>, StoreError> {
@@ -847,8 +785,49 @@ impl Store {
         Ok(Some(next))
     }
 
-    pub async fn delete_database(&self, id: &str) -> Result<bool, StoreError> {
+    /// Delete a database in one transaction. With `cascade == false`, a
+    /// non-empty database is a conflict; the row lock closes the race between
+    /// the emptiness check and a concurrent collection insert.
+    pub async fn delete_database(
+        &self,
+        id: &str,
+        cascade: bool,
+    ) -> Result<DeleteDatabaseResult, StoreError> {
         if let Some(pool) = self.pool() {
+            let mut transaction = pool
+                .begin()
+                .await
+                .map_err(|error| StoreError::invalid(error.to_string()))?;
+            let exists = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM synapseone_base_databases WHERE id = $1 FOR UPDATE",
+            )
+            .bind(id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|error| StoreError::invalid(error.to_string()))?;
+            let Some(_) = exists else {
+                transaction
+                    .rollback()
+                    .await
+                    .map_err(|error| StoreError::invalid(error.to_string()))?;
+                return Ok(DeleteDatabaseResult::default());
+            };
+            let collections = sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM synapseone_base_collections WHERE database_id = $1",
+            )
+            .bind(id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|error| StoreError::invalid(error.to_string()))?;
+            if collections > 0 && !cascade {
+                transaction
+                    .rollback()
+                    .await
+                    .map_err(|error| StoreError::invalid(error.to_string()))?;
+                return Err(StoreError::conflict(
+                    "database contains collections; pass ?cascade=true to delete them",
+                ));
+            }
             sqlx::query(
                 r#"DELETE FROM synapseone_search_index
                    WHERE collection_id IN (
@@ -856,23 +835,39 @@ impl Store {
                    )"#,
             )
             .bind(id)
-            .execute(pool)
+            .execute(&mut *transaction)
             .await
             .map_err(|error| StoreError::invalid(error.to_string()))?;
             let result = sqlx::query("DELETE FROM synapseone_base_databases WHERE id = $1")
                 .bind(id)
-                .execute(pool)
+                .execute(&mut *transaction)
                 .await
                 .map_err(|error| StoreError::invalid(error.to_string()))?;
-            return Ok(result.rows_affected() > 0);
+            transaction
+                .commit()
+                .await
+                .map_err(|error| StoreError::invalid(error.to_string()))?;
+            return Ok(DeleteDatabaseResult {
+                deleted: result.rows_affected() > 0,
+                collections,
+            });
         }
         let mut memory = self.memory().await.expect("memory store");
+        if !memory.databases.contains_key(id) {
+            return Ok(DeleteDatabaseResult::default());
+        }
         let collection_ids: Vec<String> = memory
             .collections
             .values()
             .filter(|collection| collection.database_id == id)
             .map(|collection| collection.id.clone())
             .collect();
+        if !collection_ids.is_empty() && !cascade {
+            return Err(StoreError::conflict(
+                "database contains collections; pass ?cascade=true to delete them",
+            ));
+        }
+        let deleted_collections = collection_ids.len() as i64;
         for collection_id in &collection_ids {
             memory
                 .documents
@@ -891,7 +886,11 @@ impl Store {
                 .retain(|_, record| record.collection_id != *collection_id);
             memory.collections.remove(collection_id);
         }
-        Ok(memory.databases.remove(id).is_some())
+        let deleted = memory.databases.remove(id).is_some();
+        Ok(DeleteDatabaseResult {
+            deleted,
+            collections: deleted_collections,
+        })
     }
 
     pub async fn database_stats(&self, id: &str) -> Result<DatabaseStats, StoreError> {
@@ -977,7 +976,14 @@ impl Store {
             .bind(&input.created_by)
             .fetch_optional(pool)
             .await
-            .map_err(|error| StoreError::invalid(error.to_string()))?;
+            .map_err(|error| {
+                if is_foreign_key_violation(&error) {
+                    // The database was deleted after the API resolved it.
+                    StoreError::not_found(format!("database '{}' not found", input.database_name))
+                } else {
+                    StoreError::invalid(error.to_string())
+                }
+            })?;
             let Some(row) = row else {
                 return Err(StoreError::conflict(format!(
                     "collection '{}' already exists in this database",
@@ -990,7 +996,7 @@ impl Store {
         }
         let mut memory = self.memory().await.expect("memory store");
         if !memory.databases.contains_key(&input.database_id) {
-            return Err(StoreError::invalid(format!(
+            return Err(StoreError::not_found(format!(
                 "database '{}' not found",
                 input.database_name
             )));
@@ -2345,10 +2351,86 @@ fn same_scope(
         && left_account.unwrap_or("") == right_account.unwrap_or("")
 }
 
+/// Resolve a name to one database using the single rule shared by Postgres and
+/// the in-memory backend:
+///
+/// 1. exact `(org, account)` scope;
+/// 2. for org principals, the org-wide `(org, NULL)` scope;
+/// 3. a unique remaining match in the org, otherwise `409 ambiguous_database`.
+///
+/// Account-only and platform scopes have no org fallback: they only match their
+/// exact scope. The caller passes candidates already filtered to the name and
+/// the broadest safe scope.
+fn resolve_database_candidates(
+    name: &str,
+    scope: &CollectionScope,
+    candidates: Vec<StoredDatabase>,
+) -> Result<Option<StoredDatabase>, StoreError> {
+    let exact = |org: Option<&str>, account: Option<&str>| {
+        candidates
+            .iter()
+            .find(|database| {
+                database.org_id.as_deref() == org && database.account_id.as_deref() == account
+            })
+            .cloned()
+    };
+
+    if scope.platform && scope.org_id.is_none() && scope.account_id.is_none() {
+        return Ok(exact(None, None));
+    }
+
+    if let Some(org_id) = &scope.org_id {
+        if let Some(account_id) = &scope.account_id {
+            if let Some(database) = exact(Some(org_id), Some(account_id)) {
+                return Ok(Some(database));
+            }
+        }
+        if let Some(database) = exact(Some(org_id), None) {
+            return Ok(Some(database));
+        }
+        let org_matches: Vec<&StoredDatabase> = candidates
+            .iter()
+            .filter(|database| database.org_id.as_deref() == Some(org_id.as_str()))
+            .collect();
+        return match org_matches.len() {
+            0 => Ok(None),
+            1 => Ok(Some(org_matches[0].clone())),
+            _ => Err(StoreError::conflict(format!(
+                "database '{name}' is ambiguous in this org; add accountId to disambiguate"
+            ))),
+        };
+    }
+
+    if let Some(account_id) = &scope.account_id {
+        return Ok(exact(None, Some(account_id)));
+    }
+
+    Ok(exact(None, None))
+}
+
+/// Exact scope used when a legacy write must create a default database. Unlike
+/// database *reads*, a write never adopts another account's database.
+fn exact_database_scope(scope: &CollectionScope) -> (Option<String>, Option<String>) {
+    if scope.platform && scope.org_id.is_none() && scope.account_id.is_none() {
+        (None, None)
+    } else if let Some(org_id) = &scope.org_id {
+        (Some(org_id.clone()), scope.account_id.clone())
+    } else {
+        (None, scope.account_id.clone())
+    }
+}
+
 fn is_unique_violation(error: &sqlx::Error) -> bool {
     error
         .as_database_error()
         .map(|database| database.is_unique_violation())
+        .unwrap_or(false)
+}
+
+fn is_foreign_key_violation(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .map(|database| database.code().as_deref() == Some("23503"))
         .unwrap_or(false)
 }
 
