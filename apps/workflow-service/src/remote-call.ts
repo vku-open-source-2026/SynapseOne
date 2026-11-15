@@ -44,6 +44,10 @@ export interface RunnerApiOptions {
   baseUrl: string;
   apiKey: string;
   runnerId: string;
+  /** `apikey` (default) sends X-API-Key; `bearer` sends the value as a Bearer
+   *  token. Platform runners use `bearer` for the per-execution delegated
+   *  user token while keeping their system key for the job protocol. */
+  auth?: 'apikey' | 'bearer';
   timeoutMs?: number;
 }
 
@@ -114,6 +118,7 @@ export function createRunnerApi(opts: RunnerApiOptions) {
   try { parsedBase = new URL(base); } catch { throw new Error(`SYNAPSEONE_URL must be an absolute http(s) URL, got '${base}'`); }
   if (!['http:', 'https:'].includes(parsedBase.protocol)) throw new Error(`SYNAPSEONE_URL must use http or https, got '${parsedBase.protocol}'`);
   if (!opts.apiKey) throw new Error('SYNAPSEONE_API_KEY is required');
+  const authMode = opts.auth === 'bearer' ? 'bearer' : 'apikey';
   const timeoutMs = Math.min(Math.max(Number(opts.timeoutMs) || 30000, 1000), 300000);
   const maxAttempts = envInt('SYNAPSEONE_HTTP_RETRIES', 3, 1, 6);
   const retryBaseMs = envInt('SYNAPSEONE_HTTP_RETRY_BASE_MS', 300, 50, 5000);
@@ -133,7 +138,9 @@ export function createRunnerApi(opts: RunnerApiOptions) {
           method,
           headers: {
             'Content-Type': 'application/json',
-            'X-API-Key': opts.apiKey,
+            ...(authMode === 'bearer'
+              ? { Authorization: `Bearer ${opts.apiKey}` }
+              : { 'X-API-Key': opts.apiKey }),
             'X-Workflow-Runner-Id': opts.runnerId,
             'User-Agent': 'synapseone-workflow-runner/0.7',
             ...extraHeaders,
@@ -431,13 +438,14 @@ export function createRemoteSynapseOneCall(api: ReturnType<typeof createRunnerAp
 }
 
 /** Resolve node credentials for exactly one claimed execution. */
-export function createRemoteCredentialResolver(api: ReturnType<typeof createRunnerApi>, executionId: string, runnerId: string): CredentialResolver {
+export function createRemoteCredentialResolver(api: ReturnType<typeof createRunnerApi>, executionId: string, runnerId: string, fence?: { instanceId: string; attempt: number }): CredentialResolver {
   return async (credentialId: string) => {
     if (!credentialId || typeof credentialId !== 'string' || credentialId.length > 128 || /[\r\n]/.test(credentialId)) return null;
     try {
       const r = await api.request('POST', `/v1/runner/jobs/${encodeURIComponent(executionId)}/credentials`, {
         runnerId,
         credentialId,
+        ...(fence || {}),
       });
       if (!r || typeof r.secret !== 'string') return null;
       return { kind: String(r.kind || 'bearer'), secret: r.secret };

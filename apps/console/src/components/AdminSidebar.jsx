@@ -6,7 +6,7 @@ import { useAuth } from '../lib/auth.jsx';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import {
   faHouse, faBuilding, faUsers, faServer, faChartSimple, faBoxes,
-  faListCheck, faUserShield, faArrowLeft,
+  faListCheck, faUserShield, faArrowLeft, faPlug,
 } from '@fortawesome/free-solid-svg-icons';
 
 const ITEMS = [
@@ -14,6 +14,7 @@ const ITEMS = [
   { to: '/admin/orgs', label: 'Organizations', icon: faBuilding },
   { to: '/admin/accounts', label: 'Accounts', icon: faBoxes },
   { to: '/admin/users', label: 'Users & Access', icon: faUsers },
+  { to: '/admin/runners', label: 'Platform Runners', icon: faPlug, owner: true },
   { to: '/admin/health', label: 'Service Health', icon: faServer },
   { to: '/admin/usage', label: 'Usage', icon: faChartSimple },
   { to: '/admin/audit', label: 'Audit & Security', icon: faListCheck },

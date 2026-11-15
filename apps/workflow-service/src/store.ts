@@ -11,11 +11,17 @@ import './env-compat';
 import path from 'path';
 import { Pool } from 'pg';
 import { randomUUID } from 'crypto';
-import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, or, sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { isWebhookType, isCronType, normalizeNodeType } from './engine';
-import { credentials, executions, humanTasks, inferenceJobs, secrets, secretVersions, workflowRunnerInstances, workflowRunners, workflows } from './schema';
+import {
+  DEFAULT_CPU_HEADROOM_PERCENT,
+  DEFAULT_MEMORY_HEADROOM_MB,
+  fitRunnerResources,
+  sanitizeResourceSample,
+} from './runner-resources';
+import { credentials, executions, humanTasks, inferenceJobs, runnerUsageHourly, secrets, secretVersions, workflowRunnerInstances, workflowRunners, workflows } from './schema';
 
 /** Caller principal stamped by the gateway (P0-2). Anonymous when called
  *  directly with only the internal secret (dev/tests). */
@@ -24,7 +30,28 @@ export interface Principal {
   org?: string;
   account?: string;
   kind?: string;
+  /** Verified credential scopes at the time the run was queued. A platform
+   *  runner uses these to mint the per-execution delegated token. */
+  scopes?: string[];
+  /** Bound runner registration (platform-runner machine credentials only). */
+  runnerId?: string;
 }
+
+/** CPU/RAM admission requirement for one execution or inference job. These
+ *  are incremental reservations: the workflow default is a small task slot,
+ *  while inference is CPU/RAM above the resident local model footprint. */
+export interface RunnerResourceRequirements {
+  cpu: number;
+  memoryMb: number;
+}
+
+export const DEFAULT_WORKFLOW_RESOURCES: RunnerResourceRequirements = Object.freeze({ cpu: 0.5, memoryMb: 128 });
+export const DEFAULT_INFERENCE_RESOURCES: RunnerResourceRequirements = Object.freeze({ cpu: 1, memoryMb: 256 });
+
+/** A runner heartbeat is at most 45 s old before it may admit platform work.
+ *  The runtime sampler emits every 15 s; three missed beats fail closed. */
+const RESOURCE_SAMPLE_MAX_AGE_MS = 45_000;
+const RESOURCE_SAMPLE_FUTURE_SKEW_MS = 5_000;
 
 export interface StoredWorkflow {
   id: string;
@@ -70,6 +97,11 @@ export interface StoredExecution {
   queue_name?: string | null;
   runner?: string | null;
   worker_id?: string | null;
+  /** Connector instance that claimed the run (fences same-registration replicas). */
+  runner_instance_id?: string | null;
+  target_runner_id?: string | null;
+  /** Incremental CPU/RAM reservation persisted at enqueue time. */
+  resource_requirements?: RunnerResourceRequirements | null;
   attempt?: number;
   lease_expires_at?: string | null;
   workflow_revision?: number | null;
@@ -79,7 +111,8 @@ export interface StoredExecution {
   finishedAt: string;
 }
 
-export type RunnerMode = 'custom' | 'hybrid';
+export type RunnerMode = 'custom' | 'hybrid' | 'system';
+export type RunnerScope = 'tenant' | 'platform';
 
 export type RunnerKind = 'workflow' | 'inference' | 'hybrid';
 
@@ -87,6 +120,7 @@ export interface StoredWorkflowRunner {
   id: string;
   name: string;
   kind: RunnerKind;
+  scope: RunnerScope;
   mode: RunnerMode;
   queue: string;
   inference_queue?: string | null;
@@ -131,11 +165,23 @@ export interface StoredInferenceJob {
   runner_id?: string | null;
   instance_id?: string | null;
   queue_name?: string | null;
+  target_runner_id?: string | null;
+  /** Incremental CPU/RAM reservation persisted at enqueue time. */
+  resource_requirements?: RunnerResourceRequirements | null;
   attempt: number;
   lease_expires_at?: string | null;
   created_at: string;
   updated_at: string;
   finished_at?: string | null;
+}
+
+/** Options for capacity-enforced claims. `enforceCapacity` is passed by the
+ *  protocol layer only for platform runners, so legacy/internal and tenant
+ *  claims keep their historical behaviour. `resources` may override the
+ *  persisted requirement for a single admission (used by self-tests). */
+export interface RunnerCapacityClaimOptions {
+  enforceCapacity?: boolean;
+  resources?: Partial<RunnerResourceRequirements> | null;
 }
 
 const DATABASE_URL = process.env.DATABASE_URL || '';
@@ -155,7 +201,7 @@ function getDirectPool(): Pool | null {
   }
   return directPool;
 }
-const db = pool ? drizzle(pool, { schema: { credentials, executions, inferenceJobs, workflowRunnerInstances, workflowRunners, workflows } }) : null;
+const db = pool ? drizzle(pool, { schema: { credentials, executions, inferenceJobs, runnerUsageHourly, workflowRunnerInstances, workflowRunners, workflows } }) : null;
 
 export function useDb(): boolean {
   return !!db;
@@ -166,6 +212,7 @@ const memWorkflows = new Map<string, StoredWorkflow>();
 const memExecutions = new Map<string, StoredExecution>();
 const memRunners = new Map<string, StoredWorkflowRunner>();
 const memRunnerInstances = new Map<string, StoredRunnerInstance>();
+const memRunnerUsage = new Map<string, StoredRunnerUsageHour>();
 const memInferenceJobs = new Map<string, StoredInferenceJob>();
 // newest-first ordering helper
 const memExecOrder: string[] = [];
@@ -184,6 +231,280 @@ function iso(v: Date | string | null | undefined): string {
   return nowIso();
 }
 
+// ---- runner CPU/RAM admission ----
+//
+// The reservation is the persisted `resource_requirements` of every running
+// row on the same connector instance. It is intentionally stored on the job
+// rows instead of a separate ledger: release/finish/expiry remove a row from
+// the running set in the same statement that changes its state.
+
+export function normalizeRunnerResourceRequirements(
+  value: unknown,
+  fallback: RunnerResourceRequirements,
+): RunnerResourceRequirements {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { ...fallback };
+  const source = value as Record<string, unknown>;
+  const cpu = Number(source.cpu);
+  const memoryMb = Number(source.memoryMb);
+  if (!Number.isFinite(cpu) || cpu <= 0 || !Number.isFinite(memoryMb) || memoryMb <= 0) {
+    return { ...fallback };
+  }
+  return {
+    cpu: Math.round(Math.min(cpu, 64) * 100) / 100,
+    memoryMb: Math.round(Math.min(memoryMb, 262144)),
+  };
+}
+
+function resolvedRequirements(
+  override: Partial<RunnerResourceRequirements> | null | undefined,
+  stored: unknown,
+  defaults: RunnerResourceRequirements,
+): RunnerResourceRequirements {
+  return normalizeRunnerResourceRequirements(override ?? stored, normalizeRunnerResourceRequirements(stored, defaults));
+}
+
+function runnerCapacityError(
+  code: 'runner_capacity_unavailable' | 'runner_resources_unavailable',
+  message: string,
+  details: Record<string, any> = {},
+): Error {
+  return Object.assign(new Error(message), { status: 409, code, ...details });
+}
+
+function instanceResourceMetadata(metadata: unknown): unknown {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return null;
+  return (metadata as Record<string, any>).resources ?? null;
+}
+
+interface CapacityReservation {
+  cpu: number;
+  memoryMb: number;
+}
+
+/** Server-side per-lane concurrency authority (audit fix).
+ *
+ *  The owner-configured `dockerResources.concurrency` is only a *generated
+ *  command* setting for new containers. Live containers may still report the
+ *  older value, so admission always uses the concurrency the connector last
+ *  reported on its instance row:
+ *   - workflow lane: `instance.concurrency` (heartbeat, 1..64, default 1);
+ *   - inference lane: `instance.metadata.inferenceConcurrency`
+ *     (heartbeat, clamped 1..32, default 1 — the local Python worker is serial).
+ *
+ *  The check runs inside the same advisory-lock transaction / synchronous
+ *  memory section as the reservation read, counts only live leased `running`
+ *  rows for this runner+instance, and rejects before the queued row is mutated. */
+type RunnerCapacityLane = 'workflow' | 'inference';
+
+const WORKFLOW_LANE_MAX = 64;
+const INFERENCE_LANE_MAX = 32;
+
+function instanceWorkflowConcurrency(instance: { concurrency?: unknown } | null | undefined): number {
+  const value = Number(instance?.concurrency);
+  if (!Number.isSafeInteger(value) || value < 1) return 1;
+  return Math.min(value, WORKFLOW_LANE_MAX);
+}
+
+function instanceInferenceConcurrency(instance: { metadata?: unknown } | null | undefined): number {
+  const metadata = instance?.metadata && typeof instance.metadata === 'object' && !Array.isArray(instance.metadata)
+    ? instance.metadata as Record<string, any>
+    : {};
+  const value = Number(metadata.inferenceConcurrency);
+  if (!Number.isSafeInteger(value) || value < 1) return 1;
+  return Math.min(value, INFERENCE_LANE_MAX);
+}
+
+function assertLaneCapacity(
+  lane: RunnerCapacityLane,
+  active: number,
+  limit: number,
+  required: RunnerResourceRequirements,
+): void {
+  if (active < limit) return;
+  throw runnerCapacityError(
+    'runner_capacity_unavailable',
+    `runner instance ${lane} lane reached its concurrency limit (${limit})`,
+    { required, lane, limit, active },
+  );
+}
+
+/** Reuse the runtime agent's pure admission helper (single source of truth):
+ *  CPU is `min(sampleAvailable, limit - reserved) - 10% headroom`, RAM is
+ *  `sampleAvailable - incremental reservations - 256 MiB`. Platform claims
+ *  fail closed when the instance sample is missing, invalid or older than 45 s.
+ *  The 409 carries `code` so the runner nacks instead of acking/dropping work. */
+/** Three beats of the instance's declared interval, never below 45 s. */
+function instanceResourceMaxAgeMs(metadata: unknown): number {
+  const meta = metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+    ? metadata as Record<string, any>
+    : {};
+  const raw = Number(meta.heartbeatIntervalSeconds);
+  const interval = Number.isFinite(raw) && raw >= 5 && raw <= 300 ? Math.floor(raw) : 15;
+  return Math.max(RESOURCE_SAMPLE_MAX_AGE_MS, interval * 3000);
+}
+
+function assertInstanceCapacity(
+  sample: unknown,
+  required: RunnerResourceRequirements,
+  reservations: CapacityReservation[],
+  nowMs: number,
+  maxAgeMs = RESOURCE_SAMPLE_MAX_AGE_MS,
+): void {
+  if (!sample || typeof sample !== 'object' || Array.isArray(sample)) {
+    throw runnerCapacityError(
+      'runner_resources_unavailable',
+      'runner instance has no CPU/RAM telemetry; platform claims are deferred until its next heartbeat',
+      { required, sampledAt: null },
+    );
+  }
+  const sanitized = sanitizeResourceSample(sample);
+  // Freshness is anchored to the runner's observation clock, not the receipt
+  // time. A cached sample replayed in a new heartbeat therefore stays stale.
+  const observedMs = Date.parse(sanitized.observedAt || sanitized.sampledAt);
+  if (!Number.isFinite(observedMs) || observedMs - nowMs > RESOURCE_SAMPLE_FUTURE_SKEW_MS) {
+    throw runnerCapacityError(
+      'runner_resources_unavailable',
+      'runner instance has no fresh CPU/RAM telemetry; platform claims are deferred until its next heartbeat',
+      { required, sampledAt: Number.isFinite(observedMs) ? new Date(observedMs).toISOString() : null },
+    );
+  }
+  if (nowMs - observedMs > maxAgeMs) {
+    throw runnerCapacityError(
+      'runner_resources_unavailable',
+      'runner instance telemetry is older than its heartbeat window; platform claims are deferred until its next heartbeat',
+      { required, sampledAt: new Date(observedMs).toISOString(), maxAgeMs },
+    );
+  }
+  const fit = fitRunnerResources(sanitized, { cpuCores: required.cpu, memoryMb: required.memoryMb }, {
+    staleAfterMs: maxAgeMs,
+    activeReservations: reservations.map((item) => ({ cpuCores: item.cpu, memoryMb: item.memoryMb })),
+    cpuHeadroomPercent: DEFAULT_CPU_HEADROOM_PERCENT,
+    memoryHeadroomMb: DEFAULT_MEMORY_HEADROOM_MB,
+    now: nowMs,
+  });
+  if (fit.ok) return;
+  if (fit.reason === 'stale' || fit.reason === 'unavailable' || fit.reason === 'invalid') {
+    throw runnerCapacityError(
+      'runner_resources_unavailable',
+      'runner instance has no fresh CPU/RAM telemetry; platform claims are deferred until its next heartbeat',
+      { required, sampledAt: sanitized.observedAt || sanitized.sampledAt },
+    );
+  }
+  throw runnerCapacityError(
+    'runner_capacity_unavailable',
+    'runner instance does not have enough unreserved CPU/RAM for this job',
+    {
+      required,
+      available: { cpu: fit.cpu.availableCores, memoryMb: fit.memory.availableMb },
+      sampledAt: sanitized.observedAt || sanitized.sampledAt,
+    },
+  );
+}
+
+interface InstanceCapacityLoad {
+  reservations: CapacityReservation[];
+  workflowActive: number;
+  inferenceActive: number;
+}
+
+/** One pass over both lanes: live leases feed the shared CPU/RAM pool and the
+ *  per-lane counts. Expired or unleased `running` rows release their slot. */
+function memoryInstanceCapacityLoad(instanceId: string, runnerId: string, nowMs: number): InstanceCapacityLoad {
+  const load: InstanceCapacityLoad = { reservations: [], workflowActive: 0, inferenceActive: 0 };
+  for (const execution of memExecutions.values()) {
+    if (execution.status !== 'running'
+      || execution.runner_instance_id !== instanceId
+      || execution.worker_id !== runnerId
+      || !execution.lease_expires_at
+      || Date.parse(execution.lease_expires_at) <= nowMs) continue;
+    load.workflowActive += 1;
+    load.reservations.push(normalizeRunnerResourceRequirements(execution.resource_requirements, DEFAULT_WORKFLOW_RESOURCES));
+  }
+  for (const job of memInferenceJobs.values()) {
+    if (job.status !== 'running'
+      || job.instance_id !== instanceId
+      || job.runner_id !== runnerId
+      || !job.lease_expires_at
+      || Date.parse(job.lease_expires_at) <= nowMs) continue;
+    load.inferenceActive += 1;
+    load.reservations.push(normalizeRunnerResourceRequirements(job.resource_requirements, DEFAULT_INFERENCE_RESOURCES));
+  }
+  return load;
+}
+
+/** Serialize every capacity-enforced claim for one connector instance. The
+ *  transaction-scoped advisory lock covers both lanes (a hybrid instance has
+ *  one CPU/RAM budget) and is released automatically on commit/rollback. */
+async function lockInstanceCapacity(tx: any, instanceId: string): Promise<void> {
+  await tx.execute(sql`select pg_advisory_xact_lock(hashtext('synapseone_runner_capacity'), hashtext(${instanceId}))`);
+}
+
+/** Postgres counterpart of the in-memory reservation read. The instance row
+ *  must match BOTH id and owning registration; a key bound to another
+ *  registration can never poison or borrow this instance's telemetry. */
+async function assertPostgresInstanceCapacity(tx: any, opts: {
+  instanceId: string;
+  runnerId: string;
+  required: RunnerResourceRequirements;
+  now: Date;
+  lane: RunnerCapacityLane;
+}): Promise<void> {
+  const instanceRows = await tx.select({
+    metadata: workflowRunnerInstances.metadata,
+    concurrency: workflowRunnerInstances.concurrency,
+  })
+    .from(workflowRunnerInstances)
+    .where(and(
+      eq(workflowRunnerInstances.id, opts.instanceId),
+      eq(workflowRunnerInstances.runnerId, opts.runnerId),
+    ))
+    .limit(1);
+  if (!instanceRows[0]) {
+    throw runnerCapacityError(
+      'runner_resources_unavailable',
+      'runner instance is not bound to this registration; capacity cannot be admitted',
+      { required: opts.required, sampledAt: null },
+    );
+  }
+  const instance = instanceRows[0];
+  const sample = instanceResourceMetadata(instance.metadata);
+  if (!sample || typeof sample !== 'object') {
+    throw runnerCapacityError(
+      'runner_resources_unavailable',
+      'runner instance has no CPU/RAM telemetry; platform claims are deferred until its next heartbeat',
+      { required: opts.required, sampledAt: null },
+    );
+  }
+  const executionRows = await tx.select({ requirements: executions.resourceRequirements })
+    .from(executions)
+    .where(and(
+      eq(executions.status, 'running'),
+      eq(executions.runnerInstanceId, opts.instanceId),
+      eq(executions.workerId, opts.runnerId),
+      gt(executions.leaseExpiresAt, opts.now),
+    ));
+  const jobRows = await tx.select({ requirements: inferenceJobs.resourceRequirements })
+    .from(inferenceJobs)
+    .where(and(
+      eq(inferenceJobs.status, 'running'),
+      eq(inferenceJobs.instanceId, opts.instanceId),
+      eq(inferenceJobs.runnerId, opts.runnerId),
+      gt(inferenceJobs.leaseExpiresAt, opts.now),
+    ));
+  const reservations: CapacityReservation[] = [
+    ...executionRows.map((row: any) => normalizeRunnerResourceRequirements(row.requirements, DEFAULT_WORKFLOW_RESOURCES)),
+    ...jobRows.map((row: any) => normalizeRunnerResourceRequirements(row.requirements, DEFAULT_INFERENCE_RESOURCES)),
+  ];
+  // Per-lane authority uses the instance-reported values, never the pending
+  // owner desired config (which only affects newly generated commands).
+  if (opts.lane === 'workflow') {
+    assertLaneCapacity('workflow', executionRows.length, instanceWorkflowConcurrency(instance), opts.required);
+  } else {
+    assertLaneCapacity('inference', jobRows.length, instanceInferenceConcurrency(instance), opts.required);
+  }
+  assertInstanceCapacity(sample, opts.required, reservations, opts.now.getTime(), instanceResourceMaxAgeMs(instance.metadata));
+}
+
 let ensured = false;
 export async function ensureTables(): Promise<void> {
   if (!db || ensured) return;
@@ -193,7 +514,7 @@ export async function ensureTables(): Promise<void> {
     try {
       // Hold the advisory lock on the same dedicated session that runs the
       // migration (pool connections are not guaranteed to be reused).
-      const migrationDb = drizzle(client, { schema: { credentials, executions, inferenceJobs, workflowRunnerInstances, workflowRunners, workflows } });
+      const migrationDb = drizzle(client, { schema: { credentials, executions, inferenceJobs, runnerUsageHourly, workflowRunnerInstances, workflowRunners, workflows } });
       await migrationDb.execute(sql`select pg_advisory_lock(hashtext('synapseone_workflow_migrations'))`);
       try {
         await migrate(migrationDb, {
@@ -267,6 +588,11 @@ function rowToExecution(r: typeof executions.$inferSelect): StoredExecution {
     queue_name: r.queueName != null ? String(r.queueName) : null,
     runner: r.runner != null ? String(r.runner) : null,
     worker_id: r.workerId != null ? String(r.workerId) : null,
+    runner_instance_id: r.runnerInstanceId != null ? String(r.runnerInstanceId) : null,
+    target_runner_id: r.targetRunnerId ?? null,
+    resource_requirements: r.resourceRequirements && typeof r.resourceRequirements === 'object'
+      ? r.resourceRequirements as RunnerResourceRequirements
+      : null,
     attempt: Number.isFinite(Number(r.attempt)) ? Number(r.attempt) : 0,
     lease_expires_at: r.leaseExpiresAt ? iso(r.leaseExpiresAt) : null,
     workflow_revision: r.workflowRevision != null ? Number(r.workflowRevision) : null,
@@ -419,6 +745,9 @@ export async function createExecutionRec(data: {
   queue_name?: string | null;
   runner?: string | null;
   worker_id?: string | null;
+  runner_instance_id?: string | null;
+  target_runner_id?: string | null;
+  resource_requirements?: RunnerResourceRequirements | null;
   attempt?: number;
   lease_expires_at?: string | null;
   workflow_revision?: number | null;
@@ -440,6 +769,11 @@ export async function createExecutionRec(data: {
     queue_name: data.queue_name ?? null,
     runner: data.runner ?? null,
     worker_id: data.worker_id ?? null,
+    runner_instance_id: data.runner_instance_id ?? null,
+    target_runner_id: data.target_runner_id ?? null,
+    resource_requirements: data.resource_requirements
+      ? normalizeRunnerResourceRequirements(data.resource_requirements, DEFAULT_WORKFLOW_RESOURCES)
+      : null,
     attempt: data.attempt ?? 0,
     lease_expires_at: data.lease_expires_at ?? null,
     workflow_revision: data.workflow_revision ?? null,
@@ -465,6 +799,9 @@ export async function createExecutionRec(data: {
       queueName: rec.queue_name,
       runner: rec.runner,
       workerId: rec.worker_id,
+      runnerInstanceId: rec.runner_instance_id,
+      targetRunnerId: rec.target_runner_id,
+      resourceRequirements: rec.resource_requirements ?? {},
       attempt: rec.attempt ?? 0,
       leaseExpiresAt: rec.lease_expires_at ? new Date(rec.lease_expires_at) : null,
       workflowRevision: rec.workflow_revision,
@@ -534,38 +871,99 @@ export async function listExecutionRecs(opts: {
  *  worker. Returns null when another worker already owns it or it finished.
  *  This is the cross-worker exactly-one-runner guard; the queue itself is
  *  at-least-once, so duplicates are expected and discarded here. */
-export async function claimExecutionRec(id: string, opts: { workerId: string; leaseSeconds: number }): Promise<StoredExecution | null> {
+export async function claimExecutionRec(id: string, opts: {
+  workerId: string;
+  instanceId?: string | null;
+  leaseSeconds: number;
+} & RunnerCapacityClaimOptions): Promise<StoredExecution | null> {
   const leaseSeconds = Math.min(Math.max(Number(opts.leaseSeconds) || 300, 15), 3600);
   const workerId = String(opts.workerId || '').slice(0, 128) || 'worker';
+  const instanceId = opts.instanceId ? String(opts.instanceId).slice(0, 128) : null;
   const now = new Date();
   const lease = new Date(now.getTime() + leaseSeconds * 1000);
   if (db) {
     await ensureTables();
-    const rows = await db.update(executions).set({
-      status: 'running',
-      workerId,
-      leaseExpiresAt: lease,
-      attempt: sql`${executions.attempt} + 1`,
-      startedAt: sql`case when ${executions.status} = 'queued' then ${now} else ${executions.startedAt} end`,
-      error: null,
-    }).where(and(
-      eq(executions.id, id),
-      or(
-        eq(executions.status, 'queued'),
-        and(eq(executions.status, 'running'), or(isNull(executions.leaseExpiresAt), lt(executions.leaseExpiresAt, now))),
-      ),
-    )).returning();
-    return rows[0] ? rowToExecution(rows[0]) : null;
+    const applyClaim = async (runner: any): Promise<StoredExecution | null> => {
+      const rows = await runner.update(executions).set({
+        status: 'running',
+        workerId,
+        runnerInstanceId: instanceId,
+        leaseExpiresAt: lease,
+        attempt: sql`${executions.attempt} + 1`,
+        startedAt: sql`case when ${executions.status} = 'queued' then ${now} else ${executions.startedAt} end`,
+        error: null,
+      }).where(and(
+        eq(executions.id, id),
+        or(isNull(executions.targetRunnerId), eq(executions.targetRunnerId, workerId)),
+        or(
+          eq(executions.status, 'queued'),
+          and(eq(executions.status, 'running'), or(isNull(executions.leaseExpiresAt), lt(executions.leaseExpiresAt, now))),
+        ),
+      )).returning();
+      return rows[0] ? rowToExecution(rows[0]) : null;
+    };
+    if (!opts.enforceCapacity) return applyClaim(db);
+    return db.transaction(async (tx) => {
+      if (instanceId) await lockInstanceCapacity(tx, instanceId);
+      const targetRows = await tx.select().from(executions).where(eq(executions.id, id)).limit(1);
+      const target = targetRows[0];
+      if (!target) return null;
+      if (target.targetRunnerId && target.targetRunnerId !== workerId) return null;
+      const leaseMs = target.leaseExpiresAt ? new Date(target.leaseExpiresAt).getTime() : 0;
+      const claimable = target.status === 'queued'
+        || (target.status === 'running' && leaseMs < now.getTime());
+      if (!claimable) return null;
+      const required = resolvedRequirements(opts.resources, target.resourceRequirements, DEFAULT_WORKFLOW_RESOURCES);
+      if (!instanceId) {
+        throw runnerCapacityError('runner_resources_unavailable', 'capacity admission requires a runner instance id', {
+          required, sampledAt: null,
+        });
+      }
+      await assertPostgresInstanceCapacity(tx, { instanceId, runnerId: workerId, required, now, lane: 'workflow' });
+      return applyClaim(tx);
+    });
   }
   const cur = memExecutions.get(id);
-  if (!cur) return null;
+  if (!cur || (cur.target_runner_id && cur.target_runner_id !== workerId)) return null;
   const expired = cur.status === 'running'
     && (!cur.lease_expires_at || new Date(cur.lease_expires_at).getTime() < now.getTime());
   if (cur.status !== 'queued' && !expired) return null;
+  if (opts.enforceCapacity) {
+    if (!instanceId) {
+      throw runnerCapacityError('runner_resources_unavailable', 'capacity admission requires a runner instance id', {
+        required: resolvedRequirements(opts.resources, cur.resource_requirements, DEFAULT_WORKFLOW_RESOURCES),
+        sampledAt: null,
+      });
+    }
+    const instance = memRunnerInstances.get(instanceId);
+    if (!instance || instance.runner_id !== workerId) {
+      throw runnerCapacityError(
+        'runner_resources_unavailable',
+        'runner instance is not bound to this registration; capacity cannot be admitted',
+        {
+          required: resolvedRequirements(opts.resources, cur.resource_requirements, DEFAULT_WORKFLOW_RESOURCES),
+          sampledAt: null,
+        },
+      );
+    }
+    const required = resolvedRequirements(opts.resources, cur.resource_requirements, DEFAULT_WORKFLOW_RESOURCES);
+    const load = memoryInstanceCapacityLoad(instanceId, workerId, now.getTime());
+    assertLaneCapacity('workflow', load.workflowActive, instanceWorkflowConcurrency(instance), required);
+    assertInstanceCapacity(
+      instanceResourceMetadata(instance.metadata),
+      required,
+      load.reservations,
+      now.getTime(),
+      instanceResourceMaxAgeMs(instance.metadata),
+    );
+  }
+  // No await between the capacity check above and this write: JS event-loop
+  // atomicity is the in-memory equivalent of the Postgres transaction.
   const next: StoredExecution = {
     ...cur,
     status: 'running',
     worker_id: workerId,
+    runner_instance_id: instanceId,
     lease_expires_at: lease.toISOString(),
     attempt: (cur.attempt || 0) + 1,
     error: null,
@@ -574,35 +972,77 @@ export async function claimExecutionRec(id: string, opts: { workerId: string; le
   return next;
 }
 
+/** A connector lease is fenced by instance AND monotonically increasing
+ * attempt. Omitting either never falls back to registration-only ownership.
+ * Legacy in-process jobs (no connector instance) keep their existing path. */
+type RunnerFence = { instanceId?: string | null; attempt?: number };
+function runnerFenceSql(instance: any, attempt: any, lease: any, fence: RunnerFence): any[] {
+  if (!fence.instanceId && fence.attempt === undefined) return [isNull(instance)];
+  if (!fence.instanceId || !Number.isSafeInteger(fence.attempt) || Number(fence.attempt) < 1) return [sql`false`];
+  return [eq(instance, fence.instanceId), eq(attempt, fence.attempt!), gt(lease, new Date())];
+}
+function runnerFenceMatches(instance: string | null | undefined, attempt: number | undefined, lease: string | null | undefined, fence: RunnerFence): boolean {
+  if (!fence.instanceId && fence.attempt === undefined) return !instance;
+  return !!fence.instanceId && instance === fence.instanceId
+    && Number.isSafeInteger(fence.attempt) && Number(fence.attempt) > 0
+    && attempt === fence.attempt && !!lease && new Date(lease).getTime() > Date.now();
+}
+
 /** Extend the execution lease while a runner is still working. */
-export async function heartbeatExecutionRec(id: string, opts: { workerId: string; leaseSeconds: number }): Promise<StoredExecution | null> {
+export async function heartbeatExecutionRec(id: string, opts: {
+  workerId: string;
+  instanceId?: string | null;
+  attempt?: number;
+  leaseSeconds: number;
+}): Promise<StoredExecution | null> {
   const leaseSeconds = Math.min(Math.max(Number(opts.leaseSeconds) || 300, 15), 3600);
   const lease = new Date(Date.now() + leaseSeconds * 1000);
+  const workerId = String(opts.workerId || '').slice(0, 128) || 'worker';
+  const instanceId = opts.instanceId ? String(opts.instanceId).slice(0, 128) : null;
   if (db) {
     await ensureTables();
+    const conds: any[] = [
+      eq(executions.id, id),
+      eq(executions.status, 'running'),
+      eq(executions.workerId, workerId),
+    ];
+    conds.push(...runnerFenceSql(executions.runnerInstanceId, executions.attempt, executions.leaseExpiresAt, opts));
     const rows = await db.update(executions).set({
       leaseExpiresAt: lease,
-      workerId: String(opts.workerId || '').slice(0, 128) || 'worker',
-    }).where(and(eq(executions.id, id), eq(executions.status, 'running'))).returning();
+      workerId,
+      ...(instanceId ? { runnerInstanceId: instanceId } : {}),
+    }).where(and(...conds)).returning();
     return rows[0] ? rowToExecution(rows[0]) : null;
   }
   const cur = memExecutions.get(id);
-  if (!cur || cur.status !== 'running') return null;
-  const next: StoredExecution = { ...cur, lease_expires_at: lease.toISOString() };
+  if (!cur || cur.status !== 'running' || cur.worker_id !== workerId) return null;
+  if (!runnerFenceMatches(cur.runner_instance_id, cur.attempt, cur.lease_expires_at, opts)) return null;
+  const next: StoredExecution = {
+    ...cur,
+    lease_expires_at: lease.toISOString(),
+    ...(instanceId ? { runner_instance_id: instanceId } : {}),
+  };
   memExecutions.set(id, next);
   return next;
 }
 
 /** Put a claimed execution back in the queue after a retryable failure. The
  *  queue message is nacked separately; the next delivery can claim it again. */
-export async function releaseExecutionRec(id: string, opts: { workerId?: string; error?: string }): Promise<StoredExecution | null> {
+export async function releaseExecutionRec(id: string, opts: {
+  workerId?: string;
+  instanceId?: string | null;
+  attempt?: number;
+  error?: string;
+}): Promise<StoredExecution | null> {
   if (db) {
     await ensureTables();
     const conds: any[] = [eq(executions.id, id), eq(executions.status, 'running')];
     if (opts.workerId) conds.push(eq(executions.workerId, opts.workerId));
+    conds.push(...runnerFenceSql(executions.runnerInstanceId, executions.attempt, executions.leaseExpiresAt, opts));
     const rows = await db.update(executions).set({
       status: 'queued',
       workerId: null,
+      runnerInstanceId: null,
       leaseExpiresAt: null,
       error: opts.error ? String(opts.error).slice(0, 1000) : null,
     }).where(and(...conds)).returning();
@@ -611,10 +1051,12 @@ export async function releaseExecutionRec(id: string, opts: { workerId?: string;
   const cur = memExecutions.get(id);
   if (!cur || cur.status !== 'running') return null;
   if (opts.workerId && cur.worker_id && cur.worker_id !== opts.workerId) return null;
+  if (!runnerFenceMatches(cur.runner_instance_id, cur.attempt, cur.lease_expires_at, opts)) return null;
   const next: StoredExecution = {
     ...cur,
     status: 'queued',
     worker_id: null,
+    runner_instance_id: null,
     lease_expires_at: null,
     error: opts.error ? String(opts.error).slice(0, 1000) : null,
   };
@@ -628,13 +1070,18 @@ export async function pauseExecutionRec(id: string, patch: {
   node_runs: StoredExecution['node_runs'];
   error?: string | null;
   workerId?: string | null;
+  instanceId?: string | null;
+  attempt?: number;
 }): Promise<StoredExecution | null> {
   if (db) {
     await ensureTables();
     const conds: any[] = [eq(executions.id, id), eq(executions.status, 'running')];
     if (patch.workerId) conds.push(eq(executions.workerId, patch.workerId));
+    conds.push(...runnerFenceSql(executions.runnerInstanceId, executions.attempt, executions.leaseExpiresAt, patch));
     const rows = await db.update(executions).set({
       status: 'paused',
+      workerId: null,
+      runnerInstanceId: null,
       output: patch.output,
       nodeRuns: patch.node_runs,
       error: patch.error ?? null,
@@ -646,9 +1093,12 @@ export async function pauseExecutionRec(id: string, patch: {
   const cur = memExecutions.get(id);
   if (!cur || cur.status !== 'running') return null;
   if (patch.workerId && cur.worker_id && cur.worker_id !== patch.workerId) return null;
+  if (!runnerFenceMatches(cur.runner_instance_id, cur.attempt, cur.lease_expires_at, patch)) return null;
   const next: StoredExecution = {
     ...cur,
     status: 'paused',
+    worker_id: null,
+    runner_instance_id: null,
     output: patch.output,
     node_runs: patch.node_runs,
     error: patch.error ?? null,
@@ -891,6 +1341,7 @@ export function __clearCredentials(): void {
   memSecretVersions.clear();
   memRunners.clear();
   memRunnerInstances.clear();
+  memRunnerUsage.clear();
   memInferenceJobs.clear();
 }
 
@@ -904,6 +1355,7 @@ export function __clearMem(): void {
   memSecretVersions.clear();
   memRunners.clear();
   memRunnerInstances.clear();
+  memRunnerUsage.clear();
   memInferenceJobs.clear();
 }
 
@@ -1157,6 +1609,8 @@ export async function finishExecutionRec(id: string, patch: {
   error?: string | null;
   finishedAt: string;
   workerId?: string | null;
+  instanceId?: string | null;
+  attempt?: number;
   allowedStatuses?: StoredExecution['status'][];
 }): Promise<StoredExecution | null> {
   const allowed = patch.allowedStatuses && patch.allowedStatuses.length
@@ -1166,6 +1620,7 @@ export async function finishExecutionRec(id: string, patch: {
     await ensureTables();
     const conds: any[] = [eq(executions.id, id), inArray(executions.status, allowed)];
     if (patch.workerId) conds.push(eq(executions.workerId, patch.workerId));
+    conds.push(...runnerFenceSql(executions.runnerInstanceId, executions.attempt, executions.leaseExpiresAt, patch));
     const rows = await db.update(executions).set({
       status: patch.status,
       output: patch.output,
@@ -1179,6 +1634,7 @@ export async function finishExecutionRec(id: string, patch: {
   const cur = memExecutions.get(id);
   if (!cur || !allowed.includes(cur.status)) return null;
   if (patch.workerId && cur.worker_id && cur.worker_id !== patch.workerId) return null;
+  if (!runnerFenceMatches(cur.runner_instance_id, cur.attempt, cur.lease_expires_at, patch)) return null;
   const next: StoredExecution = {
     ...cur, status: patch.status, output: patch.output, node_runs: patch.node_runs,
     error: patch.error ?? null, lease_expires_at: null, finishedAt: patch.finishedAt,
@@ -1200,6 +1656,7 @@ export async function queueExecutionResume(id: string, patch: {
       resumeNode: patch.node,
       resumeOutput: patch.output,
       workerId: null,
+      runnerInstanceId: null,
       leaseExpiresAt: null,
       error: null,
     }).where(and(eq(executions.id, id), eq(executions.status, 'paused'))).returning();
@@ -1213,6 +1670,7 @@ export async function queueExecutionResume(id: string, patch: {
     resume_node: patch.node,
     resume_output: patch.output,
     worker_id: null,
+    runner_instance_id: null,
     lease_expires_at: null,
     error: null,
   };
@@ -1503,40 +1961,65 @@ export async function upsertRunnerInstance(data: {
     created_at: now,
     updated_at: now,
   };
+  const instanceConflict = (owner: string): Error => Object.assign(
+    new Error(`runner instance '${data.id}' is already bound to registration '${owner}'`),
+    { status: 409, code: 'instance_conflict' },
+  );
   if (db) {
     await ensureTables();
-    const existing = await db.select().from(workflowRunnerInstances).where(eq(workflowRunnerInstances.id, data.id)).limit(1);
-    if (existing[0]) {
-      const rows = await db.update(workflowRunnerInstances).set({
+    const updateExisting = async (startedAt: Date | null) => {
+      const rows = await db!.update(workflowRunnerInstances).set({
         hostname: next.hostname,
         version: next.version,
         queue: next.queue,
         concurrency: next.concurrency,
         status: next.status,
         lastSeenAt: new Date(now),
-        startedAt: next.started_at ? new Date(next.started_at) : existing[0].startedAt,
+        startedAt: next.started_at ? new Date(next.started_at) : startedAt,
         metadata: next.metadata,
         updatedAt: new Date(now),
-      }).where(eq(workflowRunnerInstances.id, data.id)).returning();
-      return rowToRunnerInstance(rows[0]);
+      }).where(and(
+        eq(workflowRunnerInstances.id, data.id),
+        eq(workflowRunnerInstances.runnerId, data.runner_id),
+      )).returning();
+      return rows[0] ? rowToRunnerInstance(rows[0]) : null;
+    };
+    const existing = await db.select().from(workflowRunnerInstances).where(eq(workflowRunnerInstances.id, data.id)).limit(1);
+    if (existing[0]) {
+      if (String(existing[0].runnerId) !== data.runner_id) throw instanceConflict(String(existing[0].runnerId));
+      const updated = await updateExisting(existing[0].startedAt);
+      if (updated) return updated;
     }
-    const rows = await db.insert(workflowRunnerInstances).values({
-      id: next.id,
-      runnerId: next.runner_id,
-      hostname: next.hostname,
-      version: next.version,
-      queue: next.queue,
-      concurrency: next.concurrency,
-      status: next.status,
-      lastSeenAt: new Date(now),
-      startedAt: next.started_at ? new Date(next.started_at) : null,
-      metadata: next.metadata,
-      createdAt: new Date(now),
-      updatedAt: new Date(now),
-    }).returning();
-    return rowToRunnerInstance(rows[0]);
+    try {
+      const rows = await db.insert(workflowRunnerInstances).values({
+        id: next.id,
+        runnerId: next.runner_id,
+        hostname: next.hostname,
+        version: next.version,
+        queue: next.queue,
+        concurrency: next.concurrency,
+        status: next.status,
+        lastSeenAt: new Date(now),
+        startedAt: next.started_at ? new Date(next.started_at) : null,
+        metadata: next.metadata,
+        createdAt: new Date(now),
+        updatedAt: new Date(now),
+      }).returning();
+      return rowToRunnerInstance(rows[0]);
+    } catch (e: any) {
+      if (String(e?.code) !== '23505' && !/duplicate|unique/i.test(String(e?.message))) throw e;
+      // A concurrent first heartbeat won the insert. The id is globally
+      // unique, so only the same registration may continue updating it.
+      const raced = await db.select().from(workflowRunnerInstances).where(eq(workflowRunnerInstances.id, data.id)).limit(1);
+      if (!raced[0]) throw e;
+      if (String(raced[0].runnerId) !== data.runner_id) throw instanceConflict(String(raced[0].runnerId));
+      const updated = await updateExisting(raced[0].startedAt);
+      if (updated) return updated;
+      throw e;
+    }
   }
   const cur = memRunnerInstances.get(next.id);
+  if (cur && cur.runner_id !== data.runner_id) throw instanceConflict(cur.runner_id);
   const merged: StoredRunnerInstance = cur
     ? { ...cur, ...next, started_at: next.started_at || cur.started_at, created_at: cur.created_at }
     : next;
@@ -1572,6 +2055,30 @@ export async function listRunnerInstancesForRunners(runnerIds: string[]): Promis
     .sort((a, b) => b.last_seen_at.localeCompare(a.last_seen_at));
 }
 
+/** Key rotation/revocation invalidates every old connector credential. Mark
+ *  all existing connector instances offline without deleting their metadata
+ *  (resource history is preserved for the owner charts). A new process must
+ *  heartbeat with the new key before the registration is live again. */
+export async function markRunnerInstancesOffline(runnerId: string): Promise<number> {
+  const now = new Date();
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(workflowRunnerInstances)
+      .set({ status: 'offline', updatedAt: now })
+      .where(eq(workflowRunnerInstances.runnerId, runnerId))
+      .returning({ id: workflowRunnerInstances.id });
+    return rows.length;
+  }
+  let count = 0;
+  for (const inst of memRunnerInstances.values()) {
+    if (inst.runner_id !== runnerId) continue;
+    inst.status = 'offline';
+    inst.updated_at = now.toISOString();
+    count += 1;
+  }
+  return count;
+}
+
 export async function deleteRunnerInstance(runnerId: string, instanceId: string): Promise<boolean> {
   if (db) {
     await ensureTables();
@@ -1596,12 +2103,200 @@ export async function deleteRunnerInstancesForRunner(runnerId: string): Promise<
   }
 }
 
+/** One row per connector instance and UTC hour. Only aggregate numbers are
+ *  stored; raw samples stay in the short instance history. */
+export interface StoredRunnerUsageHour {
+  instance_id: string;
+  runner_id: string;
+  hour_start: string;
+  samples: number;
+  cpu_used_sum: number;
+  cpu_limit_sum: number;
+  mem_used_sum: number;
+  mem_limit_sum: number;
+  max_cpu_percent: number;
+  max_memory_used_mb: number;
+}
+
+export interface RunnerUsageRequest {
+  lane: 'workflow' | 'inference';
+  started_at: string;
+  finished_at: string | null;
+  status: string;
+}
+
+function usageHourStart(ms: number): string {
+  return new Date(Math.floor(ms / 3_600_000) * 3_600_000).toISOString();
+}
+
+/** Fold one fresh heartbeat sample into the hourly usage rollup. Called only
+ *  with a sanitized sample; invalid/zero timestamps are ignored. */
+export async function recordRunnerResourceUsage(
+  instanceId: string,
+  runnerId: string,
+  sample: any,
+): Promise<void> {
+  const observedMs = Date.parse(String(sample?.observedAt || sample?.sampledAt || ''));
+  if (!Number.isFinite(observedMs) || observedMs <= 0) return;
+  const cpuLimit = Math.max(0, Number(sample?.cpu?.limitCores) || 0);
+  const memLimit = Math.max(0, Number(sample?.memory?.limitMb) || 0);
+  if (cpuLimit <= 0 || memLimit <= 0) return;
+  const cpuUsed = Math.min(cpuLimit, Math.max(0, Number(sample?.cpu?.usedCores) || 0));
+  const memUsed = Math.min(memLimit, Math.max(0, Number(sample?.memory?.usedMb) || 0));
+  const cpuPercent = cpuLimit > 0 ? cpuUsed / cpuLimit * 100 : 0;
+  const hour = usageHourStart(observedMs);
+  if (db) {
+    await ensureTables();
+    await db.insert(runnerUsageHourly).values({
+      instanceId,
+      runnerId,
+      hourStart: new Date(hour),
+      samples: 1,
+      cpuUsedSum: cpuUsed,
+      cpuLimitSum: cpuLimit,
+      memUsedSum: memUsed,
+      memLimitSum: memLimit,
+      maxCpuPercent: cpuPercent,
+      maxMemUsedMb: memUsed,
+      updatedAt: new Date(),
+    }).onConflictDoUpdate({
+      target: [runnerUsageHourly.instanceId, runnerUsageHourly.hourStart],
+      set: {
+        samples: sql`${runnerUsageHourly.samples} + 1`,
+        cpuUsedSum: sql`${runnerUsageHourly.cpuUsedSum} + ${cpuUsed}`,
+        cpuLimitSum: sql`${runnerUsageHourly.cpuLimitSum} + ${cpuLimit}`,
+        memUsedSum: sql`${runnerUsageHourly.memUsedSum} + ${memUsed}`,
+        memLimitSum: sql`${runnerUsageHourly.memLimitSum} + ${memLimit}`,
+        maxCpuPercent: sql`greatest(${runnerUsageHourly.maxCpuPercent}, ${cpuPercent})`,
+        maxMemUsedMb: sql`greatest(${runnerUsageHourly.maxMemUsedMb}, ${memUsed})`,
+        updatedAt: new Date(),
+      },
+    });
+    return;
+  }
+  const key = `${instanceId}\u0000${hour}`;
+  const cur = memRunnerUsage.get(key);
+  memRunnerUsage.set(key, cur ? {
+    ...cur,
+    samples: cur.samples + 1,
+    cpu_used_sum: cur.cpu_used_sum + cpuUsed,
+    cpu_limit_sum: cur.cpu_limit_sum + cpuLimit,
+    mem_used_sum: cur.mem_used_sum + memUsed,
+    mem_limit_sum: cur.mem_limit_sum + memLimit,
+    max_cpu_percent: Math.max(cur.max_cpu_percent, cpuPercent),
+    max_memory_used_mb: Math.max(cur.max_memory_used_mb, memUsed),
+  } : {
+    instance_id: instanceId,
+    runner_id: runnerId,
+    hour_start: hour,
+    samples: 1,
+    cpu_used_sum: cpuUsed,
+    cpu_limit_sum: cpuLimit,
+    mem_used_sum: memUsed,
+    mem_limit_sum: memLimit,
+    max_cpu_percent: cpuPercent,
+    max_memory_used_mb: memUsed,
+  });
+}
+
+export async function listRunnerUsageHourly(runnerId: string, since: Date): Promise<StoredRunnerUsageHour[]> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.select().from(runnerUsageHourly)
+      .where(and(eq(runnerUsageHourly.runnerId, runnerId), gte(runnerUsageHourly.hourStart, since)))
+      .orderBy(asc(runnerUsageHourly.hourStart));
+    return rows.map((row) => ({
+      instance_id: String(row.instanceId),
+      runner_id: String(row.runnerId),
+      hour_start: iso(row.hourStart),
+      samples: Number(row.samples) || 0,
+      cpu_used_sum: Number(row.cpuUsedSum) || 0,
+      cpu_limit_sum: Number(row.cpuLimitSum) || 0,
+      mem_used_sum: Number(row.memUsedSum) || 0,
+      mem_limit_sum: Number(row.memLimitSum) || 0,
+      max_cpu_percent: Number(row.maxCpuPercent) || 0,
+      max_memory_used_mb: Number(row.maxMemUsedMb) || 0,
+    }));
+  }
+  return [...memRunnerUsage.values()]
+    .filter((row) => row.runner_id === runnerId && Date.parse(row.hour_start) >= since.getTime())
+    .sort((a, b) => a.hour_start.localeCompare(b.hour_start));
+}
+
+/** Requests attributed to a runner registration: a claimed job carries
+ *  `worker_id`/`runner_id`, a targeted but not-yet-claimed job carries
+ *  `target_runner_id`. Used to build hourly/day request counts. */
+export async function listRunnerUsageRequests(runnerId: string, since: Date): Promise<RunnerUsageRequest[]> {
+  const out: RunnerUsageRequest[] = [];
+  if (db) {
+    await ensureTables();
+    const workflowRows = await db.select({
+      startedAt: executions.startedAt,
+      finishedAt: executions.finishedAt,
+      status: executions.status,
+    }).from(executions).where(and(
+      gte(executions.startedAt, since),
+      or(eq(executions.workerId, runnerId), eq(executions.targetRunnerId, runnerId)),
+    )).limit(100_000);
+    for (const row of workflowRows) {
+      out.push({
+        lane: 'workflow',
+        started_at: iso(row.startedAt),
+        finished_at: row.finishedAt ? iso(row.finishedAt) : null,
+        status: String(row.status || ''),
+      });
+    }
+    const jobRows = await db.select({
+      createdAt: inferenceJobs.createdAt,
+      finishedAt: inferenceJobs.finishedAt,
+      status: inferenceJobs.status,
+    }).from(inferenceJobs).where(and(
+      gte(inferenceJobs.createdAt, since),
+      or(eq(inferenceJobs.runnerId, runnerId), eq(inferenceJobs.targetRunnerId, runnerId)),
+    )).limit(100_000);
+    for (const row of jobRows) {
+      out.push({
+        lane: 'inference',
+        started_at: iso(row.createdAt),
+        finished_at: row.finishedAt ? iso(row.finishedAt) : null,
+        status: String(row.status || ''),
+      });
+    }
+    return out;
+  }
+  for (const execution of memExecutions.values()) {
+    if (execution.worker_id !== runnerId && execution.target_runner_id !== runnerId) continue;
+    if (Date.parse(execution.startedAt) < since.getTime()) continue;
+    out.push({
+      lane: 'workflow',
+      started_at: execution.startedAt,
+      finished_at: execution.finishedAt || null,
+      status: execution.status,
+    });
+  }
+  for (const job of memInferenceJobs.values()) {
+    if (job.runner_id !== runnerId && job.target_runner_id !== runnerId) continue;
+    if (Date.parse(job.created_at) < since.getTime()) continue;
+    out.push({
+      lane: 'inference',
+      started_at: job.created_at,
+      finished_at: job.finished_at || null,
+      status: job.status,
+    });
+  }
+  return out;
+}
+
 export async function updateRunnerRec(id: string, patch: {
   name?: string;
   kind?: RunnerKind;
+  scope?: RunnerScope;
   mode?: RunnerMode;
   queue?: string;
   inference_queue?: string | null;
+  api_key_id?: string | null;
+  key_prefix?: string | null;
+  status?: 'waiting' | 'connected' | 'stale' | 'disabled';
   metadata?: Record<string, any>;
 }): Promise<StoredWorkflowRunner | null> {
   const now = new Date();
@@ -1610,9 +2305,13 @@ export async function updateRunnerRec(id: string, patch: {
     const rows = await db.update(workflowRunners).set({
       ...(patch.name !== undefined ? { name: patch.name } : {}),
       ...(patch.kind !== undefined ? { kind: patch.kind } : {}),
+      ...(patch.scope !== undefined ? { scope: patch.scope } : {}),
       ...(patch.mode !== undefined ? { mode: patch.mode } : {}),
       ...(patch.queue !== undefined ? { queue: patch.queue } : {}),
       ...(patch.inference_queue !== undefined ? { inferenceQueue: patch.inference_queue } : {}),
+      ...(patch.api_key_id !== undefined ? { apiKeyId: patch.api_key_id } : {}),
+      ...(patch.key_prefix !== undefined ? { keyPrefix: patch.key_prefix } : {}),
+      ...(patch.status !== undefined ? { status: patch.status } : {}),
       ...(patch.metadata !== undefined ? { metadata: patch.metadata } : {}),
       updatedAt: now,
     }).where(eq(workflowRunners.id, id)).returning();
@@ -1624,9 +2323,13 @@ export async function updateRunnerRec(id: string, patch: {
     ...cur,
     ...(patch.name !== undefined ? { name: patch.name } : {}),
     ...(patch.kind !== undefined ? { kind: patch.kind } : {}),
+    ...(patch.scope !== undefined ? { scope: patch.scope } : {}),
     ...(patch.mode !== undefined ? { mode: patch.mode } : {}),
     ...(patch.queue !== undefined ? { queue: patch.queue } : {}),
     ...(patch.inference_queue !== undefined ? { inference_queue: patch.inference_queue } : {}),
+    ...(patch.api_key_id !== undefined ? { api_key_id: patch.api_key_id } : {}),
+    ...(patch.key_prefix !== undefined ? { key_prefix: patch.key_prefix } : {}),
+    ...(patch.status !== undefined ? { status: patch.status } : {}),
     ...(patch.metadata !== undefined ? { metadata: patch.metadata } : {}),
     updated_at: now.toISOString(),
   };
@@ -1635,12 +2338,14 @@ export async function updateRunnerRec(id: string, patch: {
 }
 
 function rowToRunner(r: typeof workflowRunners.$inferSelect): StoredWorkflowRunner {
-  const mode: RunnerMode = r.mode === 'hybrid' ? 'hybrid' : 'custom';
+  const mode: RunnerMode = r.mode === 'hybrid' ? 'hybrid' : r.mode === 'system' ? 'system' : 'custom';
+  const scope: RunnerScope = r.scope === 'platform' ? 'platform' : 'tenant';
   const status = r.status === 'connected' || r.status === 'stale' || r.status === 'disabled' ? r.status : 'waiting';
   return {
     id: String(r.id),
     name: String(r.name || ''),
     kind: r.kind === 'inference' || r.kind === 'hybrid' ? r.kind : 'workflow',
+    scope,
     mode,
     queue: String(r.queue || ''),
     inference_queue: r.inferenceQueue != null ? String(r.inferenceQueue) : null,
@@ -1663,6 +2368,7 @@ export async function createRunnerRec(data: {
   id?: string;
   name: string;
   kind?: RunnerKind;
+  scope?: RunnerScope;
   mode: RunnerMode;
   queue: string;
   inference_queue?: string | null;
@@ -1677,7 +2383,8 @@ export async function createRunnerRec(data: {
     id: data.id || randomUUID(),
     name: data.name,
     kind: data.kind === 'inference' || data.kind === 'hybrid' ? data.kind : 'workflow',
-    mode: data.mode === 'hybrid' ? 'hybrid' : 'custom',
+    scope: data.scope === 'platform' ? 'platform' : 'tenant',
+    mode: data.mode === 'hybrid' ? 'hybrid' : data.mode === 'system' ? 'system' : 'custom',
     queue: data.queue,
     inference_queue: cleanTenant(data.inference_queue),
     org_id: cleanTenant(data.org_id),
@@ -1699,6 +2406,7 @@ export async function createRunnerRec(data: {
       id: rec.id,
       name: rec.name,
       kind: rec.kind,
+      scope: rec.scope,
       mode: rec.mode,
       queue: rec.queue,
       inferenceQueue: rec.inference_queue,
@@ -1725,13 +2433,19 @@ export async function getRunnerRec(id: string): Promise<StoredWorkflowRunner | n
   return memRunners.get(id) || null;
 }
 
-export async function listRunnerRecs(opts: { orgId?: string; accountId?: string; limit?: number } = {}): Promise<StoredWorkflowRunner[]> {
+export async function listRunnerRecs(opts: {
+  orgId?: string;
+  accountId?: string;
+  scope?: RunnerScope;
+  limit?: number;
+} = {}): Promise<StoredWorkflowRunner[]> {
   const limit = Math.min(Math.max(opts.limit ?? 100, 1), 200);
   if (db) {
     await ensureTables();
     const conds: any[] = [];
     if (opts.orgId) conds.push(eq(workflowRunners.orgId, opts.orgId));
     if (opts.accountId) conds.push(eq(workflowRunners.accountId, opts.accountId));
+    if (opts.scope) conds.push(eq(workflowRunners.scope, opts.scope));
     const rows = await db.select().from(workflowRunners)
       .where(conds.length ? and(...conds) : undefined)
       .orderBy(desc(workflowRunners.createdAt))
@@ -1741,6 +2455,7 @@ export async function listRunnerRecs(opts: { orgId?: string; accountId?: string;
   let arr = [...memRunners.values()];
   if (opts.orgId) arr = arr.filter((r) => r.org_id === opts.orgId);
   if (opts.accountId) arr = arr.filter((r) => r.account_id === opts.accountId);
+  if (opts.scope) arr = arr.filter((r) => r.scope === opts.scope);
   return arr.sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, limit);
 }
 
@@ -1806,6 +2521,10 @@ function rowToInferenceJob(r: typeof inferenceJobs.$inferSelect): StoredInferenc
     runner_id: r.runnerId != null ? String(r.runnerId) : null,
     instance_id: r.instanceId != null ? String(r.instanceId) : null,
     queue_name: r.queueName != null ? String(r.queueName) : null,
+    target_runner_id: r.targetRunnerId ?? null,
+    resource_requirements: r.resourceRequirements && typeof r.resourceRequirements === 'object'
+      ? r.resourceRequirements as RunnerResourceRequirements
+      : null,
     attempt: Number.isFinite(Number(r.attempt)) ? Number(r.attempt) : 0,
     lease_expires_at: r.leaseExpiresAt ? iso(r.leaseExpiresAt) : null,
     created_at: iso(r.createdAt),
@@ -1821,6 +2540,8 @@ export async function createInferenceJobRec(data: {
   org_id?: string | null;
   account_id?: string | null;
   queue_name: string;
+  target_runner_id?: string | null;
+  resource_requirements?: RunnerResourceRequirements | null;
 }): Promise<StoredInferenceJob> {
   const now = nowIso();
   const rec: StoredInferenceJob = {
@@ -1835,6 +2556,10 @@ export async function createInferenceJobRec(data: {
     runner_id: null,
     instance_id: null,
     queue_name: data.queue_name,
+    target_runner_id: data.target_runner_id ?? null,
+    resource_requirements: data.resource_requirements
+      ? normalizeRunnerResourceRequirements(data.resource_requirements, DEFAULT_INFERENCE_RESOURCES)
+      : null,
     attempt: 0,
     lease_expires_at: null,
     created_at: now,
@@ -1851,6 +2576,8 @@ export async function createInferenceJobRec(data: {
       orgId: rec.org_id,
       accountId: rec.account_id,
       queueName: rec.queue_name,
+      targetRunnerId: rec.target_runner_id,
+      resourceRequirements: rec.resource_requirements ?? {},
       createdAt: new Date(now),
       updatedAt: new Date(now),
     }).returning();
@@ -1891,39 +2618,95 @@ export async function listInferenceJobRecs(opts: { orgId?: string; accountId?: s
     .slice(0, limit);
 }
 
-export async function claimInferenceJobRec(id: string, opts: { runnerId: string; instanceId?: string | null; leaseSeconds: number }): Promise<StoredInferenceJob | null> {
+export async function claimInferenceJobRec(id: string, opts: {
+  runnerId: string;
+  instanceId?: string | null;
+  leaseSeconds: number;
+} & RunnerCapacityClaimOptions): Promise<StoredInferenceJob | null> {
   const leaseSeconds = Math.min(Math.max(Number(opts.leaseSeconds) || 120, 15), 3600);
+  const instanceId = opts.instanceId ? String(opts.instanceId).slice(0, 128) : null;
   const now = new Date();
   const lease = new Date(now.getTime() + leaseSeconds * 1000);
   if (db) {
     await ensureTables();
-    const rows = await db.update(inferenceJobs).set({
-      status: 'running',
-      runnerId: opts.runnerId,
-      instanceId: opts.instanceId || null,
-      leaseExpiresAt: lease,
-      attempt: sql`${inferenceJobs.attempt} + 1`,
-      error: null,
-      updatedAt: now,
-    }).where(and(
-      eq(inferenceJobs.id, id),
-      or(
-        eq(inferenceJobs.status, 'queued'),
-        and(eq(inferenceJobs.status, 'running'), or(isNull(inferenceJobs.leaseExpiresAt), lt(inferenceJobs.leaseExpiresAt, now))),
-      ),
-    )).returning();
-    return rows[0] ? rowToInferenceJob(rows[0]) : null;
+    const applyClaim = async (runner: any): Promise<StoredInferenceJob | null> => {
+      const rows = await runner.update(inferenceJobs).set({
+        status: 'running',
+        runnerId: opts.runnerId,
+        instanceId,
+        leaseExpiresAt: lease,
+        attempt: sql`${inferenceJobs.attempt} + 1`,
+        error: null,
+        updatedAt: now,
+      }).where(and(
+        eq(inferenceJobs.id, id),
+        or(isNull(inferenceJobs.targetRunnerId), eq(inferenceJobs.targetRunnerId, opts.runnerId)),
+        or(
+          eq(inferenceJobs.status, 'queued'),
+          and(eq(inferenceJobs.status, 'running'), or(isNull(inferenceJobs.leaseExpiresAt), lt(inferenceJobs.leaseExpiresAt, now))),
+        ),
+      )).returning();
+      return rows[0] ? rowToInferenceJob(rows[0]) : null;
+    };
+    if (!opts.enforceCapacity) return applyClaim(db);
+    return db.transaction(async (tx) => {
+      if (instanceId) await lockInstanceCapacity(tx, instanceId);
+      const targetRows = await tx.select().from(inferenceJobs).where(eq(inferenceJobs.id, id)).limit(1);
+      const target = targetRows[0];
+      if (!target) return null;
+      if (target.targetRunnerId && target.targetRunnerId !== opts.runnerId) return null;
+      const leaseMs = target.leaseExpiresAt ? new Date(target.leaseExpiresAt).getTime() : 0;
+      const claimable = target.status === 'queued'
+        || (target.status === 'running' && leaseMs < now.getTime());
+      if (!claimable) return null;
+      const required = resolvedRequirements(opts.resources, target.resourceRequirements, DEFAULT_INFERENCE_RESOURCES);
+      if (!instanceId) {
+        throw runnerCapacityError('runner_resources_unavailable', 'capacity admission requires a runner instance id', {
+          required, sampledAt: null,
+        });
+      }
+      await assertPostgresInstanceCapacity(tx, {
+        instanceId, runnerId: opts.runnerId, required, now, lane: 'inference',
+      });
+      return applyClaim(tx);
+    });
   }
   const cur = memInferenceJobs.get(id);
-  if (!cur) return null;
+  if (!cur || (cur.target_runner_id && cur.target_runner_id !== opts.runnerId)) return null;
   const expired = cur.status === 'running'
     && (!cur.lease_expires_at || new Date(cur.lease_expires_at).getTime() < now.getTime());
   if (cur.status !== 'queued' && !expired) return null;
+  if (opts.enforceCapacity) {
+    const required = resolvedRequirements(opts.resources, cur.resource_requirements, DEFAULT_INFERENCE_RESOURCES);
+    if (!instanceId) {
+      throw runnerCapacityError('runner_resources_unavailable', 'capacity admission requires a runner instance id', {
+        required, sampledAt: null,
+      });
+    }
+    const instance = memRunnerInstances.get(instanceId);
+    if (!instance || instance.runner_id !== opts.runnerId) {
+      throw runnerCapacityError(
+        'runner_resources_unavailable',
+        'runner instance is not bound to this registration; capacity cannot be admitted',
+        { required, sampledAt: null },
+      );
+    }
+    const load = memoryInstanceCapacityLoad(instanceId, opts.runnerId, now.getTime());
+    assertLaneCapacity('inference', load.inferenceActive, instanceInferenceConcurrency(instance), required);
+    assertInstanceCapacity(
+      instanceResourceMetadata(instance.metadata),
+      required,
+      load.reservations,
+      now.getTime(),
+      instanceResourceMaxAgeMs(instance.metadata),
+    );
+  }
+  // No await between the capacity check above and this write.
   const next: StoredInferenceJob = {
     ...cur,
     status: 'running',
     runner_id: opts.runnerId,
-    instance_id: opts.instanceId || null,
+    instance_id: instanceId,
     lease_expires_at: lease.toISOString(),
     attempt: (cur.attempt || 0) + 1,
     error: null,
@@ -1933,19 +2716,32 @@ export async function claimInferenceJobRec(id: string, opts: { runnerId: string;
   return next;
 }
 
-export async function heartbeatInferenceJobRec(id: string, opts: { runnerId: string; leaseSeconds: number }): Promise<StoredInferenceJob | null> {
+export async function heartbeatInferenceJobRec(id: string, opts: {
+  runnerId: string;
+  instanceId?: string | null;
+  attempt?: number;
+  leaseSeconds: number;
+}): Promise<StoredInferenceJob | null> {
   const leaseSeconds = Math.min(Math.max(Number(opts.leaseSeconds) || 120, 15), 3600);
   const lease = new Date(Date.now() + leaseSeconds * 1000);
+  const instanceId = opts.instanceId ? String(opts.instanceId).slice(0, 128) : null;
   if (db) {
     await ensureTables();
+    const conds: any[] = [
+      eq(inferenceJobs.id, id),
+      eq(inferenceJobs.status, 'running'),
+      eq(inferenceJobs.runnerId, opts.runnerId),
+    ];
+    conds.push(...runnerFenceSql(inferenceJobs.instanceId, inferenceJobs.attempt, inferenceJobs.leaseExpiresAt, opts));
     const rows = await db.update(inferenceJobs).set({
       leaseExpiresAt: lease,
       updatedAt: new Date(),
-    }).where(and(eq(inferenceJobs.id, id), eq(inferenceJobs.status, 'running'), eq(inferenceJobs.runnerId, opts.runnerId))).returning();
+    }).where(and(...conds)).returning();
     return rows[0] ? rowToInferenceJob(rows[0]) : null;
   }
   const cur = memInferenceJobs.get(id);
   if (!cur || cur.status !== 'running' || cur.runner_id !== opts.runnerId) return null;
+  if (!runnerFenceMatches(cur.instance_id, cur.attempt, cur.lease_expires_at, opts)) return null;
   const next: StoredInferenceJob = { ...cur, lease_expires_at: lease.toISOString(), updated_at: new Date().toISOString() };
   memInferenceJobs.set(id, next);
   return next;
@@ -1956,10 +2752,19 @@ export async function finishInferenceJobRec(id: string, patch: {
   result?: any;
   error?: string | null;
   runnerId: string;
+  instanceId?: string | null;
+  attempt?: number;
 }): Promise<StoredInferenceJob | null> {
   const now = new Date();
+  const instanceId = patch.instanceId ? String(patch.instanceId).slice(0, 128) : null;
   if (db) {
     await ensureTables();
+    const conds: any[] = [
+      eq(inferenceJobs.id, id),
+      eq(inferenceJobs.status, 'running'),
+      eq(inferenceJobs.runnerId, patch.runnerId),
+    ];
+    conds.push(...runnerFenceSql(inferenceJobs.instanceId, inferenceJobs.attempt, inferenceJobs.leaseExpiresAt, patch));
     const rows = await db.update(inferenceJobs).set({
       status: patch.status,
       result: patch.result ?? null,
@@ -1967,15 +2772,12 @@ export async function finishInferenceJobRec(id: string, patch: {
       leaseExpiresAt: null,
       updatedAt: now,
       finishedAt: now,
-    }).where(and(
-      eq(inferenceJobs.id, id),
-      eq(inferenceJobs.status, 'running'),
-      eq(inferenceJobs.runnerId, patch.runnerId),
-    )).returning();
+    }).where(and(...conds)).returning();
     return rows[0] ? rowToInferenceJob(rows[0]) : null;
   }
   const cur = memInferenceJobs.get(id);
   if (!cur || cur.status !== 'running' || cur.runner_id !== patch.runnerId) return null;
+  if (!runnerFenceMatches(cur.instance_id, cur.attempt, cur.lease_expires_at, patch)) return null;
   const next: StoredInferenceJob = {
     ...cur,
     status: patch.status,
@@ -1989,9 +2791,21 @@ export async function finishInferenceJobRec(id: string, patch: {
   return next;
 }
 
-export async function releaseInferenceJobRec(id: string, opts: { runnerId: string; error?: string }): Promise<StoredInferenceJob | null> {
+export async function releaseInferenceJobRec(id: string, opts: {
+  runnerId: string;
+  instanceId?: string | null;
+  attempt?: number;
+  error?: string;
+}): Promise<StoredInferenceJob | null> {
+  const instanceId = opts.instanceId ? String(opts.instanceId).slice(0, 128) : null;
   if (db) {
     await ensureTables();
+    const conds: any[] = [
+      eq(inferenceJobs.id, id),
+      eq(inferenceJobs.status, 'running'),
+      eq(inferenceJobs.runnerId, opts.runnerId),
+    ];
+    conds.push(...runnerFenceSql(inferenceJobs.instanceId, inferenceJobs.attempt, inferenceJobs.leaseExpiresAt, opts));
     const rows = await db.update(inferenceJobs).set({
       status: 'queued',
       runnerId: null,
@@ -1999,11 +2813,12 @@ export async function releaseInferenceJobRec(id: string, opts: { runnerId: strin
       leaseExpiresAt: null,
       error: opts.error ? String(opts.error).slice(0, 1000) : null,
       updatedAt: new Date(),
-    }).where(and(eq(inferenceJobs.id, id), eq(inferenceJobs.status, 'running'), eq(inferenceJobs.runnerId, opts.runnerId))).returning();
+    }).where(and(...conds)).returning();
     return rows[0] ? rowToInferenceJob(rows[0]) : null;
   }
   const cur = memInferenceJobs.get(id);
   if (!cur || cur.status !== 'running' || cur.runner_id !== opts.runnerId) return null;
+  if (!runnerFenceMatches(cur.instance_id, cur.attempt, cur.lease_expires_at, opts)) return null;
   const next: StoredInferenceJob = {
     ...cur,
     status: 'queued',

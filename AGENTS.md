@@ -182,6 +182,15 @@ E2E helpers: `bash tests/e2e/api-check.sh`, `node tests/e2e/services-check.js`,
   `QUEUE_SERVICE_URL`/`NODE_ENV=production`; the
   `tests/e2e/workflow-runner-e2e.mjs` gate asserts `transport=queue`, runs
   workflow + inference jobs on a hybrid connector, and fails on inline fallback.
+  **Owner-scoped (platform) runners** use `/v1/platform/runners` (platform
+  admin owner only), a dedicated IAM `platform_runner_keys` credential with no
+  account/user binding, `scope=platform`, `mode=system`, and the shared
+  `synapseone-wf-system` queue (queue tenant `platform`). Their key is rejected
+  by the gateway outside `/v1/runner/*`, `/v1/workflow-runners/:id/*`,
+  `/v1/queue/*` and `/v1/auth/verify`. On claim, workflow-service mints a
+  short-lived delegated token for the execution's original principal
+  (`act=platform-runner:<id>`) so data-plane nodes stay tenant-correct; never
+  make a platform runner key a tenant/`*` key.
 - **Workflow node types are n8n-compatible** (`n8n-nodes-base.*`) plus
   `synapseone.*` nodes and `synapseone.api` operations across IAM, Workflow,
   LDS, Base, Faststore, Queue and Inference. Preserve aliases when touching

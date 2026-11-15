@@ -10,7 +10,7 @@ import cors from 'cors';
 import expressRateLimit from 'express-rate-limit';
 import morgan from 'morgan';
 import dotenv from 'dotenv';
-import { createHmac } from 'crypto';
+import { createHmac, randomUUID } from 'crypto';
 import { z } from 'zod';
 import {
   createOrganization, createOrganizationWithAdmin, listOrganizations, getOrgBySlug,
@@ -44,7 +44,8 @@ import {
   signPlatformAccess, verifyPlatformAccess, signPlatformStepUp, verifyPlatformStepUp,
   createPlatformRunnerKey, verifyPlatformRunnerKey, revokePlatformRunnerKey,
   revokePlatformRunnerKeysForRunner, listPlatformRunnerKeys, normalizePlatformRunnerScopes,
-  PLATFORM_RUNNER_DEFAULT_SCOPES,
+  PLATFORM_RUNNER_DEFAULT_SCOPES, storeExecutionDelegation, verifyExecutionDelegation,
+  revokeExecutionDelegations,
 } from './tokens';
 import {
   beginTotpEnrolment, checkSecondFactor, clearLoginFailures, enableTotp, getMfa, lockRemaining, mfaEnabled,
@@ -2487,6 +2488,16 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (h.startsWith('Bearer ')) {
       try {
         const decoded: any = verifyAccess(h.slice(7));
+        if (decoded.kind === 'exec-delegated') {
+          // Execution grants are data-plane-only and die when the execution is
+          // completed/released, the runner is disabled/deleted, or they expire.
+          const grant = await verifyExecutionDelegation(String(decoded.jti || ''));
+          if (!grant
+            || grant.execution_id !== String(decoded.exec || '')
+            || grant.runner_id !== String(decoded.runner || '')) {
+            return res.status(401).json({ valid: false, error: 'delegation_revoked', message: 'This execution grant was revoked or expired.' });
+          }
+        }
         if (decoded.kind !== 'service-account') {
           const user = await getUserById(String(decoded.sub || ''));
           if (!user || user.active === false) {
@@ -2510,7 +2521,12 @@ async function auditMutation(req: express.Request, action: string, resource: str
         }
         return res.json({ valid: true, type: 'jwt', claims: decoded });
       } catch (e: any) {
-        return res.status(401).json({ valid: false, message: e.message });
+        const message = String(e?.message || 'invalid token');
+        return res.status(401).json({
+          valid: false,
+          ...(/expired/i.test(message) ? { error: 'token_expired' } : {}),
+          message,
+        });
       }
     }
     if (apiKey) {
@@ -4487,13 +4503,16 @@ async function auditMutation(req: express.Request, action: string, resource: str
       userId: z.string().uuid(),
       runnerId: z.string().trim().min(1).max(128),
       executionId: z.string().trim().min(1).max(128),
+      instanceId: z.string().trim().min(1).max(128),
       accountId: z.string().uuid().nullish(),
       scopes: z.array(z.string().min(1).max(200)).max(100).nullish(),
-      ttlSeconds: z.number().int().min(60).max(3600).optional(),
+      /** Bound to the runner's persisted lease; 1s is allowed so a 1s lease
+       *  cannot mint a 60s data grant. */
+      ttlSeconds: z.number().int().min(1).max(300).optional(),
     }).safeParse(req.body || {});
     if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
-    const { userId, runnerId, executionId, accountId, scopes: requested, ttlSeconds } = parsed.data;
-    if (!RUNNER_ID_RE.test(runnerId) || !RUNNER_ID_RE.test(executionId)) {
+    const { userId, runnerId, executionId, instanceId, accountId, scopes: requested, ttlSeconds } = parsed.data;
+    if (!RUNNER_ID_RE.test(runnerId) || !RUNNER_ID_RE.test(executionId) || !RUNNER_ID_RE.test(instanceId)) {
       return res.status(400).json({ error: 'invalid_id' });
     }
     // Never let a system runner acquire platform-control authority.
@@ -4518,18 +4537,35 @@ async function auditMutation(req: express.Request, action: string, resource: str
       const accounts = await listAccounts(user.org_id);
       account = accounts[0] || null;
     }
-    const ttl = Math.min(Math.max(Number(ttlSeconds) || 900, 60), 3600);
+    const ttl = Math.min(Math.max(Number(ttlSeconds) || 300, 1), 300);
+    const jti = randomUUID();
+    const expiresAt = new Date(Date.now() + ttl * 1000);
+    await storeExecutionDelegation({
+      jti,
+      executionId,
+      runnerId,
+      instanceId,
+      userId: user.id,
+      orgId: user.org_id,
+      accountId: account?.id || null,
+      scopes,
+      expiresAt,
+    });
     const session = signAccess({
       sub: user.id,
       email: user.email,
       org: user.org_id,
       ...(account ? { account: account.id } : {}),
       scopes,
-      kind: 'delegated',
+      kind: 'exec-delegated',
       ver: Number(user.auth_version) || 0,
       delegated: true,
-      act: { sub: `platform-runner:${runnerId}`, kind: 'platform-runner' },
-    }, { expiresIn: ttl });
+      jti,
+      exec: executionId,
+      runner: runnerId,
+      instance: instanceId,
+      act: { sub: `platform-runner:${runnerId}`, kind: 'platform-runner', exec: executionId, instance: instanceId },
+    }, { expiresIn: ttl, minExpiresIn: 1 });
     await writeAuditStrict({
       actor_type: 'platform-runner',
       actor_id: `platform-runner:${runnerId}`,
@@ -4541,6 +4577,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
         userId: user.id,
         account: account?.id || null,
         executionId,
+        runnerId,
+        instanceId,
+        jti,
         scopes,
         ttlSeconds: session.expiresIn,
       },
@@ -4551,13 +4590,37 @@ async function auditMutation(req: express.Request, action: string, resource: str
       expiresIn: session.expiresIn,
       tokenType: 'Bearer',
       delegated: true,
+      kind: 'exec-delegated',
+      jti,
       userId: user.id,
       orgId: user.org_id,
       accountId: account?.id || null,
       runnerId,
+      instanceId,
       executionId,
       scopes,
     });
+  });
+
+  app.post('/internal/platform-runners/delegations/revoke', async (req, res) => {
+    const parsed = z.object({
+      executionId: z.string().trim().min(1).max(128).optional(),
+      runnerId: z.string().trim().min(1).max(128).optional(),
+    }).safeParse(req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    if (!parsed.data.executionId && !parsed.data.runnerId) {
+      return res.status(400).json({ error: 'invalid_body', message: 'executionId or runnerId is required' });
+    }
+    const revoked = await revokeExecutionDelegations(parsed.data);
+    await writeAuditStrict({
+      actor_type: 'platform-runner',
+      actor_id: parsed.data.runnerId ? `platform-runner:${parsed.data.runnerId}` : 'platform-runner-service',
+      action: 'iam:token:platform-runner-delegate-revoke',
+      resource: parsed.data.executionId ? `execution:${parsed.data.executionId}` : `runner:${parsed.data.runnerId}`,
+      decision: true,
+      context: { ...parsed.data, revoked },
+    }).catch(() => undefined);
+    res.json({ ok: true, revoked, ...parsed.data });
   });
 
   app.post('/internal/platform/bootstrap', async (req, res) => {

@@ -27,6 +27,15 @@ pub struct Principal {
     pub key_id: Option<String>,
     #[allow(dead_code)]
     pub owner: Option<String>,
+    /// Platform-runner machine credentials are bound to one registration.
+    /// For `exec-delegated` JWTs this is the runner claim.
+    pub runner_id: Option<String>,
+    /// Per-execution delegated grant id (`jti`) and bounds.
+    pub jti: Option<String>,
+    pub exec: Option<String>,
+    pub instance: Option<String>,
+    /// `act.sub` for delegated tokens (service/runner that acted for the user).
+    pub act_sub: Option<String>,
 }
 
 impl Principal {
@@ -59,6 +68,10 @@ pub struct ApiKeyInfo {
     pub org_id: Option<String>,
     pub user_id: Option<String>,
     pub scopes: Vec<String>,
+    /// `platform-runner` for owner-scoped system compute keys; absent for
+    /// ordinary tenant API keys.
+    pub kind: Option<String>,
+    pub runner_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -314,6 +327,12 @@ impl AuthService {
         if kind == "platform-step-up" {
             return None;
         }
+        // Execution grants are verified by `verify_execution_grant` on every
+        // request (no session cache): completing, releasing or deleting the
+        // runner must invalidate the grant immediately.
+        if kind == "exec-delegated" {
+            return None;
+        }
         if claim_text(decoded, "sub")
             .filter(|value| !value.is_empty())
             .is_none()
@@ -409,6 +428,75 @@ impl AuthService {
         );
     }
 
+    /// Verify a per-execution delegated grant against IAM on **every** request.
+    /// IAM owns the `execution_delegations` row and must return 401/403 once the
+    /// execution completes/releases or the runner is revoked. This deliberately
+    /// never uses the JWT session cache.
+    pub async fn verify_execution_grant(&self, token: &str) -> Result<(), AuthFailure> {
+        if token.is_empty() {
+            return Err(AuthFailure::new(
+                StatusCode::UNAUTHORIZED,
+                "invalid_token",
+                "execution grant token is missing",
+            ));
+        }
+        let url = format!("{}/v1/auth/verify", self.iam_base.trim_end_matches('/'));
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(token)
+            .timeout(Duration::from_millis(2_500))
+            .send()
+            .await;
+        match response {
+            Ok(response) if response.status().is_success() => {
+                // IAM must positively confirm the grant. Missing/malformed
+                // `valid`, or anything other than `true`, fails closed.
+                let body = response.json::<Value>().await;
+                match body {
+                    Ok(body) if body.get("valid").and_then(Value::as_bool) == Some(true) => Ok(()),
+                    Ok(body) if body.get("valid").and_then(Value::as_bool) == Some(false) => {
+                        Err(AuthFailure::new(
+                            StatusCode::UNAUTHORIZED,
+                            "execution_grant_inactive",
+                            "execution grant is inactive or revoked",
+                        ))
+                    }
+                    _ => Err(AuthFailure::new(
+                        StatusCode::UNAUTHORIZED,
+                        "execution_grant_invalid",
+                        "IAM returned an invalid grant verification response",
+                    )),
+                }
+            }
+            Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
+                Err(AuthFailure::new(
+                    StatusCode::UNAUTHORIZED,
+                    "execution_grant_inactive",
+                    "execution grant is inactive or revoked",
+                ))
+            }
+            Ok(response) if response.status() == StatusCode::FORBIDDEN => {
+                let error = response
+                    .json::<Value>()
+                    .await
+                    .ok()
+                    .and_then(|body| body.get("error").and_then(Value::as_str).map(str::to_string))
+                    .unwrap_or_else(|| "execution_grant_forbidden".into());
+                Err(AuthFailure::new(
+                    StatusCode::FORBIDDEN,
+                    &error,
+                    "execution grant is no longer valid",
+                ))
+            }
+            _ => Err(AuthFailure::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "iam_unavailable",
+                "IAM grant check unavailable",
+            )),
+        }
+    }
+
     pub async fn verify_api_key_upstream(
         &self,
         api_key: &str,
@@ -464,6 +552,11 @@ pub async fn verify_api_key_upstream(
                     .collect()
             })
             .unwrap_or_default(),
+        kind: body.get("kind").and_then(Value::as_str).map(str::to_string),
+        runner_id: body
+            .get("runner_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     }))
 }
 
@@ -483,19 +576,33 @@ pub fn principal_from_claims(claims: &Value) -> Principal {
         scopes: claim_string_list(claims, "scopes"),
         key_id: None,
         owner: None,
+        runner_id: claim_text(claims, "runner"),
+        jti: claim_text(claims, "jti"),
+        exec: claim_text(claims, "exec"),
+        instance: claim_text(claims, "instance"),
+        act_sub: claims
+            .get("act")
+            .and_then(|act| act.get("sub"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
     }
 }
 
 fn principal_from_api_key(info: ApiKeyInfo) -> Principal {
     Principal {
         r#type: "apikey".into(),
-        kind: None,
+        kind: info.kind,
         sub: None,
         org: info.org_id,
         account: info.account_id,
         scopes: info.scopes,
         key_id: info.id,
         owner: info.user_id,
+        runner_id: info.runner_id,
+        jti: None,
+        exec: None,
+        instance: None,
+        act_sub: None,
     }
 }
 

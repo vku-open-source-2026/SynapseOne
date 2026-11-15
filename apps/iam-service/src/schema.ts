@@ -205,6 +205,35 @@ export const platformRunnerKeys = pgTable(
   ],
 );
 
+/**
+ * Per-execution delegated grants minted for platform runners. The JWT carries
+ * the jti; IAM verifies this row on every gateway session check so completing,
+ * releasing or deleting a runner revokes outstanding data-plane authority.
+ */
+export const executionDelegations = pgTable(
+  'execution_delegations',
+  {
+    jti: uuid('jti').primaryKey(),
+    executionId: text('execution_id').notNull(),
+    runnerId: text('runner_id').notNull(),
+    instanceId: text('instance_id'),
+    userId: uuid('user_id').notNull(),
+    orgId: uuid('org_id'),
+    accountId: uuid('account_id'),
+    scopes: text('scopes').array().notNull().default(sql`'{}'::text[]`),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+  },
+  (t) => [
+    index('idx_execution_delegations_execution').on(t.executionId),
+    index('idx_execution_delegations_runner').on(t.runnerId),
+    index('idx_execution_delegations_expiry')
+      .on(t.expiresAt)
+      .where(sql`${t.revokedAt} is null`),
+  ],
+);
+
 export const serviceAccounts = pgTable(
   'service_accounts',
   {

@@ -6,6 +6,16 @@ Format based on Keep a Changelog; versioning follows SemVer.
 ## [Unreleased]
 
 ### Added
+- **Owner-scoped platform runners.** Platform owners can manage shared system
+  compute connectors from `/admin/runners` (`/v1/platform/runners`). Platform
+  runners authenticate with a dedicated IAM `platform_runner_keys` credential
+  (no user/account binding, `scope=platform`, `mode=system`) instead of a user
+  token, consume the shared `synapseone-wf-system` queue, and claim workflows
+  that opt into `settings.execution.mode: "system"` across every tenant. Each
+  claimed execution receives a short-lived delegated token for the original
+  user/tenant (`act=platform-runner:<id>`), so data-plane nodes stay
+  tenant-correct and auditable. The gateway refuses system keys on tenant APIs;
+  deleting a runner or rotating its key revokes the old credential.
 - SynapseBase now has a tenant → database → collection → document namespace.
   Existing collections migrate to a per-scope `default` database, legacy flat
   routes keep working, and databases support CRUD, stats and cascade delete.

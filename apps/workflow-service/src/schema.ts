@@ -6,7 +6,7 @@
  * Workflow Drizzle schema — tables/indexes are versioned migrations.
  */
 import { sql } from 'drizzle-orm';
-import { boolean, index, integer, jsonb, pgTable, text, timestamp, uniqueIndex } from 'drizzle-orm/pg-core';
+import { boolean, doublePrecision, index, integer, jsonb, pgTable, primaryKey, text, timestamp, uniqueIndex } from 'drizzle-orm/pg-core';
 
 export const workflows = pgTable(
   'synapseone_workflows',
@@ -49,6 +49,12 @@ export const executions = pgTable(
     queueName: text('queue_name'),
     runner: text('runner'),
     workerId: text('worker_id'),
+    /** Claiming connector instance. Fences same-registration replicas. */
+    runnerInstanceId: text('runner_instance_id'),
+    /** Owner self-test target; only this registration may claim the run. */
+    targetRunnerId: text('target_runner_id'),
+    /** CPU/memory admission requirement; defaults applied by the service. */
+    resourceRequirements: jsonb('resource_requirements').$type<Record<string, any>>().notNull().default(sql`'{}'::jsonb`),
     attempt: integer('attempt').notNull().default(0),
     leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }),
     workflowRevision: integer('workflow_revision'),
@@ -177,7 +183,9 @@ export const workflowRunners = pgTable(
     name: text('name').notNull(),
     /** workflow | inference | hybrid runner capability. */
     kind: text('kind').notNull().default('workflow'),
-    /** custom | hybrid (platform workers are built into workflow-service). */
+    /** tenant = user/account runner; platform = owner-managed system compute. */
+    scope: text('scope').notNull().default('tenant'),
+    /** custom | hybrid | system (platform workers are built into workflow-service). */
     mode: text('mode').notNull().default('custom'),
     queue: text('queue').notNull(),
     inferenceQueue: text('inference_queue'),
@@ -196,6 +204,7 @@ export const workflowRunners = pgTable(
   },
   (t) => [
     index('idx_synapseone_runners_tenant').on(t.orgId, t.accountId),
+    index('idx_synapseone_runners_scope').on(t.scope),
     index('idx_synapseone_runners_queue').on(t.queue),
     index('idx_synapseone_runners_seen').on(t.lastSeenAt.desc()),
   ],
@@ -228,8 +237,33 @@ export const workflowRunnerInstances = pgTable(
   ],
 );
 
-/** Queued inference work consumed by inference/hybrid runners. */
-export const inferenceJobs = pgTable(
+/**
+ * Hourly CPU/RAM rollups per connector instance. The full sample history is
+ * intentionally short (30 min); these rollups keep day/hour usage charts cheap
+ * without growing the heartbeat payload loaded by claim admission.
+ */
+export const runnerUsageHourly = pgTable(
+  'synapseone_runner_usage_hourly',
+  {
+    instanceId: text('instance_id').notNull(),
+    runnerId: text('runner_id').notNull(),
+    hourStart: timestamp('hour_start', { withTimezone: true }).notNull(),
+    samples: integer('samples').notNull().default(0),
+    cpuUsedSum: doublePrecision('cpu_used_sum').notNull().default(0),
+    cpuLimitSum: doublePrecision('cpu_limit_sum').notNull().default(0),
+    memUsedSum: doublePrecision('memory_used_sum').notNull().default(0),
+    memLimitSum: doublePrecision('memory_limit_sum').notNull().default(0),
+    maxCpuPercent: doublePrecision('max_cpu_percent').notNull().default(0),
+    maxMemUsedMb: doublePrecision('max_memory_used_mb').notNull().default(0),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.instanceId, t.hourStart] }),
+    index('idx_synapseone_runner_usage_runner_hour').on(t.runnerId, t.hourStart.desc()),
+  ],
+);
+
+/** Queued inference work consumed by inference/hybrid runners. */export const inferenceJobs = pgTable(
   'synapseone_inference_jobs',
   {
     id: text('id').primaryKey(),
@@ -242,6 +276,9 @@ export const inferenceJobs = pgTable(
     accountId: text('account_id'),
     runnerId: text('runner_id'),
     instanceId: text('instance_id'),
+    /** Owner self-test target; only this registration may claim the job. */
+    targetRunnerId: text('target_runner_id'),
+    resourceRequirements: jsonb('resource_requirements').$type<Record<string, any>>().notNull().default(sql`'{}'::jsonb`),
     queueName: text('queue_name'),
     attempt: integer('attempt').notNull().default(0),
     leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }),

@@ -46,11 +46,103 @@ Set it per workflow with `settings.execution.mode` (Console: workflow detail →
 | `platform` (default) | `synapseone-wf-platform` | SynapseOne's built-in worker |
 | `custom` | `synapseone-wf-custom` | Your runner only |
 | `hybrid` | `synapseone-wf-shared` | Built-in worker **and** your runner |
+| `system` | `synapseone-wf-system` | Owner-managed platform runner pool (all tenants) |
 | `inline` | — | Runs inside the API request (dev/test, nested calls) |
 
 A dedicated queue is also supported:
 `settings.execution.queue: "acme-edge"` plus a runner created with the same
 `queue`. This is useful when you want a specific machine to own a workflow.
+
+## Owner-scoped (platform) runners
+
+A **platform runner** is shared system compute, not a tenant resource:
+
+- Any active platform administrator with the **owner** role can create, list,
+  rename, rotate the key of, or delete it. There is no per-user ownership: a
+  runner created by one owner is manageable by every owner.
+- It authenticates with a **platform runner key**, not a user or account API
+  key. The key is restricted to `workflow:*`, `queue:consume|ack|nack|heartbeat`
+  and `inference:*`; the gateway rejects it on every tenant data API.
+- It only claims executions whose workflow explicitly selects
+  `settings.execution.mode: "system"`. Those jobs live in the shared
+  `synapseone-wf-system` queue (queue-service tenant `platform`), so one runner
+  can serve every tenant without reading tenant queues.
+- For each claimed job the runner receives a **short-lived delegated token for
+  that execution's original user/tenant**. Workflow nodes then call Base, LDS,
+  Faststore, Queue, Warehouse, Stream, etc. with the user's tenant and scopes;
+  the audit trail records `act = platform-runner:<runnerId>`. The runner never
+  stores a user token.
+- Deleting a platform runner revokes every key bound to it. Rotating a key
+  revokes the previous key immediately, so restart the connector with the new
+  install command.
+
+Console: **Platform Admin → Platform Runners**. API: `/v1/platform/runners`
+(platform-admin JWT only; mutating routes require `platform:Admin` and
+workflow-service re-checks `role=owner` with IAM). The job protocol is the same
+`/v1/runner/*` and queue API described below; the only difference is the key
+kind and the `system` queue namespace.
+
+> System mode is opt-in per workflow. The runner pool is controlled by platform
+> owners, so a tenant can select `system` without managing a machine, but the
+> workflow must still be enqueued by an authenticated principal because the
+> per-execution delegation is minted for that principal.
+
+### Self-test and resource admission
+
+`POST /v1/platform/runners/:id/test {type: "workflow"|"embeddings"|"decision"|"route"}`
+returns immediately with `202 {ok:false,status:"queued",jobId,runnerId:null,
+targetRunnerId,pollUrl,...}`. Poll `pollUrl` until terminal; a success response
+has `ok:true`, `status:"success"` and `runnerId` equal to the actual executor
+(workflow `worker_id` / inference `runner_id`). The job is targeted at the
+selected registration; a different registration gets `409 runner_not_target`.
+Workflow tests use a single-use synthetic DAG. Inference tests use the system
+inference queue and require that the selected runner's local worker reports the
+requested real capability ready.
+
+Resource requirements are persisted on executions and inference jobs
+(`resource_requirements`, migration `0011`): workflow defaults to
+`{cpu:0.5,memoryMb:128}`, inference to `{cpu:1,memoryMb:256}` incremental above
+the resident model. Workflows set
+`settings.execution.resources {cpu:0.05..64, memoryMb:32..262144}`; inference
+jobs accept the same `resources` object in `POST /v1/inference-jobs`.
+
+Heartbeats carry sanitized `metadata.resources`
+(`{sampledAt,observedAt,receivedAt,cpu:{limitCores,usedCores,percent,availableCores},memory:{limitMb,usedMb,availableMb},source}`)
+and `metadata.activeJobs`. `observedAt` is the runner's sample clock (the server
+rejects a cached sample even when the heartbeat itself is fresh),
+`receivedAt` is the server receipt time, and `sampledAt` stays equal to
+`observedAt` for history/UI compatibility. The server preserves host/cgroup
+availability clamps, mirrors the latest sample to the runner and appends at most
+120 samples to each **connector instance** `metadata.resourceHistory`. Each
+heartbeat also folds the sample into an hourly CPU/RAM rollup
+(`synapseone_runner_usage_hourly`, migration `0012`); raw samples remain short,
+but day/hour charts do not depend on them.
+
+Platform claims use the requesting connector instance's telemetry, not another
+replica's heartbeat. Set `WORKFLOW_RUNNER_RESOURCE_ADMISSION=enforce` only after
+the telemetry-capable runner image is live; the default `off` keeps legacy
+runners working. Enforced claims return
+`409 runner_resources_unavailable` (missing/stale telemetry) or
+`409 runner_capacity_unavailable`; runners nack/requeue those jobs. Freshness is
+`max(45 s, 3 × the instance's reported heartbeatIntervalSeconds)`, and a sample
+without a measured `source` is refused rather than relabelled as host data. The
+store's atomic per-instance reservation is the final authority. Platform runner
+commands set workflow concurrency 8 and inference concurrency 1 (the local Python
+worker is serial); tenant runners keep 1.
+
+### Usage history
+
+`GET /v1/platform/runners/:id/usage?interval=hour|day|week|month&hours=24`
+returns `{from,to,interval,buckets,totals}`. `hours` accepts up to `26280`
+(three years); weekly buckets start on UTC Monday and monthly buckets on the
+first UTC day of the month. Each bucket contains request counts
+(`workflow`, `inference`, `total`), reconstructed concurrent jobs (`peak`,
+`average`) from real claim/finish intervals, and the CPU/RAM rollup at that
+time (`cpuPercent`, `memoryUsedMb`, `memoryLimitMb`, `samples`). Request counts
+use the claim time for workflow executions and enqueue time for inference jobs;
+a queued or cancelled row is counted as a request but not as concurrent work.
+The owner Console renders this as request bars plus concurrent/CPU/RAM lines
+with 24-hour, 7/30/90-day, 1-year and 3-year ranges.
 
 ## 1. Create a runner and API key
 

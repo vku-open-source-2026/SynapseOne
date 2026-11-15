@@ -430,15 +430,48 @@ impl Store {
         delay_seconds: i64,
         error: Option<&str>,
     ) -> Result<Option<NackResult>> {
+        self.nack_message_with_refund(tenant, name, receipt, requeue, delay_seconds, error, false)
+            .await
+    }
+
+    /// Nack with an optional refund of the delivery attempt that produced this
+    /// receipt. Only the trusted runner scheduling-deferral path sets this, so
+    /// waiting for capacity never consumes max attempts.
+    pub async fn nack_message_with_refund(
+        &self,
+        tenant: &str,
+        name: &str,
+        receipt: &str,
+        requeue: bool,
+        delay_seconds: i64,
+        error: Option<&str>,
+        refund_attempt: bool,
+    ) -> Result<Option<NackResult>> {
         match self {
             Store::Memory(store) => {
                 store
-                    .nack_message(tenant, name, receipt, requeue, delay_seconds, error)
+                    .nack_message_with_refund(
+                        tenant,
+                        name,
+                        receipt,
+                        requeue,
+                        delay_seconds,
+                        error,
+                        refund_attempt,
+                    )
                     .await
             }
             Store::Redis(store) => {
                 store
-                    .nack_message(tenant, name, receipt, requeue, delay_seconds, error)
+                    .nack_message_with_refund(
+                        tenant,
+                        name,
+                        receipt,
+                        requeue,
+                        delay_seconds,
+                        error,
+                        refund_attempt,
+                    )
                     .await
             }
         }
@@ -940,6 +973,20 @@ impl MemoryStore {
         delay_seconds: i64,
         error: Option<&str>,
     ) -> Result<Option<NackResult>> {
+        self.nack_message_with_refund(tenant, name, receipt, requeue, delay_seconds, error, false)
+            .await
+    }
+
+    async fn nack_message_with_refund(
+        &self,
+        tenant: &str,
+        name: &str,
+        receipt: &str,
+        requeue: bool,
+        delay_seconds: i64,
+        error: Option<&str>,
+        refund_attempt: bool,
+    ) -> Result<Option<NackResult>> {
         let delay_ms = (delay_seconds.max(0) as f64 * 1000.0).round() as i64;
         let now = now_ms();
         let result = {
@@ -960,6 +1007,9 @@ impl MemoryStore {
                 if !error.is_empty() {
                     row.envelope.last_error = Some(error.to_string());
                 }
+            }
+            if refund_attempt && requeue {
+                row.envelope.attempts = row.envelope.attempts.saturating_sub(1).max(0);
             }
             let attempts = row.envelope.attempts;
             let max_attempts = if row.envelope.max_attempts == 0 {
@@ -1626,6 +1676,20 @@ impl RedisStore {
         delay_seconds: i64,
         error: Option<&str>,
     ) -> Result<Option<NackResult>> {
+        self.nack_message_with_refund(tenant, name, receipt, requeue, delay_seconds, error, false)
+            .await
+    }
+
+    async fn nack_message_with_refund(
+        &self,
+        tenant: &str,
+        name: &str,
+        receipt: &str,
+        requeue: bool,
+        delay_seconds: i64,
+        error: Option<&str>,
+        refund_attempt: bool,
+    ) -> Result<Option<NackResult>> {
         let delay_ms = (delay_seconds.max(0) as f64 * 1000.0).round() as i64;
         let now = now_ms();
         let keys = keys_for(tenant, name);
@@ -1643,6 +1707,7 @@ impl RedisStore {
             delay_ms.to_string(),
             error.unwrap_or("").to_string(),
             if requeue { "1" } else { "0" }.to_string(),
+            if refund_attempt { "1" } else { "0" }.to_string(),
         ];
         let raw: Vec<String> = self.eval(NACK_LUA, &eval_keys, &args).await?;
         if raw.is_empty() {
@@ -2015,6 +2080,11 @@ const NACK_LUA: &str = r#"
   env.receipt = nil
   env.consumer = nil
   if ARGV[4] ~= '' then env.last_error = ARGV[4] end
+  -- Trusted scheduling deferrals refund the delivery attempt before the
+  -- normal retry-limit check, so capacity/telemetry waits are not failures.
+  if ARGV[6] == '1' and ARGV[5] ~= '0' then
+    env.attempts = math.max(0, (tonumber(env.attempts) or 0) - 1)
+  end
   local max = tonumber(env.max_attempts or 5)
   if ARGV[5] == '0' or (env.attempts or 0) >= max then
     env.dead = true

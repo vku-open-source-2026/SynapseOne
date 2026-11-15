@@ -16,7 +16,7 @@
 import './env-compat';
 import type { Principal } from './store';
 
-export type WorkflowRunnerMode = 'inline' | 'platform' | 'custom' | 'hybrid';
+export type WorkflowRunnerMode = 'inline' | 'platform' | 'custom' | 'hybrid' | 'system';
 
 export interface QueueOptions {
   maxAttempts?: number;
@@ -45,6 +45,10 @@ export const DEFAULT_PLATFORM_QUEUE = process.env.WORKFLOW_QUEUE_PLATFORM || 'sy
 export const DEFAULT_CUSTOM_QUEUE = process.env.WORKFLOW_QUEUE_CUSTOM || 'synapseone-wf-custom';
 export const DEFAULT_SHARED_QUEUE = process.env.WORKFLOW_QUEUE_SHARED || 'synapseone-wf-shared';
 export const DEFAULT_INFERENCE_QUEUE = process.env.WORKFLOW_QUEUE_INFERENCE || 'synapseone-inference';
+/** Owner-managed (platform) runner pool. Jobs live in the shared `platform`
+ *  queue namespace so one system runner can serve every tenant. */
+export const DEFAULT_SYSTEM_QUEUE = process.env.WORKFLOW_QUEUE_SYSTEM || 'synapseone-wf-system';
+export const DEFAULT_SYSTEM_INFERENCE_QUEUE = process.env.WORKFLOW_QUEUE_INFERENCE_SYSTEM || 'synapseone-inference-system';
 
 /** `queue` when a SynapseQueue URL is configured, `inline` for dev/tests.
  *  WORKFLOW_EXECUTION_MODE=queue|inline forces one or the other. */
@@ -79,6 +83,7 @@ export function runnerModeForSettings(settings: Record<string, any> | null | und
   if (raw === 'inline' || raw === 'local' || raw === 'sync') return 'inline';
   if (raw === 'custom') return 'custom';
   if (raw === 'hybrid') return 'hybrid';
+  if (raw === 'system' || raw === 'platform-runner' || raw === 'owner') return 'system';
   return 'platform';
 }
 
@@ -91,7 +96,25 @@ export function queueNameForSettings(settings: Record<string, any> | null | unde
   if (override && QUEUE_RE.test(override)) return override;
   if (mode === 'custom') return DEFAULT_CUSTOM_QUEUE;
   if (mode === 'hybrid') return DEFAULT_SHARED_QUEUE;
+  if (mode === 'system') return DEFAULT_SYSTEM_QUEUE;
   return DEFAULT_PLATFORM_QUEUE;
+}
+
+/** Queue tenant principal for a run mode. System jobs always publish into the
+ *  shared `tenant:platform` namespace, regardless of who triggered them. */
+export function queuePrincipalForMode(
+  mode: WorkflowRunnerMode,
+  principal: Principal | null | undefined,
+): Principal | null {
+  return mode === 'system' ? null : principal || null;
+}
+
+/** Inference jobs may target the shared system queue explicitly. */
+export function queuePrincipalForInferenceQueue(
+  queue: string,
+  principal: Principal | null | undefined,
+): Principal | null {
+  return queue === DEFAULT_SYSTEM_INFERENCE_QUEUE ? null : principal || null;
 }
 
 export function isQueueName(v: unknown): boolean {

@@ -30,6 +30,188 @@ use crate::usage::{feature_for_route, is_usage_excluded, UsageEvent, UsageTeleme
 
 const INTERNAL_ONLY_PATHS: [&str; 3] = ["/v1/audit/ingest", "/v1/usage/ingest", "/v1/keys/verify"];
 
+/// Owner-scoped platform runner keys are system compute. Keep them on the
+/// runner protocol, runner bootstrap/heartbeat, the platform queue namespace
+/// and key verification; everything else is denied at the edge.
+pub(crate) fn platform_runner_path_allowed(path: &str) -> bool {
+    // Platform runner paths are plain ids/queue names. Refuse encoded or
+    // non-canonical spellings so `/v1/workflow-runners/../platform` cannot be
+    // matched as one prefix by us and another by an upstream.
+    let Some(canonical) = canonical_policy_path(path) else {
+        return false;
+    };
+    if canonical != path {
+        return false;
+    }
+    path == "/v1/auth/verify"
+        || path.starts_with("/v1/runner/")
+        || path.starts_with("/v1/workflow-runners/")
+        || path.starts_with("/v1/queue/")
+}
+
+fn path_under(path: &str, prefix: &str) -> bool {
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+/// Decode one percent-encoding layer and resolve `.`/`..`/duplicate slashes.
+/// The result is used only for policy decisions; forwarding keeps the original
+/// URI. Returns `None` for malformed/ambiguous paths (invalid UTF-8/hex,
+/// remaining `%` after one decode = double encoding, backslashes, controls,
+/// or an escape above the root).
+pub(crate) fn canonical_policy_path(path: &str) -> Option<String> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = hex_value(bytes[i + 1])?;
+            let lo = hex_value(bytes[i + 2])?;
+            decoded.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let decoded = String::from_utf8(decoded).ok()?;
+    // A second layer (`%252e`) would become `%2e` above; refusing any residual
+    // `%` closes double-encoding differences between gateway and upstream.
+    if decoded.contains('%') || decoded.contains('\\') {
+        return None;
+    }
+    if decoded
+        .chars()
+        .any(|ch| ch == '\0' || ch.is_control())
+    {
+        return None;
+    }
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in decoded.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                if segments.pop().is_none() {
+                    return None;
+                }
+            }
+            value => segments.push(value),
+        }
+    }
+    Some(format!("/{}", segments.join("/")))
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Data-plane services an exec-delegated token may call. Everything else
+/// (IAM, keys, credentials, workflow definitions/executions/runners, platform
+/// admin, audit/usage, secrets, MCP) is denied. The existing scope check still
+/// runs afterwards, so the grant needs the concrete service action.
+const EXEC_DELEGATED_DATA_PLANE_PREFIXES: [&str; 10] = [
+    "/v1/base",
+    "/v1/search",
+    "/v1/lds",
+    "/v1/faststore",
+    "/v1/ocs",
+    "/v1/storage",
+    "/v1/warehouse",
+    "/v1/stream",
+    "/v1/notifications",
+    "/v1/inference",
+];
+
+fn service_prefix(path: &str) -> Option<&'static str> {
+    EXEC_DELEGATED_DATA_PLANE_PREFIXES
+        .iter()
+        .copied()
+        .find(|prefix| path_under(path, *prefix))
+}
+
+/// Data-plane scope families an execution grant may carry. Universal (`*`,
+/// `*:read`) and control-plane families are refused so a grant cannot become a
+/// master tenant credential even before the path policy runs.
+const EXEC_DELEGATED_SCOPE_FAMILIES: [&str; 11] = [
+    "base",
+    "search",
+    "lds",
+    "faststore",
+    "ocs",
+    "storage",
+    "warehouse",
+    "stream",
+    "notifications",
+    "inference",
+    "queue",
+];
+
+pub(crate) fn exec_delegated_scopes_allowed(scopes: &[String]) -> bool {
+    if scopes.is_empty() {
+        return false;
+    }
+    scopes.iter().all(|scope| {
+        let family = scope.split(':').next().unwrap_or("");
+        // Universal scopes are accepted for compatibility with the current
+        // mint, but the path allowlist below still confines them to
+        // data-plane routes; they can never reach the control plane.
+        if family == "*" {
+            return true;
+        }
+        !family.is_empty() && EXEC_DELEGATED_SCOPE_FAMILIES.contains(&family)
+    })
+}
+
+/// Policy for `kind=exec-delegated` JWTs. Requires the raw and canonical paths
+/// to resolve to the *same* data-plane service; this blocks traversal and
+/// encoding differences without breaking encoded object keys under `/v1/ocs`.
+/// Queue access is limited to message operations in the execution's tenant.
+pub(crate) fn exec_delegated_request_allowed(method: &str, raw: &str, canonical: &str) -> bool {
+    if !matches!(
+        method,
+        "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE"
+    ) {
+        return false;
+    }
+    if let (Some(raw_service), Some(canonical_service)) =
+        (service_prefix(raw), service_prefix(canonical))
+    {
+        return raw_service == canonical_service;
+    }
+    // `/v1/inference-jobs` is the inference job data lane (separate route).
+    if path_under(raw, "/v1/inference-jobs") && path_under(canonical, "/v1/inference-jobs") {
+        return true;
+    }
+    // Queue is data-plane but has destructive admin routes. Only publish /
+    // consume / ack / nack / heartbeat are allowed, and only via POST.
+    if method != "POST"
+        || !path_under(raw, "/v1/queue/queues")
+        || !path_under(canonical, "/v1/queue/queues")
+    {
+        return false;
+    }
+    let Some(rest) = canonical.strip_prefix("/v1/queue/queues/") else {
+        return false;
+    };
+    let Some((queue, action)) = rest.split_once('/') else {
+        return false;
+    };
+    if queue.is_empty() || queue.contains('/') {
+        return false;
+    }
+    matches!(action, "messages" | "consume" | "ack" | "nack" | "heartbeat")
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
@@ -625,6 +807,124 @@ async fn dispatch(State(state): State<AppState>, mut request: Request) -> Respon
             "platform_token_tenant_forbidden",
             Some("platform tokens cannot call tenant APIs"),
         );
+    }
+
+    // Legacy 1-hour platform-runner delegations minted before execution grants
+    // existed are broad user sessions with only `act.sub=platform-runner:<id>`.
+    // They must not survive the upgrade. Ordinary delegated sessions (other
+    // `act.sub`, e.g. service accounts/Tier-2) keep their existing behavior.
+    if principal_kind == Some("delegated")
+        && principal
+            .as_ref()
+            .and_then(|principal| principal.act_sub.as_deref())
+            .is_some_and(|actor| actor.starts_with("platform-runner:"))
+    {
+        update_meta(&meta, |meta| {
+            meta.error = Some("execution_grant_legacy_forbidden".into())
+        });
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "execution_grant_legacy_forbidden",
+            Some("legacy platform-runner delegations are retired; re-run the job with an exec-delegated grant"),
+        );
+    }
+
+    // Per-execution delegated grants are data-plane only. The control plane
+    // (IAM/keys/credentials/workflow/admin) is denied even if the minted scopes
+    // are broad, and the grant row is checked against IAM on every request so
+    // completion/release/runner revocation takes effect immediately.
+    if principal_kind == Some("exec-delegated") {
+        let Some(canonical) = canonical_policy_path(&path) else {
+            update_meta(&meta, |meta| {
+                meta.error = Some("execution_scope_forbidden".into())
+            });
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "execution_scope_forbidden",
+                Some("execution grants may only call canonical data-plane paths"),
+            );
+        };
+        if !exec_delegated_request_allowed(&method_text, &path, &canonical) {
+            update_meta(&meta, |meta| {
+                meta.error = Some("execution_scope_forbidden".into())
+            });
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "execution_scope_forbidden",
+                Some("execution grants may only call data-plane dataset, storage, cache, stream, notification and inference APIs"),
+            );
+        }
+        let grant = principal.as_ref();
+        if !grant.is_some_and(|principal| exec_delegated_scopes_allowed(&principal.scopes)) {
+            update_meta(&meta, |meta| {
+                meta.error = Some("execution_scope_forbidden".into())
+            });
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "execution_scope_forbidden",
+                Some("execution grants must carry data-plane scopes only"),
+            );
+        }
+        let grant_complete = grant
+            .and_then(|principal| principal.jti.as_deref())
+            .filter(|value| !value.is_empty())
+            .is_some()
+            && grant
+                .and_then(|principal| principal.exec.as_deref())
+                .filter(|value| !value.is_empty())
+                .is_some()
+            && grant
+                .and_then(|principal| principal.runner_id.as_deref())
+                .filter(|value| !value.is_empty())
+                .is_some()
+            && grant
+                .and_then(|principal| principal.instance.as_deref())
+                .filter(|value| !value.is_empty())
+                .is_some();
+        if !grant_complete {
+            update_meta(&meta, |meta| meta.error = Some("invalid_token".into()));
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid_token",
+                Some("execution grant is missing its execution/runner/instance binding"),
+            );
+        }
+        let token = request
+            .headers()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .unwrap_or("");
+        if let Err(failure) = state.auth.verify_execution_grant(token).await {
+            update_meta(&meta, |meta| meta.error = Some(failure.error.clone()));
+            return error_response(failure.status, &failure.error, Some(failure.message.as_str()));
+        }
+        // Fall through: the normal scope check and central authorization still
+        // apply, so the grant needs the concrete data-plane scope/action.
+    }
+
+    // Platform runner keys are shared system compute, not tenant credentials.
+    // They may only reach the runner protocol, runner bootstrap/heartbeat, the
+    // platform-namespaced queue and key verification. Workflow-service
+    // authorizes each claim by runner id + queue + execution mode.
+    if principal_kind == Some("platform-runner") {
+        if !platform_runner_path_allowed(&path) {
+            update_meta(&meta, |meta| {
+                meta.error = Some("platform_runner_path_forbidden".into())
+            });
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "platform_runner_path_forbidden",
+                Some("platform runner keys may only call the runner protocol, runner bootstrap and the platform queue"),
+            );
+        }
+        propagate_principal(
+            request.headers_mut(),
+            principal.as_ref(),
+            Some(route.auth),
+            &state.config.internal_secret,
+        );
+        return forward(&state, route, request, &meta, None).await;
     }
 
     // The session exchange is the boundary where a normal user proves platform

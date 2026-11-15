@@ -172,6 +172,7 @@ struct Tenant(String);
 #[derive(Clone)]
 struct Principal {
     sub: String,
+    kind: Option<String>,
     org: Option<String>,
     account: Option<String>,
 }
@@ -210,6 +211,7 @@ fn principal_from_headers(headers: &HeaderMap) -> Option<Principal> {
         }
         return Some(Principal {
             sub: user,
+            kind: clean_header_value(header(headers, "x-synapseone-kind")),
             org: clean_header_value(header(headers, "x-synapseone-org")),
             account: clean_header_value(header(headers, "x-synapseone-account")),
         });
@@ -226,7 +228,12 @@ fn principal_from_headers(headers: &HeaderMap) -> Option<Principal> {
             Some(account) => format!("apikey:{account}"),
             None => format!("{}:unknown", kind.as_deref().unwrap_or("principal")),
         };
-        return Some(Principal { sub, org, account });
+        return Some(Principal {
+            sub,
+            kind,
+            org,
+            account,
+        });
     }
     None
 }
@@ -243,6 +250,115 @@ fn resolve_caller(headers: &HeaderMap) -> Caller {
     }
 }
 
+/// System compute may only consume its two dedicated queues. The platform
+/// namespace also contains first-party service queues, which are not runner
+/// work and must remain inaccessible even to a valid platform runner key.
+fn platform_runner_system_queue(queue: &str) -> bool {
+    let workflow = std::env::var("WORKFLOW_QUEUE_SYSTEM")
+        .unwrap_or_else(|_| "synapseone-wf-system".to_string());
+    let inference = std::env::var("WORKFLOW_QUEUE_INFERENCE_SYSTEM")
+        .unwrap_or_else(|_| "synapseone-inference-system".to_string());
+    queue == workflow || queue == inference
+}
+
+fn platform_runner_queue_request_allowed(method: &str, path: &str) -> bool {
+    if method != "POST" {
+        return false;
+    }
+    let Some(suffix) = path.strip_prefix("/v1/queue/queues/") else {
+        return false;
+    };
+    let Some((queue, action)) = suffix.split_once('/') else {
+        return false;
+    };
+    if !matches!(action, "consume" | "ack" | "nack" | "heartbeat") {
+        return false;
+    }
+    platform_runner_system_queue(queue)
+}
+
+/// A platform runner deferring a job because the scheduler has no free
+/// CPU/RAM or the target/capability is not ready must not consume an attempt.
+/// Only the trusted platform-runner identity, only the two dedicated system
+/// queues, only `requeue=true`, and only this exact typed-error set qualify.
+fn platform_runner_scheduling_deferral(
+    caller: &Caller,
+    queue: &str,
+    requeue: bool,
+    error: Option<&str>,
+) -> bool {
+    if !requeue || !platform_runner_system_queue(queue) {
+        return false;
+    }
+    let Caller::Principal(principal) = caller else {
+        return false;
+    };
+    if principal.kind.as_deref() != Some("platform-runner") {
+        return false;
+    }
+    matches!(
+        error,
+        Some(
+            "runner_disabled"
+                | "runner_not_target"
+                | "runner_capability_unavailable"
+                | "runner_capacity_unavailable"
+                | "runner_resources_unavailable"
+                | "runner_not_preferred"
+        )
+    )
+}
+
+/// Legacy connectors request 30 seconds for every scheduling rejection.
+/// Bound only trusted transient deferrals so a mismatched/briefly busy
+/// connector cannot hide ready work for half a minute. User retries and
+/// disabled connectors retain their requested delay.
+fn scheduling_deferral_delay(requested: i64, trusted: bool, error: Option<&str>) -> i64 {
+    if !trusted { return requested; }
+    let maximum = match error {
+        Some("runner_not_target" | "runner_capability_unavailable" | "runner_not_preferred") => 1,
+        Some("runner_capacity_unavailable") => 2,
+        Some("runner_resources_unavailable") => 5,
+        _ => return requested,
+    };
+    requested.min(maximum)
+}
+
+/// Optional compatibility gate for platform runners that still use the legacy
+/// consume protocol. Old runners ACK a 409 claim denial, which drops system
+/// work they cannot fence. `QUEUE_PLATFORM_RUNNER_MIN_PROTOCOL=2` makes the
+/// queue reject their consume before any queue mutation, while tenant callers
+/// and the default (0/off) stay unchanged.
+fn platform_runner_consume_protocol(caller: &Caller, body: &Map<String, Value>) -> Result<(), AppError> {
+    let minimum = std::env::var("QUEUE_PLATFORM_RUNNER_MIN_PROTOCOL")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    if minimum < 2 {
+        return Ok(());
+    }
+    let Caller::Principal(principal) = caller else {
+        return Ok(());
+    };
+    if principal.kind.as_deref() != Some("platform-runner") {
+        return Ok(());
+    }
+    let protocol = body
+        .get("runnerProtocol")
+        .and_then(js_number)
+        .unwrap_or(0.0);
+    if protocol.is_finite() && protocol >= minimum as f64 {
+        return Ok(());
+    }
+    Err(AppError::request(
+        StatusCode::CONFLICT,
+        "runner_upgrade_required",
+        format!(
+            "platform runner consume is missing a supported runnerProtocol (got {protocol}, needs {minimum}); upgrade the runner image and bind it to its registration — no job was consumed"
+        ),
+    ))
+}
+
 fn clean_tenant(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() || value.chars().count() > 128 || has_control(value) {
@@ -254,6 +370,13 @@ fn clean_tenant(value: &str) -> Option<String> {
 fn tenant_for(headers: &HeaderMap, caller: &Caller, query: &str) -> Option<String> {
     match caller {
         Caller::Principal(principal) => {
+            // Platform runner keys are system compute: they only see the
+            // shared `tenant:platform` namespace that workflow-service uses
+            // for `settings.execution.mode=system` jobs. They can never select
+            // a tenant queue with x-synapseone-tenant or ?tenant=.
+            if principal.kind.as_deref() == Some("platform-runner") {
+                return Some("tenant:platform".to_string());
+            }
             if let Some(org) = &principal.org {
                 return Some(format!("org:{org}"));
             }
@@ -881,6 +1004,18 @@ async fn guard(State(state): State<AppState>, mut request: Request, next: Next) 
                 Some("SynapseQueue requires an authenticated caller".into()),
             );
         }
+        if matches!(&caller, Caller::Principal(p) if p.kind.as_deref() == Some("platform-runner"))
+            && !platform_runner_queue_request_allowed(
+                request.method().as_str(),
+                request.uri().path(),
+            )
+        {
+            return json_error(
+                StatusCode::FORBIDDEN,
+                "runner_queue_forbidden",
+                Some("Platform runners may only consume, acknowledge, retry or renew system runner work".into()),
+            );
+        }
         let query = request.uri().query().unwrap_or("").to_string();
         let Some(tenant) = tenant_for(headers, &caller, &query) else {
             return json_error(
@@ -1228,6 +1363,9 @@ async fn consume(
 ) -> Result<Response, AppError> {
     let name = clean_queue(&queue)?;
     let body = parse_body(&body)?;
+    // Reject an incompatible platform runner before ensure_queue/consume, so
+    // its old catch-409-then-ACK loop cannot lease (and drop) system jobs.
+    platform_runner_consume_protocol(&caller, &body)?;
     let max_messages = int_or_throw(
         body.get("maxMessages"),
         "maxMessages",
@@ -1372,6 +1510,7 @@ async fn ack(
 async fn nack(
     State(state): State<AppState>,
     Extension(Tenant(tenant)): Extension<Tenant>,
+    Extension(caller): Extension<Caller>,
     Path(queue): Path<String>,
     body: Bytes,
 ) -> Result<Response, AppError> {
@@ -1383,15 +1522,19 @@ async fn nack(
         .get("error")
         .map(|value| truncate_chars(&js_string(Some(value)), 1024));
     let requeue = body.get("requeue").map(bool_flag).unwrap_or(true);
+    let refund_attempt =
+        platform_runner_scheduling_deferral(&caller, &name, requeue, error.as_deref());
+    let delay_seconds = scheduling_deferral_delay(delay_seconds, refund_attempt, error.as_deref());
     let Some(result) = state
         .store
-        .nack_message(
+        .nack_message_with_refund(
             &tenant,
             &name,
             &receipt,
             requeue,
             delay_seconds,
             error.as_deref(),
+            refund_attempt,
         )
         .await?
     else {

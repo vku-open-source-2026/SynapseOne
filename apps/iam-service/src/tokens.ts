@@ -9,7 +9,7 @@ import jwt from 'jsonwebtoken';
 import { randomBytes, randomUUID } from 'crypto';
 import { and, desc, eq, gt, isNull, or, sql } from 'drizzle-orm';
 import { ensureTables, getDb, useDb, __mem, hashSecret, hashCandidates, bumpAuthVersion } from './db';
-import { apiKeys, platformRunnerKeys, refreshTokens } from './schema';
+import { apiKeys, executionDelegations, platformRunnerKeys, refreshTokens } from './schema';
 
 /** Fail fast on weak/default JWT secrets in production; warn loudly in dev. */
 function jwtSecret(): string {
@@ -65,7 +65,7 @@ export interface AccessClaims {
   typ?: string;
   action?: string;
   /** Delegated token: the service identity that acted for the user. */
-  act?: { sub: string; kind?: string };
+  act?: { sub: string; kind?: string; exec?: string; instance?: string };
   /** Delegation marker + audience (Tier-2 service). */
   delegated?: boolean;
   aud?: string;
@@ -73,13 +73,18 @@ export interface AccessClaims {
   auth_time?: number;
   /** Credential epoch (users.auth_version) captured when the token was issued. */
   ver?: number;
+  /** Per-execution delegated grant (kind=exec-delegated). */
+  exec?: string;
+  runner?: string;
+  instance?: string;
 }
 
 export function signAccess(
   claims: AccessClaims,
-  opts: { expiresIn?: number; audience?: string } = {},
+  opts: { expiresIn?: number; audience?: string; minExpiresIn?: number } = {},
 ): { token: string; expiresIn: number } {
-  const expiresIn = Math.min(Math.max(Math.floor(opts.expiresIn ?? ACCESS_TTL), 60), 86_400);
+  const floor = Math.min(Math.max(Math.floor(opts.minExpiresIn ?? 60), 1), 3600);
+  const expiresIn = Math.min(Math.max(Math.floor(opts.expiresIn ?? ACCESS_TTL), floor), 86_400);
   const kind = claims.kind || 'user';
   // Org-member user tokens carry full authority; narrow credentials (service
   // accounts, delegated tokens) pass scopes explicitly and are never widened.
@@ -677,7 +682,7 @@ async function verifyApiKeyByHash(hash: string): Promise<VerifiedApiKey | null> 
 /** Scope families a platform runner key may hold. Never `*` or data-plane
  *  services: a system key must not become a cross-tenant master key. */
 const PLATFORM_RUNNER_SCOPE_FAMILIES = new Set(['workflow', 'queue', 'inference']);
-const PLATFORM_RUNNER_SCOPE_RE = /^(workflow|queue|inference):[A-Za-z][A-Za-z0-9*-]{0,63}$/;
+const PLATFORM_RUNNER_SCOPE_RE = /^(workflow|queue|inference):(?:[A-Za-z][A-Za-z0-9*-]{0,63}|\*)$/;
 export const PLATFORM_RUNNER_DEFAULT_SCOPES = [
   'workflow:*',
   'queue:consume',
@@ -839,6 +844,118 @@ export async function revokePlatformRunnerKeysForRunner(runnerId: string): Promi
       rec.revoked_at = new Date().toISOString();
       revoked += 1;
     }
+  }
+  return revoked;
+}
+
+// ---------- per-execution delegated grants ----------
+
+export interface ExecutionDelegationInfo {
+  jti: string;
+  execution_id: string;
+  runner_id: string;
+  instance_id: string | null;
+  user_id: string;
+  org_id: string | null;
+  account_id: string | null;
+  scopes: string[];
+  expires_at: string | null;
+  revoked_at: string | null;
+}
+
+export async function storeExecutionDelegation(input: {
+  jti: string;
+  executionId: string;
+  runnerId: string;
+  instanceId?: string | null;
+  userId: string;
+  orgId?: string | null;
+  accountId?: string | null;
+  scopes: string[];
+  expiresAt: Date;
+}): Promise<void> {
+  if (useDb()) {
+    const db = getDb()!;
+    await ensureTables();
+    await db.insert(executionDelegations).values({
+      jti: input.jti,
+      executionId: input.executionId,
+      runnerId: input.runnerId,
+      instanceId: input.instanceId || null,
+      userId: input.userId,
+      orgId: input.orgId || null,
+      accountId: input.accountId || null,
+      scopes: input.scopes,
+      expiresAt: input.expiresAt,
+    });
+    return;
+  }
+  __mem.executionDelegations.set(input.jti, {
+    jti: input.jti,
+    execution_id: input.executionId,
+    runner_id: input.runnerId,
+    instance_id: input.instanceId || null,
+    user_id: input.userId,
+    org_id: input.orgId || null,
+    account_id: input.accountId || null,
+    scopes: input.scopes,
+    expires_at: input.expiresAt.toISOString(),
+    revoked_at: null,
+  });
+}
+
+/** Active grant lookup used by /v1/auth/verify on every delegated request. */
+export async function verifyExecutionDelegation(jti: string): Promise<ExecutionDelegationInfo | null> {
+  if (!jti) return null;
+  if (useDb()) {
+    const db = getDb()!;
+    await ensureTables();
+    const rows = await db.select().from(executionDelegations).where(eq(executionDelegations.jti, jti)).limit(1);
+    const row = rows[0];
+    if (!row || row.revokedAt) return null;
+    if (new Date(row.expiresAt).getTime() <= Date.now()) return null;
+    return {
+      jti: row.jti,
+      execution_id: row.executionId,
+      runner_id: row.runnerId,
+      instance_id: row.instanceId ?? null,
+      user_id: row.userId,
+      org_id: row.orgId ?? null,
+      account_id: row.accountId ?? null,
+      scopes: row.scopes || [],
+      expires_at: iso(row.expiresAt),
+      revoked_at: null,
+    };
+  }
+  const rec = __mem.executionDelegations.get(jti);
+  if (!rec || rec.revoked_at) return null;
+  if (new Date(rec.expires_at).getTime() <= Date.now()) return null;
+  return rec;
+}
+
+export async function revokeExecutionDelegations(opts: { executionId?: string; runnerId?: string }): Promise<number> {
+  const executionId = String(opts.executionId || '').trim();
+  const runnerId = String(opts.runnerId || '').trim();
+  if (!executionId && !runnerId) return 0;
+  if (useDb()) {
+    const db = getDb()!;
+    await ensureTables();
+    const conds: any[] = [isNull(executionDelegations.revokedAt)];
+    if (executionId) conds.push(eq(executionDelegations.executionId, executionId));
+    if (runnerId) conds.push(eq(executionDelegations.runnerId, runnerId));
+    const rows = await db.update(executionDelegations)
+      .set({ revokedAt: sql`now()` })
+      .where(and(...conds))
+      .returning({ jti: executionDelegations.jti });
+    return rows.length;
+  }
+  let revoked = 0;
+  for (const rec of __mem.executionDelegations.values()) {
+    if (rec.revoked_at) continue;
+    if (executionId && rec.execution_id !== executionId) continue;
+    if (runnerId && rec.runner_id !== runnerId) continue;
+    rec.revoked_at = new Date().toISOString();
+    revoked += 1;
   }
   return revoked;
 }

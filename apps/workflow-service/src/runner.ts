@@ -41,7 +41,9 @@ import os from 'os';
 import { randomUUID } from 'crypto';
 import { runWorkflow } from './engine';
 import type { Principal } from './store';
+import { RunnerResourceSampler } from './runner-resources';
 import { createRemoteCredentialResolver, createRemoteSynapseOneCall, createRunnerApi, RunnerHttpError } from './remote-call';
+import { LocalInferenceWorker, localInferenceEnv, type LocalInferenceHealth } from './local-inference';
 
 const VERSION = (() => {
   try {
@@ -78,10 +80,18 @@ interface RunnerConfig {
   runnerId: string;
   name?: string;
   kind: 'workflow' | 'inference' | 'hybrid';
-  mode: 'custom' | 'hybrid';
+  scope?: 'tenant' | 'platform';
+  mode: 'custom' | 'hybrid' | 'system';
   queue: string;
   inferenceQueue?: string | null;
   queues?: { workflow?: string | null; inference?: string | null };
+  /** Owner-managed local inference configuration (platform runners). */
+  inference?: {
+    mode?: 'local';
+    capabilities?: string[];
+    models?: Record<string, string>;
+    limits?: Record<string, any>;
+  } | null;
   heartbeatIntervalSeconds: number;
   longPollSeconds?: number;
   staleAfterSeconds?: number;
@@ -98,6 +108,11 @@ interface ClaimedWorkflowJob {
   attempt?: number;
   leaseExpiresAt?: string;
   resumeFrom?: { node: string; output: any } | null;
+  /** Present for owner-managed (platform) runners: a short-lived token for the
+   *  execution's own tenant, so the runner never stores a user credential. */
+  delegatedToken?: string;
+  delegatedTokenExpiresIn?: number;
+  delegatedScopes?: string[];
 }
 
 interface ClaimedInferenceJob {
@@ -250,18 +265,50 @@ async function main(): Promise<void> {
     throw new Error(`API key is missing inference scopes. Add inference:* (current: ${scopes.join(', ') || 'none'})`);
   }
 
+  // Inference runtime. Platform runners are required to run models inside the
+  // runner container (no separate API server/listening port). The legacy
+  // INFERENCE_RUNNER_URL path is only kept for explicitly configured tenant
+  // runners.
+  const envInferenceMode = String(process.env.INFERENCE_RUNNER_MODE || '').trim().toLowerCase();
+  const platformScope = config.scope === 'platform';
+  const inferenceMode: 'local' | 'url' = platformScope
+    ? 'local'
+    : envInferenceMode === 'url' || (envInferenceMode !== 'local' && !!String(process.env.INFERENCE_RUNNER_URL || '').trim())
+      ? 'url'
+      : 'local';
   let inferenceBackend = '';
-  if (inferenceLane) {
+  let localWorker: LocalInferenceWorker | null = null;
+  let localHealth: LocalInferenceHealth | null = null;
+  let localConfigKey = JSON.stringify(config.inference || {});
+  if (inferenceLane && inferenceMode === 'url') {
     inferenceBackend = String(process.env.INFERENCE_RUNNER_URL || '').trim().replace(/\/$/, '');
+    if (platformScope) {
+      throw new Error('platform runners must use self-contained local inference; INFERENCE_RUNNER_URL is not allowed');
+    }
     if (!inferenceBackend) {
-      throw new Error('INFERENCE_RUNNER_URL is required for an inference/hybrid runner (OpenAI-compatible base URL, e.g. http://vllm:8000/v1)');
+      throw new Error('INFERENCE_RUNNER_URL is required when INFERENCE_RUNNER_MODE=url');
     }
     try { new URL(inferenceBackend); } catch {
       throw new Error(`INFERENCE_RUNNER_URL is not a valid URL: ${inferenceBackend}`);
     }
   }
+  if (inferenceLane && inferenceMode === 'local') {
+    const script = String(process.env.LOCAL_INFERENCE_WORKER || '/app/local-inference/worker.py').trim();
+    localWorker = new LocalInferenceWorker({
+      script,
+      env: localInferenceEnv(config.inference, process.env),
+      requestTimeoutMs: Number(config.inference?.limits?.timeoutMs) || 120000,
+      onLog: (line) => log(`[local-inference] ${line}`),
+      onHealth: (health) => { localHealth = health; },
+    });
+    localHealth = await localWorker.start();
+    log(`local inference mode: script=${script} ready=${localHealth.ready} capabilities=${Object.entries(localHealth.capabilities || {}).map(([k, v]: any) => `${k}:${v?.ready ? 'ready' : 'not-ready'}`).join(',') || 'none'}`);
+    if (!localHealth.ready) {
+      log('warning: local inference is not ready; the inference lane will stay idle until a real model is loaded');
+    }
+  }
 
-  log(`starting runner=${runnerId} instance=${instanceId} host=${hostname} kind=${kind} capabilities=${capabilities.join('+')} workflowQueue=${workflowQueue || '-'} inferenceQueue=${inferenceQueue || '-'} concurrency=${concurrency}/${inferenceConcurrency} longPoll=${longPollSeconds}s version=${VERSION}`);
+  log(`starting runner=${runnerId} instance=${instanceId} host=${hostname} kind=${kind} scope=${config.scope || 'tenant'} capabilities=${capabilities.join('+')} workflowQueue=${workflowQueue || '-'} inferenceQueue=${inferenceQueue || '-'} inferenceMode=${inferenceMode} concurrency=${concurrency}/${inferenceConcurrency} longPoll=${longPollSeconds}s version=${VERSION}`);
 
   let stopping = false;
   const workflowInFlight = new Set<string>();
@@ -269,17 +316,22 @@ async function main(): Promise<void> {
   let workflowTicking = false;
   let inferenceTicking = false;
 
+  const resourceSampler = new RunnerResourceSampler();
   const heartbeat = async (status: 'connected' | 'offline' = 'connected'): Promise<void> => {
     try {
+      const resources = await resourceSampler.sample();
       await api.request('POST', `/v1/workflow-runners/${encodeURIComponent(runnerId)}/heartbeat`, {
         instanceId,
         hostname,
         version: VERSION,
         queue: workflowQueue || inferenceQueue,
         concurrency,
+        heartbeatIntervalSeconds: heartbeatSeconds,
         startedAt,
         status,
         metadata: {
+          resources,
+          activeJobs: { workflow: workflowInFlight.size, inference: inferenceInFlight.size },
           kind,
           capabilities,
           queues: [...new Set([workflowQueue, inferenceQueue].filter(Boolean))],
@@ -288,7 +340,13 @@ async function main(): Promise<void> {
           once,
           pid: process.pid,
           platform: process.platform,
+          inferenceMode,
           inferenceBackend: inferenceBackend ? new URL(inferenceBackend).host : null,
+          inferenceHealth: localWorker
+            ? localHealth
+            : inferenceBackend
+              ? { mode: 'url', ready: true, backend: new URL(inferenceBackend).host }
+              : { mode: inferenceMode, ready: false },
           proxy: api.proxy ? true : false,
         },
       });
@@ -298,9 +356,38 @@ async function main(): Promise<void> {
   };
   await heartbeat();
   const hbTimer = setInterval(() => { void heartbeat(); }, heartbeatSeconds * 1000);
+  // Owner edits to local model/capability/limit config are applied without a
+  // container restart. Restart the worker only when the config actually
+  // changes; the current job (if any) is allowed to finish first.
+  const inferConfigTimer = localWorker
+    ? setInterval(async () => {
+        try {
+          const fresh: any = await api.request('GET', `/v1/workflow-runners/${encodeURIComponent(runnerId)}/config`);
+          const nextKey = JSON.stringify(fresh?.inference || {});
+          if (nextKey === localConfigKey || inferenceInFlight.size > 0) return;
+          localConfigKey = nextKey;
+          config.inference = fresh?.inference || null;
+          log('local inference configuration changed; restarting worker');
+          await localWorker?.stop();
+          localWorker = new LocalInferenceWorker({
+            script: String(process.env.LOCAL_INFERENCE_WORKER || '/app/local-inference/worker.py').trim(),
+            env: localInferenceEnv(config.inference, process.env),
+            requestTimeoutMs: Number(config.inference?.limits?.timeoutMs) || 120000,
+            onLog: (line) => log(`[local-inference] ${line}`),
+            onHealth: (health) => { localHealth = health; },
+          });
+          localHealth = await localWorker.start();
+        } catch (e: any) {
+          log(`warning: cannot refresh local inference config: ${String(e?.message || e).slice(0, 300)}`);
+        }
+      }, 30000)
+    : null;
+  inferConfigTimer?.unref?.();
 
   const runWorkflowJob = async (executionId: string, receipt: string): Promise<void> => {
     let hb: NodeJS.Timeout | null = null;
+    let attempt: number | undefined;
+    let delegationOptions: Parameters<typeof createRunnerApi>[0] | null = null;
     try {
       const claimed = await api.request('POST', `/v1/runner/jobs/${encodeURIComponent(executionId)}/claim`, {
         runnerId,
@@ -308,9 +395,13 @@ async function main(): Promise<void> {
         leaseSeconds,
       }) as ClaimedWorkflowJob;
       if (!claimed) throw new Error('claim returned an empty workflow job');
+      attempt = claimed.attempt;
+      if (!Number.isSafeInteger(attempt) || !attempt || attempt < 1) throw new Error('claim returned an invalid workflow attempt');
       hb = setInterval(() => {
         Promise.all([
-          api.request('POST', `/v1/runner/jobs/${encodeURIComponent(executionId)}/heartbeat`, { runnerId, instanceId, leaseSeconds }).catch(() => null),
+          api.request('POST', `/v1/runner/jobs/${encodeURIComponent(executionId)}/heartbeat`, { runnerId, instanceId, attempt, leaseSeconds }).then((out: any) => {
+            if (delegationOptions && typeof out?.delegatedToken === 'string') delegationOptions.apiKey = out.delegatedToken;
+          }).catch(() => null),
           api.request('POST', `/v1/queue/queues/${encodeURIComponent(workflowQueue)}/heartbeat`, {
             receipt, visibilityTimeoutSeconds: leaseSeconds,
           }).catch(() => null),
@@ -318,9 +409,21 @@ async function main(): Promise<void> {
       }, Math.max(5, Math.floor(leaseSeconds / 3)) * 1000);
       hb.unref?.();
 
-      const synapseoneCall = createRemoteSynapseOneCall(api);
-      const credentialResolver = createRemoteCredentialResolver(api, executionId, runnerId);
-      log(`run workflow execution=${executionId} workflow=${claimed.workflow.id} trigger=${claimed.triggeredBy}`);
+      // A platform runner has no tenant of its own. It executes the claimed
+      // job as the queued user through the short-lived delegated token; its
+      // system key stays reserved for the job protocol.
+      const dataApi = claimed.delegatedToken
+        ? createRunnerApi(delegationOptions = {
+            baseUrl,
+            apiKey: claimed.delegatedToken,
+            runnerId,
+            auth: 'bearer',
+            timeoutMs: 60000,
+          })
+        : api;
+      const synapseoneCall = createRemoteSynapseOneCall(dataApi);
+      const credentialResolver = createRemoteCredentialResolver(api, executionId, runnerId, { instanceId, attempt });
+      log(`run workflow execution=${executionId} workflow=${claimed.workflow.id} trigger=${claimed.triggeredBy}${claimed.delegatedToken ? ' acting-as=execution-principal' : ''}`);
       const result = await runWorkflow(claimed.workflow, claimed.input, {
         triggeredBy: claimed.triggeredBy,
         principal: claimed.principal,
@@ -344,6 +447,7 @@ async function main(): Promise<void> {
       await api.request('POST', `/v1/runner/jobs/${encodeURIComponent(executionId)}/complete`, {
         runnerId,
         instanceId,
+        attempt,
         status: result.status,
         output: result.output,
         nodeRuns: result.nodeRuns,
@@ -353,14 +457,23 @@ async function main(): Promise<void> {
       await api.request('POST', `/v1/queue/queues/${encodeURIComponent(workflowQueue)}/ack`, { receipt });
       log(`done workflow execution=${executionId} status=${result.status}`);
     } catch (e: any) {
+      // An owner-disabled runner must not ack work it could not claim: hand it
+      // back to the queue and retry after a delay so another runner can take it.
+      if (e instanceof RunnerHttpError && e.status === 409 && ['runner_disabled', 'runner_not_target', 'runner_capability_unavailable', 'runner_capacity_unavailable', 'runner_resources_unavailable', 'runner_not_preferred'].includes(e.body?.error)) {
+        await api.request('POST', `/v1/queue/queues/${encodeURIComponent(workflowQueue)}/nack`, {
+          receipt, requeue: true, delaySeconds: 30, error: e.body?.error || 'runner_disabled',
+        }).catch(() => null);
+        log(`disabled workflow execution=${executionId}: requeued`);
+        return;
+      }
       if (e instanceof RunnerHttpError && (e.status === 404 || e.status === 409 || e.status === 403)) {
         await api.request('POST', `/v1/queue/queues/${encodeURIComponent(workflowQueue)}/ack`, { receipt }).catch(() => null);
         log(`skip workflow execution=${executionId}: ${e.status}`);
         return;
       }
       errorLog(`workflow execution ${executionId} failed:`, e?.message || e);
-      await api.request('POST', `/v1/runner/jobs/${encodeURIComponent(executionId)}/release`, {
-        runnerId, instanceId, error: String(e?.message || e).slice(0, 1000),
+      if (attempt) await api.request('POST', `/v1/runner/jobs/${encodeURIComponent(executionId)}/release`, {
+        runnerId, instanceId, attempt, error: String(e?.message || e).slice(0, 1000),
       }).catch(() => null);
       await api.request('POST', `/v1/queue/queues/${encodeURIComponent(workflowQueue)}/nack`, {
         receipt, requeue: true, delaySeconds: 10, error: String(e?.message || e).slice(0, 1024),
@@ -373,6 +486,7 @@ async function main(): Promise<void> {
 
   const runInferenceJob = async (jobId: string, receipt: string): Promise<void> => {
     let hb: NodeJS.Timeout | null = null;
+    let attempt: number | undefined;
     try {
       const claimed = await api.request('POST', `/v1/runner/inference/jobs/${encodeURIComponent(jobId)}/claim`, {
         runnerId,
@@ -380,42 +494,59 @@ async function main(): Promise<void> {
         leaseSeconds,
       }) as ClaimedInferenceJob;
       if (!claimed) throw new Error('claim returned an empty inference job');
+      attempt = claimed.attempt;
+      if (!Number.isSafeInteger(attempt) || !attempt || attempt < 1) throw new Error('claim returned an invalid inference attempt');
       hb = setInterval(() => {
         Promise.all([
-          api.request('POST', `/v1/runner/inference/jobs/${encodeURIComponent(jobId)}/heartbeat`, { runnerId, instanceId, leaseSeconds }).catch(() => null),
+          api.request('POST', `/v1/runner/inference/jobs/${encodeURIComponent(jobId)}/heartbeat`, { runnerId, instanceId, attempt, leaseSeconds }).catch(() => null),
           api.request('POST', `/v1/queue/queues/${encodeURIComponent(inferenceQueue)}/heartbeat`, {
             receipt, visibilityTimeoutSeconds: leaseSeconds,
           }).catch(() => null),
         ]).catch(() => undefined);
       }, Math.max(5, Math.floor(leaseSeconds / 3)) * 1000);
       hb.unref?.();
-      log(`run inference job=${jobId} type=${claimed.type} backend=${inferenceBackend}`);
-      const result = await localInferenceRequest(claimed.type, claimed.request, {
-        baseUrl: inferenceBackend,
-        apiKey: String(process.env.INFERENCE_RUNNER_API_KEY || ''),
-        model: process.env.INFERENCE_RUNNER_MODEL ? String(process.env.INFERENCE_RUNNER_MODEL) : undefined,
-        timeoutMs: intEnv('INFERENCE_RUNNER_TIMEOUT_MS', 120000, 1000, 300000),
-      });
+      log(`run inference job=${jobId} type=${claimed.type} mode=${inferenceMode} backend=${localWorker ? 'local-worker' : inferenceBackend}`);
+      const result = localWorker
+        ? await localWorker.infer(claimed.type, claimed.request, intEnv('LOCAL_INFERENCE_TIMEOUT_MS', 120000, 1000, 300000))
+        : await localInferenceRequest(claimed.type, claimed.request, {
+            baseUrl: inferenceBackend,
+            apiKey: String(process.env.INFERENCE_RUNNER_API_KEY || ''),
+            model: process.env.INFERENCE_RUNNER_MODEL ? String(process.env.INFERENCE_RUNNER_MODEL) : undefined,
+            timeoutMs: intEnv('INFERENCE_RUNNER_TIMEOUT_MS', 120000, 1000, 300000),
+          });
       await api.request('POST', `/v1/runner/inference/jobs/${encodeURIComponent(jobId)}/complete`, {
         runnerId,
         instanceId,
+        attempt,
         status: 'success',
         result,
       });
       await api.request('POST', `/v1/queue/queues/${encodeURIComponent(inferenceQueue)}/ack`, { receipt });
       log(`done inference job=${jobId}`);
     } catch (e: any) {
+      if (e instanceof RunnerHttpError && e.status === 409 && ['runner_disabled', 'runner_not_target', 'runner_capability_unavailable', 'runner_capacity_unavailable', 'runner_resources_unavailable', 'runner_not_preferred'].includes(e.body?.error)) {
+        await api.request('POST', `/v1/queue/queues/${encodeURIComponent(inferenceQueue)}/nack`, {
+          receipt, requeue: true, delaySeconds: 30, error: e.body?.error || 'runner_disabled',
+        }).catch(() => null);
+        log(`disabled inference job=${jobId}: requeued`);
+        return;
+      }
       if (e instanceof RunnerHttpError && (e.status === 404 || e.status === 409 || e.status === 403)) {
         await api.request('POST', `/v1/queue/queues/${encodeURIComponent(inferenceQueue)}/ack`, { receipt }).catch(() => null);
         log(`skip inference job=${jobId}: ${e.status}`);
         return;
       }
       errorLog(`inference job ${jobId} failed:`, e?.message || e);
-      await api.request('POST', `/v1/runner/inference/jobs/${encodeURIComponent(jobId)}/complete`, {
+      const detail = (e as any)?.detail;
+      const errorText = detail?.code
+        ? `${detail.code}: ${detail.message || e?.message || e}`
+        : String(e?.message || e);
+      if (attempt) await api.request('POST', `/v1/runner/inference/jobs/${encodeURIComponent(jobId)}/complete`, {
         runnerId,
         instanceId,
+        attempt,
         status: 'error',
-        error: String(e?.message || e).slice(0, 2000),
+        error: errorText.slice(0, 2000),
       }).catch(() => null);
       await api.request('POST', `/v1/queue/queues/${encodeURIComponent(inferenceQueue)}/ack`, { receipt }).catch(() => null);
     } finally {
@@ -437,6 +568,7 @@ async function main(): Promise<void> {
         // Ask only for free slots: over-consuming leaves a message invisible
         // for the whole visibility timeout when the batch cannot be dispatched.
         maxMessages: Math.min(slots, 10),
+        runnerProtocol: 2,
         visibilityTimeoutSeconds: leaseSeconds,
         consumer: `${consumer}-wf`,
         ...(waitSeconds > 0 ? { waitSeconds } : {}),
@@ -475,6 +607,12 @@ async function main(): Promise<void> {
 
   const tickInference = async (waitSeconds: number): Promise<TickResult> => {
     if (stopping || inferenceTicking || !inferenceLane) return { dispatched: 0, blocked: false, full: true };
+    // Never claim work we cannot run. The lane stays parked until the local
+    // worker reports at least one real model ready; the heartbeat exposes the
+    // same state to the owner UI.
+    if (localWorker && !Object.values(localHealth?.capabilities || {}).some((cap: any) => cap.ready === true && cap.enabled !== false)) {
+      return { dispatched: 0, blocked: false, full: true };
+    }
     inferenceTicking = true;
     try {
       const slots = inferenceConcurrency - inferenceInFlight.size;
@@ -482,6 +620,7 @@ async function main(): Promise<void> {
       const startedAt = Date.now();
       const consumed: any = await api.request('POST', `/v1/queue/queues/${encodeURIComponent(inferenceQueue)}/consume`, {
         maxMessages: Math.min(slots, 10),
+        runnerProtocol: 2,
         visibilityTimeoutSeconds: leaseSeconds,
         consumer: `${consumer}-inf`,
         ...(waitSeconds > 0 ? { waitSeconds } : {}),
@@ -521,6 +660,8 @@ async function main(): Promise<void> {
     await Promise.allSettled([tickWorkflow(0), tickInference(0)]);
     const deadline = Date.now() + 120000;
     while ((workflowInFlight.size || inferenceInFlight.size) && Date.now() < deadline) await sleep(200);
+    if (inferConfigTimer) clearInterval(inferConfigTimer);
+    await localWorker?.stop().catch(() => undefined);
     clearInterval(hbTimer);
     await heartbeat('offline').catch(() => undefined);
     return;
@@ -565,8 +706,10 @@ async function main(): Promise<void> {
     stopping = true;
     log(`${signal} received — draining ${workflowInFlight.size + inferenceInFlight.size} job(s)`);
     clearInterval(hbTimer);
+    if (inferConfigTimer) clearInterval(inferConfigTimer);
     const deadline = Date.now() + 30000;
     while ((workflowInFlight.size || inferenceInFlight.size) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 250));
+    await localWorker?.stop().catch(() => undefined);
     await heartbeat('offline').catch(() => undefined);
     log('stopped');
     process.exit(0);

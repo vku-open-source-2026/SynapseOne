@@ -76,6 +76,23 @@ routes:
     auth: either
     service: iam
 
+  # Owner-scoped (platform) runners. Served by workflow-service, but only a
+  # platform administrator JWT may reach it; workflow-service re-checks that
+  # the administrator still holds the `owner` role. Mutations require
+  # platform:Admin (operator/auditor tokens cannot manage system compute).
+  - path: /v1/platform/runners
+    target: ${WORKFLOW_SERVICE_URL:http://workflow:4002}
+    auth: jwt
+    service: platform
+    timeoutMs: 30000
+    actions:
+      - { method: POST, path: /v1/platform/runners, action: platform:Admin }
+      - { method: POST, path: /v1/platform/runners/*, action: platform:Admin }
+      - { method: POST, path: /v1/platform/runners/*/*, action: platform:Admin }
+      - { method: PATCH, path: /v1/platform/runners/*, action: platform:Admin }
+      - { method: DELETE, path: /v1/platform/runners/*, action: platform:Admin }
+      - { method: DELETE, path: /v1/platform/runners/*/*/*, action: platform:Admin }
+
   # Platform Super Admin control plane. Only JWT credentials are accepted
   # (API keys/service accounts are rejected at the gateway); normal user JWTs
   # are allowed only on /session to exchange for a short-lived platform token.

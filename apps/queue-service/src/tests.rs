@@ -23,6 +23,17 @@ const AUTH: [(&str, &str); 3] = [
     ("x-synapseone-kind", "user"),
 ];
 
+// QUEUE_PLATFORM_RUNNER_MIN_PROTOCOL is process-global. Every test that
+// consumes as a platform runner holds this lock so the env-on compatibility
+// test cannot race the default-off tests.
+static PLATFORM_RUNNER_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn platform_runner_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    PLATFORM_RUNNER_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn test_state() -> AppState {
     AppState {
         store: Store::memory(),
@@ -712,6 +723,427 @@ async fn api_key_headers_are_account_scoped_never_platform() {
 }
 
 #[tokio::test]
+async fn platform_runner_key_is_confined_to_the_platform_namespace() {
+    let _env = platform_runner_env_lock();
+    let app = test_app();
+    let runner = [
+        ("x-synapseone-kind", "platform-runner"),
+        ("x-synapseone-runner", "runner-1"),
+    ];
+    let platform = [("x-synapseone-tenant", "platform")];
+
+    // workflow-service publishes system-mode work into tenant:platform.
+    let (status, _) = call_with(
+        &app,
+        "PUT",
+        "/v1/queue/queues/synapseone-wf-system",
+        Some(json!({"maxAttempts": 5, "visibilityTimeoutSeconds": 60})),
+        &platform,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call_with(
+        &app,
+        "POST",
+        "/v1/queue/queues/synapseone-wf-system/messages",
+        Some(json!({"payload": {"kind": "workflow.run", "executionId": "exec-1"}})),
+        &platform,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // A platform runner sees and consumes exactly that namespace, even when a
+    // caller tries to override the tenant.
+    let (status, consumed) = call_with(
+        &app,
+        "POST",
+        "/v1/queue/queues/synapseone-wf-system/consume?tenant=tenant-a",
+        Some(json!({"maxMessages": 1, "consumer": "runner-1"})),
+        &runner,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{consumed}");
+    assert_eq!(consumed["messages"][0]["payload"]["executionId"], "exec-1");
+
+    // Tenant queues stay invisible: create one under tenant-a and confirm the
+    // platform runner cannot read it.
+    let (status, _) = call_with(
+        &app,
+        "PUT",
+        "/v1/queue/queues/tenant-jobs",
+        Some(json!({"maxAttempts": 3, "visibilityTimeoutSeconds": 30})),
+        &AUTH,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call_with(
+        &app,
+        "GET",
+        "/v1/queue/queues/tenant-jobs/stats",
+        None,
+        &runner,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn platform_runner_cannot_consume_first_party_work_or_mutate_system_queues() {
+    let _env = platform_runner_env_lock();
+    let app = test_app();
+    let runner = [
+        ("x-synapseone-kind", "platform-runner"),
+        ("x-synapseone-runner", "runner-1"),
+    ];
+    let platform = [("x-synapseone-tenant", "platform")];
+    for queue in [
+        "synapseone-wf-platform",
+        "synapseone-wf-system",
+        "synapseone-inference-system",
+    ] {
+        let path = format!("/v1/queue/queues/{queue}");
+        let (status, _) = call_with(&app, "PUT", &path, Some(json!({})), &platform).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = call_with(
+            &app,
+            "POST",
+            &format!("{path}/messages"),
+            Some(json!({"payload": {"queue": queue}})),
+            &platform,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+    for (method, suffix, body) in [
+        (
+            "POST",
+            "synapseone-wf-platform/consume",
+            json!({"maxMessages": 1}),
+        ),
+        (
+            "POST",
+            "synapseone-wf-platform/ack",
+            json!({"receipt": "other-work"}),
+        ),
+        (
+            "POST",
+            "synapseone-wf-system/messages",
+            json!({"payload": "injected"}),
+        ),
+        ("POST", "synapseone-wf-system/purge", json!({})),
+        ("DELETE", "synapseone-wf-system", json!({})),
+        ("PUT", "synapseone-wf-system", json!({"maxAttempts": 1})),
+        ("GET", "synapseone-wf-system/stats", json!({})),
+    ] {
+        let (status, response) = call_with(
+            &app,
+            method,
+            &format!("/v1/queue/queues/{suffix}"),
+            Some(body),
+            &runner,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{method} {suffix}: {response}"
+        );
+        assert_eq!(response["error"], "runner_queue_forbidden");
+    }
+    // Denied consumption must leave the original first-party message untouched.
+    let (status, consumed) = call_with(
+        &app,
+        "POST",
+        "/v1/queue/queues/synapseone-wf-platform/consume",
+        Some(json!({"maxMessages": 1})),
+        &platform,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        consumed["messages"][0]["payload"]["queue"],
+        "synapseone-wf-platform"
+    );
+    // A real runner still consumes and acknowledges both dedicated lanes.
+    for queue in ["synapseone-wf-system", "synapseone-inference-system"] {
+        let (status, consumed) = call_with(
+            &app,
+            "POST",
+            &format!("/v1/queue/queues/{queue}/consume"),
+            Some(json!({"maxMessages": 1})),
+            &runner,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{consumed}");
+        let receipt = consumed["messages"][0]["receipt"].as_str().unwrap();
+        for action in ["heartbeat", "ack"] {
+            let (status, body) = call_with(
+                &app,
+                "POST",
+                &format!("/v1/queue/queues/{queue}/{action}"),
+                Some(json!({"receipt": receipt, "visibilityTimeoutSeconds": 30})),
+                &runner,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{action}: {body}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn platform_runner_consume_requires_protocol_two_when_enforced() {
+    let _env = platform_runner_env_lock();
+    let app = test_app();
+    let runner = [
+        ("x-synapseone-kind", "platform-runner"),
+        ("x-synapseone-runner", "legacy-runner"),
+    ];
+    let platform = [("x-synapseone-tenant", "platform")];
+    let path = "/v1/queue/queues/synapseone-wf-system";
+    let (status, created) = call_with(
+        &app,
+        "PUT",
+        path,
+        Some(json!({"maxAttempts": 3, "visibilityTimeoutSeconds": 30})),
+        &platform,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let (status, published) = call_with(
+        &app,
+        "POST",
+        &format!("{path}/messages"),
+        Some(json!({"payload": {"kind": "system-job"}})),
+        &platform,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{published}");
+
+    // Tenant work is unaffected by the platform-runner protocol gate.
+    create_queue(&app, json!({"maxAttempts": 3})).await;
+    publish(&app, json!({"payload": "tenant-job"})).await;
+
+    let previous = std::env::var("QUEUE_PLATFORM_RUNNER_MIN_PROTOCOL").ok();
+    std::env::set_var("QUEUE_PLATFORM_RUNNER_MIN_PROTOCOL", "2");
+
+    let (legacy_status, legacy) = call_with(
+        &app,
+        "POST",
+        &format!("{path}/consume"),
+        Some(json!({"maxMessages": 1})),
+        &runner,
+    )
+    .await;
+    let (v1_status, v1) = call_with(
+        &app,
+        "POST",
+        &format!("{path}/consume"),
+        Some(json!({"maxMessages": 1, "runnerProtocol": 1})),
+        &runner,
+    )
+    .await;
+    let (_, before_upgrade) =
+        call_with(&app, "GET", &format!("{path}/stats"), None, &platform).await;
+    let (v2_status, v2) = call_with(
+        &app,
+        "POST",
+        &format!("{path}/consume"),
+        Some(json!({"maxMessages": 1, "runnerProtocol": 2})),
+        &runner,
+    )
+    .await;
+    let (tenant_status, tenant) = call(
+        &app,
+        "POST",
+        "/v1/queue/queues/jobs/consume",
+        Some(json!({"maxMessages": 1})),
+    )
+    .await;
+
+    match previous {
+        Some(value) => std::env::set_var("QUEUE_PLATFORM_RUNNER_MIN_PROTOCOL", value),
+        None => std::env::remove_var("QUEUE_PLATFORM_RUNNER_MIN_PROTOCOL"),
+    }
+
+    assert_eq!(legacy_status, StatusCode::CONFLICT, "{legacy}");
+    assert_eq!(legacy["error"], "runner_upgrade_required", "{legacy}");
+    assert!(
+        legacy["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("runnerProtocol"),
+        "{legacy}"
+    );
+    assert_eq!(v1_status, StatusCode::CONFLICT, "{v1}");
+    assert_eq!(v1["error"], "runner_upgrade_required", "{v1}");
+    // Denials happened before ensure_queue/consume: the queued job is intact.
+    assert_eq!(before_upgrade["pending"], 1, "{before_upgrade}");
+    assert_eq!(before_upgrade["inflight"], 0, "{before_upgrade}");
+    assert_eq!(v2_status, StatusCode::OK, "{v2}");
+    assert_eq!(v2["count"], 1, "{v2}");
+    assert_eq!(tenant_status, StatusCode::OK, "{tenant}");
+    assert_eq!(tenant["count"], 1, "{tenant}");
+}
+
+#[tokio::test]
+async fn platform_runner_scheduling_deferrals_do_not_exhaust_max_attempts() {
+    let _env = platform_runner_env_lock();
+    let app = test_app();
+    let runner = [
+        ("x-synapseone-kind", "platform-runner"),
+        ("x-synapseone-runner", "runner-1"),
+    ];
+    let platform = [("x-synapseone-tenant", "platform")];
+    let errors = [
+        "runner_disabled",
+        "runner_not_target",
+        "runner_capability_unavailable",
+        "runner_capacity_unavailable",
+        "runner_resources_unavailable",
+        "runner_not_preferred",
+    ];
+
+    for queue in ["synapseone-wf-system", "synapseone-inference-system"] {
+        let path = format!("/v1/queue/queues/{queue}");
+        let (status, created) = call_with(
+            &app,
+            "PUT",
+            &path,
+            Some(json!({"maxAttempts": 1, "visibilityTimeoutSeconds": 30})),
+            &platform,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let (status, published) = call_with(
+            &app,
+            "POST",
+            &format!("{path}/messages"),
+            Some(json!({"payload": {"queue": queue}})),
+            &platform,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{published}");
+
+        // More scheduling rejections than maxAttempts: every one is refunded.
+        for round in 0..2 {
+            for error in errors {
+                let (status, consumed) = call_with(
+                    &app,
+                    "POST",
+                    &format!("{path}/consume"),
+                    Some(json!({"maxMessages": 1, "consumer": "runner-1"})),
+                    &runner,
+                )
+                .await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{queue} {round} {error}: {consumed}"
+                );
+                assert_eq!(consumed["count"], 1);
+                let receipt = consumed["messages"][0]["receipt"].as_str().unwrap();
+                let (status, nacked) = call_with(
+                    &app,
+                    "POST",
+                    &format!("{path}/nack"),
+                    Some(json!({
+                        "receipt": receipt,
+                        "requeue": true,
+                        "delaySeconds": 0,
+                        "error": error,
+                    })),
+                    &runner,
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{queue} {error}: {nacked}");
+                assert_eq!(nacked["state"], "retry", "{queue} {error}: {nacked}");
+                assert_eq!(nacked["attempts"], 0, "{queue} {error}: {nacked}");
+            }
+        }
+
+        let (status, stats) =
+            call_with(&app, "GET", &format!("{path}/stats"), None, &platform).await;
+        assert_eq!(status, StatusCode::OK, "{stats}");
+        assert_eq!(stats["pending"], 1, "{queue}: {stats}");
+        assert_eq!(stats["dead"], 0, "{queue}: {stats}");
+
+        // An actual execution failure is not a scheduling deferral and still
+        // consumes the attempt and dead-letters.
+        let (_, consumed) = call_with(
+            &app,
+            "POST",
+            &format!("{path}/consume"),
+            Some(json!({"maxMessages": 1, "consumer": "runner-1"})),
+            &runner,
+        )
+        .await;
+        let receipt = consumed["messages"][0]["receipt"].as_str().unwrap();
+        let (status, dead) = call_with(
+            &app,
+            "POST",
+            &format!("{path}/nack"),
+            Some(json!({
+                "receipt": receipt,
+                "requeue": true,
+                "delaySeconds": 0,
+                "error": "execution_failed",
+            })),
+            &runner,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{dead}");
+        assert_eq!(dead["state"], "dead", "{queue}: {dead}");
+        assert_eq!(dead["attempts"], 1, "{queue}: {dead}");
+    }
+}
+
+#[tokio::test]
+async fn tenant_caller_on_system_queue_name_never_gets_an_attempt_refund() {
+    let app = test_app();
+    // Same queue name in a tenant namespace: the caller identity, not the
+    // path string, decides whether a deferral is trusted.
+    let (status, created) = call(
+        &app,
+        "PUT",
+        "/v1/queue/queues/synapseone-wf-system",
+        Some(json!({"maxAttempts": 1, "visibilityTimeoutSeconds": 30})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let (status, published) = call(
+        &app,
+        "POST",
+        "/v1/queue/queues/synapseone-wf-system/messages",
+        Some(json!({"payload": {"spoof": true}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{published}");
+    let (_, consumed) = call(
+        &app,
+        "POST",
+        "/v1/queue/queues/synapseone-wf-system/consume",
+        Some(json!({"maxMessages": 1})),
+    )
+    .await;
+    let receipt = consumed["messages"][0]["receipt"].as_str().unwrap();
+    let (status, dead) = call(
+        &app,
+        "POST",
+        "/v1/queue/queues/synapseone-wf-system/nack",
+        Some(json!({
+            "receipt": receipt,
+            "requeue": true,
+            "delaySeconds": 0,
+            "error": "runner_capacity_unavailable",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{dead}");
+    assert_eq!(dead["state"], "dead", "{dead}");
+    assert_eq!(dead["attempts"], 1, "{dead}");
+}
+
+#[tokio::test]
 async fn queue_configuration_listing_purge_and_delete() {
     let app = test_app();
     let (_, empty) = call(&app, "GET", "/v1/queue/queues", None).await;
@@ -952,6 +1384,91 @@ async fn internal_secret_gate_is_timing_safe_and_optional_in_dev() {
     assert_eq!(status, StatusCode::OK);
 }
 
+#[tokio::test]
+async fn scheduling_attempt_refund_is_atomic_in_the_valkey_script_when_configured() {
+    let Ok(url) = std::env::var("QUEUE_TEST_REDIS_URL") else {
+        return;
+    };
+    let redis = match super::store::RedisStore::connect(&url).await {
+        Ok(store) => store,
+        Err(error) => panic!("QUEUE_TEST_REDIS_URL is not usable: {error}"),
+    };
+    let store = Store::Redis(Box::new(redis));
+    let tenant = format!("tenant:refund-test-{}-{}", std::process::id(), now_ms());
+    let name = "jobs";
+    let _ = store.delete_queue(&tenant, name).await;
+    store
+        .ensure_queue(
+            &tenant,
+            name,
+            QueueOptions {
+                max_attempts: Some(1),
+                visibility_timeout_seconds: Some(30),
+            },
+        )
+        .await
+        .expect("create redis test queue");
+    store
+        .publish_message(
+            &tenant,
+            name,
+            PublishInput {
+                payload: json!({"n": 1}),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("publish redis test message");
+
+    // Repeat beyond maxAttempts: the Lua script refunds each attempt.
+    for _ in 0..3 {
+        let consumed = store
+            .consume_messages(&tenant, name, 1, 30, "runner-1")
+            .await
+            .expect("consume redis test message");
+        assert_eq!(consumed.len(), 1);
+        let retry = store
+            .nack_message_with_refund(
+                &tenant,
+                name,
+                &consumed[0].receipt,
+                true,
+                0,
+                Some("runner_capacity_unavailable"),
+                true,
+            )
+            .await
+            .expect("nack with refund")
+            .expect("receipt");
+        assert_eq!(retry.state, "retry");
+        assert_eq!(retry.attempts, 0);
+    }
+
+    // A real failure still counts and dead-letters at maxAttempts=1.
+    let consumed = store
+        .consume_messages(&tenant, name, 1, 30, "runner-1")
+        .await
+        .expect("consume redis test message");
+    let dead = store
+        .nack_message_with_refund(
+            &tenant,
+            name,
+            &consumed[0].receipt,
+            true,
+            0,
+            Some("execution_failed"),
+            false,
+        )
+        .await
+        .expect("nack without refund")
+        .expect("receipt");
+    assert_eq!(dead.state, "dead");
+    assert_eq!(dead.attempts, 1);
+
+    let _ = store.purge_queue(&tenant, name).await;
+    let _ = store.delete_queue(&tenant, name).await;
+}
+
 #[test]
 fn production_config_fails_closed() {
     let mut config = Config {
@@ -1036,4 +1553,41 @@ async fn oversized_body_is_rejected() {
     )
     .await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn transient_platform_mismatch_does_not_hide_job_for_thirty_seconds() {
+    let _env = platform_runner_env_lock();
+    let app = test_app();
+    let platform = [("x-synapseone-tenant", "platform")];
+    let runner = [("x-synapseone-kind", "platform-runner"), ("x-synapseone-runner", "runner-1")];
+    let path = "/v1/queue/queues/synapseone-wf-system";
+    let (_, _) = call_with(&app, "PUT", path, Some(json!({"maxAttempts": 1})), &platform).await;
+    let (_, _) = call_with(&app, "POST", &format!("{path}/messages"), Some(json!({"payload": {"executionId": "targeted-work"}})), &platform).await;
+    let (_, consumed) = call_with(&app, "POST", &format!("{path}/consume"), Some(json!({"maxMessages": 1})), &runner).await;
+    let receipt = consumed["messages"][0]["receipt"].as_str().unwrap();
+    let before = now_ms();
+    let (status, nacked) = call_with(&app, "POST", &format!("{path}/nack"), Some(json!({"receipt": receipt, "requeue": true, "delaySeconds": 30, "error": "runner_not_target"})), &runner).await;
+    assert_eq!(status, StatusCode::OK, "{nacked}");
+    assert_eq!(nacked["attempts"], 0);
+    let available = chrono::DateTime::parse_from_rfc3339(nacked["availableAt"].as_str().unwrap()).unwrap().timestamp_millis();
+    assert!(available >= before + 1000 && available <= now_ms() + 1000, "{nacked}");
+    tokio::time::sleep(Duration::from_millis(1050)).await;
+    let (_, consumed) = call_with(&app, "POST", &format!("{path}/consume"), Some(json!({"maxMessages": 1})), &runner).await;
+    assert_eq!(consumed["count"], 1, "{consumed}");
+    let receipt = consumed["messages"][0]["receipt"].as_str().unwrap();
+    let (_, acked) = call_with(&app, "POST", &format!("{path}/ack"), Some(json!({"receipt": receipt})), &runner).await;
+    assert_eq!(acked["ok"], true);
+}
+
+#[test]
+fn scheduling_delay_caps_preserve_user_failure_disabled_and_shorter_backoffs() {
+    for (error, cap) in [("runner_not_target",1),("runner_not_preferred",1),("runner_capability_unavailable",1),("runner_capacity_unavailable",2),("runner_resources_unavailable",5)] {
+        assert_eq!(scheduling_deferral_delay(30,true,Some(error)),cap);
+        assert_eq!(scheduling_deferral_delay(0,true,Some(error)),0);
+        assert_eq!(scheduling_deferral_delay(30,false,Some(error)),30);
+    }
+    assert_eq!(scheduling_deferral_delay(30,true,Some("runner_disabled")),30);
+    assert_eq!(scheduling_deferral_delay(30,true,Some("execution_failed")),30);
+    assert_eq!(scheduling_deferral_delay(30,true,None),30);
 }

@@ -449,11 +449,54 @@ Runner management (JWT or a runner-scoped API key):
 - `DELETE /v1/workflow-runners/:id/instances/:instanceId` (remove a stale connector)
 - `POST /v1/workflow-runners/:id/command {apiKey?}` (render the command later)
 
+Owner-scoped (platform) runners — platform-admin JWT, workflow-service requires
+an active `owner` role. Mutations are `platform:Admin` at the gateway:
+
+- `GET /v1/platform/runners/options` → tenant options + `platformRunner`
+  (`queue: synapseone-wf-system`, `inferenceQueue: synapseone-inference-system`,
+  allowed scopes).
+- `GET /v1/platform/runners` → every platform runner with live connectors.
+- `POST /v1/platform/runners {name, kind?}` → `201 {runner, apiKey, command,
+  queue, scopes}`. `kind` is `workflow|inference|hybrid`; scope/mode/queue are
+  fixed (`platform` / `system`). `apiKey` is a **platform runner key**
+  (`synapseone_pr_…`) returned once and never stored by workflow-service.
+- `GET /v1/platform/runners/:id` and `/:id/connection`.
+- `PATCH /v1/platform/runners/:id {name?, kind?}` (no tenant/queue override).
+- `POST /v1/platform/runners/:id/rotate-key` → new `apiKey` + `command`; the
+  previous key is revoked.
+- `POST /v1/platform/runners/:id/disable` / `enable` / `revoke-key`.
+  Disable blocks config/heartbeat/claims with `409 runner_disabled`; revoke-key
+  clears the key and requires rotate before reconnecting.
+- `POST /v1/platform/runners/:id/test {type: workflow|embeddings|decision|route}`
+  → `202 {ok:false,status:"queued",jobId,runnerId:null,targetRunnerId,pollUrl,...}`.
+  Poll `GET /v1/platform/runners/:id/test/:jobId` until terminal:
+  `{ok,status,type,runnerId:<actual executor>,targetRunnerId,model,dimensions,
+  vectorCount,output|result,error}`. `ok:true` only for success by the selected
+  registration; a different registration gets `409 runner_not_target`.
+- `POST /v1/platform/runners/:id/command {apiKey?}`.
+- `DELETE /v1/platform/runners/:id` (revokes every key/grant for the runner first).
+- `DELETE /v1/platform/runners/:id/instances/:instanceId`.
+
+Platform runners persist `resource_requirements` on executions/inference jobs
+(defaults `{cpu:0.5,memoryMb:128}` / `{cpu:1,memoryMb:256}`). Workflows set
+`settings.execution.resources {cpu:0.05..64, memoryMb:32..262144}`; inference
+`POST /v1/inference-jobs` accepts `resources`. Heartbeats report sanitized
+`metadata.resources` and per-instance `metadata.resourceHistory` (≤120 samples).
+Set `WORKFLOW_RUNNER_RESOURCE_ADMISSION=enforce` after the telemetry-capable
+runner image is live; enforced claims return `409 runner_resources_unavailable`
+or `409 runner_capacity_unavailable` and the runner nacks/requeues.
+
+Platform runners claim only `settings.execution.mode: "system"` executions on
+the shared platform queue. The claim response additionally carries
+`delegatedToken`, `delegatedTokenExpiresIn` and `delegatedScopes`; data-plane
+nodes use that short-lived user/tenant token, not the system key.
+
 Runner job protocol (API key + `X-Workflow-Runner-Id`):
 
 - `POST /v1/runner/jobs/:id/claim {runnerId, leaseSeconds}` → job snapshot
   `{executionId, workflow, input, principal, triggeredBy, attempt, leaseExpiresAt, resumeFrom}`;
-  `409 not_claimable` when another worker owns it.
+  `409 not_claimable` when another worker owns it. Platform runners also receive
+  the delegation fields above.
 - `POST /v1/runner/jobs/:id/heartbeat {runnerId, leaseSeconds}` (extends the DB lease)
 - `POST /v1/runner/jobs/:id/complete {runnerId, status: success|error|paused, output, nodeRuns, error?, pause?}`
 - `POST /v1/runner/jobs/:id/release {runnerId, error?}` (retryable failure; nack the queue message)

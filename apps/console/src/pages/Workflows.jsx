@@ -36,6 +36,8 @@ export default function Workflows() {
   const [execStatus, setExecStatus] = useState('');
   const [runnerMode, setRunnerMode] = useState('platform');
   const [runnerQueue, setRunnerQueue] = useState('');
+  const [runnerCpu, setRunnerCpu] = useState(0.5);
+  const [runnerMemory, setRunnerMemory] = useState(128);
   const [runnerBusy, setRunnerBusy] = useState(false);
   const EXEC_PAGE = 20;
 
@@ -67,8 +69,10 @@ export default function Workflows() {
       ? detail.settings.execution
       : {};
     const mode = String(execution.mode || detail.settings?.runner || 'platform').toLowerCase();
-    setRunnerMode(['platform', 'custom', 'hybrid', 'inline'].includes(mode) ? mode : 'platform');
+    setRunnerMode(['platform', 'custom', 'hybrid', 'system', 'inline'].includes(mode) ? mode : 'platform');
     setRunnerQueue(String(execution.queue || ''));
+    setRunnerCpu(execution.resources?.cpu ?? 0.5);
+    setRunnerMemory(execution.resources?.memoryMb ?? 128);
   }, [detail?.id, detail?.revision]);
 
   const saveRunnerSettings = async () => {
@@ -77,7 +81,8 @@ export default function Workflows() {
     setDetailErr(null);
     try {
       const settings = { ...(detail.settings || {}) };
-      const execution = { ...(settings.execution || {}), mode: runnerMode };
+      if (!Number.isFinite(Number(runnerCpu)) || Number(runnerCpu) <= 0 || !Number.isInteger(Number(runnerMemory)) || Number(runnerMemory) < 1) throw new Error('Enter positive CPU cores and memory in MiB.');
+      const execution = { ...(settings.execution || {}), mode: runnerMode, resources: { cpu: Number(runnerCpu), memoryMb: Number(runnerMemory) } };
       if (runnerQueue.trim()) execution.queue = runnerQueue.trim();
       else delete execution.queue;
       settings.execution = execution;
@@ -550,6 +555,7 @@ export default function Workflows() {
                       <option value="platform">SynapseOne platform worker</option>
                       <option value="custom">Self-hosted runner (custom queue)</option>
                       <option value="hybrid">Hybrid (platform + self-hosted share queue)</option>
+                      <option value="system">System runner pool (owner-managed, all tenants)</option>
                       <option value="inline">Inline (bypass queue)</option>
                     </select>
                   </div>
@@ -557,12 +563,14 @@ export default function Workflows() {
                     <label className="block text-[11px] text-normal-text mb-1">Queue override (optional)</label>
                     <input value={runnerQueue} onChange={(e) => setRunnerQueue(e.target.value)} placeholder="synapseone-wf-custom" spellCheck={false} className="w-full px-3 py-1.5 rounded-xl border border-slate-200 text-xs font-mono bg-white outline-none" />
                   </div>
+                  <Field label="CPU reservation (cores)"><Input type="number" min="0.05" max="64" step="0.05" value={runnerCpu} onChange={e => setRunnerCpu(e.target.value)} className="max-w-[140px]" /></Field>
+                  <Field label="Memory reservation (MiB)"><Input type="number" min="32" max="262144" step="1" value={runnerMemory} onChange={e => setRunnerMemory(e.target.value)} className="max-w-[160px]" /></Field>
                   <button onClick={saveRunnerSettings} disabled={runnerBusy} className="px-3 py-1.5 rounded-xl text-xs font-medium bg-slate-200 text-main-text disabled:opacity-60">
                     {runnerBusy ? 'Saving…' : 'Save runner'}
                   </button>
                 </div>
                 <p className="text-[11px] text-normal-text mt-1">
-                  Triggers publish a SynapseQueue job; platform/custom workers consume it. <Link className="text-main-blue" to="/runner-engine">Create a self-hosted runner</Link> to get a copy-paste command with its API key.
+                  System runners admit jobs only when current CPU and RAM can cover these reservations. Jobs wait in the queue while capacity is unavailable. <Link className="text-main-blue" to="/runner-engine">Create a self-hosted runner</Link> to get a copy-paste command with its API key.
                 </p>
               </div>
               <Field label="Execute input (JSON)">

@@ -4,7 +4,8 @@ FROM rust:1-bookworm AS builder
 WORKDIR /workspace
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release --locked
+ARG CARGO_BUILD_JOBS=1
+RUN cargo build --release --locked --jobs=${CARGO_BUILD_JOBS}
 
 FROM debian:bookworm-slim
 RUN apt-get update \

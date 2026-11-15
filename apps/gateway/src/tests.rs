@@ -16,9 +16,14 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde_json::{json, Value};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
-use crate::app::{create_app, create_app_with_decider, create_app_with_state, resolve_client_ip};
+use crate::app::{
+    canonical_policy_path, create_app, create_app_with_decider, create_app_with_state,
+    exec_delegated_request_allowed, exec_delegated_scopes_allowed, platform_runner_path_allowed,
+    resolve_client_ip,
+};
 use crate::auth::{verify_api_key_upstream, AuthService, Principal};
 use crate::authz::{
     action_for, iam_principal, resource_for, verb_for_method, AuthzDecider, AuthzDecision,
@@ -75,6 +80,31 @@ fn http() -> reqwest::Client {
         .timeout(Duration::from_secs(15))
         .build()
         .unwrap()
+}
+
+/// Send a raw HTTP/1.1 request so reqwest cannot normalize `%2e%2e`/`..`
+/// before the gateway sees it. Used only for encoded-path policy tests.
+async fn raw_get_status(base: &str, path: &str, token: &str) -> u16 {
+    let address = base.trim_start_matches("http://").to_string();
+    let mut stream = TcpStream::connect(&address).await.unwrap();
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        stream.read_to_end(&mut response),
+    )
+    .await
+    .expect("raw request timed out")
+    .unwrap();
+    let text = String::from_utf8_lossy(&response);
+    text.lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0)
 }
 
 fn now_ts() -> i64 {
@@ -145,6 +175,9 @@ enum VerifyMode {
     Revoked,
     Suspended,
     Down,
+    Malformed,
+    MissingValid,
+    ValidFalse,
 }
 
 #[derive(Clone, Debug)]
@@ -301,6 +334,13 @@ async fn mock_verify(State(state): State<Arc<MockIamState>>) -> Response {
         )
             .into_response(),
         VerifyMode::Down => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        VerifyMode::Malformed => axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from("{not-json"))
+            .unwrap(),
+        VerifyMode::MissingValid => Json(json!({ "type": "jwt" })).into_response(),
+        VerifyMode::ValidFalse => Json(json!({ "valid": false })).into_response(),
     }
 }
 
@@ -772,6 +812,195 @@ fn propagate_principal_anonymous_marker_and_stamping() {
         header_value(&headers, "x-synapseone-scopes").as_deref(),
         Some("x,y")
     );
+}
+
+#[test]
+fn platform_runner_kind_and_binding_are_stamped() {
+    let principal = Principal {
+        r#type: "apikey".into(),
+        kind: Some("platform-runner".into()),
+        runner_id: Some("runner-42".into()),
+        scopes: vec!["workflow:*".into(), "queue:consume".into()],
+        ..Principal::default()
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert("x-synapseone-runner", HeaderValue::from_static("forged"));
+    propagate_principal(&mut headers, Some(&principal), Some(AuthMode::Either), "");
+    assert_eq!(
+        header_value(&headers, "x-synapseone-kind").as_deref(),
+        Some("platform-runner")
+    );
+    assert_eq!(
+        header_value(&headers, "x-synapseone-runner").as_deref(),
+        Some("runner-42")
+    );
+    assert_eq!(
+        header_value(&headers, "x-synapsedx-runner").as_deref(),
+        Some("runner-42")
+    );
+    assert!(headers.get("x-synapseone-org").is_none());
+    assert!(headers.get("x-synapseone-account").is_none());
+}
+
+#[test]
+fn canonical_policy_path_normalizes_encoded_traversal() {
+    assert_eq!(canonical_policy_path("/v1/base/x").as_deref(), Some("/v1/base/x"));
+    assert_eq!(canonical_policy_path("/v1//base/./x").as_deref(), Some("/v1/base/x"));
+    assert_eq!(
+        canonical_policy_path("/v1/base/../iam/orgs").as_deref(),
+        Some("/v1/iam/orgs")
+    );
+    assert_eq!(
+        canonical_policy_path("/v1/base/%2e%2e/iam/orgs").as_deref(),
+        Some("/v1/iam/orgs")
+    );
+    assert_eq!(
+        canonical_policy_path("/v1/ocs/bucket/a%20b").as_deref(),
+        Some("/v1/ocs/bucket/a b")
+    );
+    // Double encoding, bad hex, backslash, controls and escaping the root are
+    // ambiguous between gateway and upstream; refuse them.
+    assert_eq!(canonical_policy_path("/v1/base/%252e%252e/iam"), None);
+    assert_eq!(canonical_policy_path("/v1/base/%zz"), None);
+    assert_eq!(canonical_policy_path("/v1/base/..\\iam"), None);
+    assert_eq!(canonical_policy_path("/v1/base/%00"), None);
+    assert_eq!(canonical_policy_path("/../v1/base"), None);
+    assert_eq!(canonical_policy_path("v1/base"), None);
+}
+
+#[test]
+fn exec_delegated_policy_is_data_plane_only() {
+    for path in [
+        "/v1/base/collections",
+        "/v1/search/x",
+        "/v1/lds/datasources",
+        "/v1/faststore/x",
+        "/v1/ocs/bucket/key",
+        "/v1/storage/bucket/key",
+        "/v1/warehouse/datasets",
+        "/v1/stream/topics/x",
+        "/v1/notifications/x",
+        "/v1/inference/x",
+        "/v1/inference-jobs/x",
+    ] {
+        let canonical = canonical_policy_path(path).unwrap();
+        assert!(exec_delegated_request_allowed("GET", path, &canonical), "{path}");
+    }
+    for path in [
+        "/v1/orgs",
+        "/v1/accounts/a1/keys",
+        "/v1/accounts/a1/credentials",
+        "/v1/keys",
+        "/v1/credentials",
+        "/v1/users",
+        "/v1/roles",
+        "/v1/service-accounts",
+        "/v1/policies",
+        "/v1/workflows",
+        "/v1/workflows/x/execute",
+        "/v1/executions",
+        "/v1/human-tasks",
+        "/v1/workflow-runners",
+        "/v1/runner/jobs/x/claim",
+        "/v1/platform/runners",
+        "/v1/audit",
+        "/v1/usage",
+        "/v1/secrets",
+        "/v1/scim/tokens",
+        "/v1/queue/queues",
+        "/v1/queue/queues/q/purge",
+        "/v1/queue/queues/q/stats",
+    ] {
+        let canonical = canonical_policy_path(path).unwrap();
+        assert!(!exec_delegated_request_allowed("GET", path, &canonical), "{path}");
+    }
+    let queue_publish = "/v1/queue/queues/q/messages";
+    assert!(exec_delegated_request_allowed(
+        "POST",
+        queue_publish,
+        &canonical_policy_path(queue_publish).unwrap()
+    ));
+    assert!(!exec_delegated_request_allowed(
+        "GET",
+        queue_publish,
+        &canonical_policy_path(queue_publish).unwrap()
+    ));
+}
+
+#[test]
+fn exec_delegated_scopes_must_be_data_plane_only() {
+    for scopes in [
+        vec!["base:read".to_string()],
+        vec!["base:*".to_string()],
+        vec!["ocs:write".to_string()],
+        vec!["queue:consume".to_string()],
+    ] {
+        assert!(exec_delegated_scopes_allowed(&scopes), "{scopes:?}");
+    }
+    for scopes in [
+        vec!["*".to_string()],
+        vec!["*:read".to_string()],
+    ] {
+        assert!(exec_delegated_scopes_allowed(&scopes), "{scopes:?}");
+    }
+    for scopes in [
+        vec![],
+        vec!["iam:*".to_string()],
+        vec!["workflow:*".to_string()],
+        vec!["platform:admin".to_string()],
+        vec!["keys:write".to_string()],
+        vec!["credentials:read".to_string()],
+        vec!["unknown:read".to_string()],
+    ] {
+        assert!(!exec_delegated_scopes_allowed(&scopes), "{scopes:?}");
+    }
+}
+
+#[test]
+fn exec_delegated_policy_rejects_path_normalization_bypasses() {
+    for (raw, method) in [
+        ("/v1/base/../iam/orgs", "GET"),
+        ("/v1/base/%2e%2e/iam/orgs", "GET"),
+        ("/v1/base/%252e%252e/v1/iam/orgs", "GET"),
+        ("/v1/base/../workflows", "GET"),
+        ("/%76%31/base", "GET"),
+        ("/v1/ocs/../keys", "GET"),
+        ("/v1/queue/queues/../x/messages", "POST"),
+        ("/v1/queue/queues/q/%2e%2e/stats", "POST"),
+    ] {
+        let canonical = canonical_policy_path(raw);
+        assert!(
+            canonical
+                .as_deref()
+                .map(|value| !exec_delegated_request_allowed(method, raw, value))
+                .unwrap_or(true),
+            "{method} {raw}"
+        );
+    }
+}
+
+#[test]
+fn platform_runner_paths_are_the_only_allowed_surface() {
+    for path in [
+        "/v1/auth/verify",
+        "/v1/runner/jobs/exec-1/claim",
+        "/v1/workflow-runners/runner-1/config",
+        "/v1/workflow-runners/runner-1/heartbeat",
+        "/v1/queue/queues/synapseone-wf-system/consume",
+    ] {
+        assert!(platform_runner_path_allowed(path), "{path}");
+    }
+    for path in [
+        "/v1/workflows",
+        "/v1/base/collections",
+        "/v1/lds/datasources",
+        "/v1/keys",
+        "/v1/platform/runners",
+        "/v1/workflow-runners",
+        "/v1/queue",
+    ] {
+        assert!(!platform_runner_path_allowed(path), "{path}");
+    }
 }
 
 #[test]
@@ -2993,4 +3222,280 @@ async fn cors_allowed_origins_and_preflight() {
             .unwrap(),
         "*"
     );
+}
+
+#[tokio::test]
+async fn exec_delegated_grants_are_data_plane_only_and_checked_every_request() {
+    let (iam, mock) = MockIam::spawn().await;
+    let upstream = Upstream::spawn().await;
+    let routes = vec![
+        with_service(route("/v1/base", upstream.base(), AuthMode::Either), "base"),
+        with_service(route("/v1/ocs", upstream.base(), AuthMode::Either), "storage"),
+        with_service(route("/v1/queue", upstream.base(), AuthMode::Either), "queue"),
+        with_service(route("/v1/keys", upstream.base(), AuthMode::Either), "iam"),
+        with_service(route("/v1/accounts", upstream.base(), AuthMode::Either), "iam"),
+        with_service(route("/v1/platform", upstream.base(), AuthMode::Jwt), "platform"),
+        with_service(route("/v1/runner", upstream.base(), AuthMode::Either), "workflow"),
+        with_service(route("/v1/credentials", upstream.base(), AuthMode::Either), "workflow"),
+        with_service(route("/v1/workflows", upstream.base(), AuthMode::Either), "workflow"),
+    ];
+    let gateway = spawn_gateway(test_config(&iam.base), routes).await;
+    let client = http();
+    let token = sign(json!({
+        "sub": "user-1",
+        "org": "org-1",
+        "account": "acc-1",
+        "kind": "exec-delegated",
+        "scopes": ["base:read", "storage:read", "queue:write"],
+        "jti": "11111111-1111-4111-8111-111111111111",
+        "exec": "exec-1",
+        "runner": "runner-1",
+        "instance": "instance-1",
+        "iss": TEST_ISSUER,
+        "exp": now_ts() + 300,
+    }));
+
+    // Allowed data-plane: forwarded, and IAM is asked on every request (no
+    // session-cache reuse for grants).
+    let first = client
+        .get(format!("{}/v1/base/collections", gateway.base))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(upstream.hits(), 1);
+    assert_eq!(mock.verify_hits(), 1);
+    let second = client
+        .get(format!("{}/v1/base/collections", gateway.base))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(upstream.hits(), 2);
+    assert_eq!(mock.verify_hits(), 2, "grant must be verified on every request");
+
+    // Completion/release/runner revocation flips IAM to 401; the next request
+    // must not reach the upstream.
+    mock.set_verify(VerifyMode::Revoked);
+    let revoked = client
+        .get(format!("{}/v1/base/collections", gateway.base))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+    let revoked_body: Value = revoked.json().await.unwrap();
+    assert_eq!(revoked_body["error"], "execution_grant_inactive");
+    assert_eq!(upstream.hits(), 2);
+    mock.set_verify(VerifyMode::Ok);
+
+    // A 200 from IAM is not enough: `valid:true` must be explicit. Malformed
+    // JSON, a missing `valid`, or `valid:false` all fail closed.
+    for (mode, error) in [
+        (VerifyMode::Malformed, "execution_grant_invalid"),
+        (VerifyMode::MissingValid, "execution_grant_invalid"),
+        (VerifyMode::ValidFalse, "execution_grant_inactive"),
+    ] {
+        mock.set_verify(mode);
+        let rejected = client
+            .get(format!("{}/v1/base/collections", gateway.base))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED, "{error}");
+        let body: Value = rejected.json().await.unwrap();
+        assert_eq!(body["error"], error);
+        assert_eq!(upstream.hits(), 2);
+    }
+    mock.set_verify(VerifyMode::Ok);
+
+    // Control-plane routes are denied before any IAM/upstream traffic.
+    let hits_before = upstream.hits();
+    let verify_before = mock.verify_hits();
+    for path in [
+        "/v1/keys",
+        "/v1/credentials",
+        "/v1/workflows",
+        "/v1/accounts/a1/keys",
+        "/v1/runner/jobs/exec-1/claim",
+    ] {
+        let response = client
+            .get(format!("{}{}", gateway.base, path))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"], "execution_scope_forbidden", "{path}");
+    }
+    let platform = client
+        .get(format!("{}/v1/platform/runners", gateway.base))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(platform.status(), StatusCode::FORBIDDEN);
+    assert_eq!(upstream.hits(), hits_before);
+    assert_eq!(mock.verify_hits(), verify_before, "denied paths need no grant check");
+
+    // Encoded/traversal spellings that route to a data-plane prefix are denied.
+    for path in [
+        "/v1/base/../keys",
+        "/v1/base/%2e%2e/keys",
+        "/v1/base/%252e%252e/keys",
+    ] {
+        let response = client
+            .get(format!("{}{}", gateway.base, path))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+    // reqwest/undici normalize `%2e%2e` before sending; use a raw socket so
+    // the gateway policy itself sees the encoded traversal. A normalized
+    // unknown path (/v1/v1/...) is a 404 before auth and is not asserted as a
+    // policy 403.
+    let hits_before_raw = upstream.hits();
+    for path in [
+        "/v1/base/%2e%2e/v1/workflows",
+        "/v1/base/%2e%2e/iam/orgs",
+    ] {
+        let status = raw_get_status(&gateway.base, path, &token).await;
+        assert_eq!(status, 403, "{path}");
+        assert_eq!(upstream.hits(), hits_before_raw, "{path}");
+    }
+
+    // A legitimate encoded object key stays allowed.
+    let object = client
+        .get(format!("{}/v1/ocs/bucket/a%20b", gateway.base))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(object.status(), StatusCode::OK);
+    assert_eq!(upstream.path(), "/v1/ocs/bucket/a%20b");
+
+    // Queue message ops are allowed; queue admin is not.
+    let queue = client
+        .post(format!("{}/v1/queue/queues/q/messages", gateway.base))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(queue.status(), StatusCode::OK);
+    let purge = client
+        .post(format!("{}/v1/queue/queues/q/purge", gateway.base))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(purge.status(), StatusCode::FORBIDDEN);
+
+    // A token claiming the kind without grant bindings is invalid.
+    let unbound = sign(json!({
+        "sub": "user-1",
+        "org": "org-1",
+        "kind": "exec-delegated",
+        "scopes": ["base:read"],
+        "iss": TEST_ISSUER,
+        "exp": now_ts() + 300,
+    }));
+    let response = client
+        .get(format!("{}/v1/base/collections", gateway.base))
+        .bearer_auth(&unbound)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // Universal/control-plane scopes are refused even on a data-plane path.
+    for scopes in [json!(["iam:*"]), json!(["workflow:*"])] {
+        let broad = sign(json!({
+            "sub": "user-1",
+            "org": "org-1",
+            "kind": "exec-delegated",
+            "scopes": scopes,
+            "jti": "11111111-1111-4111-8111-111111111111",
+            "exec": "exec-1",
+            "runner": "runner-1",
+            "instance": "instance-1",
+            "iss": TEST_ISSUER,
+            "exp": now_ts() + 300,
+        }));
+        let denied = client
+            .get(format!("{}/v1/base/collections", gateway.base))
+            .bearer_auth(&broad)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let body: Value = denied.json().await.unwrap();
+        assert_eq!(body["error"], "execution_scope_forbidden");
+    }
+    // A universal scope is accepted on data-plane only; it cannot reach the
+    // control plane (the mint should still narrow scopes).
+    let universal = sign(json!({
+        "sub": "user-1", "org": "org-1", "kind": "exec-delegated",
+        "scopes": ["*"], "jti": "11111111-1111-4111-8111-111111111111",
+        "exec": "exec-1", "runner": "runner-1", "instance": "instance-1",
+        "iss": TEST_ISSUER, "exp": now_ts() + 300,
+    }));
+    let data = client
+        .get(format!("{}/v1/base/collections", gateway.base))
+        .bearer_auth(&universal)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(data.status(), StatusCode::OK);
+    let control = client
+        .get(format!("{}/v1/keys", gateway.base))
+        .bearer_auth(&universal)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(control.status(), StatusCode::FORBIDDEN);
+
+    // Legacy 1-hour platform-runner delegations (kind=delegated with only
+    // act.sub=platform-runner:<id>) are retired even if IAM still considers
+    // the user session valid. Ordinary delegated sessions keep working.
+    let legacy = sign(json!({
+        "sub": "user-1",
+        "org": "org-1",
+        "kind": "delegated",
+        "scopes": ["*"],
+        "act": { "sub": "platform-runner:runner-1" },
+        "iss": TEST_ISSUER,
+        "exp": now_ts() + 300,
+    }));
+    let legacy_response = client
+        .get(format!("{}/v1/base/collections", gateway.base))
+        .bearer_auth(&legacy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(legacy_response.status(), StatusCode::UNAUTHORIZED);
+    let legacy_body: Value = legacy_response.json().await.unwrap();
+    assert_eq!(legacy_body["error"], "execution_grant_legacy_forbidden");
+
+    let ordinary = sign(json!({
+        "sub": "user-1",
+        "org": "org-1",
+        "kind": "delegated",
+        "scopes": ["*"],
+        "act": { "sub": "service-account:sa-1" },
+        "iss": TEST_ISSUER,
+        "exp": now_ts() + 300,
+    }));
+    let ordinary_response = client
+        .get(format!("{}/v1/base/collections", gateway.base))
+        .bearer_auth(&ordinary)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ordinary_response.status(), StatusCode::OK);
 }

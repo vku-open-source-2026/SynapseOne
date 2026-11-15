@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: 2026 VKU.VIC
 FROM rust:1-bookworm AS builder
 WORKDIR /workspace
+# Bound the build to one cargo job: this image is built on the shared prod host
+# while other release work runs; root queues the build.
+ENV CARGO_BUILD_JOBS=1
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --release --locked

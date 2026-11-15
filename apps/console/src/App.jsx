@@ -61,6 +61,7 @@ const AdminServiceHealth = React.lazy(() => import('./pages/admin/ServiceHealth.
 const AdminUsage = React.lazy(() => import('./pages/admin/Usage.jsx'));
 const AdminAudit = React.lazy(() => import('./pages/admin/Audit.jsx'));
 const AdminPlatformAdmins = React.lazy(() => import('./pages/admin/PlatformAdmins.jsx'));
+const AdminRunners = React.lazy(() => import('./pages/admin/Runners.jsx'));
 
 import { appLoginUrl, isCanonicalAppHost } from './lib/site.js';
 import { LanguageProvider } from './lib/i18n.jsx';
@@ -210,6 +211,7 @@ function AppRoutes() {
           <Route path="/admin/usage" element={<PlatformGuard><AdminLayout><AdminUsage /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/audit" element={<PlatformGuard><AdminLayout><AdminAudit /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/access" element={<PlatformGuard><AdminLayout><AdminPlatformAdmins /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/runners" element={<PlatformGuard><AdminLayout><AdminRunners /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/*" element={<PlatformGuard><AdminLayout><AdminNotFound /></AdminLayout></PlatformGuard>} />
           <Route path="*" element={<NotFound />} />
         </Routes>

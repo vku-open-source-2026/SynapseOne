@@ -69,12 +69,21 @@ pub fn propagate_principal(
                 principal.kind.as_deref().unwrap_or("user"),
             );
         } else if principal.r#type == "apikey" {
-            insert(headers, "x-synapseone-kind", "apikey");
+            // Platform runner keys keep their distinct kind and bound runner
+            // id; ordinary tenant keys remain kind=apikey.
+            insert(
+                headers,
+                "x-synapseone-kind",
+                principal.kind.as_deref().unwrap_or("apikey"),
+            );
             if let Some(org) = &principal.org {
                 insert(headers, "x-synapseone-org", org);
             }
             if let Some(account) = &principal.account {
                 insert(headers, "x-synapseone-account", account);
+            }
+            if let Some(runner_id) = &principal.runner_id {
+                insert(headers, "x-synapseone-runner", runner_id);
             }
             // A user-bound API key (verified IAM `user_id`) acts **for that
             // user**: stamp the owner so workflow/audit/data-plane attribution
@@ -98,7 +107,7 @@ pub fn propagate_principal(
     // Mirror canonical headers onto the legacy prefix for rolling deploys.
     // Values were stripped above, so this cannot amplify client identity.
     for name in [
-        "user", "org", "account", "scopes", "kind", "internal", "anon",
+        "user", "org", "account", "scopes", "kind", "runner", "internal", "anon",
     ] {
         if let Some(value) = headers.get(format!("x-synapseone-{name}")).cloned() {
             headers.insert(HeaderName::from_static(legacy_static(name)), value);
@@ -113,6 +122,7 @@ fn legacy_static(name: &str) -> &'static str {
         "account" => "x-synapsedx-account",
         "scopes" => "x-synapsedx-scopes",
         "kind" => "x-synapsedx-kind",
+        "runner" => "x-synapsedx-runner",
         "internal" => "x-synapsedx-internal",
         "anon" => "x-synapsedx-anon",
         _ => "x-synapsedx-kind",

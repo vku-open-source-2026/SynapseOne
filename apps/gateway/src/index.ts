@@ -187,6 +187,9 @@ function jwtCacheTtlMs(): number {
 export function clearSessionCache(): void { SESSION_CACHE.clear(); }
 export async function validateJwtSession(token: string, decoded: any, iamBase = IAM_SERVICE_URL): Promise<{ status: number; error: string } | null> {
   if (!decoded || decoded.kind === 'platform-step-up') return null;
+  // Execution grants are verified by verifyExecGrant on every request (never
+  // cached): completion/release/runner revocation must invalidate immediately.
+  if (decoded.kind === 'exec-delegated') return null;
   if (!decoded.sub) return { status: 401, error: 'invalid_token' };
   const ttl = jwtCacheTtlMs();
   const key = createHash('sha256').update(token).digest('hex');
@@ -227,6 +230,43 @@ export async function validateJwtSession(token: string, decoded: any, iamBase = 
   }
 }
 
+/** Verify a per-execution delegated grant against IAM on every request.
+ *  IAM owns the execution_delegations row and must return 401/403 once the
+ *  execution completes/releases or the runner is revoked. No cache. */
+export async function verifyExecGrant(token: string, iamBase = IAM_SERVICE_URL): Promise<{ status: number; error: string } | null> {
+  if (!token) return { status: 401, error: 'invalid_token' };
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 2500);
+  try {
+    const r = await fetch(`${iamBase.replace(/\/$/, '')}/v1/auth/verify`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${token}` },
+      signal: ctl.signal,
+    });
+    clearTimeout(timer);
+    if (r.ok) {
+      // IAM must positively confirm the grant. Missing/malformed `valid`, or
+      // anything other than `true`, fails closed.
+      let body: any = null;
+      let parsed = false;
+      try { body = await r.json(); parsed = true; } catch { /* malformed */ }
+      if (parsed && body && body.valid === true) return null;
+      if (parsed && body && body.valid === false) return { status: 401, error: 'execution_grant_inactive' };
+      return { status: 401, error: 'execution_grant_invalid' };
+    }
+    if (r.status === 401) return { status: 401, error: 'execution_grant_inactive' };
+    if (r.status === 403) {
+      let error = 'execution_grant_forbidden';
+      try { const body: any = await r.json(); if (body?.error) error = String(body.error); } catch { /* default */ }
+      return { status: 403, error };
+    }
+    return { status: 503, error: 'iam_unavailable' };
+  } catch {
+    clearTimeout(timer);
+    return { status: 503, error: 'iam_unavailable' };
+  }
+}
+
 function authMiddleware(mode: RouteRule['auth']) {
   return (async (req: express.Request, res: express.Response, next: express.NextFunction) => {
     if (mode === 'none') {
@@ -254,6 +294,11 @@ function authMiddleware(mode: RouteRule['auth']) {
             org: decoded.org,
             account: decoded.account,
             scopes: decoded.scopes || [],
+            ...(decoded.jti ? { jti: String(decoded.jti) } : {}),
+            ...(decoded.exec ? { exec: String(decoded.exec) } : {}),
+            ...(decoded.runner ? { runnerId: String(decoded.runner) } : {}),
+            ...(decoded.instance ? { instance: String(decoded.instance) } : {}),
+            ...(decoded.act?.sub ? { actSub: String(decoded.act.sub) } : {}),
           };
           return next();
         } catch { /* try API key below */ }
@@ -266,11 +311,13 @@ function authMiddleware(mode: RouteRule['auth']) {
             if (info) {
               (req as any).principal = {
                 type: 'apikey',
+                kind: info.kind || 'apikey',
                 account: info.account_id,
                 org: (info as any).org_id,
                 scopes: info.scopes,
                 keyId: info.id,
                 owner: info.user_id,
+                ...(info.runner_id ? { runnerId: info.runner_id } : {}),
               };
             }
             next();
@@ -309,6 +356,11 @@ function authMiddleware(mode: RouteRule['auth']) {
             org: decoded.org,
             account: decoded.account,
             scopes: decoded.scopes || [],
+            ...(decoded.jti ? { jti: String(decoded.jti) } : {}),
+            ...(decoded.exec ? { exec: String(decoded.exec) } : {}),
+            ...(decoded.runner ? { runnerId: String(decoded.runner) } : {}),
+            ...(decoded.instance ? { instance: String(decoded.instance) } : {}),
+            ...(decoded.act?.sub ? { actSub: String(decoded.act.sub) } : {}),
           };
           return next();
         } catch (e) {
@@ -331,11 +383,13 @@ function authMiddleware(mode: RouteRule['auth']) {
               }
               (req as any).principal = {
                 type: 'apikey',
+                kind: info.kind || 'apikey',
                 account: info.account_id,
                 org: (info as any).org_id,
                 scopes: info.scopes,
                 keyId: info.id,
                 owner: info.user_id,
+                ...(info.runner_id ? { runnerId: info.runner_id } : {}),
               };
               return next();
             },
@@ -367,7 +421,15 @@ export async function verifyApiKeyUpstream(
   apiKey: string,
   iamBase?: string,
   internalSecret: string | undefined = INTERNAL_SECRET,
-): Promise<{ id?: string; account_id: string; org_id?: string; user_id?: string | null; scopes: string[] } | null> {
+): Promise<{
+  id?: string;
+  account_id?: string;
+  org_id?: string;
+  user_id?: string | null;
+  scopes: string[];
+  kind?: string;
+  runner_id?: string;
+} | null> {
   const iam = (iamBase || process.env.IAM_SERVICE_URL || 'http://iam:4001').replace(/\/$/, '');
   const ctl = new AbortController();
   const to = setTimeout(() => ctl.abort(), 5000);
@@ -388,7 +450,15 @@ export async function verifyApiKeyUpstream(
     if (!r.ok) return null;
     const j: any = await r.json();
     if (!j.valid) return null;
-    return { id: j.id, account_id: j.account_id, ...(j.org_id ? { org_id: j.org_id } : {}), user_id: j.user_id ?? null, scopes: j.scopes || [] };
+    return {
+      id: j.id,
+      ...(j.account_id ? { account_id: j.account_id } : {}),
+      ...(j.org_id ? { org_id: j.org_id } : {}),
+      user_id: j.user_id ?? null,
+      scopes: j.scopes || [],
+      ...(j.kind ? { kind: j.kind } : {}),
+      ...(j.runner_id ? { runner_id: j.runner_id } : {}),
+    };
   } catch {
     clearTimeout(to);
     throw new Error('iam_unreachable');
@@ -421,6 +491,117 @@ export function parseTrustProxy(raw: string | undefined): boolean | number | str
   return v;
 }
 
+function pathUnder(pathname: string, prefix: string): boolean {
+  return pathname === prefix || pathname.startsWith(`${prefix}/`);
+}
+
+/** Decode one percent-encoding layer and resolve `.`/`..`/duplicate slashes.
+ *  Used only for policy; forwarding keeps the original URI. Returns null for
+ *  malformed/ambiguous paths (invalid encoding, residual `%` after one decode,
+ *  backslashes, controls, or an escape above the root). */
+export function canonicalPolicyPath(pathname: string): string | null {
+  const raw = String(pathname || '');
+  if (!raw.startsWith('/')) return null;
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+  if (decoded.includes('%') || decoded.includes('\\')) return null;
+  if (/[\u0000-\u001f\u007f]/.test(decoded)) return null;
+  const segments: string[] = [];
+  for (const segment of decoded.split('/')) {
+    if (segment === '' || segment === '.') continue;
+    if (segment === '..') {
+      if (!segments.length) return null;
+      segments.pop();
+      continue;
+    }
+    segments.push(segment);
+  }
+  return `/${segments.join('/')}`;
+}
+
+/** Platform runner keys are system compute, not tenant credentials. They may
+ *  only reach the runner job protocol, runner bootstrap/heartbeat, the
+ *  platform-namespaced queue, and key verification. Everything else is a hard
+ *  403 at the edge, even if the key somehow holds a broader scope. Encoded or
+ *  non-canonical spellings are refused so gateway/upstream prefix matching
+ *  cannot diverge. */
+export function platformRunnerPathAllowed(pathname: string): boolean {
+  const p = String(pathname || '');
+  const canonical = canonicalPolicyPath(p);
+  if (!canonical || canonical !== p) return false;
+  if (p === '/v1/auth/verify') return true;
+  return ['/v1/runner/', '/v1/workflow-runners/', '/v1/queue/']
+    .some((prefix) => p.startsWith(prefix));
+}
+
+/** Data-plane services an exec-delegated token may call. Everything else
+ *  (IAM, keys, credentials, workflow definitions/executions/runners, platform
+ *  admin, audit/usage, secrets, MCP) is denied. The normal scope check still
+ *  runs afterwards. */
+const EXEC_DELEGATED_DATA_PLANE_PREFIXES = [
+  '/v1/base',
+  '/v1/search',
+  '/v1/lds',
+  '/v1/faststore',
+  '/v1/ocs',
+  '/v1/storage',
+  '/v1/warehouse',
+  '/v1/stream',
+  '/v1/notifications',
+  '/v1/inference',
+];
+
+const EXEC_DELEGATED_SCOPE_FAMILIES = [
+  'base', 'search', 'lds', 'faststore', 'ocs', 'storage', 'warehouse',
+  'stream', 'notifications', 'inference', 'queue',
+];
+
+/** Execution grants may carry data-plane scope families only; universal (`*`,
+ *  `*:read`) and control-plane families are refused. */
+export function execDelegatedScopesAllowed(scopes: string[]): boolean {
+  if (!Array.isArray(scopes) || scopes.length === 0) return false;
+  return scopes.every((scope) => {
+    const family = String(scope || '').split(':')[0];
+    // Universal scopes are accepted for compatibility with the current mint,
+    // but the path allowlist still confines them to data-plane routes.
+    if (family === '*') return true;
+    return family !== '' && EXEC_DELEGATED_SCOPE_FAMILIES.includes(family);
+  });
+}
+
+function servicePrefix(pathname: string): string | null {
+  return EXEC_DELEGATED_DATA_PLANE_PREFIXES.find((prefix) => pathUnder(pathname, prefix)) || null;
+}
+
+/** Policy for `kind=exec-delegated` JWTs. Raw and canonical paths must resolve
+ *  to the same data-plane service; queue access is limited to message ops. */
+export function execDelegatedRequestAllowed(method: string, rawPath: string, canonicalPath: string): boolean {
+  if (!['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(String(method || '').toUpperCase())) {
+    return false;
+  }
+  const rawService = servicePrefix(rawPath);
+  const canonicalService = servicePrefix(canonicalPath);
+  if (rawService && canonicalService) return rawService === canonicalService;
+  if (pathUnder(rawPath, '/v1/inference-jobs') && pathUnder(canonicalPath, '/v1/inference-jobs')) {
+    return true;
+  }
+  if (String(method || '').toUpperCase() !== 'POST') return false;
+  if (!pathUnder(rawPath, '/v1/queue/queues') || !pathUnder(canonicalPath, '/v1/queue/queues')) {
+    return false;
+  }
+  const rest = canonicalPath.slice('/v1/queue/queues/'.length);
+  const slash = rest.indexOf('/');
+  if (slash <= 0) return false;
+  const queue = rest.slice(0, slash);
+  const action = rest.slice(slash + 1);
+  if (!queue || queue.includes('/')) return false;
+  return ['messages', 'consume', 'ack', 'nack', 'heartbeat'].includes(action);
+}
+
 /** Xóa x-synapseone-* do client gửi (chống spoof), ghi lại từ principal đã verify.
  *  Auth:none routes: đánh dấu `x-synapseone-anon: 1` để upstream phân biệt
  *  khách ẩn danh công khai (public LDS export) với platform context nội bộ —
@@ -433,6 +614,7 @@ export function propagatePrincipal(req: express.Request): void {
   delete h['x-synapseone-account'];
   delete h['x-synapseone-scopes'];
   delete h['x-synapseone-kind'];
+  delete h['x-synapseone-runner'];
   delete h['x-synapseone-internal'];
   delete h['x-synapseone-anon'];
   // Never let a client smuggle the legacy prefix past the new canonical names.
@@ -455,9 +637,12 @@ export function propagatePrincipal(req: express.Request): void {
     if (Array.isArray(p.scopes) && p.scopes.length) h['x-synapseone-scopes'] = p.scopes.join(',');
     h['x-synapseone-kind'] = String(p.kind || 'user');
   } else if (p?.type === 'apikey') {
-    h['x-synapseone-kind'] = 'apikey';
+    // Platform runner keys are machine credentials with no tenant. Keep the
+    // distinct kind so workflow/queue can bind them to the runner protocol.
+    h['x-synapseone-kind'] = String((p as any).kind || 'apikey');
     if ((p as any).org) h['x-synapseone-org'] = String((p as any).org);
     if ((p as any).account) h['x-synapseone-account'] = String((p as any).account);
+    if ((p as any).runnerId) h['x-synapseone-runner'] = String((p as any).runnerId);
     // A user-bound API key (verified IAM `user_id`) acts for that user: stamp the
     // owner so workflow/audit/owner-only policies see the real user while the
     // credential keeps `kind=apikey`. Account-level keys have no owner and stay
@@ -474,7 +659,7 @@ export function propagatePrincipal(req: express.Request): void {
   // Mirror canonical headers onto the legacy prefix so a rolling deploy can
   // keep older upstream images working. Values are set only after the strip
   // above, so this can never amplify client-supplied identity.
-  for (const name of ['user', 'org', 'account', 'scopes', 'kind', 'internal', 'anon']) {
+  for (const name of ['user', 'org', 'account', 'scopes', 'kind', 'runner', 'internal', 'anon']) {
     const value = h[`x-synapseone-${name}`];
     if (value !== undefined) h[`x-synapsedx-${name}`] = value;
   }
@@ -772,7 +957,7 @@ export function createApp(): express.Express {
     if (!route) return res.status(404).json({ error: 'not_found', message: 'No gateway route matched' });
     (req as any).synapseoneRoute = route;
     httpCounter.inc({ route: route.path, status: 'incoming' });
-    return authMiddleware(route.auth)(req, res, (err?: any) => {
+    return authMiddleware(route.auth)(req, res, async (err?: any) => {
       if (err) return next(err);
       // Per-route authorization (#23): the credential must carry a scope that
       // covers this service+action. Derive the service from the route table
@@ -788,6 +973,73 @@ export function createApp(): express.Express {
       if (!isPlatformPath && principal?.kind === 'platform-admin') {
         (req as any).synapseoneError = 'platform_token_tenant_forbidden';
         return res.status(403).json({ error: 'platform_token_tenant_forbidden', message: 'platform tokens cannot call tenant APIs' });
+      }
+      // Legacy 1-hour platform-runner delegations minted before execution
+      // grants existed are broad user sessions with only
+      // `act.sub=platform-runner:<id>`. They must not survive the upgrade.
+      // Ordinary delegated sessions (other act.sub) keep working.
+      if (principal?.kind === 'delegated' && typeof principal.actSub === 'string'
+          && principal.actSub.startsWith('platform-runner:')) {
+        (req as any).synapseoneError = 'execution_grant_legacy_forbidden';
+        return res.status(401).json({
+          error: 'execution_grant_legacy_forbidden',
+          message: 'legacy platform-runner delegations are retired; re-run the job with an exec-delegated grant',
+        });
+      }
+      // Per-execution delegated grants are data-plane only. The control plane
+      // (IAM/keys/credentials/workflow/admin) is denied even if the minted
+      // scopes are broad, and the grant row is checked against IAM on every
+      // request so completion/release/runner revocation takes effect at once.
+      if (principal?.kind === 'exec-delegated') {
+        const canonical = canonicalPolicyPath(req.path);
+        if (!canonical || !execDelegatedRequestAllowed(req.method, req.path, canonical)) {
+          (req as any).synapseoneError = 'execution_scope_forbidden';
+          return res.status(403).json({
+            error: 'execution_scope_forbidden',
+            message: 'execution grants may only call data-plane dataset, storage, cache, stream, notification and inference APIs',
+          });
+        }
+        const grant = principal as any;
+        if (!execDelegatedScopesAllowed(grant.scopes || [])) {
+          (req as any).synapseoneError = 'execution_scope_forbidden';
+          return res.status(403).json({
+            error: 'execution_scope_forbidden',
+            message: 'execution grants must carry data-plane scopes only',
+          });
+        }
+        if (!grant.jti || !grant.exec || !grant.runnerId || !grant.instance) {
+          (req as any).synapseoneError = 'invalid_token';
+          return res.status(401).json({
+            error: 'invalid_token',
+            message: 'execution grant is missing its execution/runner/instance binding',
+          });
+        }
+        const authHeader = String(Array.isArray(req.headers.authorization) ? req.headers.authorization[0] : (req.headers.authorization || ''));
+        const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+        const rejected = await verifyExecGrant(token);
+        if (rejected) {
+          (req as any).synapseoneError = rejected.error;
+          return res.status(rejected.status).json({
+            error: rejected.error,
+            message: rejected.error === 'iam_unavailable' ? 'IAM grant check unavailable' : 'execution grant is inactive or revoked',
+          });
+        }
+        // Fall through: the normal scope check and central authorization still
+        // apply, so the grant needs the concrete data-plane scope/action.
+      }
+      // System compute credentials are deliberately not tenant policies: the
+      // runner protocol is authorized by workflow-service (runner id + queue +
+      // execution mode), and the queue only sees the platform namespace.
+      if (principal?.kind === 'platform-runner') {
+        if (!platformRunnerPathAllowed(req.path)) {
+          (req as any).synapseoneError = 'platform_runner_path_forbidden';
+          return res.status(403).json({
+            error: 'platform_runner_path_forbidden',
+            message: 'platform runner keys may only call the runner protocol, runner bootstrap and the platform queue',
+          });
+        }
+        propagatePrincipal(req);
+        return next();
       }
       // The session exchange is the boundary where a normal user proves platform
       // administrator status + a fresh second factor. Central tenant-policy

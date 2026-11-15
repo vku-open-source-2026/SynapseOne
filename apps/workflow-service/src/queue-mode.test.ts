@@ -302,7 +302,8 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
     })).json();
     await updateWorkflowRec(wf.id, { name: 'unreviewed change' });
     const claim = await fetch(`${base}/v1/runner/jobs/${queued.executionId}/claim`, {
-      method: 'POST', headers: RUNNER_AUTH, body: JSON.stringify({ runnerId: runner.id }),
+      method: 'POST', headers: RUNNER_AUTH,
+      body: JSON.stringify({ runnerId: runner.id, instanceId: 'connector-rev', leaseSeconds: 60 }),
     });
     assert.equal(claim.status, 409);
     const rejected = await claim.json();
@@ -459,7 +460,7 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
 
     const claim = await fetch(`${base}/v1/runner/jobs/${queued.executionId}/claim`, {
       method: 'POST', headers: RUNNER_AUTH,
-      body: JSON.stringify({ runnerId: runner.id, leaseSeconds: 60 }),
+      body: JSON.stringify({ runnerId: runner.id, instanceId: 'connector-http', leaseSeconds: 60 }),
     });
     const claimText = await claim.text();
     assert.equal(claim.status, 200, claimText);
@@ -469,7 +470,14 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
 
     const done = await fetch(`${base}/v1/runner/jobs/${queued.executionId}/complete`, {
       method: 'POST', headers: RUNNER_AUTH,
-      body: JSON.stringify({ runnerId: runner.id, status: 'success', output: { doubled: 10 }, nodeRuns: [] }),
+      body: JSON.stringify({
+        runnerId: runner.id,
+        instanceId: 'connector-http',
+        attempt: job.attempt,
+        status: 'success',
+        output: { doubled: 10 },
+        nodeRuns: [],
+      }),
     });
     const doneText = await done.text();
     assert.equal(done.status, 200, doneText);
@@ -497,7 +505,7 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
     })).json();
     const claim = await fetch(`${base}/v1/runner/jobs/${queued.executionId}/claim`, {
       method: 'POST', headers: other,
-      body: JSON.stringify({ runnerId: runner.id }),
+      body: JSON.stringify({ runnerId: runner.id, instanceId: 'connector-other', leaseSeconds: 60 }),
     });
     assert.equal(claim.status, 404);
   });
@@ -582,7 +590,13 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
 
     const complete = await fetch(`${base}/v1/runner/inference/jobs/${queued.jobId}/complete`, {
       method: 'POST', headers: RUNNER_AUTH,
-      body: JSON.stringify({ runnerId: runner.id, status: 'success', result: { choices: [{ message: { content: 'pong' } }] } }),
+      body: JSON.stringify({
+        runnerId: runner.id,
+        instanceId: 'connector-inf',
+        attempt: job.attempt,
+        status: 'success',
+        result: { choices: [{ message: { content: 'pong' } }] },
+      }),
     });
     assert.equal(complete.status, 200);
 
