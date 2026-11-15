@@ -664,6 +664,10 @@ services:
       context: ./apps/ocs-service
     image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-ocs:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
+    # The backup volume was created by the legacy root-run sidecar. The Rust
+    # image runs as a non-root app user, so this one-shot/loop service keeps
+    # root only to read and prune the existing backup files.
+    user: "0:0"
     entrypoint: ["/usr/local/bin/s3-backup"]
     command: ["loop"]
     environment:
