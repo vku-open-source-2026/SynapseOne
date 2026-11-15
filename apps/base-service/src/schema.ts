@@ -6,7 +6,7 @@
  * SynapseBase Drizzle schema — the single source of truth for tables/indexes.
  */
 import { sql } from 'drizzle-orm';
-import { index, integer, jsonb, pgTable, primaryKey, text, timestamp, uniqueIndex } from 'drizzle-orm/pg-core';
+import { foreignKey, index, integer, jsonb, pgTable, primaryKey, text, timestamp, uniqueIndex } from 'drizzle-orm/pg-core';
 import type { BaseMapping } from './mapping';
 
 /** Tenant-scoped database namespace: one database owns many collections, so a
@@ -44,9 +44,7 @@ export const baseCollections = pgTable(
   'synapseone_base_collections',
   {
     id: text('id').primaryKey(),
-    databaseId: text('database_id')
-      .notNull()
-      .references(() => baseDatabases.id, { onDelete: 'cascade' }),
+    databaseId: text('database_id').notNull(),
     name: text('name').notNull(),
     description: text('description'),
     mapping: jsonb('mapping').$type<BaseMapping>().notNull().default(sql`'{"fields":{}}'::jsonb`),
@@ -57,6 +55,14 @@ export const baseCollections = pgTable(
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
+    // Keep the constraint name short enough for PostgreSQL's 63-byte
+    // identifier limit; Drizzle's generated name exceeds it and PostgreSQL
+    // silently truncates it, which makes the snapshot diverge from the DB.
+    foreignKey({
+      columns: [t.databaseId],
+      foreignColumns: [baseDatabases.id],
+      name: 'synapseone_base_collections_database_id_fkey',
+    }).onDelete('cascade'),
     uniqueIndex('idx_base_collections_database_name').on(t.databaseId, t.name),
     index('idx_base_collections_database').on(t.databaseId, t.createdAt),
     index('idx_base_collections_tenant').on(t.orgId, t.accountId),

@@ -1210,34 +1210,36 @@ async fn delete_database(
 ) -> Result<Response, ApiError> {
     let database_name = path_param(&path, "database")?;
     let database = load_database(&state, &headers, &params, &database_name).await?;
-    let stats = state
-        .store
-        .database_stats(&database.id)
-        .await
-        .map_err(|error| ApiError::from(crate::error::InternalError(error.message)))?;
     let cascade = params
         .get("cascade")
         .map(|value| value == "1" || value == "true")
         .unwrap_or(false);
-    if stats.collections > 0 && !cascade {
+    let result = state
+        .store
+        .delete_database(&database.id, cascade)
+        .await
+        .map_err(|error| match error.code {
+            StoreErrorCode::Conflict => ApiError::new(
+                StatusCode::CONFLICT,
+                "database_not_empty",
+                "database contains collections; pass ?cascade=true to delete them",
+            ),
+            _ => ApiError::from(crate::error::InternalError(error.message)),
+        })?;
+    if !result.deleted {
         return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "database_not_empty",
-            "database contains collections; pass ?cascade=true to delete them",
+            StatusCode::NOT_FOUND,
+            "database_not_found",
+            format!("database '{database_name}' not found"),
         ));
     }
-    state
-        .store
-        .delete_database(&database.id)
-        .await
-        .map_err(|error| ApiError::from(crate::error::InternalError(error.message)))?;
     Ok(json_response(
         StatusCode::OK,
         json!({
             "ok": true,
             "id": database.id,
             "name": database.name,
-            "deletedCollections": stats.collections,
+            "deletedCollections": result.collections,
         }),
     ))
 }
@@ -1296,8 +1298,8 @@ async fn list_collections(
         })
         .collect();
     if let Some(database) = database {
-        load_database(&state, &headers, &params, &database).await?;
-        collections.retain(|collection| collection.database_name == database);
+        let resolved = load_database(&state, &headers, &params, &database).await?;
+        collections.retain(|collection| collection.database_id == resolved.id);
     }
     if let Some(org_id) = params.get("orgId").filter(|value| !value.is_empty()) {
         collections.retain(|collection| collection.org_id.as_deref() == Some(org_id.as_str()));
@@ -1494,6 +1496,9 @@ async fn create_collection(
         .map_err(|error| match error.code {
             StoreErrorCode::Conflict => {
                 ApiError::new(StatusCode::CONFLICT, "collection_exists", error.message)
+            }
+            StoreErrorCode::NotFound => {
+                ApiError::new(StatusCode::NOT_FOUND, "database_not_found", error.message)
             }
             _ => ApiError::from(crate::error::InternalError(error.message)),
         })?;
