@@ -27,9 +27,7 @@ def _local_decision_defaults(monkeypatch):
     monkeypatch.setattr(
         settings, "DECISION_MODEL_NAME", "vllm-sr/Decision-2.0-Eos-0.8B"
     )
-    monkeypatch.setattr(
-        decision_engine, "model_name", "vllm-sr/Decision-2.0-Eos-0.8B"
-    )
+    monkeypatch.setattr(decision_engine, "model_name", "vllm-sr/Decision-2.0-Eos-0.8B")
     monkeypatch.setattr(decision_engine, "_is_loaded", False)
     monkeypatch.setattr(decision_engine, "_model", None)
     monkeypatch.setattr(decision_engine, "_load_error", None)
@@ -331,13 +329,9 @@ def test_openrouter_decisions_url_derivation(monkeypatch):
     monkeypatch.setattr(settings, "OPENROUTER_API_KEY", "mock_key")
     engine = DecisionEngine()
 
-    monkeypatch.setattr(
-        settings, "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
-    )
+    monkeypatch.setattr(settings, "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
     monkeypatch.setattr(settings, "OPENROUTER_DECISIONS_URL", "")
-    assert (
-        engine._openrouter_url() == "https://openrouter.ai/api/alpha/decisions"
-    )
+    assert engine._openrouter_url() == "https://openrouter.ai/api/alpha/decisions"
 
     monkeypatch.setattr(
         settings, "OPENROUTER_DECISIONS_URL", "https://example.test/decisions"

@@ -239,15 +239,11 @@ class BaseService:
             patch["description"] = description
         if not patch:
             raise ValueError("provide name or description")
-        return self._req(
-            "PATCH", f"/v1/base/databases/{quote(name, safe='')}", patch
-        )
+        return self._req("PATCH", f"/v1/base/databases/{quote(name, safe='')}", patch)
 
     def delete_database(self, name: str, cascade: bool = False) -> dict:
         qs = "?cascade=true" if cascade else ""
-        return self._req(
-            "DELETE", f"/v1/base/databases/{quote(name, safe='')}{qs}"
-        )
+        return self._req("DELETE", f"/v1/base/databases/{quote(name, safe='')}{qs}")
 
     def database_stats(self, name: str) -> dict:
         return self._req("GET", f"/v1/base/databases/{quote(name, safe='')}/stats")
@@ -439,9 +435,7 @@ class BaseService:
             patch["description"] = description
         if mapping is not UNSET:
             patch["mapping"] = mapping
-        return self._req(
-            "PATCH", f"{self._root()}/{quote(collection, safe='')}", patch
-        )
+        return self._req("PATCH", f"{self._root()}/{quote(collection, safe='')}", patch)
 
     def delete_collection(self, collection: str) -> dict:
         """Delete a collection and all its documents."""
@@ -449,9 +443,7 @@ class BaseService:
 
     def collection_stats(self, collection: str) -> dict:
         """Fetch a collection's document stats."""
-        return self._req(
-            "GET", f"{self._root()}/{quote(collection, safe='')}/stats"
-        )
+        return self._req("GET", f"{self._root()}/{quote(collection, safe='')}/stats")
 
     # ---- documents ----
     def create_document(
@@ -701,8 +693,7 @@ class BaseService:
             params["as"] = as_view
         return self._req(
             "GET",
-            f"{self._root()}/{quote(collection, safe='')}/changes?"
-            f"{urlencode(params)}",
+            f"{self._root()}/{quote(collection, safe='')}/changes?{urlencode(params)}",
         )
 
 

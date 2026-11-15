@@ -389,8 +389,7 @@ class DecisionEngine:
                     # Model's native system_one interface
                     # format questions dict into model's expected format
                     q_dict = {
-                        k: v.model_dump(exclude_none=True)
-                        for k, v in questions.items()
+                        k: v.model_dump(exclude_none=True) for k, v in questions.items()
                     }
                     with self._lock:
                         if self._torch is not None:
@@ -474,9 +473,7 @@ class DecisionEngine:
         return {
             "model": self.model_name,
             "architecture": (
-                "openrouter-decisions"
-                if openrouter
-                else "Qwen3.5-0.8B-hybrid-backbone"
+                "openrouter-decisions" if openrouter else "Qwen3.5-0.8B-hybrid-backbone"
             ),
             "backend": (
                 "openrouter"

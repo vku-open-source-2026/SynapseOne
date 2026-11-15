@@ -321,8 +321,7 @@ def test_base_database_handle_scopes_collection_paths():
 
         analytics.create_document("users", data={"name": "Ada"}, id="u1")
         assert (
-            _seen["path"]
-            == "/v1/base/databases/analytics/collections/users/documents"
+            _seen["path"] == "/v1/base/databases/analytics/collections/users/documents"
         )
 
         typed = c.base.collection(
