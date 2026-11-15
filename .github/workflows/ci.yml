@@ -80,7 +80,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - run: docker compose build
+      # Build the control/data services that carry the release contract.
+      # Inference/model images are built and published by their own release
+      # pipeline; rebuilding the multi-GB model stack on every PR is not a gate.
+      - run: docker compose build iam workflow queue base gateway console
       - name: Build self-hosted workflow runner image (CI fallback model stage)
         run: |
           docker build -f apps/workflow-runner/Dockerfile \
