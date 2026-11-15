@@ -3762,3 +3762,26 @@ async fn postgres_live_lifecycle_when_configured() {
         .execute(pool)
         .await;
 }
+
+#[test]
+fn runtime_multidb_repair_follows_the_applied_0008_timestamp() {
+    let migrations = crate::store::MIGRATIONS;
+    let repair = migrations
+        .iter()
+        .find(|(when, sql)| *when == 1_797_000_000_001 && sql.contains("0009 repair"))
+        .expect("the forward repair must be journaled after 0008");
+    assert!(repair.1.contains("DROP NOT NULL"));
+    let applied_0008 = migrations
+        .iter()
+        .find(|(when, _)| *when == 1_797_000_000_000)
+        .expect("0008 must keep its applied timestamp");
+    assert!(applied_0008.1.contains("database_id"));
+    assert!(migrations
+        .iter()
+        .position(|(when, _)| *when == 1_797_000_000_000)
+        .unwrap()
+        < migrations
+            .iter()
+            .position(|(when, _)| *when == 1_797_000_000_001)
+            .unwrap());
+}
