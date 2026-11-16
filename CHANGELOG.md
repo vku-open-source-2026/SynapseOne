@@ -6,10 +6,319 @@ Format based on Keep a Changelog; versioning follows SemVer.
 ## [Unreleased]
 
 ### Added
+- **Owner-scoped platform runners.** Platform owners can manage shared system
+  compute connectors from `/admin/runners` (`/v1/platform/runners`). Platform
+  runners authenticate with a dedicated IAM `platform_runner_keys` credential
+  (no user/account binding, `scope=platform`, `mode=system`) instead of a user
+  token, consume the shared `synapseone-wf-system` queue, and claim workflows
+  that opt into `settings.execution.mode: "system"` across every tenant. Each
+  claimed execution receives a short-lived delegated token for the original
+  user/tenant (`act=platform-runner:<id>`), so data-plane nodes stay
+  tenant-correct and auditable. The gateway refuses system keys on tenant APIs;
+  deleting a runner or rotating its key revokes the old credential.
+- SynapseBase now has a tenant → database → collection → document namespace.
+  Existing collections migrate to a per-scope `default` database, legacy flat
+  routes keep working, and databases support CRUD, stats and cascade delete.
+  The console adds database selection plus create/rename/delete actions.
+
+### Fixed
+- Warehouse dataset deletion now stops every associated stream worker before
+  dropping the dataset table, ingest markers and jobs.
+
+### Changed
+- Faststore, Queue, OCS, Warehouse, Base and the Tier-1 gateway now ship as
+  Rust/Axum services. They keep the existing HTTP contracts, tenant/auth/audit
+  semantics, Redis key namespaces and Lua scripts, Drizzle-compatible schema
+  bootstrap and use `--healthcheck` instead of Node.js.
+
+### Added
+- **SynapseBase database namespaces**: `synapseone_base_databases` adds a
+  tenant-scoped `database → collection → documents` hierarchy. Collection
+  names are unique per database (`(database_id, name)`), so independent apps can
+  reuse names such as `users` without collisions. New
+  `/v1/base/databases[/:database[/collections/...]]` routes; the legacy flat
+  `/v1/base/collections/...` routes keep working against a per-tenant `default`
+  database (or `?database=<name>`). `DELETE` refuses non-empty databases unless
+  `?cascade=true`. SDKs expose database-scoped handles (`base.database(name)`,
+  `WithBaseDatabase`, `BaseService::database`). Migration
+  `0008_base_databases` is replay-safe and attaches all existing collections to
+  `default` without rewriting documents. See `docs/synapsebase.md`.
+- **Platform Super Admin** (`/admin`, `/v1/platform/*`): dedicated cross-tenant
+  control plane with Overview, Organizations, Users & Access, Service Health,
+  Usage and Audit & Security. Platform administrators are stored separately from
+  tenant `is_org_admin`, exchange a normal user JWT plus a fresh TOTP code for a
+  short-lived `kind=platform-admin` token, and require step-up for destructive
+  actions. Owner/operator/auditor roles are enforced server-side.
+- IAM migration `0007_fluffy_scarecrow.sql`: `platform_admins`,
+  `organizations.kind`, `audit_log.org_id` + index, and platform list indexes.
+- `tools/backfill-audit-org.mjs` for the legacy audit context backfill.
+- Docs: `docs/platform-superadmin.md` (bootstrap, MFA, recovery, rollback).
+- Real Platform Owner account provisioned and verified on an isolated local
+  stack: password login, email verification, TOTP MFA, platform session,
+  cross-tenant reads, tenant isolation, step-up and audit. See
+  `docs/platform-superadmin-login.md` (no secrets).
+- Console login now supports first-party email + password (previously dev-only
+  email login); MFA challenge and recovery-code paths are unchanged.
+- Admin console: secure invite/registration flow, organization account creation,
+  role-aware actions, audit pagination/resource filters, usage pagination and
+  model-token table, step-up dialog fixes, mobile/dark-mode fixes and an admin
+  404 route.
+- IAM migration `0008_shocking_grandmaster.sql`: `platform_step_ups`.
+- `@synapseone/cli` 0.10.0: first-class commands for Faststore, Queue,
+  Stream, OCS, Notifications, Search, Secrets, Inference/AI, Warehouse,
+  Human tasks, Usage and SCIM. `synapseone call` remains only as an escape
+  hatch for endpoints without a dedicated command.
+
+### Changed
+- Database performance: transaction-mode PgBouncer for IAM, workflow and
+  SynapseBase; tuned Postgres settings for the production host; and a
+  fail-open SynapseBase document read cache backed by Synapse Faststore.
+  See `docs/database-performance.md`.
+
+### Fixed
+- `/v1/platform/session` reaches IAM for a normal user JWT instead of being
+  pre-empted by tenant policy enforcement; denied exchanges are audited as
+  `platform:session:exchange` with `decision=false`.
+- Platform step-up proofs are now single-use (`jti`), bound to the issuing
+  platform session and one action; replay and cross-action reuse are rejected.
+- The only platform owner can no longer be demoted through
+  `POST /v1/platform/admins`; owner counts exclude inactive user rows.
+- The reserved platform slug is protected from registration/OIDC/direct org
+  creation, and bootstrap refuses a tenant organization with that slug.
+- Platform administrators must belong to a `kind=platform` organization.
+- Invited accounts use one-time activation codes (`/v1/auth/invite/accept`,
+  Console `/register`); email+org alone can no longer claim an existing
+  membership. Bootstrap/org creation/platform grants return `inviteToken` once.
+- Revoking MFA/sessions/disabling an account now also revokes API keys; platform
+  admin revocation clears sessions and keys.
+- Step-up JWTs are rejected as tenant access tokens by the gateway.
+
+### Security
+- Gateway scope enforcement now derives the required service from the matched
+  route (including action overrides), closing write bypasses on OCS,
+  notifications, warehouse, search, secrets, human tasks and SCIM for narrow
+  API keys.
+- API keys can only be bound to their owner unless the caller is an org admin;
+  ordinary members can no longer mint a key that inherits an administrator's
+  policies.
+- SCIM provisioning token creation/revocation follows the sensitive-mutation
+  policy; `IAM_SENSITIVE_MUTATION_MODE=enforce` requires an org admin for
+  privileged account/user/role/policy/key/service-account mutations.
+- Organization administrator grant/revoke now writes a full audit record
+  (actor, target, old/new value, reason).
+- Audit reads are org-admin only. Direct `POST /v1/orgs` can be disabled with
+  `IAM_ALLOW_DIRECT_ORG_CREATE=false`; the platform API creates orgs with a
+  first admin transactionally.
+- `AUTHZ_MODE_REQUIRED=true` makes the gateway fail boot when central
+  authorization is `off`.
+
+### Added
+- **Synapse Warehouse** (`apps/warehouse-service`, `/v1/warehouse`): tenant-scoped
+  DuckDB OLAP datasets, read-only SQL with file/DDL blocking, batch SQL
+  transforms, SynapseStream-driven stream ETL jobs, ETL templates and a
+  TypeScript SDK namespace (`client.warehouse`).
+- SynapseFlow ETL templates: `etl-batch-warehouse`,
+  `etl-stream-warehouse` and `etl-stream-microbatch` (consume -> ingest -> ack
+  with at-least-once semantics).
+
+### Changed
+- Inference service now runs embeddings on ONNX Runtime int8 by default
+  (AVX-512 VNNI / AVX2 / ARM64 graphs), with PyTorch and deterministic mock
+  fallbacks. CPU PyTorch is installed by default for the 0.8B Decision-2.0
+  model (`INSTALL_TORCH=0` drops it); added CPU thread pinning, model-load
+  backoff, build-time graph prefetch, and a real OpenRouter fallback model.
+- Enabled the real Decision-2.0 model end to end: fixed the loader (the bundled
+  runtime rejects `torch_dtype`), pass `device`/`threads`, unwrap
+  `system_one`'s `{"answers": ...}`, and normalise native `choice`/`noul`/`score`
+  fields to the existing `best_choice`/`answer` API contract. The 0.8B model is
+  FP32 on CPU (~3.6 GB RSS); use `DECISION_ENABLED=false` on small nodes.
+
+## [0.9.0] - 2026-11-10
+
+### Added
+- Public GHCR images for every first-party service
+  (`ghcr.io/vku-open-source-2026/synapseone-*`) plus a self-host guide for both
+  `docker compose pull` and building from source. Release tags publish
+  `vX.Y.Z`, `latest` and `sha-<commit>` image tags.
+- Docs now cover every platform service (IAM, Workflow, AI/Inference, LDS,
+  Base, Faststore, Queue, Stream, OCS and Notifications) with quick starts,
+  endpoint tables and the complete overview service map.
+
+### Security
+- IAM no longer returns `password_hash` (or any `scrypt$…` material) on
+  `/v1/auth/login`, `/v1/auth/refresh`, `/v1/auth/me`, `/v1/orgs/:id/users`
+  and the OIDC callback. User rows are stripped through `publicUser()` before
+  serialization, and the in-memory `listUsers` path is covered too.
+- Password-reset/verification tokens are now **opt-in**
+  (`IAM_EXPOSE_LIFECYCLE_TOKENS=true`); they were previously on by default in
+  any non-production process. The prod compose overlay pins the flag to `false`
+  and `IS_PROD` also honours `SYNAPSEONE_ENV`/`SYNAPSEDX_ENV`/`APP_ENV`/
+  `ENVIRONMENT`, so a deployment that forgets `NODE_ENV=production` still fails
+  closed instead of echoing reset tokens to unauthenticated callers.
+
+### Changed: Console public pages and shell
+- Vietnamese/English switch and light/dark/system theme on the public pages, sign-in
+  and the console top bar. The choice is saved per browser and applied before first
+  paint. Vietnamese is the default.
+- Dark theme for the whole Console through shared colour tokens in `index.css`.
+- Home and About use a quieter layout: left-aligned headings, terminal panels for the
+  CLI and self-host commands, and a drawn tier stack instead of ASCII art. Platform
+  features on Home and About share one set of numbered cards with blue icon tiles
+  (lucide icons). About lists the team and partner organisations, and every public
+  page has a full footer (product, project, support and licence links).
+- Home explains the product in three new sections: where a request goes (client,
+  gateway, services, storage), one task in five clients (JavaScript, Python, Go, CLI
+  and cURL tabs) and the products running on SynapseOne as a tier stack (SynapseCity
+  and SynapseCitySOS on SynapseDX), with room for more Tier-3 apps.
+- About focuses on the project instead of repeating Home: why SynapseOne exists
+  (problem and answer), four principles with where each shows up in the repo, a
+  release timeline from this CHANGELOG with in-progress and roadmap items, larger
+  team cards and the partner list. The feature grid and tier stack moved to Home.
+- Accessibility: console pages have a real h1, icon-only buttons (code copy, request
+  pager) have labels, and footer links have a larger tap area on phones.
+- Docs and API Docs use one docs layout: section navigation on the left, an
+  "On this page" list, dark code panels with a copy button, method labels and
+  translated page chrome. API Docs gains a filter, highlighted path parameters and a
+  cleaner try-it panel; public docs pages have the full footer.
+- Dashboard request timeline: bars fit the card without a scrollbar, the time axis
+  sits on its own row and the tooltip is no longer clipped.
+- Console top bar is a solid band, so page content no longer shows between the
+  controls while scrolling. Console pages end with a footer (licence, docs, GitHub,
+  issues) that stays at the bottom of short pages.
+- Console polish: stat cards keep a minimum width (no wrapped labels on wide
+  screens), thin scrollbars, readable dark colours for translucent rows and grey
+  text, icon spacing in buttons, aligned inline forms (Users, Roles), the sidebar
+  title on one line at 1024px and no long dashes in console text.
+- Font changed to Be Vietnam Pro (JetBrains Mono for code), which renders stacked
+  Vietnamese diacritics correctly.
+- Navigation labels keep the width of their longest translation, so switching the
+  language no longer moves the header buttons.
+
+### Added — MFA, sign-in lockout, production object storage and backups
+- **TOTP multi-factor authentication** (RFC 6238, no new dependencies): enrol with
+  `POST /v1/auth/mfa/totp/setup` + `/enable` (10 single-use recovery codes),
+  `GET /v1/auth/mfa`, `/recovery-codes`, `/disable`. Password and dev logins of an
+  enrolled user return `401 mfa_required` with a 5-minute `mfaToken` and finish at
+  `POST /v1/auth/mfa/verify`. Secrets are sealed with AES-256-GCM
+  (`IAM_MFA_ENCRYPTION_KEY`), each TOTP step is accepted once, and the challenge
+  token can never be used as an access token. IAM migration `0006_mfa_lockout`.
+- **Sign-in lockout**: `IAM_LOGIN_MAX_FAILURES` (5) wrong passwords or MFA codes lock
+  the user for `IAM_LOGIN_LOCKOUT_SECONDS` (900) → `429 account_locked` + `Retry-After`.
+  Org admins: `DELETE /v1/users/:id/mfa` (lost device) and `POST /v1/users/:id/unlock`.
+- Clients: JS/Python/Go SDK MFA methods, CLI `login --password/--code/--recovery-code`
+  and `mfa …`, Console *Security* page, MFA step on sign-in and admin actions on *Users*.
+- **Object storage**: Compose runs SeaweedFS 4.48 (Apache-2.0) instead of S3Mock on
+  the same `s3:9090` endpoint, in dev and production (S3Mock deleted its files on
+  every container stop). Data lives in the `seaweeddata` volume.
+- **Backups** (docker-compose.yml): `pg-backup` (daily pg_dump of the platform and
+  Authentik databases, checksums, retention, `tools/backup/pg-restore.sh`) and
+  `s3-backup` (daily incremental object-store snapshots deduplicated by SHA-256, with
+  Content-Type, retention and `restore`).
+
+### Fixed
+- OCS S3 client decodes XML character references in listed keys, ETags,
+  continuation tokens and multipart upload IDs. On SeaweedFS, keys containing `&`
+  were listed as `&amp;` and ETags as `&#34;…&#34;`.
+
+### Added
+- **SynapseBase Graph**: tenant-scoped property graph
+  (`synapseone_base_graph_nodes`/`_edges`) with node/edge upsert, bounded
+  recursive-CTE traversal (depth <= 5) and graph stats.
+- **SynapseBase GIS**: PostGIS `geometry(Geometry,4326)` features with a GiST
+  index plus bbox, radius-metres, polygon and extent queries.
+- **Real vector search**: the search index stores 384-d inference embeddings in
+  `embedding_vec vector(384)` with an HNSW cosine index; hashed 64-d vectors
+  remain the offline fallback.
+- JS and Python SDK graph/GIS methods, released as `@synapseone/sdk@0.9.0`,
+  `@synapseone/cli@0.9.0` and `synapseone-sdk==0.9.0` on npm/PyPI.
+
+### Changed
+- The platform Postgres image is now
+  `synapseone/postgres:16-pgvector-postgis` (pgvector + PostGIS 3) and the
+  initialisation SQL enables both extensions.
+- TLS edge now serves `contribution.synapsecity.sbs` (OpenInfra GISTool data
+  contribution portal): HTTPS server block, `/api/` proxy to the backend,
+  ACME/HTTP redirect, and the host added to the Let's Encrypt certificate.
+
+### Changed
+- The bundled object store is now **SeaweedFS** (real S3 semantics, persistent
+  `seaweeddata` volume, loopback-only host port) instead of the `adobe/s3mock`
+  test double. SynapseOCS, the backup sidecar and the `s3-init` bucket probe
+  keep the same `http://s3:9090` endpoint and `STORAGE_S3_*` credentials, so an
+  external MinIO/AWS S3/R2 backend remains a pure env swap.
+
+### Security
+- Tenant webhooks are SSRF-guarded: notification `webhook` deliveries resolve
+  DNS, reject private/loopback/link-local/CGNAT/metadata targets and refuse
+  redirects, so a tenant cannot make Tier-1 call internal services
+  (`notifications-service/src/ssrf.ts`).
+- Internal-only ingest endpoints (`/v1/audit/ingest`, `/v1/usage/ingest`) and
+  `/v1/keys/verify` are no longer reachable through the public gateway; IAM
+  additionally rejects them when an end-user credential or principal header is
+  present, closing audit/usage forgery and key-probing with a tenant token.
+- Dependency security updates: body-parser 1.20.9, follow-redirects 1.16.2,
+  qs 6.16.2, zod 4.6.7 (with the Zod v4 `z.record` migration) and
+  react-router-dom 7.18.5. Production `npm audit` is clean.
+- Notification queue consumer fix: SynapseQueue returns message fields at the
+  top level, so the previous `item.message.payload` read silently acked and
+  dropped every queued notification. Delivery now accepts both shapes.
+
+
+### Security
+- SynapseOCS fails closed when `STORAGE_S3_ENDPOINT` is unset and logs a loud
+  production warning when the configured endpoint is a private/`http://` test
+  mock (`adobe/s3mock`). Production must point at a real S3-compatible backend
+  (MinIO/AWS S3/Cloudflare R2); the bundled mock is documented as dev-only.
+- Compose no longer hardcodes the mock URL as the OCS storage default: the
+  service inherits `S3_ENDPOINT`/`STORAGE_S3_ENDPOINT` and runs with
+  `NODE_ENV=production`, so the boot guard is effective.
+
+### Added
+- Durable human tasks / wait-for-signal (`/v1/human-tasks`, `humanTask` node)
+  with claim, complete/reject/expire, SLA deadlines and exactly-once resume.
+- Tenant-scoped full-text, semantic and hybrid search over Base documents
+  (`/v1/search`) with ACL filtering, highlights, facets, cursor pagination and
+  idempotent reindex.
+- Tenant secret vault (`/v1/secrets`) with AES-256-GCM encryption, versioned
+  rotation with grace, revocation, rotation webhook and metadata-only lists.
+- SCIM 2.0 Users/Groups provisioning (`/scim/v2`) with scoped SCIM tokens,
+  filters, deprovisioning (session/API-key revocation) and audited group-role
+  mapping.
+- JS/Python/Go SDK helpers for human tasks, search, secrets and SCIM tokens.
+
+### Added
+- SynapseDX management console is served at the public root `https://synapsedx.sbs/`
+  while `/v1/*` and `/health` stay on the Tier-2 gateway; the legacy
+  `cloud.synapsedx.sbs` host redirects to the root.
+- Release images now use Buildx provenance/SBOM attestations and keyless
+  cosign signing (#49).
 - Security/quality workflows with CodeQL (TypeScript + Python), dependency
   review, actionlint, Dependabot and PR template.
 - Tier-1 roadmap issues for durable human tasks, SCIM, search, secrets, audit
   export and release signing (#44–#49).
+
+### Added — AWS-style token management & central authorization
+- **Central policy enforcement at the gateway** (`AUTHZ_MODE=off|audit|enforce`,
+  `AUTHZ_CACHE_TTL_MS`): every authenticated request on a route with a `service:` in
+  `routes.yaml` is mapped to `<service>:<Verb>` (GET/HEAD=Read, DELETE=Delete, else
+  Write; RPC overrides such as `POST …/query` → `base:Read`) on
+  `arn:synapseone:<org>:<account>:<service>:<path>` and decided by IAM
+  (`POST /internal/authorize`, gateway-only). `enforce` → `403 access_denied`
+  (fail-closed `503` when IAM is down); `audit` → `x-synapseone-authz: would-deny`
+  header. Denials are audited. Default is `off`.
+- **IAM**: organization administrators (first user of an org; migration `0005`
+  backfills existing users), `PUT /v1/users/:id/org-admin`; AWS-style managed policies
+  (`GET /v1/managed-policies`, `POST …/policies {managed}`); service-account roles
+  (`GET/POST/DELETE /v1/service-accounts/:id/roles`); API keys: scopes enforced,
+  owner-bound keys inherit their user's policies, `last_used_at`, rotation with grace
+  period (`POST /v1/keys/:id/rotate`).
+- **Clients**: token-management methods in the JS/Python/Go SDKs (`RotateAPIKey`, …);
+  CLI `org-admin`, `managed-policies`, `keys rotate`, `sa grant`; Console key
+  rotation/scopes/owner/last-used on *API Keys*, managed-policy picker on *Policies*.
+- **Tests**: IAM principal authorization suite and gateway authz suite.
+- Gateway routes for human tasks, search, secrets, SCIM tokens and the legacy
+  storage API declare their authorization service (`workflow`, `base`, `secrets`,
+  `iam`, `storage`); `POST /v1/search` and `POST /v1/secrets/*/read` map to `Read`.
 
 ## [0.7.1] - 2026-11-04
 

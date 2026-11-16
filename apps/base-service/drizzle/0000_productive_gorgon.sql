@@ -25,7 +25,21 @@ CREATE TABLE IF NOT EXISTS "synapseone_base_documents" (
 DO $$ BEGIN
   ALTER TABLE "synapseone_base_documents" ADD CONSTRAINT "synapseone_base_documents_collection_id_fkey" FOREIGN KEY ("collection_id") REFERENCES "public"."synapseone_base_collections"("id") ON DELETE cascade ON UPDATE no action;
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;--> statement-breakpoint
-CREATE UNIQUE INDEX IF NOT EXISTS "idx_base_collections_scope_name" ON "synapseone_base_collections" USING btree (coalesce("org_id", ''),coalesce("account_id", ''),"name");--> statement-breakpoint
+-- Pre-0008 scope index. Do not recreate it once the database namespace
+-- migration has added database_id: collection names may then repeat across
+-- databases in the same tenant scope.
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = current_schema()
+      AND table_name = 'synapseone_base_collections'
+      AND column_name = 'database_id'
+  ) THEN
+    CREATE UNIQUE INDEX IF NOT EXISTS "idx_base_collections_scope_name"
+      ON "synapseone_base_collections"
+      USING btree (coalesce("org_id", ''), coalesce("account_id", ''), "name");
+  END IF;
+END $$;--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "idx_base_collections_tenant" ON "synapseone_base_collections" USING btree ("org_id","account_id");--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "idx_base_collections_org_name" ON "synapseone_base_collections" USING btree ("org_id","name","created_at") WHERE "synapseone_base_collections"."org_id" is not null;--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "idx_base_collections_account_name" ON "synapseone_base_collections" USING btree ("account_id","name") WHERE "synapseone_base_collections"."org_id" is null and "synapseone_base_collections"."account_id" is not null;--> statement-breakpoint

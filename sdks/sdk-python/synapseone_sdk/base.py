@@ -176,30 +176,217 @@ class BaseService:
     ``object`` payloads; pass exactly one of the two on writes.
     """
 
-    def __init__(self, http: HttpClient) -> None:
+    def __init__(self, http: HttpClient, database: str | None = None) -> None:
         self._http = http
+        self._database = database
+
+    def database(self, name: str) -> "BaseService":
+        """Bind this handle to a database namespace.
+
+        Without it, collection/document calls keep using the legacy flat
+        ``/v1/base/collections`` routes and the tenant's ``default`` database.
+        """
+        if not str(name).strip():
+            raise ValueError("database name is required")
+        return BaseService(self._http, str(name))
+
+    @property
+    def database_name(self) -> str | None:
+        return self._database
+
+    def _root(self) -> str:
+        if self._database:
+            return f"/v1/base/databases/{quote(self._database, safe='')}/collections"
+        return "/v1/base/collections"
+
+    def list_databases(
+        self, org_id: str | None = None, account_id: str | None = None
+    ) -> dict | list:
+        params = {
+            key: value
+            for key, value in (("orgId", org_id), ("accountId", account_id))
+            if value
+        }
+        qs = f"?{urlencode(params)}" if params else ""
+        return self._req("GET", f"/v1/base/databases{qs}")
+
+    def create_database(
+        self,
+        name: str,
+        description: str | None = None,
+        org_id: str | None = None,
+        account_id: str | None = None,
+    ) -> dict:
+        body: dict[str, Any] = {"name": name}
+        if description is not None:
+            body["description"] = description
+        if org_id is not None:
+            body["orgId"] = org_id
+        if account_id is not None:
+            body["accountId"] = account_id
+        return self._req("POST", "/v1/base/databases", body)
+
+    def get_database(self, name: str) -> dict:
+        return self._req("GET", f"/v1/base/databases/{quote(name, safe='')}")
+
+    def update_database(
+        self, name: str, *, new_name: str | None = None, description: Any = UNSET
+    ) -> dict:
+        patch: dict[str, Any] = {}
+        if new_name is not None:
+            patch["name"] = new_name
+        if description is not UNSET:
+            patch["description"] = description
+        if not patch:
+            raise ValueError("provide name or description")
+        return self._req("PATCH", f"/v1/base/databases/{quote(name, safe='')}", patch)
+
+    def delete_database(self, name: str, cascade: bool = False) -> dict:
+        qs = "?cascade=true" if cascade else ""
+        return self._req("DELETE", f"/v1/base/databases/{quote(name, safe='')}{qs}")
+
+    def database_stats(self, name: str) -> dict:
+        return self._req("GET", f"/v1/base/databases/{quote(name, safe='')}/stats")
 
     def _req(self, method: str, path: str, body: Any | None = None) -> Any:
         return self._http.request(method, path, body)
 
     def collection(
-        self, name: str, *, model: type | None = None, mapping: Any | None = None
+        self,
+        name: str,
+        *,
+        model: type | None = None,
+        mapping: Any | None = None,
+        database: str | None = None,
     ) -> BaseCollection:
-        """Bind a collection name (plus optional model/mapping) for typed use."""
-        return BaseCollection(self, name, model=model, mapping=mapping)
+        """Bind a collection name (plus optional model/mapping) for typed use.
+
+        Pass ``database=`` to use a database namespace instead of the tenant
+        ``default`` database.
+        """
+        service = self.database(database) if database else self
+        return BaseCollection(service, name, model=model, mapping=mapping)
+
+    # ---- graph (property graph per collection) ----
+    def graph_upsert_nodes(self, collection: str, nodes: list) -> dict:
+        return self._req(
+            "POST",
+            f"{self._root()}/{quote(collection, safe='')}/graph/nodes",
+            {"nodes": nodes},
+        )
+
+    def graph_upsert_edges(self, collection: str, edges: list) -> dict:
+        return self._req(
+            "POST",
+            f"{self._root()}/{quote(collection, safe='')}/graph/edges",
+            {"edges": edges},
+        )
+
+    def graph_node(
+        self, collection: str, node_id: str, depth: int = 1, limit: int = 200
+    ) -> dict:
+        qs = urlencode({"depth": depth, "limit": limit})
+        return self._req(
+            "GET",
+            f"{self._root()}/{quote(collection, safe='')}/graph/nodes/{quote(node_id, safe='')}?{qs}",
+        )
+
+    def graph_query(
+        self,
+        collection: str,
+        start: list[str],
+        depth: int = 1,
+        limit: int = 200,
+        edge_types: list[str] | None = None,
+    ) -> dict:
+        body = {"start": start, "depth": depth, "limit": limit}
+        if edge_types:
+            body["edgeTypes"] = edge_types
+        return self._req(
+            "POST",
+            f"{self._root()}/{quote(collection, safe='')}/graph/query",
+            body,
+        )
+
+    def graph_stats(self, collection: str) -> dict:
+        return self._req(
+            "GET", f"{self._root()}/{quote(collection, safe='')}/graph/stats"
+        )
+
+    def graph_delete_node(self, collection: str, node_id: str) -> dict:
+        return self._req(
+            "DELETE",
+            f"{self._root()}/{quote(collection, safe='')}/graph/nodes/{quote(node_id, safe='')}",
+        )
+
+    # ---- GIS (PostGIS GeoJSON per collection) ----
+    def geo_upsert(self, collection: str, features: list) -> dict:
+        return self._req(
+            "POST",
+            f"{self._root()}/{quote(collection, safe='')}/geo/features",
+            {"features": features},
+        )
+
+    def geo_list(
+        self, collection: str, bbox: str | None = None, limit: int = 200
+    ) -> dict:
+        params: dict[str, Any] = {"limit": limit}
+        if bbox:
+            params["bbox"] = bbox
+        return self._req(
+            "GET",
+            f"{self._root()}/{quote(collection, safe='')}/geo/features?{urlencode(params)}",
+        )
+
+    def geo_near(
+        self,
+        collection: str,
+        lat: float,
+        lng: float,
+        radius_meters: float,
+        limit: int = 200,
+    ) -> dict:
+        return self._req(
+            "POST",
+            f"{self._root()}/{quote(collection, safe='')}/geo/near",
+            {"lat": lat, "lng": lng, "radiusMeters": radius_meters, "limit": limit},
+        )
+
+    def geo_within(self, collection: str, geometry: dict, limit: int = 200) -> dict:
+        return self._req(
+            "POST",
+            f"{self._root()}/{quote(collection, safe='')}/geo/within",
+            {"geometry": geometry, "limit": limit},
+        )
+
+    def geo_stats(self, collection: str) -> dict:
+        return self._req(
+            "GET", f"{self._root()}/{quote(collection, safe='')}/geo/stats"
+        )
+
+    def geo_delete(self, collection: str, feature_id: str) -> dict:
+        return self._req(
+            "DELETE",
+            f"{self._root()}/{quote(collection, safe='')}/geo/features/{quote(feature_id, safe='')}",
+        )
 
     # ---- collections ----
     def list_collections(
-        self, org_id: str | None = None, account_id: str | None = None
+        self,
+        org_id: str | None = None,
+        account_id: str | None = None,
+        database: str | None = None,
     ) -> list:
-        """List collections, optionally filtered by org and/or account."""
+        """List collections, optionally filtered by org/account or database."""
+        if database and not self._database:
+            return self.database(database).list_collections(org_id, account_id)
         params: dict[str, Any] = {}
         if org_id:
             params["orgId"] = org_id
         if account_id:
             params["accountId"] = account_id
         qs = f"?{urlencode(params)}" if params else ""
-        return self._req("GET", f"/v1/base/collections{qs}")
+        return self._req("GET", f"{self._root()}{qs}")
 
     def create_collection(
         self,
@@ -208,8 +395,13 @@ class BaseService:
         mapping: Any | None = None,
         org_id: str | None = None,
         account_id: str | None = None,
+        database: str | None = None,
     ) -> dict:
         """Create a collection, optionally with an object<->data mapping."""
+        if database and not self._database:
+            return self.database(database).create_collection(
+                name, description, mapping, org_id, account_id
+            )
         body: dict = {"name": name}
         if description is not None:
             body["description"] = description
@@ -219,11 +411,11 @@ class BaseService:
             body["orgId"] = org_id
         if account_id:
             body["accountId"] = account_id
-        return self._req("POST", "/v1/base/collections", body)
+        return self._req("POST", self._root(), body)
 
     def get_collection(self, collection: str) -> dict:
         """Fetch a collection plus document stats."""
-        return self._req("GET", f"/v1/base/collections/{quote(collection, safe='')}")
+        return self._req("GET", f"{self._root()}/{quote(collection, safe='')}")
 
     def update_collection(
         self,
@@ -243,19 +435,15 @@ class BaseService:
             patch["description"] = description
         if mapping is not UNSET:
             patch["mapping"] = mapping
-        return self._req(
-            "PATCH", f"/v1/base/collections/{quote(collection, safe='')}", patch
-        )
+        return self._req("PATCH", f"{self._root()}/{quote(collection, safe='')}", patch)
 
     def delete_collection(self, collection: str) -> dict:
         """Delete a collection and all its documents."""
-        return self._req("DELETE", f"/v1/base/collections/{quote(collection, safe='')}")
+        return self._req("DELETE", f"{self._root()}/{quote(collection, safe='')}")
 
     def collection_stats(self, collection: str) -> dict:
         """Fetch a collection's document stats."""
-        return self._req(
-            "GET", f"/v1/base/collections/{quote(collection, safe='')}/stats"
-        )
+        return self._req("GET", f"{self._root()}/{quote(collection, safe='')}/stats")
 
     # ---- documents ----
     def create_document(
@@ -275,7 +463,7 @@ class BaseService:
         if id is not None:
             body["id"] = id
         return self._req(
-            "POST", f"/v1/base/collections/{quote(collection, safe='')}/documents", body
+            "POST", f"{self._root()}/{quote(collection, safe='')}/documents", body
         )
 
     def get_document(self, collection: str, doc_id: str, as_view: str = "data") -> dict:
@@ -283,7 +471,7 @@ class BaseService:
         qs = f"?as={quote(as_view, safe='')}" if as_view != "data" else ""
         return self._req(
             "GET",
-            f"/v1/base/collections/{quote(collection, safe='')}/documents/"
+            f"{self._root()}/{quote(collection, safe='')}/documents/"
             f"{quote(doc_id, safe='')}{qs}",
         )
 
@@ -309,7 +497,7 @@ class BaseService:
             body["merge"] = True
         return self._req(
             "PUT",
-            f"/v1/base/collections/{quote(collection, safe='')}/documents/"
+            f"{self._root()}/{quote(collection, safe='')}/documents/"
             f"{quote(doc_id, safe='')}",
             body,
         )
@@ -337,7 +525,7 @@ class BaseService:
             body["ifVersion"] = if_version
         return self._req(
             "PATCH",
-            f"/v1/base/collections/{quote(collection, safe='')}/documents/"
+            f"{self._root()}/{quote(collection, safe='')}/documents/"
             f"{quote(doc_id, safe='')}",
             body,
         )
@@ -349,7 +537,7 @@ class BaseService:
         qs = f"?ifVersion={int(if_version)}" if if_version is not None else ""
         return self._req(
             "DELETE",
-            f"/v1/base/collections/{quote(collection, safe='')}/documents/"
+            f"{self._root()}/{quote(collection, safe='')}/documents/"
             f"{quote(doc_id, safe='')}{qs}",
         )
 
@@ -389,7 +577,7 @@ class BaseService:
         if select is not None:
             body["select"] = select
         raw = self._req(
-            "POST", f"/v1/base/collections/{quote(collection, safe='')}/query", body
+            "POST", f"{self._root()}/{quote(collection, safe='')}/query", body
         )
         return QueryResult(
             items=list(raw.get("items", [])),
@@ -429,7 +617,7 @@ class BaseService:
             body["select"] = select
         raw = self._req(
             "POST",
-            f"/v1/base/collections/{quote(collection, safe='')}/vector-search",
+            f"{self._root()}/{quote(collection, safe='')}/vector-search",
             body,
         )
         return VectorSearchResult(
@@ -451,7 +639,7 @@ class BaseService:
         qs = f"?{urlencode(params)}" if params else ""
         return self._req(
             "GET",
-            f"/v1/base/collections/{quote(collection, safe='')}/documents{qs}",
+            f"{self._root()}/{quote(collection, safe='')}/documents{qs}",
         )
 
     def increment(
@@ -468,7 +656,7 @@ class BaseService:
             body["ifVersion"] = if_version
         return self._req(
             "POST",
-            f"/v1/base/collections/{quote(collection, safe='')}/documents/"
+            f"{self._root()}/{quote(collection, safe='')}/documents/"
             f"{quote(doc_id, safe='')}/increment",
             body,
         )
@@ -482,7 +670,7 @@ class BaseService:
         """
         return self._req(
             "POST",
-            f"/v1/base/collections/{quote(collection, safe='')}/documents:batch",
+            f"{self._root()}/{quote(collection, safe='')}/documents:batch",
             {"operations": operations},
         )
 
@@ -505,8 +693,7 @@ class BaseService:
             params["as"] = as_view
         return self._req(
             "GET",
-            f"/v1/base/collections/{quote(collection, safe='')}/changes?"
-            f"{urlencode(params)}",
+            f"{self._root()}/{quote(collection, safe='')}/changes?{urlencode(params)}",
         )
 
 
@@ -519,10 +706,55 @@ def _write_body(data: Any, object: Any) -> dict:
         raise ValueError("provide exactly one of data or object")
     return {"data": data} if has_data else {"object": object}
 
+    # ---------------------------------------------------------------------------
+    # typed collection
+    # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# typed collection
-# ---------------------------------------------------------------------------
+    # ---- tenant-scoped search (#46) ----
+    def search(
+        self,
+        query: str,
+        *,
+        mode: str = "fulltext",
+        collection: str | None = None,
+        collections: list[str] | None = None,
+        filters: dict | None = None,
+        limit: int = 20,
+        cursor: str | None = None,
+    ) -> dict:
+        """Full-text, semantic or hybrid search over Base documents."""
+        body: dict[str, Any] = {
+            "query": query,
+            "mode": mode,
+            "limit": limit,
+            "filters": filters or {},
+        }
+        if collection:
+            body["collection"] = collection
+        if collections:
+            body["collections"] = collections
+        if cursor:
+            body["cursor"] = cursor
+        return self._req("POST", "/v1/search", body)
+
+    def search_fulltext(self, query: str, **kwargs: Any) -> dict:
+        return self.search(query, mode="fulltext", **kwargs)
+
+    def search_semantic(self, query: str, **kwargs: Any) -> dict:
+        return self.search(query, mode="semantic", **kwargs)
+
+    def search_hybrid(self, query: str, **kwargs: Any) -> dict:
+        return self.search(query, mode="hybrid", **kwargs)
+
+    def reindex_search(self, collections: list[str] | None = None) -> dict:
+        return self._req(
+            "POST",
+            "/v1/search/reindex",
+            {"collections": collections} if collections else {},
+        )
+
+    def search_status(self) -> dict:
+        return self._req("GET", "/v1/search/status")
 
 
 class BaseCollection:

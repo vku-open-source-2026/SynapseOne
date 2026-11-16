@@ -6,6 +6,7 @@
  * Notification rendering + provider adapters + retry loop.
  */
 import type { NotificationRecord } from './db';
+import { assertWebhookUrlAllowed } from './ssrf';
 
 export interface DeliveryResult {
   ok: boolean;
@@ -20,7 +21,12 @@ export function renderTemplate(template: string, data: Record<string, unknown> =
   });
 }
 
-function timeoutFetch(url: string, body: unknown, timeoutMs = 10_000): Promise<Response> {
+function timeoutFetch(
+  url: string,
+  body: unknown,
+  timeoutMs = 10_000,
+  init: { redirect?: RequestRedirect } = {},
+): Promise<Response> {
   const ctl = new AbortController();
   const to = setTimeout(() => ctl.abort(), timeoutMs);
   return fetch(url, {
@@ -28,6 +34,7 @@ function timeoutFetch(url: string, body: unknown, timeoutMs = 10_000): Promise<R
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
     signal: ctl.signal,
+    ...(init.redirect ? { redirect: init.redirect } : {}),
   }).finally(() => clearTimeout(to));
 }
 
@@ -42,13 +49,29 @@ export async function deliver(notification: NotificationRecord): Promise<Deliver
       case 'webhook': {
         const url = notification.recipient.url || notification.recipient.webhookUrl;
         if (!url || !/^https?:\/\//i.test(url)) return { ok: false, error: 'webhook recipient.url must be an http(s) URL' };
+        // Tenant-controlled URL: block private/internal targets (SSRF) and
+        // never follow redirects (a public URL could redirect into the VPC).
+        // The private-target bypass exists for offline tests only and is
+        // ignored in production.
+        const allowPrivate = process.env.NOTIFICATIONS_WEBHOOK_ALLOW_PRIVATE === 'true'
+          && process.env.NODE_ENV !== 'production';
+        if (!allowPrivate) {
+          try {
+            await assertWebhookUrlAllowed(url);
+          } catch (error) {
+            return { ok: false, error: (error as Error).message.slice(0, 300) };
+          }
+        }
         const r = await timeoutFetch(url, {
           id: notification.id,
           subject,
           body: text,
           data: notification.metadata,
           tenant: notification.tenant,
-        });
+        }, 10_000, { redirect: 'manual' });
+        if (r.status >= 300 && r.status < 400) {
+          return { ok: false, error: `webhook redirect rejected (${r.status})` };
+        }
         return r.ok ? { ok: true } : { ok: false, error: `webhook ${r.status}` };
       }
       case 'email': {

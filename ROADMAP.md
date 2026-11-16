@@ -24,7 +24,7 @@
       (StringEquals/StringLike/IfExists) + `POST /v1/authorize` + dry-run simulator + audit log
 - [x] Token: JWT + atomic rotating refresh + logout/logout-all + API key
       (verify/revoke) + service account + OIDC (Authentik/Keycloak) + dev-login kill-switch
-- [x] Core data: Postgres (schema + seed) + Redis + S3 (S3Mock, bucket init) via compose
+- [x] Core data: Postgres (schema + seed) + Redis + S3 (SeaweedFS, bucket init) via compose
 - [x] Workflow: n8n proxied control-plane + 3 versioned templates (webhookId-correct) +
       activate/deactivate/execute/get + trigger→execution verified on real n8n
 - [x] SDKs: JS/TS + Python + Go (full API parity), Apache-2.0, unit + live tested

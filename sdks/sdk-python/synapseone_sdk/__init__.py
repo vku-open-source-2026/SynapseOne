@@ -57,9 +57,11 @@ from .iam import IamService
 from .inference import InferenceService
 from .lds import LdsService
 from .notifications import NotificationsService
+from .ocs import OcsService
 from .queue import QueueService
 from .storage import StorageService
 from .stream import StreamService
+from .warehouse import WarehouseService
 from .workflow import WorkflowService, trigger_webhook, unwrap_executions
 
 __all__ = [
@@ -74,6 +76,7 @@ __all__ = [
     "LdsService",
     "QueryResult",
     "VectorSearchResult",
+    "OcsService",
     "QueueService",
     "StreamService",
     "StorageService",
@@ -84,6 +87,7 @@ __all__ = [
     "SynapseOneError",
     "iter_text",
     "parse_chat_delta",
+    "WarehouseService",
     "WorkflowService",
     "data_to_object",
     "normalize_mapping",
@@ -130,7 +134,9 @@ class SynapseOneClient:
         self.health = HealthService(self._http)
         self.readiness = self.health
         self.storage = StorageService(self._http)
+        self.ocs = OcsService(self._http)
         self.notifications = NotificationsService(self._http)
+        self.warehouse = WarehouseService(self._http)
 
     # ---- transport knobs (also mirrored by JS setToken/setApiKey and Go) ----
     @property

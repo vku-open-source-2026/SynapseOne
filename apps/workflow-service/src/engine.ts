@@ -235,10 +235,12 @@ export interface NodeRun {
 }
 
 export interface RunResult {
-  status: 'success' | 'error';
+  status: 'success' | 'error' | 'paused';
   output: any;
   nodeRuns: NodeRun[];
   error?: string;
+  /** Present when status === 'paused'. */
+  pause?: { node: string; task: any };
   /** With settings.onError=continue: errors that were absorbed per node. */
   partialErrors?: string[];
 }
@@ -269,6 +271,31 @@ export interface RunOpts {
   principal?: RunPrincipal | null;
   credentialResolver?: CredentialResolver;
   synapseoneCall?: SynapseOneCall;
+  /** Durable human-task bridge (#44). When a humanTask node is reached the
+   *  engine creates the task and pauses; the caller persists the checkpoint. */
+  humanTask?: {
+    create(input: {
+      node: string;
+      title: string;
+      description?: string;
+      assignee?: string | null;
+      candidateRoles?: string[];
+      decisionSchema?: Record<string, any>;
+      payload?: Record<string, any>;
+      deadline?: string | null;
+    }): Promise<any>;
+  };
+  /** Resume after a human decision: continue from the outgoing edges of
+   *  `node` with `output` as its result data. */
+  resumeFrom?: { node: string; output: any };
+}
+
+/** Thrown when a humanTask node pauses the run. Carries the created task. */
+export class HumanTaskPause extends Error {
+  constructor(public readonly node: string, public readonly task: any) {
+    super(`workflow paused for human task ${task?.id || ''}`.trim());
+    this.name = 'HumanTaskPause';
+  }
 }
 
 /** Audit actor for an execution: workflow:<id> principal:<sub|anonymous> (P0-2). */
@@ -295,8 +322,12 @@ export function isManualTriggerType(type: unknown): boolean {
   const t = normalizeNodeType(type);
   return t === 'manualTrigger' || t === 'n8n-nodes-base.manualTrigger' || t === 'synapseone.manualTrigger';
 }
+export function isMcpTriggerType(type: unknown): boolean {
+  const t = normalizeNodeType(type);
+  return t === 'mcpTrigger' || t === 'n8n-nodes-base.mcpTrigger' || t === 'synapseone.mcpTrigger';
+}
 export function isTriggerType(type: unknown): boolean {
-  return isWebhookType(type) || isCronType(type) || isManualTriggerType(type);
+  return isWebhookType(type) || isCronType(type) || isManualTriggerType(type) || isMcpTriggerType(type);
 }
 export function isCodeType(type: unknown): boolean {
   const t = normalizeNodeType(type);
@@ -383,6 +414,9 @@ const TRIGGER_TYPES = new Set([
   'synapseone.webhook',
   'synapseone.cron',
   'synapseone.manualTrigger',
+  'n8n-nodes-base.mcpTrigger',
+  'mcpTrigger',
+  'synapseone.mcpTrigger',
 ]);
 
 const MAX_CODE_BYTES = 50 * 1024;
@@ -898,6 +932,53 @@ function hasHeader(headers: Record<string, string>, name: string): boolean {
   return Object.keys(headers).some((k) => k.toLowerCase() === want);
 }
 
+/** Capability marker for the credential-destination protection contract. */
+export const HTTP_CREDENTIAL_DESTINATION_PROTECTION = 1 as const;
+
+/**
+ * Credential requests must declare a strict origin allowlist. Entries are
+ * exact canonical origins only (`https://host[:port]`); paths, wildcards,
+ * queries, userinfo and trailing slashes are rejected.
+ */
+function credentialAllowedOrigins(authCfg: any): Set<string> | null {
+  if (!authCfg || authCfg.allowedOrigins === undefined) return null;
+  const list = authCfg.allowedOrigins;
+  if (!Array.isArray(list) || list.length === 0) {
+    throw new Error('auth.allowedOrigins must be a non-empty array of exact origins');
+  }
+  if (list.length > 20) throw new Error('auth.allowedOrigins supports at most 20 origins');
+  const origins = new Set<string>();
+  for (const raw of list) {
+    if (typeof raw !== 'string' || !raw || raw.length > 2048 || /\s/.test(raw)) {
+      throw new Error('auth.allowedOrigins entries must be exact origin strings');
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(raw);
+    } catch {
+      throw new Error(`auth.allowedOrigins entry is malformed: ${raw.slice(0, 120)}`);
+    }
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      throw new Error('auth.allowedOrigins entries must use http(s)');
+    }
+    if (parsed.username || parsed.password || parsed.search || parsed.hash || parsed.pathname !== '/') {
+      throw new Error('auth.allowedOrigins entries must be exact origins without paths, queries, userinfo or fragments');
+    }
+    if (raw !== parsed.origin) {
+      throw new Error('auth.allowedOrigins entries must be canonical origins (no trailing slash or case variants)');
+    }
+    origins.add(parsed.origin);
+  }
+  return origins;
+}
+
+function assertCredentialOrigin(url: string, origins: Set<string>): void {
+  const origin = new URL(url).origin;
+  if (!origins.has(origin)) {
+    throw new Error(`credential destination origin ${origin} is not in auth.allowedOrigins`);
+  }
+}
+
 async function execHttp(node: EngineNode, input: any, ctx?: { principal?: RunPrincipal | null; credentialResolver?: CredentialResolver }): Promise<any> {
   const p = node.parameters || {};
   let url = String(p.url ?? p.uri ?? '');
@@ -908,6 +989,28 @@ async function execHttp(node: EngineNode, input: any, ctx?: { principal?: RunPri
     await assertUrlAllowed(url);
   } catch (e: any) {
     throw new Error(`httpRequest: ${e?.message || e}`);
+  }
+  // P0-4/P1-16: credential-backed auth — the node stores only a credentialId,
+  // the secret is resolved server-side and never lands in nodeRuns or params.
+  // Destination allowlisting is evaluated on the actual URL BEFORE resolving
+  // the credential, and re-evaluated on every redirect hop.
+  const authCfg = (p.auth && typeof p.auth === 'object' && !Array.isArray(p.auth) ? p.auth : null) as any;
+  const credentialId = authCfg?.credentialId || (typeof p.credentialId === 'string' ? p.credentialId : null);
+  let allowedOrigins: Set<string> | null;
+  try {
+    allowedOrigins = credentialAllowedOrigins(authCfg);
+  } catch (e: any) {
+    throw new Error(`httpRequest: ${e?.message || e}`);
+  }
+  if (credentialId && !allowedOrigins) {
+    throw new Error('httpRequest: credential-backed auth requires auth.allowedOrigins');
+  }
+  if (allowedOrigins) {
+    try {
+      assertCredentialOrigin(url, allowedOrigins);
+    } catch (e: any) {
+      throw new Error(`httpRequest: ${e?.message || e}`);
+    }
   }
   const method = String(p.method ?? 'GET').toUpperCase();
   if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'].includes(method)) throw new Error(`httpRequest: unsupported method ${method}`);
@@ -920,10 +1023,6 @@ async function execHttp(node: EngineNode, input: any, ctx?: { principal?: RunPri
       if (h?.name) headers[String(h.name)] = String(toValue(h.value, input));
     }
   }
-  // P0-4/P1-16: credential-backed auth — the node stores only a credentialId,
-  // the secret is resolved server-side and never lands in nodeRuns or params.
-  const authCfg = (p.auth && typeof p.auth === 'object' ? p.auth : null) as any;
-  const credentialId = authCfg?.credentialId || (typeof p.credentialId === 'string' ? p.credentialId : null);
   if (credentialId) {
     if (!ctx?.credentialResolver) throw new Error('httpRequest: auth.credentialId needs a credentialResolver (server wiring)');
     const cred = await ctx.credentialResolver(credentialId);
@@ -951,15 +1050,24 @@ async function execHttp(node: EngineNode, input: any, ctx?: { principal?: RunPri
       throw new Error(`httpRequest: unsupported credential kind '${kind}'`);
     }
   }
-  // P0-3: propagate the run principal downstream on first-party calls so the
-  // receiving service can authorize (never override explicit headers).
+  // Workflow JSON is untrusted. Never forward caller-chosen platform identity
+  // headers, even when written with the legacy prefix or mixed casing.
+  for (const key of Object.keys(headers)) {
+    const lower = key.toLowerCase();
+    if (lower.startsWith('x-synapseone-') || lower.startsWith('x-synapsedx-')) delete headers[key];
+  }
+  // First-party identity is derived exclusively from the actual run principal.
+  // Attach the internal secret only to an allowlisted origin and a bound run.
   try {
     const u = new URL(url);
     if (ctx?.principal?.sub && isAllowedSelfUrl(u)) {
-      if (!hasHeader(headers, 'x-synapseone-kind')) headers['X-SynapseOne-Kind'] = String(ctx.principal.kind || 'user');
-      if (!hasHeader(headers, 'x-synapseone-user')) headers['X-SynapseOne-User'] = String(ctx.principal.sub);
-      if (ctx.principal.org && !hasHeader(headers, 'x-synapseone-org')) headers['X-SynapseOne-Org'] = String(ctx.principal.org);
-      if (ctx.principal.account && !hasHeader(headers, 'x-synapseone-account')) headers['X-SynapseOne-Account'] = String(ctx.principal.account);
+      headers['X-SynapseOne-Kind'] = String(ctx.principal.kind || 'user');
+      headers['X-SynapseOne-User'] = String(ctx.principal.sub);
+      if (ctx.principal.org) headers['X-SynapseOne-Org'] = String(ctx.principal.org);
+      if (ctx.principal.account) headers['X-SynapseOne-Account'] = String(ctx.principal.account);
+      if (process.env.SYNAPSEONE_INTERNAL_SECRET) headers['X-SynapseOne-Internal'] = process.env.SYNAPSEONE_INTERNAL_SECRET;
+    } else if (isAllowedSelfUrl(u)) {
+      headers['X-SynapseOne-Anon'] = '1';
     }
   } catch { /* url already validated above */ }
   let body: string | undefined;
@@ -996,6 +1104,13 @@ async function execHttp(node: EngineNode, input: any, ctx?: { principal?: RunPri
       } catch (e: any) {
         throw new Error(`httpRequest: ${e?.message || e}`);
       }
+      if (allowedOrigins) {
+        try {
+          assertCredentialOrigin(curUrl, allowedOrigins);
+        } catch (e: any) {
+          throw new Error(`httpRequest: redirect ${e?.message || e}`);
+        }
+      }
       const r = await fetch(curUrl, { method: curMethod, headers, body: curBody, signal: ctl.signal, redirect: 'manual' as any });
       if (r.status >= 300 && r.status < 400) {
         const loc = r.headers.get('location');
@@ -1011,6 +1126,14 @@ async function execHttp(node: EngineNode, input: any, ctx?: { principal?: RunPri
           await assertUrlAllowed(next);
         } catch (e: any) {
           throw new Error(`httpRequest: redirect ${e?.message || e}`);
+        }
+        if (new URL(next).origin !== new URL(curUrl).origin) {
+          // An allowlisted service may redirect to an external origin. Neither
+          // its platform secret nor custom credential headers may follow it.
+          const publicHeaders = new Set(['accept', 'accept-language', 'content-type', 'user-agent']);
+          for (const key of Object.keys(headers)) {
+            if (!publicHeaders.has(key.toLowerCase())) delete headers[key];
+          }
         }
         curUrl = next;
         // 301/302/303 downgrade to GET without body (fetch semantics).
@@ -1028,7 +1151,9 @@ async function execHttp(node: EngineNode, input: any, ctx?: { principal?: RunPri
         /* keep text */
       }
       if (!r.ok) throw new Error(`httpRequest: ${curMethod} ${curUrl} -> ${r.status}`);
-      const out = { statusCode: r.status, body: parsed };
+      const out = p.includeInput === true
+        ? { statusCode: r.status, body: parsed, input: clone(input) }
+        : { statusCode: r.status, body: parsed };
       if (safeJsonSize(out) > MAX_OUTPUT_BYTES) throw new Error('httpRequest: response exceeds 500KB');
       return out;
     }
@@ -1061,6 +1186,8 @@ export const SYNAPSEONE_API_RESOURCES: Record<string, string[]> = {
   base: ['list-collections', 'create-document', 'get-document', 'query-documents', 'delete-document', 'vector-search'],
   faststore: ['get', 'set', 'incr', 'delete', 'hash-get', 'hash-set'],
   queue: ['list', 'publish', 'consume', 'ack'],
+  stream: ['list-topics', 'publish', 'ensure-group', 'consume', 'ack'],
+  warehouse: ['list-datasets', 'create-dataset', 'ingest', 'query', 'run-batch', 'ensure-stream', 'list-jobs'],
   inference: ['chat', 'embeddings', 'decision', 'route'],
 };
 
@@ -1092,6 +1219,15 @@ const SYNAPSEONE_API_REQUIRED: Record<string, string[]> = {
   'queue.publish': ['queue', 'payload'],
   'queue.consume': ['queue'],
   'queue.ack': ['queue', 'receipt'],
+  'stream.ensure-group': ['topic', 'group'],
+  'stream.consume': ['topic', 'group'],
+  'stream.ack': ['topic', 'group', 'ids'],
+  'stream.publish': ['topic', 'payload'],
+  'warehouse.create-dataset': ['name', 'columns'],
+  'warehouse.ingest': ['datasetId', 'rows'],
+  'warehouse.query': ['sql'],
+  'warehouse.run-batch': ['targetDatasetId', 'sql'],
+  'warehouse.ensure-stream': ['targetDatasetId', 'streamTopic'],
   'inference.chat': ['messages'],
   'inference.embeddings': ['input'],
   'inference.decision': ['state', 'questions'],
@@ -1241,6 +1377,18 @@ async function execSynapseOne(node: EngineNode, input: any, ctx?: { principal?: 
       }
       continue;
     }
+    if (resource === 'warehouse' && operation === 'ingest' && f === 'rows') {
+      if (!Array.isArray((args as any).rows)) {
+        throw new Error("synapseone.api: warehouse.ingest needs an array 'rows'");
+      }
+      continue;
+    }
+    if (resource === 'stream' && operation === 'ack' && f === 'ids') {
+      if (!Array.isArray((args as any).ids)) {
+        throw new Error("synapseone.api: stream.ack needs an array 'ids'");
+      }
+      continue;
+    }
     const v = (args as any)[f];
     if (v === undefined || v === null || String(v).trim() === '') {
       throw new Error(`synapseone.api: '${resource}.${operation}' needs '${f}' (put it in input or use ={{ $json.${f} }})`);
@@ -1265,6 +1413,10 @@ async function execSynapseOne(node: EngineNode, input: any, ctx?: { principal?: 
   const out = await ctx.synapseoneCall(resource, operation, args, ctx.principal);
   if (safeJsonSize(out) > MAX_OUTPUT_BYTES) throw new Error('synapseone.api: response exceeds 500KB');
   if (resource === 'base' && operation === 'vector-search' && out && typeof out === 'object' && !Array.isArray(out) && input && typeof input === 'object' && !Array.isArray(input)) {
+    return { ...clone(input), ...clone(out) };
+  }
+  if (resource === 'warehouse' && operation === 'ingest' && out && typeof out === 'object' && !Array.isArray(out) && input && typeof input === 'object' && !Array.isArray(input)) {
+    // Keep the consumed stream batch available for a follow-up stream.ack.
     return { ...clone(input), ...clone(out) };
   }
   return clone(out);
@@ -2319,11 +2471,41 @@ export async function execCodeSandbox(node: EngineNode, input: any, opts?: { tim
 
 // ---------- DAG runner ----------
 
+/** Credential ids literally referenced by a workflow definition. A node may
+ *  only resolve a secret that its own graph declares; tenant-wide credential
+ *  ids are not enough. */
+export function referencedCredentialIds(value: unknown): Set<string> {
+  const ids = new Set<string>();
+  const walk = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item);
+      return;
+    }
+    if (!node || typeof node !== 'object') return;
+    for (const [key, item] of Object.entries(node as Record<string, unknown>)) {
+      if (key === 'credentialId' && typeof item === 'string' && item.trim()) ids.add(item.trim());
+      else walk(item);
+    }
+  };
+  walk(value);
+  return ids;
+}
+
 export async function runWorkflow(
   definition: { nodes?: EngineNode[]; connections?: Connections; name?: string; settings?: Record<string, any> },
   input: any,
   opts?: RunOpts,
 ): Promise<RunResult> {
+  // P2 hardening: scope credential resolution to the ids this graph declares.
+  // A compromised or mistaken node cannot read an arbitrary tenant credential.
+  if (opts?.credentialResolver) {
+    const allowed = referencedCredentialIds(definition);
+    const resolve = opts.credentialResolver;
+    opts = {
+      ...opts,
+      credentialResolver: (id: string) => allowed.has(id) ? resolve(id) : Promise.resolve(null),
+    };
+  }
   const nodes = Array.isArray(definition?.nodes) ? definition.nodes : [];
   // Accept workflows saved before the rebrand: normalise legacy node types
   // once at the boundary so every downstream switch sees `synapseone.*`.
@@ -2349,6 +2531,15 @@ export async function runWorkflow(
   const entries = entryNodes(nodes, connections).filter((n) => byName.has(n));
   type QueueItem = { name: string; input: any };
   const queue: QueueItem[] = entries.map((name) => ({ name, input: clone(input ?? {}) }));
+  if (opts?.resumeFrom) {
+    // Resume at the completed human task: do not replay earlier nodes, walk
+    // only its outgoing edges with the human decision as the node output.
+    queue.length = 0;
+    const resumeName = opts.resumeFrom.node;
+    for (const b of outgoingBranches(resumeName, connections)) {
+      for (const e of b) queue.push({ name: e.node, input: clone(opts.resumeFrom.output) });
+    }
+  }
   const visitCount = new Map<string, number>();
   const maxSteps = nodes.length * 3 + 10;
   let steps = 0;
@@ -2440,6 +2631,9 @@ export async function runWorkflow(
       case 'manualTrigger':
       case 'n8n-nodes-base.manualTrigger':
       case 'synapseone.manualTrigger':
+      case 'mcpTrigger':
+      case 'n8n-nodes-base.mcpTrigger':
+      case 'synapseone.mcpTrigger':
         output = await execTrigger(node, data);
         break;
       case 'noOp':
@@ -2504,6 +2698,33 @@ export async function runWorkflow(
         // Configuration-only node: pass through when it is also used in flow.
         output = clone(data);
         break;
+      case 'humanTask':
+      case 'waitForSignal':
+      case 'synapseone.humanTask':
+      case 'synapseone.waitForSignal': {
+        if (opts?.resumeFrom?.node === node.name) {
+          output = clone(opts.resumeFrom.output);
+          break;
+        }
+        const p = node.parameters || {};
+        const minutes = Number(p.deadlineMinutes ?? p.deadline ?? 0);
+        const deadline = Number.isFinite(minutes) && minutes > 0
+          ? new Date(Date.now() + minutes * 60_000).toISOString()
+          : (typeof p.deadlineAt === 'string' ? p.deadlineAt : null);
+        const task = opts?.humanTask
+          ? await opts.humanTask.create({
+              node: node.name,
+              title: String(p.title || node.name || 'Human task'),
+              description: String(p.description || ''),
+              assignee: p.assignee ? String(p.assignee) : null,
+              candidateRoles: Array.isArray(p.candidateRoles) ? p.candidateRoles.map(String) : [],
+              decisionSchema: p.decisionSchema && typeof p.decisionSchema === 'object' ? p.decisionSchema : {},
+              payload: data && typeof data === 'object' ? data : { value: data },
+              deadline,
+            })
+          : { id: `task-${Date.now()}`, status: 'pending', synthetic: true };
+        throw new HumanTaskPause(node.name, task);
+      }
       default: {
         if (isIntegrationType(node.type)) {
           const r = await runNodeWithRetry('integration', node, data);
@@ -2543,6 +2764,19 @@ export async function runWorkflow(
       return { output: r.output, ...(r.branch !== undefined ? { branch: r.branch } : {}) };
     } catch (e: any) {
       const finishedAt = new Date().toISOString();
+      if (e instanceof HumanTaskPause) {
+        nodeRuns.push({
+          node: node.name,
+          type: node.type,
+          status: 'success',
+          input: clone(data),
+          output: { humanTask: e.task },
+          durationMs: Date.now() - t0,
+          startedAt,
+          finishedAt,
+        });
+        throw e;
+      }
       const msg = e?.message || String(e);
       nodeRuns.push({
         node: node.name,
@@ -2579,6 +2813,15 @@ export async function runWorkflow(
       execOut = r.output;
       branch = (r as any).branch;
     } catch (e: any) {
+      if (e instanceof HumanTaskPause) {
+        const result: RunResult = {
+          status: 'paused',
+          output: { humanTask: e.task },
+          nodeRuns,
+          pause: { node: e.node, task: e.task },
+        };
+        return result;
+      }
       const msg = `${cur.name}: ${e?.message || e}`;
       // P2 dead-letter: settings.onError=continue absorbs the failure and
       // keeps the run going with an empty item (errors surface in

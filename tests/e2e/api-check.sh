@@ -6,6 +6,18 @@
 # Tra ve exit 0 neu tat ca pass.
 set -uo pipefail
 BASE="${SYNAPSEONE_BASE_URL:-http://localhost:8080}"
+IAM_INTERNAL="${IAM_INTERNAL_URL:-http://127.0.0.1:4001}"
+INTERNAL_SECRET="${SYNAPSEONE_INTERNAL_SECRET:-$(grep -E '^SYNAPSEONE_INTERNAL_SECRET=' .env 2>/dev/null | cut -d= -f2-)}"
+# /v1/keys/verify is intentionally not exposed through the public gateway.
+verify_key_internal() {
+  if [ -n "$INTERNAL_SECRET" ]; then
+    curl -s -XPOST "$IAM_INTERNAL/v1/keys/verify" -H 'Content-Type: application/json' \
+      -H "x-synapseone-internal: $INTERNAL_SECRET" -d "{\"apiKey\":\"$1\"}" | jq -r .valid
+  else
+    curl -s -XPOST "$IAM_INTERNAL/v1/keys/verify" -H 'Content-Type: application/json' \
+      -d "{\"apiKey\":\"$1\"}" | jq -r .valid
+  fi
+}
 pass=0; fail=0
 ok()   { pass=$((pass+1)); echo "PASS $1"; }
 bad()  { fail=$((fail+1)); echo "FAIL $1 -- $2"; }
@@ -61,9 +73,10 @@ curl -s -XDELETE "$BASE/v1/roles/$ROLE" -H"$H" | grep -q '"ok":true' && ok role-
 # keys lifecycle: create -> verify -> revoke -> verify-invalid
 KEY_JSON=$(curl -s -XPOST "$BASE/v1/accounts/$ACC/keys" -H'Content-Type: application/json' -H"$H" -d'{"name":"e2e"}')
 KID=$(echo "$KEY_JSON" | jq -r .id); KVAL=$(echo "$KEY_JSON" | jq -r .apiKey)
-[ "$(curl -s -XPOST "$BASE/v1/keys/verify" -H'Content-Type: application/json' -H"$H" -d"{\"apiKey\":\"$KVAL\"}" | jq -r .valid)" = "true" ] && ok key-verify || bad key-verify ""
+[ "$(verify_key_internal "$KVAL")" = "true" ] && ok key-verify || bad key-verify ""
+[ "$(curl -s -o /dev/null -w '%{http_code}' -XPOST "$BASE/v1/keys/verify" -H'Content-Type: application/json' -H"$H" -d'{"apiKey":"x"}')" = "404" ] && ok key-verify-gateway-blocked || bad key-verify-gateway-blocked ""
 curl -s -XDELETE "$BASE/v1/keys/$KID" -H"$H" | grep -q '"ok":true' && ok key-revoke || bad key-revoke ""
-[ "$(curl -s -XPOST "$BASE/v1/keys/verify" -H'Content-Type: application/json' -H"$H" -d"{\"apiKey\":\"$KVAL\"}" | jq -r .valid)" = "false" ] && ok key-dead || bad key-dead ""
+[ "$(verify_key_internal "$KVAL")" = "false" ] && ok key-dead || bad key-dead ""
 
 # service account token + refresh rotation + logout
 SA=$(curl -s -XPOST "$BASE/v1/accounts/$ACC/service-accounts" -H'Content-Type: application/json' -H"$H" -d'{"slug":"sa"}' | jq -r .id)

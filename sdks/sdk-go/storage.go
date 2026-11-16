@@ -59,6 +59,9 @@ func (c *Client) doRawWithHeaders(method, path string, body []byte, contentType 
 	if h.key != "" && h.value != "" {
 		req.Header.Set(h.key, h.value)
 	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
 	client := c.HTTP
 	resp, err := client.Do(req)
 	if err != nil {

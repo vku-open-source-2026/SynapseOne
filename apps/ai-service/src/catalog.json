@@ -1,0 +1,1861 @@
+[
+ {
+  "method": "POST",
+  "path": "/v1/auth/login",
+  "auth": "none",
+  "desc": "Dev sign-in, mints JWT + refresh",
+  "body": {
+   "email": "demo@acme.local",
+   "orgSlug": "acme"
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/auth/refresh",
+  "auth": "none",
+  "desc": "Rotate refresh token (single-use)",
+  "body": {
+   "refreshToken": "<rt>"
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/auth/logout",
+  "auth": "none",
+  "desc": "Revoke one refresh token",
+  "body": {
+   "refreshToken": "<rt>"
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/auth/logout-all",
+  "auth": "none",
+  "desc": "Revoke all of your own sessions",
+  "body": {
+   "refreshToken": "<rt>"
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/auth/verify",
+  "auth": "jwt/key",
+  "desc": "Verify a Bearer token or X-API-Key"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/auth/me",
+  "auth": "jwt",
+  "desc": "The user behind the Bearer token"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/auth/oidc/config",
+  "auth": "none",
+  "desc": "OIDC issuer/client (Authentik/Keycloak)"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/auth/oidc/start?org=acme",
+  "auth": "none",
+  "desc": "Build IdP authorize URL + signed state"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/auth/oidc/callback",
+  "auth": "none",
+  "desc": "Real code exchange → tokens (or demo email in dev)",
+  "body": {
+   "code": "<code>",
+   "state": "<state>"
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/auth/sessions",
+  "auth": "jwt",
+  "desc": "Your active sessions (one per refresh token)"
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/auth/sessions/:id",
+  "auth": "jwt",
+  "desc": "Revoke one of your sessions (lost device)"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/auth/mfa/verify",
+  "auth": "none",
+  "desc": "Second sign-in step after 401 mfa_required (TOTP or recovery code)",
+  "body": {
+   "mfaToken": "<mfaToken>",
+   "code": "123456"
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/auth/mfa",
+  "auth": "jwt",
+  "desc": "Your MFA status (enabled, recovery codes left)"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/auth/mfa/totp/setup",
+  "auth": "jwt",
+  "desc": "Start TOTP enrolment → secret + otpauth:// URL for the authenticator app"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/auth/mfa/totp/enable",
+  "auth": "jwt",
+  "desc": "Confirm enrolment with a code → 10 recovery codes (shown once)",
+  "body": {
+   "code": "123456"
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/auth/mfa/recovery-codes",
+  "auth": "jwt",
+  "desc": "Replace your recovery codes (needs a TOTP code)",
+  "body": {
+   "code": "123456"
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/auth/mfa/disable",
+  "auth": "jwt",
+  "desc": "Turn MFA off (TOTP or recovery code)",
+  "body": {
+   "code": "123456"
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/orgs",
+  "auth": "either",
+  "desc": "List organizations"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/orgs",
+  "auth": "either",
+  "desc": "Create an org",
+  "body": {
+   "slug": "acme-2",
+   "displayName": "ACME 2"
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/orgs/:orgId/accounts",
+  "auth": "either",
+  "desc": "Accounts in the org"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/orgs/:orgId/accounts",
+  "auth": "either",
+  "desc": "Create an account",
+  "body": {
+   "slug": "prod",
+   "displayName": "Production"
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/orgs/:orgId/users",
+  "auth": "either",
+  "desc": "Users in the org"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/orgs/:orgId/users",
+  "auth": "either",
+  "desc": "Add a user",
+  "body": {
+   "email": "a@acme.local"
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/accounts/:accountId/roles",
+  "auth": "either",
+  "desc": "Roles in the account"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/accounts/:accountId/roles",
+  "auth": "either",
+  "desc": "Create a role",
+  "body": {
+   "slug": "runner"
+  }
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/roles/:roleId",
+  "auth": "either",
+  "desc": "Delete a role"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/accounts/:accountId/policies",
+  "auth": "either",
+  "desc": "Policies in the account"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/accounts/:accountId/policies",
+  "auth": "either",
+  "desc": "Create an AWS-style policy",
+  "body": {
+   "slug": "run-only",
+   "document": {
+    "Version": "2026-01-01",
+    "Statement": [
+     {
+      "Effect": "Allow",
+      "Action": [
+       "workflow:Execute"
+      ],
+      "Resource": "*"
+     }
+    ]
+   }
+  }
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/policies/:policyId",
+  "auth": "either",
+  "desc": "Delete a policy"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/roles/:roleId/attach",
+  "auth": "either",
+  "desc": "Attach a policy to a role",
+  "body": {
+   "policyId": "<pid>"
+  }
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/roles/:roleId/policies/:policyId",
+  "auth": "either",
+  "desc": "Detach a policy from a role"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/roles/:roleId/policies",
+  "auth": "either",
+  "desc": "Policies attached to a role"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/users/:userId/assign",
+  "auth": "either",
+  "desc": "Assign a role to a user",
+  "body": {
+   "roleId": "<rid>"
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/users/:userId/roles",
+  "auth": "either",
+  "desc": "Roles assigned to a user"
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/users/:userId/roles/:roleId",
+  "auth": "either",
+  "desc": "Remove a role from a user"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/users/:userId/policies",
+  "auth": "either",
+  "desc": "The user's effective policies"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/authorize",
+  "auth": "either",
+  "desc": "Evaluate Allow/Deny (+Condition)",
+  "body": {
+   "userId": "<uid>",
+   "action": "workflow:Execute",
+   "resource": "*",
+   "context": {
+    "team": "etl"
+   }
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/authorize/dry-run",
+  "auth": "either",
+  "desc": "Simulator without a user",
+  "body": {
+   "documents": [],
+   "action": "workflow:Execute",
+   "resource": "*"
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/audit",
+  "auth": "either",
+  "desc": "Audit log (?limit, ?actor, ?allowed=true|false)"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/managed-policies",
+  "auth": "either",
+  "desc": "AWS-style managed policies (AdministratorAccess, ReadOnlyAccess, …)"
+ },
+ {
+  "method": "PUT",
+  "path": "/v1/users/:userId/org-admin",
+  "auth": "either",
+  "desc": "Grant/revoke organization administrator (org admins only)",
+  "body": {
+   "isOrgAdmin": true
+  }
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/users/:userId/mfa",
+  "auth": "either",
+  "desc": "Reset a user's MFA after a lost device (org admins only)"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/users/:userId/unlock",
+  "auth": "either",
+  "desc": "Clear a sign-in lockout (org admins only)"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/accounts/:accountId/keys",
+  "auth": "either",
+  "desc": "Create a key (shown once)",
+  "body": {
+   "name": "demo",
+   "scopes": [
+    "*"
+   ]
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/accounts/:accountId/keys",
+  "auth": "either",
+  "desc": "List key metadata (id/prefix only, never secrets)"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/keys/verify",
+  "auth": "either",
+  "desc": "Verify a key",
+  "body": {
+   "apiKey": "<key>"
+  }
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/keys/:id",
+  "auth": "either",
+  "desc": "Revoke a key"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/accounts/:accountId/service-accounts",
+  "auth": "either",
+  "desc": "Service accounts"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/accounts/:accountId/service-accounts",
+  "auth": "either",
+  "desc": "Create a service account",
+  "body": {
+   "slug": "etl-worker"
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/service-accounts/:id/token",
+  "auth": "either",
+  "desc": "Mint a kind=service-account JWT",
+  "body": {}
+ },
+ {
+  "method": "POST",
+  "path": "/v1/keys/:id/rotate",
+  "auth": "either",
+  "desc": "Rotate a key (new secret; old key valid for graceSeconds)",
+  "body": {
+   "graceSeconds": 300
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/service-accounts/:id/roles",
+  "auth": "either",
+  "desc": "Roles granted to a service account"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/service-accounts/:id/roles",
+  "auth": "either",
+  "desc": "Grant a role to a service account",
+  "body": {
+   "roleId": "<rid>"
+  }
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/service-accounts/:id/roles/:roleId",
+  "auth": "either",
+  "desc": "Remove a role from a service account"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/accounts/:accountId/credentials",
+  "auth": "either",
+  "desc": "Store an account credential (secret write-only)",
+  "body": {
+   "name": "stripe-live",
+   "type": "bearer",
+   "secret": "<secret>"
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/accounts/:accountId/credentials",
+  "auth": "either",
+  "desc": "List credential metadata (never secrets)"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/credentials/:id",
+  "auth": "either",
+  "desc": "One credential metadata (never the secret)"
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/credentials/:id",
+  "auth": "either",
+  "desc": "Delete a credential"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/credentials/:id/rotate",
+  "auth": "either",
+  "desc": "Rotate a credential secret (bumps version)",
+  "body": {
+   "secret": "<new-secret>"
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/credentials",
+  "auth": "either",
+  "desc": "Credential metadata (?accountId, never secrets)"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/credentials",
+  "auth": "either",
+  "desc": "Store a credential (encrypted at rest)",
+  "body": {
+   "accountId": "<aid>",
+   "name": "api",
+   "kind": "bearer",
+   "secret": "<secret>"
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/templates",
+  "auth": "either",
+  "desc": "Built-in templates"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/templates/:name",
+  "auth": "either",
+  "desc": "One template in detail"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/workflows",
+  "auth": "either",
+  "desc": "Workflows (local engine)"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/workflows",
+  "auth": "either",
+  "desc": "Create from a template or raw definition",
+  "body": {
+   "template": "webhook-to-log",
+   "name": "demo"
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/workflows/:id",
+  "auth": "either",
+  "desc": "Workflow details"
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/workflows/:id",
+  "auth": "either",
+  "desc": "Delete a workflow"
+ },
+ {
+  "method": "PUT",
+  "path": "/v1/workflows/:id",
+  "auth": "either",
+  "desc": "Update name/definition",
+  "body": {
+   "name": "demo",
+   "definition": {
+    "nodes": [],
+    "connections": {}
+   }
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/workflows/test-run",
+  "auth": "either",
+  "desc": "Try a definition without saving",
+  "body": {
+   "definition": {
+    "nodes": [],
+    "connections": {}
+   },
+   "input": {}
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/workflows/:id/activate",
+  "auth": "either",
+  "desc": "Activate"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/workflows/:id/deactivate",
+  "auth": "either",
+  "desc": "Deactivate"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/workflows/:id/execute",
+  "auth": "either",
+  "desc": "Execute manually",
+  "body": {}
+ },
+ {
+  "method": "GET",
+  "path": "/v1/executions",
+  "auth": "either",
+  "desc": "Execution history (?limit&offset&workflowId&status&includeData, returns {data: []})"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/executions/:id",
+  "auth": "either",
+  "desc": "One execution in detail (?includeData=true for node I/O)"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/lds/licenses",
+  "auth": "either",
+  "desc": "Built-in open-data license catalog (SPDX ids)"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/lds/datasources",
+  "auth": "either",
+  "desc": "Datasources you can see (?orgId&accountId)"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/lds/datasources",
+  "auth": "either",
+  "desc": "Create a datasource (license required)",
+  "body": {
+   "name": "Business Registry",
+   "entityType": "Organization",
+   "license": "CC-BY-4.0"
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/lds/datasources/:id",
+  "auth": "either",
+  "desc": "Datasource + attribute registry + stats"
+ },
+ {
+  "method": "PATCH",
+  "path": "/v1/lds/datasources/:id",
+  "auth": "either",
+  "desc": "Update license/contexts/visibility",
+  "body": {
+   "license": "ODbL-1.0"
+  }
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/lds/datasources/:id",
+  "auth": "either",
+  "desc": "Delete a datasource"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/lds/datasources/:id/attributes",
+  "auth": "either",
+  "desc": "Attribute registry (schema)"
+ },
+ {
+  "method": "PUT",
+  "path": "/v1/lds/datasources/:id/attributes",
+  "auth": "either",
+  "desc": "Replace registry (reserved names rejected; default deny)",
+  "body": {
+   "attributes": [
+    {
+     "name": "name",
+     "ngsiLdType": "Property",
+     "visibility": "public"
+    }
+   ]
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/lds/datasources/:id/records",
+  "auth": "either",
+  "desc": "Ingest record(s); reserved fields quarantined",
+  "body": {
+   "id": "55001",
+   "name": "ACME"
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/lds/datasources/:id/entities",
+  "auth": "either",
+  "desc": "NGSI-LD export (?limit&offset&visibility=public|restricted)"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/lds/datasources/:id/entities/:entityId",
+  "auth": "either",
+  "desc": "One NGSI-LD entity"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/lds/datasources/:id/stats",
+  "auth": "either",
+  "desc": "Record count + visibility buckets"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/base/collections",
+  "auth": "either",
+  "desc": "List document collections"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/base/collections",
+  "auth": "either",
+  "desc": "Create a collection with an optional object mapping",
+  "body": {
+   "name": "parks",
+   "mapping": {
+    "fields": {
+     "name": {
+      "path": "profile.name",
+      "type": "string"
+     }
+    },
+    "additional": false
+   }
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/base/collections/:collection",
+  "auth": "either",
+  "desc": "Collection metadata, mapping and stats"
+ },
+ {
+  "method": "PATCH",
+  "path": "/v1/base/collections/:collection",
+  "auth": "either",
+  "desc": "Update collection name, description or mapping"
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/base/collections/:collection",
+  "auth": "either",
+  "desc": "Delete a collection and its documents"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/base/collections/:collection/stats",
+  "auth": "either",
+  "desc": "Collection document count and size stats"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/base/collections/:collection/documents",
+  "auth": "either",
+  "desc": "Create a document from data or object",
+  "body": {
+   "id": "park-1",
+   "object": {
+    "name": "Central",
+    "capacity": 120
+   }
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/base/collections/:collection/documents",
+  "auth": "either",
+  "desc": "List raw documents (?limit&offset)"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/base/collections/:collection/documents/:id",
+  "auth": "either",
+  "desc": "Read one document (?as=object)"
+ },
+ {
+  "method": "PUT",
+  "path": "/v1/base/collections/:collection/documents/:id",
+  "auth": "either",
+  "desc": "Upsert/replace a document; merge/ifVersion supported"
+ },
+ {
+  "method": "PATCH",
+  "path": "/v1/base/collections/:collection/documents/:id",
+  "auth": "either",
+  "desc": "Partially update a document; unset/ifVersion supported"
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/base/collections/:collection/documents/:id",
+  "auth": "either",
+  "desc": "Delete a document (?ifVersion)"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/base/collections/:collection/query",
+  "auth": "either",
+  "desc": "Filter, sort, project and page documents",
+  "body": {
+   "where": {
+    "capacity": {
+     "gte": 100
+    }
+   },
+   "orderBy": [
+    {
+     "field": "name",
+     "direction": "asc"
+    }
+   ],
+   "limit": 50
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/base/collections/:collection/vector-search",
+  "auth": "either",
+  "desc": "Vector similarity search with optional metadata filter",
+  "body": {
+   "vector": [
+    0.1,
+    0.2,
+    0.3
+   ],
+   "limit": 5,
+   "as": "object"
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/base/collections/:collection/graph/nodes",
+  "auth": "either",
+  "desc": "Upsert property-graph nodes with labels and properties",
+  "body": {
+   "nodes": [
+    {
+     "id": "doc:1",
+     "labels": [
+      "Document"
+     ],
+     "properties": {
+      "title": "Bão số 12"
+     }
+    }
+   ]
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/base/collections/:collection/graph/edges",
+  "auth": "either",
+  "desc": "Upsert typed edges between graph nodes",
+  "body": {
+   "edges": [
+    {
+     "from": "doc:1",
+     "to": "province:hanoi",
+     "type": "MENTIONS"
+    }
+   ]
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/base/collections/:collection/graph/nodes/:id?depth=2",
+  "auth": "either",
+  "desc": "Traverse a bounded subgraph from a node",
+  "body": null
+ },
+ {
+  "method": "POST",
+  "path": "/v1/base/collections/:collection/graph/query",
+  "auth": "either",
+  "desc": "Traverse from start nodes with depth and edge-type filters",
+  "body": {
+   "start": [
+    "doc:1"
+   ],
+   "depth": 2,
+   "edgeTypes": [
+    "MENTIONS"
+   ]
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/base/collections/:collection/graph/stats",
+  "auth": "either",
+  "desc": "Graph node and edge counts",
+  "body": null
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/base/collections/:collection/graph/nodes/:id",
+  "auth": "either",
+  "desc": "Delete a graph node and incident edges",
+  "body": null
+ },
+ {
+  "method": "POST",
+  "path": "/v1/base/collections/:collection/geo/features",
+  "auth": "either",
+  "desc": "Upsert GeoJSON features into PostGIS",
+  "body": {
+   "features": [
+    {
+     "id": "p1",
+     "properties": {
+      "name": "Hà Nội"
+     },
+     "geometry": {
+      "type": "Point",
+      "coordinates": [
+       105.85,
+       21.03
+      ]
+     }
+    }
+   ]
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/base/collections/:collection/geo/features?bbox=105,20,107,22",
+  "auth": "either",
+  "desc": "List GIS features with an optional bounding box",
+  "body": null
+ },
+ {
+  "method": "POST",
+  "path": "/v1/base/collections/:collection/geo/near",
+  "auth": "either",
+  "desc": "Radius query in metres",
+  "body": {
+   "lat": 21.03,
+   "lng": 105.85,
+   "radiusMeters": 5000
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/base/collections/:collection/geo/within",
+  "auth": "either",
+  "desc": "Features within a polygon",
+  "body": {
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       105,
+       20
+      ],
+      [
+       107,
+       20
+      ],
+      [
+       107,
+       22
+      ],
+      [
+       105,
+       22
+      ],
+      [
+       105,
+       20
+      ]
+     ]
+    ]
+   }
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/base/collections/:collection/geo/stats",
+  "auth": "either",
+  "desc": "GIS feature count and extent",
+  "body": null
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/base/collections/:collection/geo/features/:id",
+  "auth": "either",
+  "desc": "Delete a GIS feature",
+  "body": null
+ },
+ {
+  "method": "POST",
+  "path": "/v1/base/collections/:collection/documents/:id/increment",
+  "auth": "either",
+  "desc": "Atomically increment a numeric field",
+  "body": {
+   "field": "profile.capacity",
+   "by": 10
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/base/collections/:collection/documents:batch",
+  "auth": "either",
+  "desc": "Batch create/set/update/delete documents",
+  "body": {
+   "operations": [
+    {
+     "op": "create",
+     "object": {
+      "name": "North",
+      "capacity": 80
+     }
+    }
+   ]
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/base/collections/:collection/changes",
+  "auth": "either",
+  "desc": "Change feed of upserts since a timestamp"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/faststore/stats",
+  "auth": "either",
+  "desc": "Key counts by type for the current tenant"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/faststore/keys",
+  "auth": "either",
+  "desc": "Scan keys (?prefix&limit&cursor)"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/faststore/keys/:key",
+  "auth": "either",
+  "desc": "Read a string key with TTL"
+ },
+ {
+  "method": "PUT",
+  "path": "/v1/faststore/keys/:key",
+  "auth": "either",
+  "desc": "Set a string key with optional TTL/NX/XX",
+  "body": {
+   "value": "hello",
+   "ttlSeconds": 600
+  }
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/faststore/keys/:key",
+  "auth": "either",
+  "desc": "Delete a key"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/faststore/keys/:key/ttl",
+  "auth": "either",
+  "desc": "Read remaining TTL (-1 means no expiry)"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/faststore/keys/:key/expire",
+  "auth": "either",
+  "desc": "Set or clear a key TTL",
+  "body": {
+   "ttlSeconds": 600
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/faststore/keys/:key/incr",
+  "auth": "either",
+  "desc": "Atomically increment a counter",
+  "body": {
+   "by": 1
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/faststore/batch",
+  "auth": "either",
+  "desc": "Run 1..100 set/get/delete/incr/expire operations",
+  "body": {
+   "operations": [
+    {
+     "op": "set",
+     "key": "a",
+     "value": 1
+    }
+   ]
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/faststore/hashes/:key",
+  "auth": "either",
+  "desc": "Read all hash fields"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/faststore/hashes/:key/length",
+  "auth": "either",
+  "desc": "Number of hash fields"
+ },
+ {
+  "method": "PUT",
+  "path": "/v1/faststore/hashes/:key",
+  "auth": "either",
+  "desc": "Set hash fields",
+  "body": {
+   "values": {
+    "name": "Alice"
+   },
+   "ttlSeconds": 600
+  }
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/faststore/hashes/:key",
+  "auth": "either",
+  "desc": "Delete a hash"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/faststore/hashes/:key/:field",
+  "auth": "either",
+  "desc": "Read one hash field"
+ },
+ {
+  "method": "PUT",
+  "path": "/v1/faststore/hashes/:key/:field",
+  "auth": "either",
+  "desc": "Set one hash field",
+  "body": {
+   "value": "Alice"
+  }
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/faststore/hashes/:key/:field",
+  "auth": "either",
+  "desc": "Delete one hash field"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/faststore/hashes/:key/incr",
+  "auth": "either",
+  "desc": "Increment a hash field",
+  "body": {
+   "field": "visits",
+   "by": 1
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/faststore/lists/:key",
+  "auth": "either",
+  "desc": "Read a list range (?start&stop)"
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/faststore/lists/:key",
+  "auth": "either",
+  "desc": "Delete a list"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/faststore/lists/:key/length",
+  "auth": "either",
+  "desc": "List length"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/faststore/lists/:key/push",
+  "auth": "either",
+  "desc": "Push list values",
+  "body": {
+   "values": [
+    "login"
+   ],
+   "side": "right"
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/faststore/lists/:key/pop",
+  "auth": "either",
+  "desc": "Pop list values",
+  "body": {
+   "side": "left",
+   "count": 1
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/faststore/lists/:key/trim",
+  "auth": "either",
+  "desc": "Trim a list to a range",
+  "body": {
+   "start": 0,
+   "stop": 99
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/faststore/sets/:key",
+  "auth": "either",
+  "desc": "Read set members"
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/faststore/sets/:key",
+  "auth": "either",
+  "desc": "Delete a set"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/faststore/sets/:key/add",
+  "auth": "either",
+  "desc": "Add set members",
+  "body": {
+   "members": [
+    "admin"
+   ]
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/faststore/sets/:key/remove",
+  "auth": "either",
+  "desc": "Remove set members",
+  "body": {
+   "members": [
+    "admin"
+   ]
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/faststore/sets/:key/contains",
+  "auth": "either",
+  "desc": "Check set membership",
+  "body": {
+   "member": "admin"
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/faststore/sets/:key/card",
+  "auth": "either",
+  "desc": "Set cardinality"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/faststore/zsets/:key",
+  "auth": "either",
+  "desc": "Read a sorted-set range (?start&stop&rev&withScores)"
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/faststore/zsets/:key",
+  "auth": "either",
+  "desc": "Delete a sorted set"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/faststore/zsets/:key/card",
+  "auth": "either",
+  "desc": "Sorted-set cardinality"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/faststore/zsets/:key/add",
+  "auth": "either",
+  "desc": "Add scored members",
+  "body": {
+   "members": [
+    {
+     "member": "alice",
+     "score": 100
+    }
+   ]
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/faststore/zsets/:key/incr",
+  "auth": "either",
+  "desc": "Increment a member score",
+  "body": {
+   "member": "alice",
+   "by": 5
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/faststore/zsets/:key/remove",
+  "auth": "either",
+  "desc": "Remove sorted-set members",
+  "body": {
+   "members": [
+    "alice"
+   ]
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/faststore/zsets/:key/score",
+  "auth": "either",
+  "desc": "Read a member score",
+  "body": {
+   "member": "alice"
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/faststore/zsets/:key/rank",
+  "auth": "either",
+  "desc": "Read a member rank",
+  "body": {
+   "member": "alice"
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/faststore/locks/:name/acquire",
+  "auth": "either",
+  "desc": "Acquire a distributed lock",
+  "body": {
+   "ttlSeconds": 30,
+   "waitMs": 0
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/faststore/locks/:name/release",
+  "auth": "either",
+  "desc": "Release a lock with its owner token",
+  "body": {
+   "token": "<token>"
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/faststore/locks/:name/extend",
+  "auth": "either",
+  "desc": "Extend a lock lease",
+  "body": {
+   "token": "<token>",
+   "ttlSeconds": 30
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/queue/queues",
+  "auth": "either",
+  "desc": "List queues and configs"
+ },
+ {
+  "method": "PUT",
+  "path": "/v1/queue/queues/:queue",
+  "auth": "either",
+  "desc": "Create or update a queue",
+  "body": {
+   "maxAttempts": 5,
+   "visibilityTimeoutSeconds": 30
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/queue/queues/:queue",
+  "auth": "either",
+  "desc": "Queue config and stats"
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/queue/queues/:queue",
+  "auth": "either",
+  "desc": "Delete a queue and all messages"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/queue/queues/:queue/purge",
+  "auth": "either",
+  "desc": "Clear all messages but keep the queue config"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/queue/queues/:queue/stats",
+  "auth": "either",
+  "desc": "Queue counters and delivery config"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/queue/queues/:queue/messages",
+  "auth": "either",
+  "desc": "Publish one message",
+  "body": {
+   "payload": {
+    "to": "alice@acme.test"
+   },
+   "dedupeKey": "welcome:alice"
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/queue/queues/:queue/messages:batch",
+  "auth": "either",
+  "desc": "Publish 1..100 messages",
+  "body": {
+   "messages": [
+    {
+     "payload": {
+      "n": 1
+     }
+    }
+   ]
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/queue/queues/:queue/consume",
+  "auth": "either",
+  "desc": "Lease up to 100 messages",
+  "body": {
+   "maxMessages": 10,
+   "visibilityTimeoutSeconds": 30,
+   "consumer": "worker-1"
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/queue/queues/:queue/ack",
+  "auth": "either",
+  "desc": "Acknowledge one receipt or a batch",
+  "body": {
+   "receipt": "<receipt>"
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/queue/queues/:queue/nack",
+  "auth": "either",
+  "desc": "Retry or dead-letter a message",
+  "body": {
+   "receipt": "<receipt>",
+   "requeue": true,
+   "delaySeconds": 0
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/queue/queues/:queue/heartbeat",
+  "auth": "either",
+  "desc": "Extend a message lease",
+  "body": {
+   "receipt": "<receipt>",
+   "visibilityTimeoutSeconds": 30
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/queue/queues/:queue/messages",
+  "auth": "either",
+  "desc": "Peek pending messages (?limit&ready)"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/queue/queues/:queue/dead",
+  "auth": "either",
+  "desc": "List dead letters"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/queue/queues/:queue/dead/:id/replay",
+  "auth": "either",
+  "desc": "Replay a dead letter",
+  "body": {
+   "delaySeconds": 0,
+   "resetAttempts": true
+  }
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/queue/queues/:queue/dead/:id",
+  "auth": "either",
+  "desc": "Delete a dead letter"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/stream/topics",
+  "auth": "either",
+  "desc": "List stream topics for the tenant"
+ },
+ {
+  "method": "PUT",
+  "path": "/v1/stream/topics/:topic",
+  "auth": "either",
+  "desc": "Create or update a stream topic",
+  "body": {
+   "maxLen": 10000
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/stream/topics/:topic",
+  "auth": "either",
+  "desc": "Get stream topic configuration"
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/stream/topics/:topic",
+  "auth": "either",
+  "desc": "Delete stream topic and events"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/stream/topics/:topic/stats",
+  "auth": "either",
+  "desc": "Topic statistics and consumer groups"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/stream/topics/:topic/events",
+  "auth": "either",
+  "desc": "Publish an event to a stream topic",
+  "body": {
+   "payload": {
+    "sensor": "temp-1",
+    "value": 25.4
+   },
+   "key": "sensor-1"
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/stream/topics/:topic/events:batch",
+  "auth": "either",
+  "desc": "Batch publish events (up to 100)",
+  "body": {
+   "events": [
+    {
+     "payload": {
+      "a": 1
+     }
+    },
+    {
+     "payload": {
+      "a": 2
+     }
+    }
+   ]
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/stream/topics/:topic/read",
+  "auth": "either",
+  "desc": "Raw stream read / tail (non-destructive)",
+  "body": {
+   "fromId": "0-0",
+   "count": 100
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/stream/topics/:topic/range",
+  "auth": "either",
+  "desc": "Historical time-range query / replay (?start&end&count)"
+ },
+ {
+  "method": "PUT",
+  "path": "/v1/stream/topics/:topic/groups/:group",
+  "auth": "either",
+  "desc": "Create a consumer group",
+  "body": {
+   "startId": "$"
+  }
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/stream/topics/:topic/groups/:group",
+  "auth": "either",
+  "desc": "Destroy a consumer group"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/stream/topics/:topic/groups/:group/read",
+  "auth": "either",
+  "desc": "Read events via consumer group",
+  "body": {
+   "consumer": "worker-1",
+   "count": 10,
+   "autoAck": false
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/stream/topics/:topic/groups/:group/ack",
+  "auth": "either",
+  "desc": "Acknowledge processed event IDs",
+  "body": {
+   "ids": [
+    "1730000000000-0"
+   ]
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/ocs/buckets",
+  "auth": "either",
+  "desc": "List buckets (?withStats=1)"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/ocs/buckets",
+  "auth": "either",
+  "desc": "Create a bucket with an optional quota",
+  "body": {
+   "name": "city-assets",
+   "quotaBytes": 1073741824
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/ocs/buckets/:bucket",
+  "auth": "either",
+  "desc": "Bucket metadata and usage"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/ocs/buckets/:bucket/stats",
+  "auth": "either",
+  "desc": "Object/byte counts and quota"
+ },
+ {
+  "method": "DELETE",
+  "path": "/v1/ocs/buckets/:bucket",
+  "auth": "either",
+  "desc": "Delete a bucket (force=true removes objects)"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/ocs/buckets/:bucket/objects",
+  "auth": "either",
+  "desc": "List objects (prefix, delimiter, limit, cursor)"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/ocs/buckets/:bucket/objects/copy",
+  "auth": "either",
+  "desc": "Copy an object",
+  "body": {
+   "sourceKey": "a.txt",
+   "destinationKey": "b.txt"
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/ocs/buckets/:bucket/presign",
+  "auth": "either",
+  "desc": "HMAC-signed object URL",
+  "body": {
+   "key": "a.txt",
+   "method": "GET",
+   "expiresIn": 900
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/ocs/buckets/:bucket/uploads",
+  "auth": "either",
+  "desc": "Start a multipart upload",
+  "body": {
+   "key": "video.mp4",
+   "contentType": "video/mp4"
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/ocs/buckets/:bucket/uploads/:uploadId/complete",
+  "auth": "either",
+  "desc": "Complete a multipart upload",
+  "body": {
+   "key": "video.mp4",
+   "parts": [
+    {
+     "partNumber": 1,
+     "etag": "<etag>"
+    }
+   ]
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/notifications",
+  "auth": "either",
+  "desc": "Queue one notification per channel",
+  "body": {
+   "channels": [
+    "email"
+   ],
+   "recipient": {
+    "email": "ops@example.com"
+   },
+   "subject": "Flood alert",
+   "body": "Level {{level}}m",
+   "data": {
+    "level": 2.5
+   }
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/notifications",
+  "auth": "either",
+  "desc": "Recent notifications (?status&limit)"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/notifications/:id",
+  "auth": "either",
+  "desc": "Status and attempt history"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/notifications/:id/cancel",
+  "auth": "either",
+  "desc": "Cancel a queued/failed delivery"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/notifications/preferences/:recipient",
+  "auth": "either",
+  "desc": "Allowed channels and unsubscribe flag"
+ },
+ {
+  "method": "PUT",
+  "path": "/v1/notifications/preferences/:recipient",
+  "auth": "either",
+  "desc": "Set channels and unsubscribe flag",
+  "body": {
+   "channels": [
+    "email"
+   ],
+   "unsubscribed": false
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/notifications/unsubscribe",
+  "auth": "either",
+  "desc": "Unsubscribe a recipient",
+  "body": {
+   "recipient": "ops@example.com"
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/search",
+  "auth": "either",
+  "desc": "Full-text, semantic or hybrid search",
+  "body": {
+   "query": "central park",
+   "mode": "hybrid",
+   "limit": 10
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/search",
+  "auth": "either",
+  "desc": "Search via query string (?q&mode)"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/search/reindex",
+  "auth": "either",
+  "desc": "Rebuild the tenant-visible search index"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/search/status",
+  "auth": "either",
+  "desc": "Index freshness and document count"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/secrets",
+  "auth": "either",
+  "desc": "Store an encrypted, versioned secret",
+  "body": {
+   "name": "smtp-password",
+   "value": "<secret>"
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/secrets",
+  "auth": "either",
+  "desc": "Secret metadata (never values)"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/secrets/:name/read",
+  "auth": "either",
+  "desc": "Audited decrypt of one version",
+  "body": {}
+ },
+ {
+  "method": "POST",
+  "path": "/v1/secrets/:name/rotate",
+  "auth": "either",
+  "desc": "Rotate a secret with a grace window",
+  "body": {
+   "value": "<new-secret>",
+   "graceSeconds": 86400
+  }
+ },
+ {
+  "method": "POST",
+  "path": "/v1/human-tasks",
+  "auth": "either",
+  "desc": "Create a durable human task",
+  "body": {
+   "title": "Approve flood alert",
+   "assignee": "alice@acme.local"
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/human-tasks",
+  "auth": "either",
+  "desc": "Tenant-scoped task list"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/human-tasks/:id/complete",
+  "auth": "either",
+  "desc": "Complete and resume the paused execution",
+  "body": {
+   "decision": {
+    "approved": true
+   },
+   "note": "go ahead"
+  }
+ },
+ {
+  "method": "GET",
+  "path": "/v1/usage/summary",
+  "auth": "either",
+  "desc": "Request/feature aggregates (?from&to&feature&statusClass&method&q&accountId)"
+ },
+ {
+  "method": "GET",
+  "path": "/v1/usage/events",
+  "auth": "either",
+  "desc": "Request log, newest first (?from&to&limit&offset + same filters)"
+ },
+ {
+  "method": "POST",
+  "path": "/v1/usage/ingest",
+  "auth": "internal",
+  "desc": "Gateway telemetry batch ingest (service-to-service)"
+ },
+ {
+  "method": "GET",
+  "path": "/health",
+  "auth": "none",
+  "desc": "Liveness per service + gateway"
+ },
+ {
+  "method": "GET",
+  "path": "/ready",
+  "auth": "none",
+  "desc": "Aggregate readiness (503 when degraded)"
+ },
+ {
+  "method": "GET",
+  "path": "/metrics",
+  "auth": "none",
+  "desc": "Prometheus metrics (gateway)"
+ },
+ {
+  "method": "GET",
+  "path": "/",
+  "auth": "none",
+  "desc": "Service index + live route table"
+ }
+]
