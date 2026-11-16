@@ -73,8 +73,14 @@ jobs:
               -t "ghcr.io/${OWNER}/synapseone-${name}:latest" \
               "${context}"
           done
-          # Self-hosted workflow runner: shares the workflow engine source, so
-          # its Dockerfile is built from the repository root context.
+          # Self-hosted workflow runner: shares the workflow engine source and
+          # bakes the inference model stack that the loop just pushed. Pull and
+          # tag it under the Dockerfile's local default before building.
+          for attempt in 1 2 3; do
+            if docker pull "ghcr.io/${OWNER}/synapseone-inference:${TAG}"; then break; fi
+            sleep 10
+          done
+          docker tag "ghcr.io/${OWNER}/synapseone-inference:${TAG}" synapseone/inference:0.9.1-20261114
           docker buildx build --push --provenance=true --sbom=true \
             -f apps/workflow-runner/Dockerfile \
             -t "ghcr.io/${OWNER}/synapseone-workflow-runner:${TAG}" \
