@@ -27,7 +27,8 @@ spec:
             - { name: IAM_JWT_SECRET, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: iam-jwt-secret } } }
             - { name: IAM_API_KEY_PEPPER, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: api-key-pepper } } }
             - { name: SYNAPSEONE_INTERNAL_SECRET, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: internal-secret } } }
-            - { name: REDIS_URL, value: "redis://redis:6379" }
+            - { name: VALKEY_URL, value: "redis://valkey:6379" }
+            - { name: REDIS_URL, value: "redis://valkey:6379" }
             - { name: OIDC_ISSUER, value: "https://auth.example.com/application/o/synapseone/" }
             - { name: OIDC_CLIENT_ID, value: "synapseone-platform" }
             - { name: OIDC_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: oidc-client-secret } } }
@@ -37,6 +38,14 @@ spec:
             - { name: NODE_ENV, value: "production" }
             - { name: IAM_ALLOW_DEV_LOGIN, value: "false" }
             - { name: IAM_ALLOW_OIDC_DEMO_CALLBACK, value: "false" }
+            - { name: IAM_SENSITIVE_MUTATION_MODE, value: "enforce" }
+            - { name: IAM_ALLOW_DIRECT_ORG_CREATE, value: "false" }
+            - { name: PLATFORM_ADMIN_ENABLED, value: "true" }
+            - { name: PLATFORM_ADMIN_REQUIRE_MFA, value: "true" }
+            - { name: PLATFORM_ADMIN_REQUIRE_STEP_UP, value: "true" }
+            - { name: PLATFORM_ORG_SLUG, value: "synapseone-platform" }
+            - { name: PLATFORM_BOOTSTRAP_SECRET, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: platform-bootstrap-secret, optional: true } } }
+            - { name: PLATFORM_RECOVERY_SECRET, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: platform-recovery-secret, optional: true } } }
             - { name: HSTS_ENABLED, value: "true" }
           securityContext: { runAsNonRoot: true, runAsUser: 1000, allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } }
           resources: { requests: { cpu: "100m", memory: "128Mi" }, limits: { cpu: "500m", memory: "512Mi" } }
@@ -89,6 +98,8 @@ spec:
             - { name: HSTS_ENABLED, value: "true" }
             - { name: CORS_ORIGIN, value: "https://console.example.com" }
             - { name: GATEWAY_VERIFY_APIKEY, value: "true" }
+            - { name: AUTHZ_MODE, value: "audit" }
+            - { name: AUTHZ_MODE_REQUIRED, value: "true" }
             - { name: PROXY_TIMEOUT_MS, value: "30000" }
             # Trust exactly one hop (the Ingress controller) for client IPs.
             - { name: TRUST_PROXY, value: "1" }
@@ -253,7 +264,8 @@ spec:
           image: ghcr.io/synapseone/faststore:0.7.0
           ports: [{ containerPort: 4006 }]
           env:
-            - { name: FASTSTORE_REDIS_URL, value: "redis://redis:6379" }
+            - { name: FASTSTORE_VALKEY_URL, value: "redis://valkey:6379" }
+            - { name: FASTSTORE_REDIS_URL, value: "redis://valkey:6379" }
             - { name: SYNAPSEONE_INTERNAL_SECRET, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: internal-secret } } }
             - { name: IAM_SERVICE_URL, value: "http://iam:4001" }
             - { name: AUDIT_TRAIL, value: "true" }
@@ -292,7 +304,8 @@ spec:
           image: ghcr.io/synapseone/queue:0.7.0
           ports: [{ containerPort: 4007 }]
           env:
-            - { name: QUEUE_REDIS_URL, value: "redis://redis:6379" }
+            - { name: QUEUE_VALKEY_URL, value: "redis://valkey:6379" }
+            - { name: QUEUE_REDIS_URL, value: "redis://valkey:6379" }
             - { name: SYNAPSEONE_INTERNAL_SECRET, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: internal-secret } } }
             - { name: IAM_SERVICE_URL, value: "http://iam:4001" }
             - { name: AUDIT_TRAIL, value: "true" }
@@ -333,8 +346,9 @@ spec:
           env:
             - { name: PORT, value: "4009" }
             # Durable engine required in production (no memory fallback).
-            - { name: STREAM_ENGINE, value: "redis" }
-            - { name: STREAM_REDIS_URL, value: "redis://redis:6379" }
+            - { name: STREAM_ENGINE, value: "valkey" }
+            - { name: STREAM_VALKEY_URL, value: "redis://valkey:6379" }
+            - { name: STREAM_REDIS_URL, value: "redis://valkey:6379" }
             - { name: SYNAPSEONE_INTERNAL_SECRET, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: internal-secret } } }
             - { name: IAM_SERVICE_URL, value: "http://iam:4001" }
             - { name: AUDIT_TRAIL, value: "true" }
@@ -354,6 +368,62 @@ metadata:
 spec:
   selector: { app: stream }
   ports: [{ port: 4009, targetPort: 4009 }]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: warehouse-data
+  namespace: synapseone
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: warehouse
+  namespace: synapseone
+spec:
+  # One writer: DuckDB files and SynapseStream consumer groups are single-writer.
+  replicas: 1
+  selector:
+    matchLabels: { app: warehouse }
+  template:
+    metadata:
+      labels: { app: warehouse }
+    spec:
+      containers:
+        - name: warehouse
+          image: ghcr.io/synapseone/warehouse:0.9.0
+          ports: [{ containerPort: 4012 }]
+          env:
+            - { name: PORT, value: "4012" }
+            - { name: NODE_ENV, value: "production" }
+            - { name: WAREHOUSE_DATA_DIR, value: "/data/warehouse" }
+            - { name: WAREHOUSE_THREADS, value: "2" }
+            - { name: STREAM_SERVICE_URL, value: "http://stream:4009" }
+            - { name: SYNAPSEONE_INTERNAL_SECRET, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: internal-secret } } }
+            - { name: CORS_ORIGIN, value: "https://console.example.com" }
+          volumeMounts:
+            - { name: warehouse-data, mountPath: /data/warehouse }
+          securityContext: { runAsNonRoot: true, runAsUser: 1000, allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } }
+          resources: { requests: { cpu: "200m", memory: "512Mi" }, limits: { cpu: "2000m", memory: "2Gi" } }
+          livenessProbe: { httpGet: { path: /health, port: 4012 }, initialDelaySeconds: 20, periodSeconds: 30 }
+          readinessProbe: { httpGet: { path: /health, port: 4012 }, initialDelaySeconds: 5, periodSeconds: 10 }
+      volumes:
+        - name: warehouse-data
+          persistentVolumeClaim: { claimName: warehouse-data }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: warehouse
+  namespace: synapseone
+spec:
+  selector: { app: warehouse }
+  ports: [{ port: 4012, targetPort: 4012 }]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -380,8 +450,15 @@ spec:
             - { name: OPENROUTER_API_KEY, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: openrouter-api-key } } }
             - { name: OPENROUTER_MODEL, value: "liquid/lfm-2.5-2.6b:free" }
             - { name: INFERENCE_DEVICE, value: "cpu" }
+            - { name: EMBEDDING_BACKEND, value: "auto" }
+            - { name: EMBEDDING_BATCH_SIZE, value: "32" }
+            - { name: EMBEDDING_MAX_LENGTH, value: "256" }
+            - { name: INFERENCE_CPU_THREADS, value: "2" }
+            - { name: DECISION_ENABLED, value: "true" }
+            - { name: DECISION_THREADS, value: "2" }
+            - { name: DECISION_WARMUP, value: "true" }
           securityContext: { runAsNonRoot: true, runAsUser: 1000, allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } }
-          resources: { requests: { cpu: "200m", memory: "512Mi" }, limits: { cpu: "2000m", memory: "4Gi" } }
+          resources: { requests: { cpu: "500m", memory: "1Gi" }, limits: { cpu: "2000m", memory: "6Gi" } }
           livenessProbe: { httpGet: { path: /health, port: 4008 }, initialDelaySeconds: 30, periodSeconds: 30 }
           readinessProbe: { httpGet: { path: /health, port: 4008 }, initialDelaySeconds: 20, periodSeconds: 15 }
 ---

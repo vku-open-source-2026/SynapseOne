@@ -10,10 +10,10 @@ import cors from 'cors';
 import expressRateLimit from 'express-rate-limit';
 import morgan from 'morgan';
 import dotenv from 'dotenv';
-import { createHmac } from 'crypto';
+import { createHmac, randomUUID } from 'crypto';
 import { z } from 'zod';
 import {
-  createOrganization, listOrganizations, getOrgBySlug,
+  createOrganization, createOrganizationWithAdmin, listOrganizations, getOrgBySlug,
   createAccount, listAccounts, upsertUser, listUsers, getUserById, findUserByOrgEmail,
   createRole, createPolicy,
   attachPolicy, assignRole, detachPolicy, unassignRole, policiesForUser, useDb, deleteRole, deletePolicy,
@@ -22,9 +22,13 @@ import {
   getRoleById, getPolicyById, getAccountById, accountsForUser, getOrgById,
   policiesForRole, rolesForUser, ensureTables,
   setUserPassword, markEmailVerified, storeOneTimeToken, consumeOneTimeToken,
-  setUserActive, updateUserProfile,
+  setUserActive, updateUserProfile, publicUser,
   setOrgAdmin, orgHasAdmin, assignRoleToServiceAccount, unassignRoleFromServiceAccount, rolesForServiceAccount,
-  type User,
+  getPlatformAdmin, listPlatformAdmins, grantPlatformAdmin, revokePlatformAdmin, countActivePlatformOwners,
+  registerPlatformStepUp, consumePlatformStepUp,
+  listPlatformOrganizations, getPlatformOrganization, getPlatformOrganizationResources, listPlatformUsers, getPlatformOverviewCounts, platformAuditStats,
+  setOrganizationStatus, listUserRowsByEmail, revokeServiceAccount, listPlatformAccounts,
+  type PlatformAdmin, type User,
 } from './db';
 import {
   createScimToken, listScimTokens, revokeScimToken, verifyScimToken,
@@ -37,6 +41,11 @@ import {
   consumeAndRevokeRefresh, findRefreshOwner, refreshExpiry, revokeApiKey, createApiKeyRecord,
   verifyApiKey, verifyAccess, listApiKeys, findApiKeyById, signDelegated,
   listRefreshSessions, revokeRefreshById, revokeApiKeysForUser, rotateApiKey,
+  signPlatformAccess, verifyPlatformAccess, signPlatformStepUp, verifyPlatformStepUp,
+  createPlatformRunnerKey, verifyPlatformRunnerKey, revokePlatformRunnerKey,
+  revokePlatformRunnerKeysForRunner, listPlatformRunnerKeys, normalizePlatformRunnerScopes,
+  PLATFORM_RUNNER_DEFAULT_SCOPES, storeExecutionDelegation, verifyExecutionDelegation,
+  revokeExecutionDelegations,
 } from './tokens';
 import {
   beginTotpEnrolment, checkSecondFactor, clearLoginFailures, enableTotp, getMfa, lockRemaining, mfaEnabled,
@@ -44,12 +53,13 @@ import {
   TOTP_DIGITS, TOTP_PERIOD,
 } from './mfa';
 import { decideForPrincipal, managedPolicyList, MANAGED_POLICIES, type PrincipalInput } from './authz';
-import { secretsEqual, hashCandidates } from './db';
+import { secretsEqual, hashCandidates, withTransaction } from './db';
 import { ingestUsageEvents, listUsageEvents, purgeUsage, usageSummary, type UsageFilter } from './usage';
-import { assertOidcConfig, isPublicHttpsUrl, signState, exchangeCode, authorizationEndpoint, oidcSettings, OidcError } from './oidc';
+import { startUsageRollup } from './usage-rollup';
+import { assertOidcConfig, isPublicHttpsUrl, createOidcState, exchangeCode, authorizationEndpoint, oidcSettings, OidcError } from './oidc';
 import {
   hashPassword, verifyPassword, passwordPolicyError, newOneTimeToken,
-  resetTokenExpiry, verifyTokenExpiry, PASSWORD_MAX,
+  resetTokenExpiry, verifyTokenExpiry, inviteTokenExpiry, PASSWORD_MAX,
 } from './passwords';
 
 dotenv.config();
@@ -63,8 +73,23 @@ const VERSION = (() => {
   }
 })();
 
-const IS_PROD = process.env.NODE_ENV === 'production';
+/**
+ * Production detection. `NODE_ENV=production` is the documented switch, but a
+ * deployment that forgets it (the prod compose overlay/Helm values are the only
+ * places that set it) would silently fall back to dev behaviour — including
+ * echoing password-reset/verification tokens in API responses. Accept the
+ * common environment aliases so a live stack fails closed even then.
+ */
+const IS_PROD = (() => {
+  if (process.env.NODE_ENV === 'production') return true;
+  const env = (process.env.SYNAPSEONE_ENV ?? process.env.SYNAPSEDX_ENV ?? process.env.APP_ENV ?? process.env.ENVIRONMENT ?? '').trim().toLowerCase();
+  return env === 'production' || env === 'prod';
+})();
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function isUniqueViolation(e: any): boolean {
+  return e?.code === '23505' || e?.cause?.code === '23505' || /duplicate key value/i.test(String(e?.message || ''));
+}
+
 function isUuid(s: string): boolean { return UUID_RE.test(s || ''); }
 /** Linear-time email sanity check (avoids CodeQL's polynomial-regex alert). */
 function validScimEmail(value: string): boolean {
@@ -184,6 +209,30 @@ async function resolveCallerUser(req: express.Request, trustStamped: boolean): P
   return null;
 }
 
+/** A user JWT must still map to an active account. Disabling or deleting a
+ *  user must invalidate existing access tokens before their natural expiry. */
+async function claimsUserStatus(claims: any): Promise<'ok' | 'inactive' | 'revoked' | 'org_suspended'> {
+  if (!claims) return 'revoked';
+  if (claims.kind === 'service-account') {
+    const sa = await getServiceAccount(String(claims.sub || ''));
+    if (!sa || sa.revoked_at) return 'revoked';
+    const account = claims.account ? await getAccountById(String(claims.account)) : null;
+    const org = account ? await getOrgById(account.org_id) : null;
+    return org && org.status === 'suspended' ? 'org_suspended' : 'ok';
+  }
+  if (!claims.sub) return 'revoked';
+  const user = await getUserById(String(claims.sub));
+  if (!user || user.active === false) return 'inactive';
+  const org = await getOrgById(user.org_id);
+  if (org && org.status === 'suspended') return 'org_suspended';
+  // Credential epoch: logout-all/disable/MFA-reset bumps users.auth_version.
+  return Number(claims.ver || 0) === Number(user.auth_version || 0) ? 'ok' : 'revoked';
+}
+
+function orgSuspendedResponse(res: express.Response): express.Response {
+  return res.status(403).json({ error: 'org_suspended', message: 'This organization is suspended. Contact a platform administrator.' });
+}
+
 /** May the caller act for `accountId`? Role-based account membership first,
  *  then same-org fallback (login JWTs carry org but no account, and fresh
  *  users hold no roles yet — without this the bootstrap flow could never mint
@@ -203,6 +252,8 @@ async function canActForAccount(req: express.Request, trustStamped: boolean, acc
  *  are granted roles/managed policies by an admin. */
 async function bootstrapOrgAdmin(user: User): Promise<User> {
   if (user.is_org_admin) return user;
+  const org = await getOrgById(user.org_id);
+  if (org?.kind === 'platform') return user;
   if (await orgHasAdmin(user.org_id)) return user;
   return (await setOrgAdmin(user.id, true)) || user;
 }
@@ -222,6 +273,339 @@ async function canActForOrg(req: express.Request, trustStamped: boolean, orgId: 
   return !!org && org === orgId;
 }
 
+/** Sensitive IAM mutations (roles, policies, users, keys, service accounts)
+ *  need more than tenant membership. The default is audit for a safe rollout;
+ *  production should set enforce. The bootstrap rule still makes the first
+ *  user of an org an org admin, so a fresh tenant remains manageable. */
+function sensitiveMutationMode(): 'off' | 'audit' | 'enforce' {
+  const raw = String(process.env.IAM_SENSITIVE_MUTATION_MODE || 'audit').trim().toLowerCase();
+  return raw === 'off' || raw === 'enforce' ? raw : 'audit';
+}
+
+async function requireSensitiveMutation(
+  req: express.Request,
+  res: express.Response,
+  trustStamped: boolean,
+  orgId: string,
+  action: string,
+): Promise<boolean> {
+  const mode = sensitiveMutationMode();
+  if (mode === 'off') return true;
+  if (await callerIsOrgAdmin(req, trustStamped, orgId)) return true;
+  if (mode === 'audit') {
+    const actor = await resolveCallerUser(req, trustStamped);
+    await logAudit({
+      actor_type: actor ? 'user' : 'service',
+      actor_id: actor || '',
+      action: `${action}:would-deny`,
+      resource: String(req.path || ''),
+      decision: false,
+      context: { org: orgId, mode, method: req.method, route: req.path },
+    }).catch(() => undefined);
+    return true;
+  }
+  res.status(403).json({
+    error: 'org_admin_required',
+    message: 'only an organization administrator can perform this operation',
+  });
+  return false;
+}
+
+async function orgForAccount(accountId: string): Promise<string | null> {
+  const acc = await getAccountById(accountId);
+  return acc?.org_id || null;
+}
+
+function platformFeatureEnabled(): boolean {
+  return (process.env.PLATFORM_ADMIN_ENABLED ?? (IS_PROD ? 'false' : 'true')) === 'true';
+}
+
+const PLATFORM_ROLE_RANK: Record<string, number> = { auditor: 1, operator: 2, owner: 3 };
+const PLATFORM_STEP_UP_ACTIONS = new Set([
+  'org:create',
+  'org:account:create',
+  'org:suspend',
+  'org:reactivate',
+  'org:role:create',
+  'org:policy:create',
+  'org:key:revoke',
+  'org:service-account:revoke',
+  'user:org-admin',
+  'user:reset-mfa',
+  'user:invite',
+  'user:revoke-sessions',
+  'user:disable',
+  'user:enable',
+  'user:unlock',
+  'admin:grant',
+  'admin:revoke',
+]);
+
+/**
+ * A recent login that completed a second factor can open the platform console
+ * without asking for the same OTP twice in a row. The claim is signed by IAM
+ * and the window is intentionally short; anything older falls back to the
+ * explicit fresh-code exchange.
+ */
+function hasFreshLoginMfa(claims: any): boolean {
+  const raw = Number(process.env.PLATFORM_FRESH_MFA_SECONDS ?? 900);
+  const windowMs = Math.min(Math.max(Number.isFinite(raw) ? Math.floor(raw) : 900, 60), 3600) * 1000;
+  const amr = Array.isArray(claims?.amr) ? claims.amr.map(String) : [];
+  const authTime = Number(claims?.auth_time || 0) * 1000;
+  return amr.some((entry: string) => entry === 'totp' || entry === 'recovery' || entry === 'mfa')
+    && authTime > 0
+    && Date.now() - authTime <= windowMs;
+}
+
+async function currentPlatformAdmin(
+  req: express.Request,
+  res: express.Response,
+  minRole: 'auditor' | 'operator' | 'owner' = 'auditor',
+): Promise<{ claims: any; admin: PlatformAdmin; user: User } | null> {
+  if (!platformFeatureEnabled()) {
+    res.status(404).json({ error: 'not_found', message: 'platform administration is disabled' });
+    return null;
+  }
+  const h = firstHeader(req.headers.authorization as any);
+  if (!h.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'unauthorized', message: 'platform administrator Bearer token required' });
+    return null;
+  }
+  let claims: any;
+  try {
+    claims = verifyPlatformAccess(h.slice(7));
+  } catch {
+    await auditPlatformDenied(req, '', null, 'platform:access', 'invalid_platform_token');
+    res.status(403).json({ error: 'platform_admin_required', message: 'a platform administrator token is required' });
+    return null;
+  }
+  const admin = await getPlatformAdmin(String(claims.sub || ''));
+  if (!admin || admin.revoked_at) {
+    await auditPlatformDenied(req, String(claims.sub || ''), null, 'platform:access', 'admin_revoked_or_missing');
+    res.status(403).json({ error: 'platform_admin_inactive', message: 'platform administrator access has been revoked' });
+    return null;
+  }
+  const user = await getUserById(String(claims.sub));
+  if (!user || user.active === false) {
+    await auditPlatformDenied(req, String(claims.sub || ''), user?.org_id || null, 'platform:access', 'account_inactive');
+    res.status(403).json({ error: 'platform_admin_inactive', message: 'platform administrator account is inactive' });
+    return null;
+  }
+  // Long platform sessions remain revocable: revoking sessions/passwords bumps
+  // users.auth_version, so an older token is rejected before its natural expiry.
+  if (Number(claims.ver || 0) !== Number(user.auth_version || 0)) {
+    await auditPlatformDenied(req, user.id, user.org_id, 'platform:access', 'session_revoked');
+    res.status(403).json({ error: 'platform_session_revoked', message: 'the platform session is no longer valid; sign in again' });
+    return null;
+  }
+  const org = await getOrgById(user.org_id);
+  if (!org || (org.kind || 'tenant') !== 'platform') {
+    await auditPlatformDenied(req, user.id, user.org_id, 'platform:access', 'platform_org_required');
+    res.status(403).json({ error: 'platform_admin_org_required', message: 'platform administrators must belong to the platform organization' });
+    return null;
+  }
+  const requireMfa = (process.env.PLATFORM_ADMIN_REQUIRE_MFA ?? 'true') === 'true';
+  if (requireMfa && !(await mfaEnabled(user.id))) {
+    await auditPlatformDenied(req, user.id, user.org_id, 'platform:access', 'mfa_not_enabled');
+    res.status(403).json({ error: 'platform_mfa_required', message: 'enable TOTP MFA before using the platform console' });
+    return null;
+  }
+  if ((PLATFORM_ROLE_RANK[admin.role] || 0) < (PLATFORM_ROLE_RANK[minRole] || 0)) {
+    await auditPlatformDenied(req, user.id, user.org_id, 'platform:access', 'role_required');
+    res.status(403).json({ error: 'platform_role_required', message: `platform ${minRole} role required` });
+    return null;
+  }
+  return { claims, admin, user };
+}
+
+/** Authorized organization contexts for one verified email. Read-only
+ *  metadata; tokens are never minted here. `preferred` lets clients land a
+ *  dual-role Platform Administrator in the platform console without trusting a
+ *  client-side label, while the platform session still requires fresh MFA. */
+async function authorizedContextsFor(user: User) {
+  // Own context is always allowed. Cross-organization rows sharing this email
+  // are revealed only after the caller has proven ownership of that address
+  // (`email_verified`). Password login does not imply verification: a stranger
+  // can self-register a victim's email with their own password.
+  const emailProven = user.email_verified === true;
+  const rows = emailProven ? await listUserRowsByEmail(user.email) : [user];
+  const contexts: any[] = [];
+  for (const row of rows) {
+    if (row.active === false) continue;
+    const org = await getOrgById(row.org_id);
+    if (!org || org.status === 'suspended') continue;
+    if (org.kind === 'platform') {
+      const admin = await getPlatformAdmin(row.id);
+      if (!admin || admin.revoked_at) continue;
+      contexts.push({
+        id: `platform:${org.id}`, type: 'platform', orgId: org.id, slug: org.slug,
+        name: org.display_name, role: admin.role, userId: row.id,
+      });
+    } else {
+      contexts.push({
+        id: `tenant:${org.id}`, type: 'tenant', orgId: org.id, slug: org.slug,
+        name: org.display_name, role: row.is_org_admin ? 'org_admin' : 'member', userId: row.id,
+      });
+    }
+  }
+  contexts.sort((a, b) => (a.type === b.type ? a.slug.localeCompare(b.slug) : a.type === 'platform' ? -1 : 1));
+  const current = contexts.find((c) => c.orgId === user.org_id && c.userId === user.id) || null;
+  const preferred = contexts.find((c) => c.type === 'platform') || current;
+  return { contexts, current, preferred };
+}
+
+/** Attach authoritative context metadata to a freshly issued session. If the
+ *  lookup fails we expose `contextsError` instead of silently pretending the
+ *  account has no contexts (which previously routed superadmins to /dashboard). */
+async function sessionWithContexts(session: Record<string, any>, user: User) {
+  try {
+    const { contexts, current, preferred } = await authorizedContextsFor(user);
+    return { ...session, contexts, currentContext: current, preferredContext: preferred };
+  } catch (e: any) {
+    console.error('[iam][contexts] failed to attach session contexts:', e?.message || e);
+    return { ...session, contexts: null, currentContext: null, preferredContext: null, contextsError: 'contexts_unavailable' };
+  }
+}
+
+/** Resolve the platform identity for a verified user session. Platform
+ *  privileges are bound to the caller's own user row: a same-email membership
+ *  in another organization never upgrades into the platform organization. */
+async function resolvePlatformIdentity(user: User) {
+  const admin = await getPlatformAdmin(user.id);
+  if (!admin || admin.revoked_at) return { status: 'platform_admin_required' as const };
+  const org = await getOrgById(user.org_id);
+  if (!org || (org.kind || 'tenant') !== 'platform' || org.status === 'suspended') {
+    return { status: 'platform_org_required' as const };
+  }
+  return { status: 'ok' as const, user, admin, org };
+}
+
+async function requirePlatformStepUp(
+  req: express.Request,
+  res: express.Response,
+  ctx: { claims: any; user: User },
+  action: string,
+): Promise<boolean> {
+  if ((process.env.PLATFORM_ADMIN_REQUIRE_STEP_UP ?? 'true') !== 'true') return true;
+  const token = firstHeader(req.headers['x-platform-step-up'] as any);
+  const sessionJti = String(ctx.claims?.jti || '');
+  const claims = token ? verifyPlatformStepUp(token, ctx.user.id, action, sessionJti) : null;
+  if (!claims) {
+    await auditPlatformDenied(req, ctx.user.id, ctx.user.org_id, action, 'step_up_required');
+    res.status(403).json({ error: 'platform_step_up_required', message: 'fresh TOTP step-up verification is required for this action' });
+    return false;
+  }
+  const consumed = await consumePlatformStepUp({
+    jti: String(claims.jti),
+    userId: ctx.user.id,
+    sessionJti,
+    action,
+  });
+  if (!consumed) {
+    await auditPlatformDenied(req, ctx.user.id, ctx.user.org_id, action, 'step_up_replayed_or_expired');
+    res.status(403).json({ error: 'platform_step_up_required', message: 'this step-up proof was already used, expired, or belongs to another session' });
+    return false;
+  }
+  return true;
+}
+
+/** Retry a privileged audit insert, then fail closed. Used by platform and
+ *  tenant administrative mutations so a lost audit row is never silent. */
+async function writeAuditStrict(entry: Parameters<typeof logAudit>[0]): Promise<void> {
+  let lastError: any;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await logAudit(entry);
+      return;
+    } catch (e: any) {
+      lastError = e;
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 25 * (attempt + 1)));
+    }
+  }
+  console.error('[iam][audit] privileged audit write failed:', entry.action, lastError?.message || lastError);
+  throw Object.assign(new Error('privileged audit write failed'), {
+    status: 503,
+    code: 'audit_write_failed',
+  });
+}
+
+/** Privileged platform actions must never silently succeed without their
+ *  audit row. Retry transient DB failures, then fail closed with 503. */
+async function auditPlatformAction(
+  req: express.Request,
+  actorId: string,
+  action: string,
+  targetOrgId?: string | null,
+  extra: Record<string, unknown> = {},
+): Promise<void> {
+  const entry = {
+    actor_type: 'platform-admin',
+    actor_id: actorId,
+    action,
+    resource: String(req.path || ''),
+    decision: true,
+    org_id: targetOrgId || null,
+    context: {
+      platformAdmin: true,
+      ...(targetOrgId ? { targetOrg: targetOrgId } : {}),
+      requestId: firstHeader(req.headers['x-request-id'] as any) || '',
+      ...extra,
+    },
+  };
+  await writeAuditStrict(entry);
+}
+
+/** Denied platform-plane attempts are security events too. A denied request
+ *  remains denied even if the audit sink is degraded; log loudly for alerting. */
+async function auditPlatformDenied(
+  req: express.Request,
+  actorId: string,
+  targetOrgId: string | null | undefined,
+  action: string,
+  reason: string,
+): Promise<void> {
+  try {
+    await logAudit({
+      actor_type: 'user',
+      actor_id: actorId || '',
+      action,
+      resource: String(req.path || ''),
+      decision: false,
+      org_id: targetOrgId || null,
+      context: {
+        platformAdmin: false,
+        reason,
+        requestId: firstHeader(req.headers['x-request-id'] as any) || '',
+      },
+    });
+  } catch (e: any) {
+    console.error('[iam][audit] denied-action audit write failed:', action, reason, e?.message || e);
+  }
+}
+
+/** Issue a one-time activation code for a passwordless invited account. */
+async function issueInvite(user: User): Promise<string | null> {
+  if (user.password_hash) return null;
+  const token = newOneTimeToken('invite');
+  await storeOneTimeToken(user.id, token.hash, 'invite', inviteTokenExpiry());
+  return token.value;
+}
+
+function parsePlatformRange(req: express.Request, res: express.Response, defaultHours = 24): { from: Date; to: Date } | null {
+  const to = req.query.to ? new Date(String(req.query.to)) : new Date();
+  const from = req.query.from ? new Date(String(req.query.from)) : new Date(to.getTime() - defaultHours * 3600_000);
+  if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime())) {
+    res.status(400).json({ error: 'invalid_time', message: 'from/to must be valid ISO timestamps' });
+    return null;
+  }
+  const span = to.getTime() - from.getTime();
+  if (span <= 0 || span > 366 * 86_400_000) {
+    res.status(400).json({ error: 'invalid_time', message: 'time range must be positive and at most 366 days' });
+    return null;
+  }
+  return { from, to };
+}
+
 /** Optional OIDC org allowlist (#9): comma-separated slugs. Empty = any slug
  *  is allowed (membership rules below still apply). */
 function oidcAllowedOrgs(): string[] {
@@ -238,13 +622,16 @@ async function resolveOidcIdentity(
   email: string,
   displayName?: string,
   externalSub?: string,
-): Promise<{ user: import('./db').User } | { error: 'org_not_allowed' | 'org_membership_required'; message: string }> {
+): Promise<{ user: import('./db').User } | { error: 'org_not_allowed' | 'org_membership_required' | 'reserved_org_slug'; message: string }> {
   const allowed = oidcAllowedOrgs();
   if (allowed.length && !allowed.includes(slug)) {
     return { error: 'org_not_allowed', message: `organization '${slug}' is not in OIDC_ALLOWED_ORGS` };
   }
   let org = await getOrgBySlug(slug);
   if (!org) {
+    if (slug.toLowerCase() === (process.env.PLATFORM_ORG_SLUG || 'synapseone-platform').toLowerCase()) {
+      return { error: 'reserved_org_slug', message: 'This organization slug is reserved for platform administration.' };
+    }
     try {
       org = await createOrganization(slug, slug);
     } catch (e: any) {
@@ -284,18 +671,30 @@ export function registrationAllowsNewOrgs(): boolean {
 }
 
 /** Dev-only convenience: return reset/verification tokens in the response
- *  (there is no mailer wired by default). Never enabled in production. */
+ *  (there is no mailer wired by default). Opt-in: a deployment must set
+ *  `IAM_EXPOSE_LIFECYCLE_TOKENS=true` explicitly, so an unset/typo'd env can
+ *  never hand a reset token to an unauthenticated caller. Forced off in prod. */
 export function exposesLifecycleTokens(): boolean {
   if (IS_PROD) return false;
-  return (process.env.IAM_EXPOSE_LIFECYCLE_TOKENS ?? 'true') === 'true';
+  return process.env.IAM_EXPOSE_LIFECYCLE_TOKENS === 'true';
 }
 
 /** Issue an access+refresh pair for a user (login/register/refresh). */
-async function issueSession(user: { id: string; email: string; org_id: string }): Promise<{ accessToken: string; expiresIn: number; refreshToken: string; user: unknown }> {
-  const { token, expiresIn } = signAccess({ sub: user.id, email: user.email, org: user.org_id });
+async function issueSession(
+  user: { id: string; email: string; org_id: string; auth_version?: number },
+  options: { amr?: string[]; authTime?: number } = {},
+): Promise<{ accessToken: string; expiresIn: number; refreshToken: string; user: unknown }> {
+  const { token, expiresIn } = signAccess({
+    sub: user.id,
+    email: user.email,
+    org: user.org_id,
+    ver: Number(user.auth_version) || 0,
+    ...(options.amr && options.amr.length ? { amr: options.amr } : {}),
+    ...(options.authTime ? { auth_time: options.authTime } : {}),
+  });
   const rt = newRefreshToken();
   await storeRefresh(user.id, rt.hash, refreshExpiry());
-  return { accessToken: token, expiresIn, refreshToken: rt.value, user };
+  return { accessToken: token, expiresIn, refreshToken: rt.value, user: publicUser(user as User) };
 }
 
 function sendLocked(res: express.Response, seconds: number) {
@@ -338,6 +737,19 @@ async function requireUserCaller(req: express.Request, res: express.Response): P
   const user = await getUserById(claims.sub);
   if (!user) {
     res.status(404).json({ error: 'user_not_found' });
+    return null;
+  }
+  if (user.active === false) {
+    res.status(401).json({ error: 'account_deactivated', message: 'This account has been deactivated.' });
+    return null;
+  }
+  const callerOrg = await getOrgById(user.org_id);
+  if (callerOrg && callerOrg.status === 'suspended') {
+    orgSuspendedResponse(res);
+    return null;
+  }
+  if (Number(claims.ver || 0) !== Number(user.auth_version || 0)) {
+    res.status(401).json({ error: 'token_revoked', message: 'This session was revoked. Sign in again.' });
     return null;
   }
   return user;
@@ -390,13 +802,27 @@ async function resolveServiceIdentity(req: express.Request): Promise<
     if (!claims.account) {
       return { ok: false, error: 'service_account_unbound', status: 403, message: 'Service account has no account binding' };
     }
-    const acc = await getAccountById(claims.account);
+    const sa = await getServiceAccount(String(claims.sub || ''));
+    if (!sa || sa.revoked_at) {
+      return { ok: false, error: 'service_account_revoked', status: 403, message: 'Service account is revoked or missing' };
+    }
+    const acc = await getAccountById(String(claims.account));
+    if (!acc) {
+      return { ok: false, error: 'service_account_unbound', status: 403, message: 'Service account account binding no longer exists' };
+    }
+    if (sa.account_id !== acc.id) {
+      return { ok: false, error: 'service_account_binding_changed', status: 403, message: 'Service account account binding no longer matches its token' };
+    }
+    const org = await getOrgById(acc.org_id);
+    if (!org || org.status === 'suspended') {
+      return { ok: false, error: 'org_suspended', status: 403, message: 'This organization is suspended or missing' };
+    }
     return {
       ok: true,
       kind: 'service-account',
-      id: String(claims.sub || ''),
-      accountId: claims.account,
-      orgId: acc?.org_id || null,
+      id: sa.id,
+      accountId: acc.id,
+      orgId: acc.org_id,
       scopes: Array.isArray(claims.scopes) ? claims.scopes : [],
     };
   }
@@ -404,13 +830,26 @@ async function resolveServiceIdentity(req: express.Request): Promise<
   if (apiKey) {
     const rec = await verifyApiKey(apiKey);
     if (!rec) return { ok: false, error: 'invalid_api_key', status: 401, message: 'API key is invalid or expired' };
+    // Only account-level keys minted by an operator may exchange. A user-bound
+    // key carries that member's authority and must never self-delegate into a
+    // different identity (even the same user or an org admin).
+    if (rec.user_id) {
+      return { ok: false, error: 'exchange_requires_account_key', status: 403, message: 'User-bound API keys cannot exchange for delegated user tokens' };
+    }
     const acc = await getAccountById(rec.account_id);
+    if (!acc) {
+      return { ok: false, error: 'account_not_found', status: 403, message: 'API key account no longer exists' };
+    }
+    const org = await getOrgById(acc.org_id);
+    if (!org || org.status === 'suspended') {
+      return { ok: false, error: 'org_suspended', status: 403, message: 'This organization is suspended or missing' };
+    }
     return {
       ok: true,
       kind: 'apikey',
       id: `apikey:${rec.account_id}`,
       accountId: rec.account_id,
-      orgId: acc?.org_id || null,
+      orgId: acc.org_id,
       scopes: rec.scopes || [],
     };
   }
@@ -556,11 +995,32 @@ export function createApp(): express.Express {
     if (!process.env.DATABASE_URL) {
       throw new Error('[iam] DATABASE_URL must be set in production (in-memory fallback would split-brain).');
     }
+    if (platformFeatureEnabled()) {
+      if ((process.env.PLATFORM_ADMIN_REQUIRE_MFA ?? 'true') !== 'true') {
+        throw new Error('[iam] PLATFORM_ADMIN_REQUIRE_MFA must be true when the platform console is enabled in production.');
+      }
+      if ((process.env.PLATFORM_ADMIN_REQUIRE_STEP_UP ?? 'true') !== 'true') {
+        throw new Error('[iam] PLATFORM_ADMIN_REQUIRE_STEP_UP must be true when the platform console is enabled in production.');
+      }
+      const slug = process.env.PLATFORM_ORG_SLUG || 'synapseone-platform';
+      if (!/^[a-z0-9-]{1,64}$/.test(slug)) {
+        throw new Error('[iam] PLATFORM_ORG_SLUG must match ^[a-z0-9-]{1,64}$.');
+      }
+      for (const [name, value] of [
+        ['PLATFORM_BOOTSTRAP_SECRET', process.env.PLATFORM_BOOTSTRAP_SECRET],
+        ['PLATFORM_RECOVERY_SECRET', process.env.PLATFORM_RECOVERY_SECRET],
+      ] as const) {
+        if (value && value.length < 32) throw new Error(`[iam] ${name} must be at least 32 characters.`);
+      }
+    }
     // OIDC must be browser-reachable: public HTTPS issuer + redirect (issue #21).
     assertOidcConfig();
   }
   const app = express();
   app.disable('x-powered-by');
+  // IAM sits behind the gateway/edge; trust exactly one proxy hop so the
+  // brute-force limiter keys on the real client, never silently on the gateway.
+  if (process.env.NODE_ENV === 'production' || process.env.TRUST_PROXY === '1') app.set('trust proxy', 1);
   // Baseline security headers (no extra dep; API-only service).
   app.use((_req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -628,14 +1088,14 @@ async function auditMutation(req: express.Request, action: string, resource: str
     resolveCallerOrg(req, TRUST_STAMPED),
     resolveCallerUser(req, TRUST_STAMPED),
   ]);
-  await logAudit({
+  await writeAuditStrict({
     actor_type: user ? 'user' : 'service',
     actor_id: user || '',
     action,
     resource,
     decision: true,
     context: { ...(org ? { org } : {}), ...(user ? { callerUser: user } : {}), ...extra },
-  }).catch(() => undefined);
+  });
 }
 
   // Audit retention (opt-in): hourly purge of rows older than N days.
@@ -673,9 +1133,11 @@ async function auditMutation(req: express.Request, action: string, resource: str
     setInterval(sweep, 60 * 60 * 1000).unref?.();
     setTimeout(sweep, 45_000).unref?.();
   }
+  // Hourly usage rollups → Synapse Warehouse (no-op without WAREHOUSE_SERVICE_URL).
+  startUsageRollup();
   const PUBLIC_PREFIXES = ['/v1/auth/'];
   const PUBLIC_EXACT = new Set(['/v1/auth']);
-  app.use(((req: express.Request, res: express.Response, next: express.NextFunction) => {
+  app.use(((async (req: express.Request, res: express.Response, next: express.NextFunction) => {
     const p = req.path;
     if (p === '/health' || PUBLIC_EXACT.has(p) || PUBLIC_PREFIXES.some((x) => p.startsWith(x))) return next();
     // Gateway telemetry + data-plane audit ingest: authenticated by the shared
@@ -706,7 +1168,17 @@ async function auditMutation(req: express.Request, action: string, resource: str
       if (p === '/v1/keys/verify') return next();
       const h = firstHeader(req.headers.authorization as any);
       if (h.startsWith('Bearer ')) {
-        try { verifyAccess(h.slice(7)); return next(); } catch { /* fall through */ }
+        try {
+          const claims = verifyAccess(h.slice(7));
+          const state = await claimsUserStatus(claims);
+          if (state !== 'ok') {
+            if (state === 'org_suspended') return orgSuspendedResponse(res);
+            return res.status(401).json(state === 'revoked'
+              ? { error: 'token_revoked', message: 'This session was revoked. Sign in again.' }
+              : { error: 'account_deactivated', message: 'This account has been deactivated.' });
+          }
+          return next();
+        } catch { /* fall through */ }
       }
       const apiKey = firstHeader(req.headers['x-api-key'] as any);
       if (apiKey) {
@@ -722,7 +1194,14 @@ async function auditMutation(req: express.Request, action: string, resource: str
     const h = firstHeader(req.headers.authorization as any);
     if (h.startsWith('Bearer ')) {
       try {
-        verifyAccess(h.slice(7));
+        const claims = verifyAccess(h.slice(7));
+        const state = await claimsUserStatus(claims);
+        if (state !== 'ok') {
+          if (state === 'org_suspended') return orgSuspendedResponse(res);
+          return res.status(401).json(state === 'revoked'
+            ? { error: 'token_revoked', message: 'This session was revoked. Sign in again.' }
+            : { error: 'account_deactivated', message: 'This account has been deactivated.' });
+        }
         return next();
       } catch { /* fall through to apikey */ }
     }
@@ -738,7 +1217,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
     // GATEWAY_VERIFY_APIKEY=true keeps working without extra config.
     if (p === '/v1/keys/verify') return next();
     return res.status(401).json({ error: 'unauthorized', message: 'Provide Bearer JWT or X-API-Key' });
-  }) as any);
+  })) as any);
 
   // Bọc mọi async handler: Express 4 không catch async throw (treo request /
   // unhandledRejection khi lỗi DB như slug trùng). Map unique-violation → 409.
@@ -766,8 +1245,17 @@ async function auditMutation(req: express.Request, action: string, resource: str
   }
 
   // Brute-force guard for credential endpoints (in-memory; edge WAF still required in prod).
-  const authLimiter = rateLimit(60, 60_000);
-  app.use('/v1/auth/', authLimiter as any);
+  const authLimiter = rateLimit(
+    Math.max(1, Number(process.env.IAM_AUTH_RATE_LIMIT_PER_MIN) || 60),
+    60_000,
+  );
+  // `/v1/auth/verify` is a machine-to-machine token check that Tier-2 calls on
+  // every write. Keep the brute-force ceiling for credential endpoints while
+  // letting verification use the internal-service traffic path.
+  app.use('/v1/auth/', ((req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (req.path === '/verify') return next();
+    return authLimiter(req, res, next);
+  }) as any);
   // SCIM is machine-to-machine but still needs a brute-force / abuse ceiling.
   const scimLimiter = rateLimit(120, 60_000);
   app.use('/scim/', scimLimiter as any);
@@ -799,7 +1287,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
       provider: cfg.provider,
       codeExchange: true,
       // Whether a browser can actually reach the configured IdP (public HTTPS).
+      // Local development may use an http://localhost IdP; production must not.
       issuerPublic: isPublicHttpsUrl(cfg.issuer),
+      ssoAvailable: isPublicHttpsUrl(cfg.issuer) || process.env.NODE_ENV !== 'production',
       demoCallback: isDemoCallbackEnabled(),
       note: 'Federated OIDC upstream. IAM keeps the shadow user + org/account/role/policy authorization.',
     });
@@ -807,9 +1297,25 @@ async function auditMutation(req: express.Request, action: string, resource: str
 
   app.get('/v1/auth/oidc/start', async (req, res) => {
     const cfg = oidcSettings();
-    const org = typeof req.query.org === 'string' && /^[a-z0-9-]{1,64}$/.test(req.query.org) ? req.query.org : 'acme';
-    // HMAC-signed state binds the org + a 10-minute expiry (verified in /callback).
-    const state = signState(org);
+    if (process.env.NODE_ENV === 'production' && !isPublicHttpsUrl(cfg.issuer)) {
+      return res.status(503).json({
+        error: 'sso_unavailable',
+        message: 'SSO is not available: the configured issuer is not a public HTTPS URL.',
+      });
+    }
+    const org = typeof req.query.org === 'string' ? req.query.org.trim().toLowerCase() : '';
+    if (!/^[a-z0-9-]{1,64}$/.test(org)) {
+      return res.status(400).json({
+        error: 'oidc_org_required',
+        message: 'Choose an organization before signing in with SSO.',
+      });
+    }
+    const allowed = oidcAllowedOrgs();
+    if (allowed.length && !allowed.includes(org)) {
+      return res.status(403).json({ error: 'org_not_allowed', message: `organization '${org}' is not allowed for SSO` });
+    }
+    // Signed state binds org + nonce + encrypted PKCE verifier + 10-minute expiry.
+    const { state, nonce, codeChallenge } = createOidcState(org);
     try {
       // Use the IdP's discovery document instead of guessing `<issuer>/authorize`;
       // this validates the endpoint (https + issuer origin in production).
@@ -820,9 +1326,12 @@ async function auditMutation(req: express.Request, action: string, resource: str
         scope: 'openid email profile',
         redirect_uri: cfg.redirectUri,
         state,
+        nonce,
+        code_challenge: codeChallenge,
+        code_challenge_method: 'S256',
       });
       const sep = endpoint.includes('?') ? '&' : '?';
-      res.json({ authorizeUrl: `${endpoint}${sep}${params.toString()}`, state });
+      res.json({ authorizeUrl: `${endpoint}${sep}${params.toString()}`, state, nonce });
     } catch (e: any) {
       if (e instanceof OidcError) {
         return res.status(e.status).json({ error: e.code, message: e.message, issuer: cfg.issuer });
@@ -854,11 +1363,23 @@ async function auditMutation(req: express.Request, action: string, resource: str
             return res.status(403).json({ error: resolved.error, message: resolved.message });
           }
           const user = await bootstrapOrgAdmin(resolved.user);
-          const { token, expiresIn } = signAccess({ sub: user.id, email: user.email, org: user.org_id });
-          const rt = newRefreshToken();
-          await storeRefresh(user.id, rt.hash, refreshExpiry());
+          if (user.active === false) return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated.' });
+          const oidcOrg = await getOrgById(user.org_id);
+          if (oidcOrg && oidcOrg.status === 'suspended') return orgSuspendedResponse(res);
+          // Do not silently bypass local MFA assurance. Users with an enrolled
+          // TOTP factor must complete it even when the upstream IdP signed them in.
+          if (await mfaEnabled(user.id)) {
+            const left = await lockRemaining(user.id);
+            if (left > 0) return sendLocked(res, left);
+            return sendMfaChallenge(res, user.id, 'oidc');
+          }
+          const session = await sessionWithContexts(await issueSession(user), user);
+          await logAudit({
+            actor_type: 'user', actor_id: user.id, action: 'iam:auth:login', resource: `user:${user.id}`,
+            decision: true, context: { org: user.org_id, method: 'oidc', provider: oidcSettings().provider },
+          }).catch(() => undefined);
           noStore(res);
-          return res.json({ accessToken: token, expiresIn, refreshToken: rt.value, user });
+          return res.json(session);
         } catch (e: any) {
           if (e instanceof OidcError) {
             return res.status(e.status).json({ error: e.code, message: e.message });
@@ -889,11 +1410,13 @@ async function auditMutation(req: express.Request, action: string, resource: str
         return res.status(403).json({ error: resolved.error, message: resolved.message });
       }
       const user = await bootstrapOrgAdmin(resolved.user);
-      const { token, expiresIn } = signAccess({ sub: user.id, email: user.email, org: user.org_id });
-      const rt = newRefreshToken();
-      await storeRefresh(user.id, rt.hash, refreshExpiry());
+      if (user.active === false) return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated.' });
+      const demoOrg = await getOrgById(user.org_id);
+      if (demoOrg && demoOrg.status === 'suspended') return orgSuspendedResponse(res);
+      if (await mfaEnabled(user.id)) return sendMfaChallenge(res, user.id, 'oidc');
+      const session = await sessionWithContexts(await issueSession(user), user);
       noStore(res);
-      res.json({ accessToken: token, expiresIn, refreshToken: rt.value, user });
+      res.json(session);
     } catch (e: any) {
       res.status(500).json({ error: 'oidc_callback_failed', message: e.message });
     }
@@ -917,6 +1440,11 @@ async function auditMutation(req: express.Request, action: string, resource: str
     }
     if (write && !token.scopes.includes('scim:write')) {
       res.status(403).json({ schemas: ['urn:ietf:params:scim:api:messages:2.0:Error'], detail: 'scim:write scope required', status: '403' });
+      return null;
+    }
+    const scimOrg = await getOrgById(token.orgId);
+    if (!scimOrg || scimOrg.status === 'suspended') {
+      res.status(403).json({ schemas: ['urn:ietf:params:scim:api:messages:2.0:Error'], detail: 'organization is suspended', status: '403' });
       return null;
     }
     return token;
@@ -1213,6 +1741,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
   app.post('/v1/scim/tokens', async (req, res) => {
     const org = await resolveCallerOrg(req, TRUST_STAMPED);
     if (!org) return res.status(403).json({ error: 'org_required', message: 'SCIM tokens are org-scoped' });
+    if (!(await requireSensitiveMutation(req, res, TRUST_STAMPED, org, 'iam:scim:token:create'))) return;
     const b = (req.body || {}) as any;
     const scopes = Array.isArray(b.scopes)
       ? b.scopes.map(String).filter((s: string) => s === 'scim:read' || s === 'scim:write')
@@ -1234,6 +1763,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
   app.get('/v1/scim/tokens', async (req, res) => {
     const org = await resolveCallerOrg(req, TRUST_STAMPED);
     if (!org) return res.status(403).json({ error: 'org_required' });
+    if (!(await requireSensitiveMutation(req, res, TRUST_STAMPED, org, 'iam:scim:token:list'))) return;
     res.setHeader('cache-control', 'no-store');
     res.json({ items: await listScimTokens(org) });
   });
@@ -1241,6 +1771,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
   app.delete('/v1/scim/tokens/:id', async (req, res) => {
     const org = await resolveCallerOrg(req, TRUST_STAMPED);
     if (!org) return res.status(403).json({ error: 'org_required' });
+    if (!(await requireSensitiveMutation(req, res, TRUST_STAMPED, org, 'iam:scim:token:revoke'))) return;
     if (!isUuid(req.params.id)) return res.status(400).json({ error: 'invalid_id' });
     const ok = await revokeScimToken(org, req.params.id);
     if (!ok) return res.status(404).json({ error: 'not_found' });
@@ -1271,6 +1802,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       if (user && user.active === false) {
         return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated by an administrator.' });
       }
+      if (user && org && org.status === 'suspended') return orgSuspendedResponse(res);
       if (!user || !ok) {
         const lockedFor = user ? await recordLoginFailure(user.id) : 0;
         await logAudit({
@@ -1283,7 +1815,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       // keep counting until the whole login succeeds.
       if (await mfaEnabled(user.id)) return sendMfaChallenge(res, user.id, 'pwd');
       await clearLoginFailures(user.id);
-      const session = await issueSession(user);
+      const session = await sessionWithContexts(await issueSession(user), user);
       await logAudit({
         actor_type: 'user', actor_id: user.id, action: 'iam:auth:login', resource: `org:${user.org_id}`,
         decision: true, context: { method: 'password', org: user.org_id },
@@ -1298,7 +1830,12 @@ async function auditMutation(req: express.Request, action: string, resource: str
         message: 'Passwordless dev login is disabled. Use email+password or the OIDC flow.',
       });
     }
-    const org = (await getOrgBySlug(slug)) || (await createOrganization(slug, slug));
+    const existingOrg = await getOrgBySlug(slug);
+    if (!existingOrg && slug.toLowerCase() === (process.env.PLATFORM_ORG_SLUG || 'synapseone-platform').toLowerCase()) {
+      return res.status(403).json({ error: 'reserved_org_slug', message: 'This organization slug is reserved for platform administration.' });
+    }
+    const org = existingOrg || (await createOrganization(slug, slug));
+    if (org.status === 'suspended') return orgSuspendedResponse(res);
     const user = await bootstrapOrgAdmin(await upsertUser(org.id, email, email));
     if (user.active === false) {
       return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated by an administrator.' });
@@ -1308,7 +1845,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       if (left > 0) return sendLocked(res, left);
       return sendMfaChallenge(res, user.id, 'dev');
     }
-    const session = await issueSession(user);
+    const session = await sessionWithContexts(await issueSession(user), user);
     noStore(res);
     res.json(session);
   });
@@ -1331,6 +1868,8 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (user.active === false) {
       return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated by an administrator.' });
     }
+    const mfaOrg = await getOrgById(user.org_id);
+    if (mfaOrg && mfaOrg.status === 'suspended') return orgSuspendedResponse(res);
     const left = await lockRemaining(user.id);
     if (left > 0) return sendLocked(res, left);
     const result = await checkSecondFactor(user.id, { code, recoveryCode });
@@ -1343,7 +1882,10 @@ async function auditMutation(req: express.Request, action: string, resource: str
       return res.status(401).json({ error: 'invalid_mfa_code', message: 'The verification code is incorrect' });
     }
     await clearLoginFailures(user.id);
-    const session = await issueSession(user);
+    const session = await sessionWithContexts(await issueSession(user, {
+      amr: ['pwd', result.method === 'recovery' ? 'recovery' : 'totp'],
+      authTime: Math.floor(Date.now() / 1000),
+    }), user);
     await logAudit({
       actor_type: 'user', actor_id: user.id, action: 'iam:auth:login', resource: `org:${user.org_id}`,
       decision: true, context: { method: challenge.amr[0] || 'pwd', mfa: result.method, org: user.org_id, recoveryCodesRemaining: result.remainingRecovery },
@@ -1455,6 +1997,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
 
     let org = await getOrgBySlug(slug);
     if (!org) {
+      if (slug.toLowerCase() === (process.env.PLATFORM_ORG_SLUG || 'synapseone-platform').toLowerCase()) {
+        return res.status(403).json({ error: 'reserved_org_slug', message: 'This organization slug is reserved for platform administration.' });
+      }
       if (!registrationAllowsNewOrgs()) {
         return res.status(403).json({ error: 'unknown_org', message: 'Organization does not exist and self-service org creation is disabled' });
       }
@@ -1465,16 +2010,22 @@ async function auditMutation(req: express.Request, action: string, resource: str
         if (!org) throw e;
       }
     } else {
-      // Joining an EXISTING org requires an invitation (an existing user row):
-      // org membership grants org-wide access, so this must never be
-      // self-service by guessing a slug (same rule as the OIDC callback).
+      // Joining an EXISTING org requires a one-time invite code. Membership
+      // grants org-wide access, so an email+slug guess must never be enough.
       const existing = await findUserByOrgEmail(org.id, email);
       if (!existing) {
         return res.status(403).json({
           error: 'org_membership_required',
-          message: 'Your email is not invited to this organization. Ask an admin to invite you, or choose a new organization slug.',
+          message: 'Your email is not invited to this organization. Ask an admin to invite you.',
         });
       }
+      if (existing.password_hash) {
+        return res.status(409).json({ error: 'account_exists', message: 'An account with this email already has a password. Sign in or reset it.' });
+      }
+      return res.status(403).json({
+        error: 'invite_required',
+        message: 'Use the one-time activation code from your administrator.',
+      });
     }
     const existing = await findUserByOrgEmail(org.id, email);
     if (existing?.password_hash) {
@@ -1484,7 +2035,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
     await setUserPassword(user.id, await hashPassword(password));
     const verify = newOneTimeToken('verify');
     await storeOneTimeToken(user.id, verify.hash, 'verify', verifyTokenExpiry());
-    const session = await issueSession(user);
+    const session = await sessionWithContexts(await issueSession(user), user);
     await logAudit({
       actor_type: 'user', actor_id: user.id, action: 'iam:user:register', resource: `org:${org.id}`,
       decision: true, context: { org: org.id, email },
@@ -1492,9 +2043,45 @@ async function auditMutation(req: express.Request, action: string, resource: str
     noStore(res);
     res.status(201).json({
       ...session,
-      user: { ...(session.user as any), email_verified: false },
+      user: { ...publicUser(user), email_verified: false },
       ...(exposesLifecycleTokens() ? { emailVerificationToken: verify.value } : {}),
     });
+  });
+
+  /** Activate an invited account with a one-time invite code. The code is
+   *  generated by a platform admin (or org admin) and returned exactly once. */
+  app.post('/v1/auth/invite/accept', async (req, res) => {
+    const schema = z.object({
+      token: z.string().trim().min(10).max(512),
+      password: z.string().min(1).max(PASSWORD_MAX),
+      displayName: z.string().trim().max(200).nullish(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    let userId: string | null = null;
+    for (const hash of hashCandidates(parsed.data.token)) {
+      userId = await consumeOneTimeToken(hash, 'invite');
+      if (userId) break;
+    }
+    if (!userId) {
+      return res.status(400).json({ error: 'invalid_invite_token', message: 'This activation code is invalid, expired or already used.' });
+    }
+    const user = await getUserById(userId);
+    if (!user) return res.status(404).json({ error: 'user_not_found' });
+    if (user.active === false) return res.status(403).json({ error: 'account_deactivated' });
+    if (user.password_hash) return res.status(409).json({ error: 'account_exists', message: 'This account already has a password.' });
+    const policyErr = passwordPolicyError(parsed.data.password, user.email);
+    if (policyErr) return res.status(400).json({ error: 'weak_password', message: policyErr });
+    await setUserPassword(user.id, await hashPassword(parsed.data.password));
+    if (parsed.data.displayName) await updateUserProfile(user.id, { displayName: sanitizeName(parsed.data.displayName) });
+    const fresh = (await getUserById(user.id)) || user;
+    const session = await sessionWithContexts(await issueSession(fresh), fresh);
+    await logAudit({
+      actor_type: 'user', actor_id: user.id, action: 'iam:user:invite-accept', resource: `user:${user.id}`,
+      decision: true, context: { org: user.org_id },
+    }).catch(() => undefined);
+    noStore(res);
+    return res.status(201).json(session);
   });
 
   app.post('/v1/auth/password/change', async (req, res) => {
@@ -1665,8 +2252,14 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
     const { userId, accountId, orgId, scopes: requested, audience, ttlSeconds } = parsed.data;
 
+    if (!caller.orgId) return res.status(403).json({ error: 'caller_org_unbound', message: 'The calling credential has no organization binding' });
     const user = await getUserById(userId);
     if (!user) return res.status(404).json({ error: 'user_not_found' });
+    if (user.active === false) return res.status(403).json({ error: 'account_deactivated', message: 'The target account is deactivated' });
+    const targetOrg = await getOrgById(user.org_id);
+    if (!targetOrg || targetOrg.status === 'suspended') {
+      return res.status(403).json({ error: 'org_suspended', message: 'The target organization is suspended or missing' });
+    }
 
     // Target tenant binding: the caller's account/org decides what is reachable.
     const account = await getAccountById(accountId || caller.accountId);
@@ -1688,6 +2281,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
 
     const { token, expiresIn } = signDelegated({
       userId: user.id,
+      ver: Number(user.auth_version) || 0,
       org: user.org_id,
       account: account.id,
       scopes,
@@ -1742,7 +2336,10 @@ async function auditMutation(req: express.Request, action: string, resource: str
     const rt = newRefreshToken();
     await storeRefresh(rec.user_id, rt.hash, refreshExpiry());
     const user = await getUserById(rec.user_id).catch(() => null);
-    const { token, expiresIn } = signAccess(user ? { sub: user.id, email: user.email, org: user.org_id } : { sub: rec.user_id });
+    if (!user || user.active === false) return res.status(401).json({ error: 'account_deactivated' });
+    const org = await getOrgById(user.org_id);
+    if (org && org.status === 'suspended') return orgSuspendedResponse(res);
+    const { token, expiresIn } = signAccess({ sub: user.id, email: user.email, org: user.org_id, ver: Number(user.auth_version) || 0 });
     noStore(res);
     res.json({ accessToken: token, expiresIn, refreshToken: rt.value });
   });
@@ -1774,26 +2371,187 @@ async function auditMutation(req: express.Request, action: string, resource: str
       const decoded: any = verifyAccess(h.slice(7));
       const user = await getUserById(decoded.sub);
       if (!user) return res.status(404).json({ error: 'user_not_found' });
-      res.json({ user, kind: decoded.kind || 'user' });
+      if (user.active === false) return res.status(401).json({ error: 'account_deactivated', message: 'This account has been deactivated.' });
+      if (Number(decoded.ver || 0) !== Number(user.auth_version || 0)) {
+        return res.status(401).json({ error: 'token_revoked', message: 'This session was revoked. Sign in again.' });
+      }
+      const meOrg = await getOrgById(user.org_id);
+      if (meOrg && meOrg.status === 'suspended') return orgSuspendedResponse(res);
+      res.json({ user: publicUser(user), kind: decoded.kind || 'user' });
     } catch (e: any) {
       return res.status(401).json({ error: 'invalid_token', message: e.message });
     }
+  });
+
+
+  /** Authorized contexts for the signed-in email. Read-only metadata; no
+   *  tokens are minted here. Platform context still requires its own MFA
+   *  exchange, and tenant switches revalidate membership server-side. */
+  app.get('/v1/auth/contexts', async (req, res) => {
+    const h = firstHeader(req.headers.authorization as any);
+    if (!h.startsWith('Bearer ')) return res.status(401).json({ error: 'unauthorized' });
+    let claims: any;
+    try { claims = verifyAccess(h.slice(7)); } catch { return res.status(401).json({ error: 'invalid_token' }); }
+    if (claims.kind && claims.kind !== 'user') return res.status(403).json({ error: 'user_session_required' });
+    const user = await getUserById(String(claims.sub));
+    if (!user || user.active === false) return res.status(401).json({ error: 'account_deactivated' });
+    if (Number(claims.ver || 0) !== Number(user.auth_version || 0)) {
+      return res.status(401).json({ error: 'token_revoked', message: 'This session was revoked. Sign in again.' });
+    }
+    const currentOrg = await getOrgById(user.org_id);
+    if (!currentOrg) return res.status(404).json({ error: 'org_not_found' });
+    if (currentOrg.status === 'suspended') return orgSuspendedResponse(res);
+    const { contexts, current, preferred } = await authorizedContextsFor(user);
+    res.json({
+      current,
+      contexts,
+      preferred,
+      platformPreferred: preferred?.type === 'platform' && preferred.id !== current?.id,
+    });
+  });
+
+  app.post('/v1/auth/contexts/switch', loginLimiter, async (req, res) => {
+    const h = firstHeader(req.headers.authorization as any);
+    if (!h.startsWith('Bearer ')) return res.status(401).json({ error: 'unauthorized' });
+    let claims: any;
+    try { claims = verifyAccess(h.slice(7)); } catch { return res.status(401).json({ error: 'invalid_token' }); }
+    if (claims.kind && claims.kind !== 'user') return res.status(403).json({ error: 'user_session_required' });
+    const currentUser = await getUserById(String(claims.sub));
+    if (!currentUser || currentUser.active === false) return res.status(401).json({ error: 'account_deactivated' });
+    if (Number(claims.ver || 0) !== Number(currentUser.auth_version || 0)) return res.status(401).json({ error: 'token_revoked' });
+    const currentOrg = await getOrgById(currentUser.org_id);
+    if (!currentOrg) return res.status(404).json({ error: 'org_not_found' });
+    if (currentOrg.status === 'suspended') return orgSuspendedResponse(res);
+    const parsed = z.object({
+      orgId: z.string().uuid(),
+      // A context switch is a fresh authentication of the target identity, not
+      // an email lookup. The target row's own password is always required.
+      password: z.string().max(PASSWORD_MAX).optional(),
+    }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: 'orgId (uuid) and target password required' });
+    const targetOrg = await getOrgById(parsed.data.orgId);
+    if (!targetOrg || targetOrg.status === 'suspended') return res.status(404).json({ error: 'org_not_found' });
+    if (targetOrg.kind === 'platform') {
+      return res.status(409).json({
+        error: 'platform_context_login_required',
+        message: 'Sign in with the platform organization and complete MFA to enter Platform Administration.',
+        orgSlug: targetOrg.slug,
+      });
+    }
+    const rows = await listUserRowsByEmail(currentUser.email);
+    const membership = rows.find((u) => u.org_id === targetOrg.id && u.active !== false);
+    // Context discovery returns metadata, not password material. Reload the
+    // authoritative identity for authentication (the PostgreSQL projection
+    // intentionally omits password_hash).
+    const target = membership ? await getUserById(membership.id) : null;
+    if (!target || target.active === false || target.org_id !== targetOrg.id
+      || target.email.trim().toLowerCase() !== currentUser.email.trim().toLowerCase()) {
+      return res.status(403).json({ error: 'context_not_authorized', message: 'No membership for this organization.' });
+    }
+    if (!target.password_hash) {
+      // OIDC-only / invited rows must establish their own session. Never mint
+      // one from another row that merely shares the email address.
+      return res.status(403).json({
+        error: 'target_login_required',
+        message: 'Sign in with this organization to establish its session.',
+        orgSlug: targetOrg.slug,
+      });
+    }
+    if (typeof parsed.data.password !== 'string' || parsed.data.password.length === 0) {
+      return res.status(401).json({ error: 'target_password_required', message: 'Enter the target organization password to switch.' });
+    }
+    const left = await lockRemaining(target.id);
+    if (left > 0) return sendLocked(res, left);
+    if (!(await verifyPassword(parsed.data.password, target.password_hash))) {
+      const lockedFor = await recordLoginFailure(target.id);
+      await logAudit({
+        actor_type: 'user', actor_id: target.id, action: 'iam:auth:context-switch', resource: `org:${targetOrg.id}`,
+        decision: false, context: { fromOrg: currentUser.org_id, toOrg: targetOrg.id, method: 'password', ...(lockedFor ? { lockedForSeconds: lockedFor } : {}) },
+      }).catch(() => undefined);
+      return res.status(401).json({ error: 'invalid_credentials', message: 'Email or password is incorrect' });
+    }
+    // The target row's own second factor is mandatory; the caller row's MFA
+    // (or a matching email) is never accepted as proof for another identity.
+    if (await mfaEnabled(target.id)) return sendMfaChallenge(res, target.id, 'context');
+    await clearLoginFailures(target.id);
+    const session = await sessionWithContexts(await issueSession(target), target);
+    await logAudit({
+      actor_type: 'user', actor_id: target.id, action: 'iam:auth:context-switch', resource: `org:${targetOrg.id}`,
+      decision: true, context: { fromOrg: currentUser.org_id, toOrg: targetOrg.id, method: 'password' },
+    }).catch(() => undefined);
+    noStore(res);
+    res.json({ ...session, context: { id: `tenant:${targetOrg.id}`, type: 'tenant', orgId: targetOrg.id, slug: targetOrg.slug, name: targetOrg.display_name, role: target.is_org_admin ? 'org_admin' : 'member' } });
   });
 
   app.get('/v1/auth/verify', async (req, res) => {    const h = firstHeader(req.headers.authorization as any);
     const apiKey = firstHeader(req.headers['x-api-key'] as any);
     if (h.startsWith('Bearer ')) {
       try {
-        const decoded = verifyAccess(h.slice(7));
+        const decoded: any = verifyAccess(h.slice(7));
+        if (decoded.kind === 'exec-delegated') {
+          // Execution grants are data-plane-only and die when the execution is
+          // completed/released, the runner is disabled/deleted, or they expire.
+          const grant = await verifyExecutionDelegation(String(decoded.jti || ''));
+          if (!grant
+            || grant.execution_id !== String(decoded.exec || '')
+            || grant.runner_id !== String(decoded.runner || '')) {
+            return res.status(401).json({ valid: false, error: 'delegation_revoked', message: 'This execution grant was revoked or expired.' });
+          }
+        }
+        if (decoded.kind !== 'service-account') {
+          const user = await getUserById(String(decoded.sub || ''));
+          if (!user || user.active === false) {
+            return res.status(401).json({ valid: false, error: 'account_deactivated', message: 'This account has been deactivated.' });
+          }
+          if (Number(decoded.ver || 0) !== Number(user.auth_version || 0)) {
+            return res.status(401).json({ valid: false, error: 'token_revoked', message: 'This session was revoked. Sign in again.' });
+          }
+          const verifyOrg = await getOrgById(user.org_id);
+          if (verifyOrg && verifyOrg.status === 'suspended') {
+            return res.status(403).json({ valid: false, error: 'org_suspended', message: 'This organization is suspended.' });
+          }
+        } else if (decoded.kind === 'service-account') {
+          const sa = await getServiceAccount(String(decoded.sub || ''));
+          const account = decoded.account ? await getAccountById(String(decoded.account)) : null;
+          const org = account ? await getOrgById(account.org_id) : null;
+          if (!sa || sa.revoked_at) return res.status(403).json({ valid: false, error: 'service_account_revoked' });
+          if (!account || !org || org.status === 'suspended') {
+            return res.status(403).json({ valid: false, error: 'org_suspended', message: 'This organization is suspended.' });
+          }
+        }
         return res.json({ valid: true, type: 'jwt', claims: decoded });
       } catch (e: any) {
-        return res.status(401).json({ valid: false, message: e.message });
+        const message = String(e?.message || 'invalid token');
+        return res.status(401).json({
+          valid: false,
+          ...(/expired/i.test(message) ? { error: 'token_expired' } : {}),
+          message,
+        });
       }
     }
     if (apiKey) {
       const rec = await verifyApiKey(apiKey);
-      if (!rec) return res.status(401).json({ valid: false });
-      return res.json({ valid: true, type: 'apikey', ...rec });
+      if (rec) {
+        const acc = rec.account_id ? await getAccountById(rec.account_id) : null;
+        const keyOrg = acc ? await getOrgById(acc.org_id) : null;
+        if (!acc || !keyOrg || keyOrg.status === 'suspended') {
+          return res.status(403).json({ valid: false, error: 'org_suspended' });
+        }
+        return res.json({ valid: true, type: 'apikey', ...rec, org_id: keyOrg.id });
+      }
+      const runnerKey = await verifyPlatformRunnerKey(apiKey);
+      if (runnerKey) {
+        return res.json({
+          valid: true,
+          type: 'platform-runner-key',
+          kind: 'platform-runner',
+          id: runnerKey.id,
+          runner_id: runnerKey.runner_id,
+          name: runnerKey.name,
+          scopes: runnerKey.scopes,
+        });
+      }
+      return res.status(401).json({ valid: false });
     }
     return res.status(400).json({ error: 'credential_required', message: 'provide Bearer or X-API-Key' });
   });
@@ -1813,11 +2571,25 @@ async function auditMutation(req: express.Request, action: string, resource: str
         displayName: z.string().trim().min(2).max(200),
       });
       const b = schema.parse(req.body);
-      const created = await createOrganization(sanitizeName(b.slug, 64), sanitizeName(b.displayName));
-      await auditMutation(req, 'iam:org:create', `org:${created.id}`, { slug: created.slug });
+      const allowDirect = (process.env.IAM_ALLOW_DIRECT_ORG_CREATE ?? (IS_PROD ? 'false' : 'true')) === 'true';
+      if (!allowDirect) {
+        return res.status(403).json({
+          error: 'platform_org_create_required',
+          message: 'organization creation is managed by a platform administrator',
+        });
+      }
+      const created = await withTransaction(async () => {
+        const org = await createOrganization(sanitizeName(b.slug, 64), sanitizeName(b.displayName));
+        await auditMutation(req, 'iam:org:create', `org:${org.id}`, { slug: org.slug });
+        return org;
+      });
       res.status(201).json(created);
     } catch (e: any) {
-      if (e?.code === '23505' || e?.status === 409) {
+      if (e?.code === 'audit_write_failed' || e?.status === 503) throw e;
+      if (e?.code === 'reserved_org_slug' || e?.status === 403) {
+        return res.status(403).json({ error: 'reserved_org_slug', message: 'This organization slug is reserved for platform administration.' });
+      }
+      if (isUniqueViolation(e) || e?.status === 409) {
         return res.status(409).json({ error: 'conflict', message: 'organization slug exists' });
       }
       res.status(400).json({ error: 'invalid_body', message: e.message });
@@ -1846,11 +2618,16 @@ async function auditMutation(req: express.Request, action: string, resource: str
       if (!(await canActForOrg(req, TRUST_STAMPED, req.params.orgId))) {
         return res.status(403).json({ error: 'forbidden', message: 'organization belongs to another tenant' });
       }
-      const created = await createAccount(req.params.orgId, b.slug, sanitizeName(b.displayName));
-      await auditMutation(req, 'iam:account:create', `account:${created.id}`, { org: req.params.orgId, slug: created.slug });
+      if (!(await requireSensitiveMutation(req, res, TRUST_STAMPED, req.params.orgId, 'iam:account:create'))) return;
+      const created = await withTransaction(async () => {
+        const account = await createAccount(req.params.orgId, b.slug, sanitizeName(b.displayName));
+        await auditMutation(req, 'iam:account:create', `account:${account.id}`, { org: req.params.orgId, slug: account.slug });
+        return account;
+      });
       res.status(201).json(created);
     } catch (e: any) {
-      if (e?.code === '23505' || e?.status === 409) {
+      if (e?.code === 'audit_write_failed' || e?.status === 503) throw e;
+      if (isUniqueViolation(e) || e?.status === 409) {
         return res.status(409).json({ error: 'conflict', message: 'account slug exists' });
       }
       res.status(400).json({ error: 'invalid_body', message: e.message });
@@ -1873,9 +2650,14 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!(await canActForOrg(req, TRUST_STAMPED, req.params.orgId))) {
       return res.status(403).json({ error: 'forbidden', message: 'organization belongs to another tenant' });
     }
-    const created = await upsertUser(req.params.orgId, email, displayName ? sanitizeName(displayName) : undefined);
-    await auditMutation(req, 'iam:user:create', `user:${created.id}`, { org: req.params.orgId, email });
-    res.status(201).json(created);
+    if (!(await requireSensitiveMutation(req, res, TRUST_STAMPED, req.params.orgId, 'iam:user:create'))) return;
+    const result = await withTransaction(async () => {
+      const created = await upsertUser(req.params.orgId, email, displayName ? sanitizeName(displayName) : undefined);
+      const inviteToken = await issueInvite(created);
+      await auditMutation(req, 'iam:user:create', `user:${created.id}`, { org: req.params.orgId, email, inviteIssued: !!inviteToken });
+      return { created, inviteToken };
+    });
+    res.status(201).json({ ...publicUser(result.created), inviteToken: result.inviteToken });
   });
 
   app.get('/v1/orgs/:orgId/users', async (req, res) => {
@@ -1904,8 +2686,13 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!(await canActForAccount(req, TRUST_STAMPED, req.params.accountId))) {
       return res.status(403).json({ error: 'forbidden', message: 'account belongs to another tenant' });
     }
-    const created = await createRole(req.params.accountId, slug, sanitizeName(description || ''));
-    await auditMutation(req, 'iam:role:create', `role:${created.id}`, { account: req.params.accountId, slug });
+    const orgId = await orgForAccount(req.params.accountId);
+    if (!orgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, orgId, 'iam:role:create'))) return;
+    const created = await withTransaction(async () => {
+      const role = await createRole(req.params.accountId, slug, sanitizeName(description || ''));
+      await auditMutation(req, 'iam:role:create', `role:${role.id}`, { account: req.params.accountId, slug });
+      return role;
+    });
     res.status(201).json(created);
   });
 
@@ -1937,9 +2724,15 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!(await canActForAccount(req, TRUST_STAMPED, role.account_id))) {
       return res.status(403).json({ error: 'forbidden', message: 'role belongs to another tenant' });
     }
-    const ok = await deleteRole(req.params.roleId);
+    const orgId = await orgForAccount(role.account_id);
+    if (!orgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, orgId, 'iam:role:delete'))) return;
+    const ok = await withTransaction(async () => {
+      const deleted = await deleteRole(req.params.roleId);
+      if (!deleted) return false;
+      await auditMutation(req, 'iam:role:delete', `role:${req.params.roleId}`, { account: role.account_id });
+      return true;
+    });
     if (!ok) return res.status(404).json({ error: 'role_not_found' });
-    await auditMutation(req, 'iam:role:delete', `role:${req.params.roleId}`, { account: role.account_id });
     res.json({ ok: true });
   });
 
@@ -1965,9 +2758,14 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!(await canActForAccount(req, TRUST_STAMPED, req.params.accountId))) {
       return res.status(403).json({ error: 'forbidden', message: 'account belongs to another tenant' });
     }
+    const orgId = await orgForAccount(req.params.accountId);
+    if (!orgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, orgId, 'iam:policy:create'))) return;
     const desc = description || (managed ? `${managed} (managed): ${MANAGED_POLICIES[managed].description}` : '');
-    const created = await createPolicy(req.params.accountId, slug, sanitizeName(desc), document);
-    await auditMutation(req, 'iam:policy:create', `policy:${created.id}`, { account: req.params.accountId, slug, ...(managed ? { managed } : {}) });
+    const created = await withTransaction(async () => {
+      const policy = await createPolicy(req.params.accountId, slug, sanitizeName(desc), document);
+      await auditMutation(req, 'iam:policy:create', `policy:${policy.id}`, { account: req.params.accountId, slug, ...(managed ? { managed } : {}) });
+      return policy;
+    });
     res.status(201).json(created);
   });
 
@@ -1988,9 +2786,15 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!(await canActForAccount(req, TRUST_STAMPED, pol.account_id))) {
       return res.status(403).json({ error: 'forbidden', message: 'policy belongs to another tenant' });
     }
-    const ok = await deletePolicy(req.params.policyId);
+    const orgId = await orgForAccount(pol.account_id);
+    if (!orgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, orgId, 'iam:policy:delete'))) return;
+    const ok = await withTransaction(async () => {
+      const deleted = await deletePolicy(req.params.policyId);
+      if (!deleted) return false;
+      await auditMutation(req, 'iam:policy:delete', `policy:${req.params.policyId}`, { account: pol.account_id });
+      return true;
+    });
     if (!ok) return res.status(404).json({ error: 'policy_not_found' });
-    await auditMutation(req, 'iam:policy:delete', `policy:${req.params.policyId}`, { account: pol.account_id });
     res.json({ ok: true });
   });
 
@@ -2010,8 +2814,12 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!(await canActForAccount(req, TRUST_STAMPED, role.account_id))) {
       return res.status(403).json({ error: 'forbidden', message: 'role belongs to another tenant' });
     }
-    await attachPolicy(req.params.roleId, req.body.policyId);
-    await auditMutation(req, 'iam:policy:attach', `role:${req.params.roleId}`, { policyId: req.body.policyId, account: role.account_id });
+    const orgId = await orgForAccount(role.account_id);
+    if (!orgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, orgId, 'iam:policy:attach'))) return;
+    await withTransaction(async () => {
+      await attachPolicy(req.params.roleId, req.body.policyId);
+      await auditMutation(req, 'iam:policy:attach', `role:${req.params.roleId}`, { policyId: req.body.policyId, account: role.account_id });
+    });
     res.json({ ok: true });
   });
   app.delete('/v1/roles/:roleId/policies/:policyId', async (req, res) => {
@@ -2024,8 +2832,12 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!(await canActForAccount(req, TRUST_STAMPED, role.account_id))) {
       return res.status(403).json({ error: 'forbidden', message: 'role belongs to another tenant' });
     }
-    await detachPolicy(req.params.roleId, req.params.policyId);
-    await auditMutation(req, 'iam:policy:detach', `role:${req.params.roleId}`, { policyId: req.params.policyId, account: role.account_id });
+    const orgId = await orgForAccount(role.account_id);
+    if (!orgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, orgId, 'iam:policy:detach'))) return;
+    await withTransaction(async () => {
+      await detachPolicy(req.params.roleId, req.params.policyId);
+      await auditMutation(req, 'iam:policy:detach', `role:${req.params.roleId}`, { policyId: req.params.policyId, account: role.account_id });
+    });
     res.json({ ok: true });
   });
   app.post('/v1/users/:userId/assign', async (req, res) => {
@@ -2045,8 +2857,11 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!(await canActForOrg(req, TRUST_STAMPED, user.org_id))) {
       return res.status(403).json({ error: 'forbidden', message: 'user belongs to another tenant' });
     }
-    await assignRole(req.params.userId, req.body.roleId);
-    await auditMutation(req, 'iam:role:assign', `user:${req.params.userId}`, { roleId: req.body.roleId, org: user.org_id });
+    if (!(await requireSensitiveMutation(req, res, TRUST_STAMPED, user.org_id, 'iam:role:assign'))) return;
+    await withTransaction(async () => {
+      await assignRole(req.params.userId, req.body.roleId);
+      await auditMutation(req, 'iam:role:assign', `user:${req.params.userId}`, { roleId: req.body.roleId, org: user.org_id });
+    });
     res.json({ ok: true });
   });
   app.delete('/v1/users/:userId/roles/:roleId', async (req, res) => {
@@ -2059,8 +2874,11 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!(await canActForOrg(req, TRUST_STAMPED, user.org_id))) {
       return res.status(403).json({ error: 'forbidden', message: 'user belongs to another tenant' });
     }
-    await unassignRole(req.params.userId, req.params.roleId);
-    await auditMutation(req, 'iam:role:unassign', `user:${req.params.userId}`, { roleId: req.params.roleId, org: user.org_id });
+    if (!(await requireSensitiveMutation(req, res, TRUST_STAMPED, user.org_id, 'iam:role:unassign'))) return;
+    await withTransaction(async () => {
+      await unassignRole(req.params.userId, req.params.roleId);
+      await auditMutation(req, 'iam:role:unassign', `user:${req.params.userId}`, { roleId: req.params.roleId, org: user.org_id });
+    });
     res.json({ ok: true });
   });
 
@@ -2196,6 +3014,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
     }
     const org = await resolveCallerOrg(req, TRUST_STAMPED);
     if (!org) return res.status(403).json({ error: 'org_required', message: 'an organization-scoped credential is required' });
+    if (!(await callerIsOrgAdmin(req, TRUST_STAMPED, org))) {
+      return res.status(403).json({ error: 'org_admin_required', message: 'audit access requires an organization administrator' });
+    }
     const rows: any[] = [];
     for (let offset = 0; offset < rawLimit; offset += 200) {
       const page = await queryAudit({
@@ -2244,7 +3065,10 @@ async function auditMutation(req: express.Request, action: string, resource: str
       return res.status(400).json({ error: 'invalid_time', message: 'from/to must be valid ISO timestamps' });
     }
     const org = await resolveCallerOrg(req, TRUST_STAMPED);
-    if (!org) return res.json([]);
+    if (!org) return res.status(403).json({ error: 'org_required', message: 'audit access requires an organization' });
+    if (!(await callerIsOrgAdmin(req, TRUST_STAMPED, org))) {
+      return res.status(403).json({ error: 'org_admin_required', message: 'audit access requires an organization administrator' });
+    }
     noStore(res);
     res.json(await queryAudit({ limit, offset, actor, allowed, orgId: org, action, resource, from, to }));
   });
@@ -2277,26 +3101,41 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!(await canActForAccount(req, TRUST_STAMPED, req.params.accountId))) {
       return res.status(403).json({ error: 'forbidden', message: 'account belongs to another tenant' });
     }
+    const keyOrgId = await orgForAccount(req.params.accountId);
+    if (!keyOrgId) return res.status(403).json({ error: 'forbidden', message: 'account belongs to another tenant' });
+    const callerUserId = await resolveCallerUser(req, TRUST_STAMPED);
+    // Account-level keys (no user owner) are administrative. Self-bound keys
+    // are allowed for ordinary members; binding another user is checked below.
+    if (!userId && !(await requireSensitiveMutation(req, res, TRUST_STAMPED, keyOrgId, 'iam:key:create-account'))) return;
     // Scope narrowing (#23): a credential can never mint authority it lacks.
     const callerScopes = await resolveCallerScopes(req, TRUST_STAMPED);
     if (!scopesSubset(keyScopes, callerScopes)) {
       return res.status(403).json({ error: 'scope_escalation', message: 'Cannot mint scopes the caller does not hold' });
     }
-    // An optional userId binding must live in the key's account org.
+    // An optional userId binding must live in the key's account org, and an
+    // owner other than the caller is an administrator-only operation. This
+    // prevents a member from minting a key that inherits an org admin's
+    // policies (privilege escalation).
+    let ownerTarget: User | null = null;
     if (userId != null) {
-      const target = await getUserById(userId);
+      ownerTarget = await getUserById(userId);
       const acc = await getAccountById(req.params.accountId);
-      if (!target || !acc || target.org_id !== acc.org_id) {
+      if (!ownerTarget || !acc || ownerTarget.org_id !== acc.org_id) {
         return res.status(403).json({ error: 'cross_tenant', message: 'userId is outside the account organization' });
       }
-    }
-    const k = await createApiKeyRecord(req.params.accountId, userId || null, keyName, keyScopes, exp);
-    await logAudit({
-      actor_type: 'user', actor_id: (await resolveCallerUser(req, TRUST_STAMPED)) || '',
-      action: 'iam:key:create', resource: `account:${req.params.accountId}`,
-      decision: true,
-      context: { org: (await resolveCallerOrg(req, TRUST_STAMPED)) || undefined, account: req.params.accountId, keyId: k.id, scopes: keyScopes },
-    }).catch(() => undefined);
+      if (!callerUserId) {
+        return res.status(403).json({ error: 'user_owner_required', message: 'only a user session can bind an API key to a user' });
+      }
+      if (userId !== callerUserId && !(await callerIsOrgAdmin(req, TRUST_STAMPED, ownerTarget.org_id))) {
+        return res.status(403).json({ error: 'key_owner_forbidden', message: 'only an organization administrator can create a key for another user' });
+      }    }
+    const k = await withTransaction(async () => {
+      const key = await createApiKeyRecord(req.params.accountId, userId || null, keyName, keyScopes, exp);
+      await auditMutation(req, 'iam:key:create', `account:${req.params.accountId}`, {
+        org: keyOrgId, account: req.params.accountId, keyId: key.id, scopes: keyScopes, ownerUserId: userId || null,
+      });
+      return key;
+    });
     res.status(201).json({ id: k.id, apiKey: k.value, prefix: k.prefix, warning: 'Save this apiKey now — it is shown only once.' });
   });
 
@@ -2315,11 +3154,30 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (hasEndUserCredential(req)) {
       return res.status(403).json({ error: 'forbidden', message: 'internal endpoint: end-user credentials are not accepted' });
     }
-    const rec = await verifyApiKey((req.body || {}).apiKey || '');
-    if (!rec) return res.status(401).json({ valid: false });
-    // Include the owning org: the gateway uses this for usage attribution (#28).
-    const acc = rec.account_id ? await getAccountById(rec.account_id) : null;
-    res.json({ valid: true, ...rec, ...(acc?.org_id ? { org_id: acc.org_id } : {}) });
+    const presented = String((req.body || {}).apiKey || '');
+    const rec = await verifyApiKey(presented);
+    if (rec) {
+      // Include the owning org: the gateway uses this for usage attribution (#28).
+      const acc = rec.account_id ? await getAccountById(rec.account_id) : null;
+      const keyOrg = acc ? await getOrgById(acc.org_id) : null;
+      if (!acc || !keyOrg || keyOrg.status === 'suspended') {
+        return res.status(403).json({ valid: false, error: 'org_suspended' });
+      }
+      return res.json({ valid: true, ...rec, ...(acc?.org_id ? { org_id: acc.org_id } : {}) });
+    }
+    // Platform (owner-scoped) runner key: no tenant binding. The gateway stamps
+    // kind=platform-runner and the bound runner id; workflow-service only
+    // accepts it on the runner protocol and queue paths.
+    const runnerKey = await verifyPlatformRunnerKey(presented);
+    if (!runnerKey) return res.status(401).json({ valid: false });
+    res.json({
+      valid: true,
+      kind: 'platform-runner',
+      id: runnerKey.id,
+      runner_id: runnerKey.runner_id,
+      name: runnerKey.name,
+      scopes: runnerKey.scopes,
+    });
   });
 
   app.delete('/v1/keys/:id', async (req, res) => {
@@ -2329,9 +3187,15 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!(await canActForAccount(req, TRUST_STAMPED, rec.account_id))) {
       return res.status(403).json({ error: 'forbidden', message: 'key belongs to another tenant' });
     }
-    const ok = await revokeApiKey(req.params.id);
+    const keyOrgId = await orgForAccount(rec.account_id);
+    if (!keyOrgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, keyOrgId, 'iam:key:revoke'))) return;
+    const ok = await withTransaction(async () => {
+      const revoked = await revokeApiKey(req.params.id);
+      if (!revoked) return false;
+      await auditMutation(req, 'iam:key:revoke', `key:${req.params.id}`, { account: rec.account_id });
+      return true;
+    });
     if (!ok) return res.status(404).json({ error: 'key_not_found' });
-    await auditMutation(req, 'iam:key:revoke', `key:${req.params.id}`, { account: rec.account_id });
     res.json({ ok: true });
   });
 
@@ -2348,6 +3212,8 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!(await canActForAccount(req, TRUST_STAMPED, rec.account_id))) {
       return res.status(403).json({ error: 'forbidden', message: 'key belongs to another tenant' });
     }
+    const keyOrgId = await orgForAccount(rec.account_id);
+    if (!keyOrgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, keyOrgId, 'iam:key:rotate'))) return;
     const next = await rotateApiKey(req.params.id, grace);
     if (!next) return res.status(409).json({ error: 'key_inactive', message: 'revoked or expired keys cannot be rotated' });
     noStore(res);
@@ -2373,8 +3239,13 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!(await canActForAccount(req, TRUST_STAMPED, req.params.accountId))) {
       return res.status(403).json({ error: 'forbidden', message: 'account belongs to another tenant' });
     }
-    const created = await createServiceAccount(req.params.accountId, slug, sanitizeName(description || ''));
-    await auditMutation(req, 'iam:service-account:create', `service-account:${created.id}`, { account: req.params.accountId, slug });
+    const saOrgId = await orgForAccount(req.params.accountId);
+    if (!saOrgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, saOrgId, 'iam:service-account:create'))) return;
+    const created = await withTransaction(async () => {
+      const sa = await createServiceAccount(req.params.accountId, slug, sanitizeName(description || ''));
+      await auditMutation(req, 'iam:service-account:create', `service-account:${sa.id}`, { account: req.params.accountId, slug });
+      return sa;
+    });
     res.status(201).json(created);
   });
 
@@ -2432,9 +3303,15 @@ async function auditMutation(req: express.Request, action: string, resource: str
     }
     const sa = await getServiceAccount(req.params.id);
     if (!sa) return res.status(404).json({ error: 'service_account_not_found' });
+    const saAccount = await getAccountById(sa.account_id);
+    const saOrg = saAccount ? await getOrgById(saAccount.org_id) : null;
+    if (sa.revoked_at) return res.status(403).json({ error: 'service_account_revoked' });
+    if (!saOrg || saOrg.status === 'suspended') return orgSuspendedResponse(res);
     if (!(await canActForAccount(req, TRUST_STAMPED, sa.account_id))) {
       return res.status(403).json({ error: 'forbidden', message: 'service account belongs to another tenant' });
     }
+    const saOrgId = await orgForAccount(sa.account_id);
+    if (!saOrgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, saOrgId, 'iam:service-account:token'))) return;
     const callerHasWildcard = callerScopes.includes('*');
     if (!callerHasWildcard && scopes.some((s) => !callerScopes.includes(s))) {
       return res.status(403).json({ error: 'scope_escalation', message: 'Cannot mint scopes the caller does not hold' });
@@ -2472,14 +3349,26 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (role.account_id !== sa.account_id) {
       return res.status(403).json({ error: 'cross_account', message: "role must belong to the service account's account" });
     }
-    await assignRoleToServiceAccount(sa.id, roleId);
+    const saOrgId = await orgForAccount(sa.account_id);
+    if (!saOrgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, saOrgId, 'iam:service-account:role:assign'))) return;
+    await withTransaction(async () => {
+      await assignRoleToServiceAccount(sa.id, roleId);
+      await auditMutation(req, 'iam:service-account:role:assign', `service-account:${sa.id}`, { roleId, account: sa.account_id });
+    });
     res.json({ ok: true });
   });
   app.delete('/v1/service-accounts/:id/roles/:roleId', async (req, res) => {
     if (!isUuid(req.params.roleId)) return res.status(400).json({ error: 'invalid_id', message: 'roleId must be a UUID' });
     const sa = await saForCaller(req, res);
     if (!sa) return;
-    const ok = await unassignRoleFromServiceAccount(sa.id, req.params.roleId);
+    const saOrgId = await orgForAccount(sa.account_id);
+    if (!saOrgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, saOrgId, 'iam:service-account:role:unassign'))) return;
+    const ok = await withTransaction(async () => {
+      const removed = await unassignRoleFromServiceAccount(sa.id, req.params.roleId);
+      if (!removed) return false;
+      await auditMutation(req, 'iam:service-account:role:unassign', `service-account:${sa.id}`, { roleId: req.params.roleId, account: sa.account_id });
+      return true;
+    });
     if (!ok) return res.status(404).json({ error: 'assignment_not_found' });
     res.json({ ok: true });
   });
@@ -2499,10 +3388,22 @@ async function auditMutation(req: express.Request, action: string, resource: str
       return res.status(403).json({ error: 'org_admin_required', message: 'only an organization administrator can change administrators' });
     }
     if (!flag && user.is_org_admin) {
-      const admins = (await listUsers(user.org_id)).filter((u) => u.is_org_admin);
-      if (admins.length <= 1) return res.status(409).json({ error: 'last_admin', message: 'an organization needs at least one administrator' });
+      const admins = (await listUsers(user.org_id)).filter((u) => u.is_org_admin && u.active !== false);
+      if (admins.length <= 1) return res.status(409).json({ error: 'last_admin', message: 'an organization needs at least one active administrator' });
     }
-    res.json(await setOrgAdmin(user.id, flag));
+    const reason = typeof (req.body || {}).reason === 'string' ? String((req.body || {}).reason).slice(0, 500) : '';
+    const updated = await withTransaction(async () => {
+      const u = await setOrgAdmin(user.id, flag);
+      await auditMutation(req, 'iam:user:org-admin', `user:${user.id}`, {
+        org: user.org_id,
+        targetUserId: user.id,
+        oldValue: !!user.is_org_admin,
+        newValue: flag,
+        ...(reason ? { reason } : {}),
+      });
+      return u;
+    });
+    res.json(updated ? publicUser(updated) : { ok: true });
   });
 
   // Lost authenticator: an org administrator removes the user's second
@@ -2510,17 +3411,25 @@ async function auditMutation(req: express.Request, action: string, resource: str
   app.delete('/v1/users/:userId/mfa', mfaLimiter, async (req, res) => {
     const user = await orgAdminTarget(req, res, TRUST_STAMPED);
     if (!user) return;
-    const removed = await removeMfa(user.id);
-    await clearLoginFailures(user.id);
-    await auditMutation(req, 'iam:mfa:reset', `user:${user.id}`, { org: user.org_id, removed });
+    const removed = await withTransaction(async () => {
+      const had = await removeMfa(user.id);
+      await clearLoginFailures(user.id);
+      // A stolen session must not survive a second-factor reset.
+      await revokeAllRefresh(user.id);
+      await revokeApiKeysForUser(user.id);
+      await auditMutation(req, 'iam:mfa:reset', `user:${user.id}`, { org: user.org_id, removed: had });
+      return had;
+    });
     res.json({ ok: true, removed });
   });
 
   app.post('/v1/users/:userId/unlock', mfaLimiter, async (req, res) => {
     const user = await orgAdminTarget(req, res, TRUST_STAMPED);
     if (!user) return;
-    await clearLoginFailures(user.id);
-    await auditMutation(req, 'iam:user:unlock', `user:${user.id}`, { org: user.org_id });
+    await withTransaction(async () => {
+      await clearLoginFailures(user.id);
+      await auditMutation(req, 'iam:user:unlock', `user:${user.id}`, { org: user.org_id });
+    });
     res.json({ ok: true });
   });
 
@@ -2629,6 +3538,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
         resource: e.resource || '',
         // `decision` is the historical boolean; `result` keeps denied vs error.
         decision: e.result === 'allowed',
+        org_id: org,
         context: {
           ...(org ? { org } : {}),
           ...(e.accountId ? { account: e.accountId } : {}),
@@ -2720,7 +3630,1063 @@ async function auditMutation(req: express.Request, action: string, resource: str
     res.json(await listUsageEvents({ ...parsed.filter, orgId: org }));
   });
 
-  // 404
+  // ---------- Platform Super Admin control plane ----------
+  // These routes are served by IAM but only accept a dedicated platform-admin
+  // token (kind=platform-admin, aud=synapseone-platform-admin). They never
+  // accept tenant JWTs, API keys, or service-account tokens as a platform
+  // session. The gateway route lives at /v1/platform.
+
+  app.post('/v1/platform/session', mfaLimiter, async (req, res) => {
+    if (!platformFeatureEnabled()) return res.status(404).json({ error: 'not_found' });
+    const h = firstHeader(req.headers.authorization as any);
+    if (!h.startsWith('Bearer ')) return res.status(401).json({ error: 'unauthorized', message: 'user Bearer token required' });
+    let claims: any;
+    try { claims = verifyAccess(h.slice(7)); } catch { return res.status(401).json({ error: 'invalid_token' }); }
+    if (claims.kind && claims.kind !== 'user') {
+      await auditPlatformDenied(req, String(claims.sub || ''), null, 'platform:session:exchange', 'non_user_credential');
+      return res.status(403).json({ error: 'platform_session_requires_user', message: 'sign in as a user before opening the platform console' });
+    }
+    const user = await getUserById(claims.sub);
+    if (!user || user.active === false) {
+      await auditPlatformDenied(req, String(claims.sub || ''), user?.org_id || null, 'platform:session:exchange', 'account_inactive');
+      return res.status(403).json({ error: 'platform_admin_inactive' });
+    }
+    // Platform privileges are bound to the caller's own user row. A tenant row
+    // that merely shares the platform account's email can never exchange into
+    // the platform organization.
+    const identity = await resolvePlatformIdentity(user);
+    if (identity.status !== 'ok') {
+      const reason = identity.status === 'platform_admin_required' ? 'not_platform_admin' : identity.status;
+      await auditPlatformDenied(req, user.id, user.org_id, 'platform:session:exchange', reason);
+      if (identity.status === 'platform_org_required') {
+        return res.status(403).json({ error: 'platform_admin_org_required', message: 'platform administrators must belong to the platform organization' });
+      }
+      return res.status(403).json({ error: 'platform_admin_required' });
+    }
+    const requireMfa = (process.env.PLATFORM_ADMIN_REQUIRE_MFA ?? 'true') === 'true';
+    if (requireMfa && !(await mfaEnabled(user.id))) {
+      await auditPlatformDenied(req, user.id, user.org_id, 'platform:session:exchange', 'mfa_not_enabled');
+      return res.status(403).json({ error: 'platform_mfa_required', message: 'enable TOTP MFA on the platform organization account before using the platform console' });
+    }
+    const parsed = z.object({
+      code: z.string().trim().max(16).nullish(),
+      recoveryCode: z.string().trim().max(32).nullish(),
+    }).safeParse(req.body);
+    // The login flow already completed MFA moments ago in the common case.
+    // Reuse that signed proof instead of asking for a second consecutive OTP.
+    const freshLoginMfa = requireMfa && hasFreshLoginMfa(claims);
+    if (requireMfa && !freshLoginMfa) {
+      const locked = await lockRemaining(user.id);
+      if (locked > 0) return res.status(429).json({ error: 'account_locked', message: 'too many failed verification attempts', retryAfter: locked });
+      if (!parsed.success || (!parsed.data.code && !parsed.data.recoveryCode)) {
+        await auditPlatformDenied(req, user.id, user.org_id, 'platform:session:exchange', 'fresh_mfa_required');
+        return res.status(403).json({ error: 'platform_mfa_required', message: 'enter a fresh authenticator code to open the platform console' });
+      }
+      const check = await checkSecondFactor(user.id, parsed.data);
+      if (!check.ok) {
+        const lockedFor = await recordLoginFailure(user.id);
+        await auditPlatformDenied(req, user.id, user.org_id, 'platform:session:exchange', 'invalid_mfa_code');
+        return res.status(401).json({
+          error: 'invalid_mfa_code',
+          message: 'The verification code is incorrect',
+          ...(lockedFor ? { lockedForSeconds: lockedFor } : {}),
+        });
+      }
+    }
+    const session = signPlatformAccess({ userId: user.id, role: identity.admin.role, ver: Number(user.auth_version) || 0 });
+    await auditPlatformAction(req, user.id, 'platform:session:exchange', identity.org.id, {
+      role: identity.admin.role,
+      mfa: freshLoginMfa ? 'fresh_login' : requireMfa ? 'code' : 'disabled',
+    });
+    noStore(res);
+    return res.json({
+      accessToken: session.token,
+      expiresIn: session.expiresIn,
+      role: identity.admin.role,
+      user: publicUser(user),
+      mfa: { enabled: requireMfa ? true : await mfaEnabled(user.id) },
+      mfaRequired: requireMfa,
+      stepUpRequired: (process.env.PLATFORM_ADMIN_REQUIRE_STEP_UP ?? 'true') === 'true',
+    });
+  });
+
+  app.post('/v1/platform/step-up', mfaLimiter, async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    const parsed = z.object({
+      code: z.string().trim().max(16).nullish(),
+      recoveryCode: z.string().trim().max(32).nullish(),
+      action: z.string().trim().max(64),
+    }).safeParse(req.body);
+    if (!parsed.success || (!parsed.data.code && !parsed.data.recoveryCode)) {
+      return res.status(400).json({ error: 'invalid_body', message: 'code or recoveryCode required' });
+    }
+    if (!PLATFORM_STEP_UP_ACTIONS.has(parsed.data.action)) {
+      return res.status(400).json({ error: 'invalid_step_up_action', message: 'unknown step-up action' });
+    }
+    const sessionJti = String(ctx.claims?.jti || '');
+    if (!sessionJti) return res.status(403).json({ error: 'platform_session_required', message: 'obtain a fresh platform session' });
+    const locked = await lockRemaining(ctx.user.id);
+    if (locked > 0) return res.status(429).json({ error: 'account_locked', message: 'too many failed verification attempts', retryAfter: locked });
+    const result = await checkSecondFactor(ctx.user.id, { code: parsed.data.code, recoveryCode: parsed.data.recoveryCode });
+    if (!result.ok) {
+      const lockedFor = await recordLoginFailure(ctx.user.id);
+      await auditPlatformDenied(req, ctx.user.id, ctx.user.org_id, parsed.data.action, 'invalid_step_up_code');
+      return res.status(401).json({
+        error: 'invalid_mfa_code',
+        message: 'The verification code is incorrect',
+        ...(lockedFor ? { lockedForSeconds: lockedFor } : {}),
+      });
+    }
+    const step = signPlatformStepUp({
+      userId: ctx.user.id,
+      role: ctx.admin.role,
+      sessionJti,
+      action: parsed.data.action,
+    });
+    await registerPlatformStepUp({
+      jti: step.jti,
+      userId: ctx.user.id,
+      sessionJti,
+      action: parsed.data.action,
+      expiresAt: new Date(Date.now() + step.expiresIn * 1000),
+    });
+    await auditPlatformAction(req, ctx.user.id, 'platform:step-up', ctx.user.org_id, { action: parsed.data.action });
+    noStore(res);
+    return res.json({ stepUpToken: step.token, expiresIn: step.expiresIn, action: parsed.data.action });
+  });
+
+  app.get('/v1/platform/me', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'auditor');
+    if (!ctx) return;
+    noStore(res);
+    res.json({
+      user: publicUser(ctx.user),
+      role: ctx.admin.role,
+      mfa: { enabled: await mfaEnabled(ctx.user.id) },
+      mfaRequired: (process.env.PLATFORM_ADMIN_REQUIRE_MFA ?? 'true') === 'true',
+      stepUpRequired: (process.env.PLATFORM_ADMIN_REQUIRE_STEP_UP ?? 'true') === 'true',
+      platformOrgId: ctx.user.org_id,
+    });
+  });
+
+  app.get('/v1/platform/overview', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'auditor');
+    if (!ctx) return;
+    const range = parsePlatformRange(req, res, 24);
+    if (!range) return;
+    const [counts, usage, audit] = await Promise.all([
+      getPlatformOverviewCounts(),
+      usageSummary({ from: range.from, to: range.to }),
+      platformAuditStats(range.from, range.to),
+    ]);
+    noStore(res);
+    res.json({
+      from: range.from.toISOString(),
+      to: range.to.toISOString(),
+      tenancy: counts,
+      usage: usage.totals,
+      audit,
+    });
+  });
+
+  app.get('/v1/platform/orgs', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'auditor');
+    if (!ctx) return;
+    const limit = req.query.limit === undefined ? 50 : Number(req.query.limit);
+    const offset = req.query.offset === undefined ? 0 : Number(req.query.offset);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) return res.status(400).json({ error: 'invalid_limit' });
+    if (!Number.isInteger(offset) || offset < 0 || offset > 100_000) return res.status(400).json({ error: 'invalid_offset' });
+    const out = await listPlatformOrganizations({ q: String(req.query.q || ''), limit, offset });
+    noStore(res);
+    res.json({ ...out, limit, offset });
+  });
+
+  app.post('/v1/platform/orgs', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    const parsed = z.object({
+      slug: z.string().trim().regex(/^[a-z0-9-]{1,64}$/),
+      displayName: z.string().trim().min(2).max(200),
+      adminEmail: z.string().trim().toLowerCase().email().max(320),
+      adminDisplayName: z.string().trim().max(200).nullish(),
+      reason: z.string().trim().max(500).nullish(),
+    }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    const b = parsed.data;
+    if (b.slug.toLowerCase() === (process.env.PLATFORM_ORG_SLUG || 'synapseone-platform').toLowerCase()) {
+      return res.status(403).json({ error: 'reserved_org_slug', message: 'this slug is reserved for the platform organization' });
+    }
+    if (await getOrgBySlug(b.slug)) return res.status(409).json({ error: 'conflict', message: 'organization slug exists' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'org:create'))) return;
+    const result = await withTransaction(async () => {
+      const { organization: created, admin } = await createOrganizationWithAdmin(
+        sanitizeName(b.slug, 64),
+        sanitizeName(b.displayName),
+        b.adminEmail,
+        b.adminDisplayName ? sanitizeName(b.adminDisplayName) : undefined,
+      );
+      const inviteToken = await issueInvite(admin);
+      await auditPlatformAction(req, ctx.user.id, 'platform:org:create', created.id, {
+        slug: created.slug,
+        adminUserId: admin.id,
+        adminEmail: b.adminEmail,
+        ...(b.reason ? { reason: b.reason } : {}),
+      });
+      return { created, admin, inviteToken };
+    });
+    noStore(res);
+    res.status(201).json({ organization: result.created, admin: publicUser(result.admin), inviteToken: result.inviteToken });
+  });
+
+  app.post('/v1/platform/orgs/:orgId/accounts', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id' });
+    const parsed = z.object({
+      slug: z.string().trim().regex(/^[a-z0-9-]{1,64}$/),
+      displayName: z.string().trim().min(2).max(200),
+      reason: z.string().trim().max(500).nullish(),
+    }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    const org = await getOrgById(req.params.orgId);
+    if (!org || (org.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'org_not_found' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'org:account:create'))) return;
+    try {
+      const account = await withTransaction(async () => {
+        const created = await createAccount(org.id, parsed.data.slug, sanitizeName(parsed.data.displayName));
+        await auditPlatformAction(req, ctx.user.id, 'platform:org:account:create', org.id, {
+          accountId: created.id,
+          slug: created.slug,
+          ...(parsed.data.reason ? { reason: parsed.data.reason } : {}),
+        });
+        return created;
+      });
+      noStore(res);
+      res.status(201).json(account);
+    } catch (e: any) {
+      if (e?.code === 'audit_write_failed' || e?.status === 503) throw e;
+      if (isUniqueViolation(e) || e?.status === 409) return res.status(409).json({ error: 'conflict', message: 'account slug exists' });
+      return res.status(400).json({ error: 'invalid_body', message: e.message });
+    }
+  });
+
+  app.get('/v1/platform/orgs/:orgId', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'auditor');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id' });
+    const out = await getPlatformOrganization(req.params.orgId);
+    if (!out) return res.status(404).json({ error: 'org_not_found' });
+    noStore(res);
+    res.json(out);
+  });
+
+
+  app.get('/v1/platform/orgs/:orgId/resources', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'auditor');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id' });
+    const out = await getPlatformOrganizationResources(req.params.orgId);
+    if (!out) return res.status(404).json({ error: 'org_not_found' });
+    noStore(res);
+    res.json(out);
+  });
+
+  app.get('/v1/platform/orgs/:orgId/audit', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'auditor');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id' });
+    const org = await getOrgById(req.params.orgId);
+    if (!org || (org.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'org_not_found' });
+    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+    const offset = Math.min(Math.max(Number(req.query.offset) || 0, 0), 100_000);
+    noStore(res);
+    res.json(await queryAudit({ orgId: org.id, limit, offset }));
+  });
+
+  app.post('/v1/platform/orgs/:orgId/suspend', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id' });
+    const org = await getOrgById(req.params.orgId);
+    if (!org) return res.status(404).json({ error: 'org_not_found' });
+    if ((org.kind || 'tenant') === 'platform' || org.slug === (process.env.PLATFORM_ORG_SLUG || 'synapseone-platform')) {
+      return res.status(403).json({ error: 'platform_org_protected', message: 'The platform organization cannot be suspended.' });
+    }
+    if ((org.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'org_not_found' });
+    const reason = typeof (req.body || {}).reason === 'string' ? String((req.body || {}).reason).trim().slice(0, 500) : '';
+    if (reason.length < 3) return res.status(400).json({ error: 'reason_required', message: 'A suspension reason is required.' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'org:suspend'))) return;
+    const result = await withTransaction(async () => {
+      const users = await listUsers(org.id);
+      let revoked = 0;
+      for (const u of users) {
+        revoked += await revokeAllRefresh(u.id);
+        await revokeApiKeysForUser(u.id);
+      }
+      const accounts = await listAccounts(org.id);
+      for (const account of accounts) {
+        for (const key of await listApiKeys(account.id)) {
+          if (!key.revoked_at) await revokeApiKey(key.id);
+        }
+      }
+      const updated = await setOrganizationStatus(org.id, 'suspended', ctx.user.id, reason);
+      await auditPlatformAction(req, ctx.user.id, 'platform:org:suspend', org.id, { slug: org.slug, reason, users: users.length, revoked });
+      return { organization: updated, revoked };
+    });
+    res.json({ ok: true, ...result });
+  });
+
+  app.post('/v1/platform/orgs/:orgId/reactivate', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id' });
+    const org = await getOrgById(req.params.orgId);
+    if (!org || (org.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'org_not_found' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'org:reactivate'))) return;
+    const updated = await withTransaction(async () => {
+      const row = await setOrganizationStatus(org.id, 'active', ctx.user.id, '');
+      await auditPlatformAction(req, ctx.user.id, 'platform:org:reactivate', org.id, { slug: org.slug });
+      return row;
+    });
+    res.json({ ok: true, organization: updated });
+  });
+
+  app.post('/v1/platform/orgs/:orgId/roles', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id' });
+    const org = await getOrgById(req.params.orgId);
+    if (!org || (org.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'org_not_found' });
+    const parsed = z.object({
+      accountId: z.string().uuid(),
+      slug: z.string().trim().regex(/^[a-z0-9-]{1,64}$/),
+      description: z.string().trim().max(500).nullish(),
+    }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    const account = await getAccountById(parsed.data.accountId);
+    if (!account || account.org_id !== org.id) return res.status(403).json({ error: 'cross_org', message: 'account is outside the organization' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'org:role:create'))) return;
+    const created = await withTransaction(async () => {
+      const role = await createRole(account.id, parsed.data.slug, sanitizeName(parsed.data.description || ''));
+      await auditPlatformAction(req, ctx.user.id, 'platform:org:role:create', org.id, { accountId: account.id, roleId: role.id, slug: role.slug });
+      return role;
+    });
+    res.status(201).json(created);
+  });
+
+  app.post('/v1/platform/orgs/:orgId/policies', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id' });
+    const org = await getOrgById(req.params.orgId);
+    if (!org || (org.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'org_not_found' });
+    const parsed = z.object({
+      accountId: z.string().uuid(),
+      slug: z.string().trim().regex(/^[a-z0-9-]{1,64}$/),
+      description: z.string().trim().max(500).nullish(),
+      document: z.any(),
+    }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    const docErr = validatePolicyDocument(parsed.data.document);
+    if (docErr) return res.status(400).json({ error: 'invalid_document', message: docErr });
+    const account = await getAccountById(parsed.data.accountId);
+    if (!account || account.org_id !== org.id) return res.status(403).json({ error: 'cross_org', message: 'account is outside the organization' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'org:policy:create'))) return;
+    const created = await withTransaction(async () => {
+      const policy = await createPolicy(account.id, parsed.data.slug, sanitizeName(parsed.data.description || ''), parsed.data.document);
+      await auditPlatformAction(req, ctx.user.id, 'platform:org:policy:create', org.id, { accountId: account.id, policyId: policy.id, slug: policy.slug });
+      return policy;
+    });
+    res.status(201).json(created);
+  });
+
+  app.post('/v1/platform/orgs/:orgId/keys/:keyId/revoke', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId) || !isUuid(req.params.keyId)) return res.status(400).json({ error: 'invalid_id' });
+    const key = await findApiKeyById(req.params.keyId);
+    if (!key) return res.status(404).json({ error: 'key_not_found' });
+    const account = await getAccountById(key.account_id);
+    if (!account || account.org_id !== req.params.orgId) return res.status(404).json({ error: 'key_not_found' });
+    if (key.revoked_at) return res.status(409).json({ error: 'key_already_revoked' });
+    const reason = typeof (req.body || {}).reason === 'string' ? String((req.body || {}).reason).trim().slice(0, 500) : '';
+    if (!(await requirePlatformStepUp(req, res, ctx, 'org:key:revoke'))) return;
+    const ok = await withTransaction(async () => {
+      const revoked = await revokeApiKey(req.params.keyId);
+      await auditPlatformAction(req, ctx.user.id, 'platform:org:key:revoke', req.params.orgId, { keyId: req.params.keyId, accountId: account.id, ...(reason ? { reason } : {}) });
+      return revoked;
+    });
+    if (!ok) return res.status(409).json({ error: 'key_already_revoked' });
+    res.json({ ok: true });
+  });
+
+  app.post('/v1/platform/orgs/:orgId/service-accounts/:id/revoke', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId) || !isUuid(req.params.id)) return res.status(400).json({ error: 'invalid_id' });
+    const sa = await getServiceAccount(req.params.id);
+    if (!sa) return res.status(404).json({ error: 'service_account_not_found' });
+    const account = await getAccountById(sa.account_id);
+    if (!account || account.org_id !== req.params.orgId) return res.status(404).json({ error: 'service_account_not_found' });
+    if (sa.revoked_at) return res.status(409).json({ error: 'service_account_already_revoked' });
+    const reason = typeof (req.body || {}).reason === 'string' ? String((req.body || {}).reason).trim().slice(0, 500) : '';
+    if (!(await requirePlatformStepUp(req, res, ctx, 'org:service-account:revoke'))) return;
+    const ok = await withTransaction(async () => {
+      const revoked = await revokeServiceAccount(sa.id);
+      await auditPlatformAction(req, ctx.user.id, 'platform:org:service-account:revoke', req.params.orgId, { serviceAccountId: sa.id, accountId: account.id, ...(reason ? { reason } : {}) });
+      return revoked;
+    });
+    if (!ok) return res.status(409).json({ error: 'service_account_already_revoked' });
+    res.json({ ok: true });
+  });
+
+  app.get('/v1/platform/accounts', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'auditor');
+    if (!ctx) return;
+    const limit = req.query.limit === undefined ? 50 : Number(req.query.limit);
+    const offset = req.query.offset === undefined ? 0 : Number(req.query.offset);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) return res.status(400).json({ error: 'invalid_limit' });
+    if (!Number.isInteger(offset) || offset < 0 || offset > 100_000) return res.status(400).json({ error: 'invalid_offset' });
+    const orgId = req.query.orgId === undefined ? undefined : String(req.query.orgId);
+    if (orgId && !isUuid(orgId)) return res.status(400).json({ error: 'invalid_orgId' });
+    const out = await listPlatformAccounts({ q: String(req.query.q || ''), ...(orgId ? { orgId } : {}), limit, offset });
+    noStore(res);
+    res.json({ ...out, limit, offset });
+  });
+
+  app.get('/v1/platform/users', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'auditor');
+    if (!ctx) return;
+    const limit = req.query.limit === undefined ? 50 : Number(req.query.limit);
+    const offset = req.query.offset === undefined ? 0 : Number(req.query.offset);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) return res.status(400).json({ error: 'invalid_limit' });
+    if (!Number.isInteger(offset) || offset < 0 || offset > 100_000) return res.status(400).json({ error: 'invalid_offset' });
+    const orgId = req.query.orgId === undefined ? undefined : String(req.query.orgId);
+    if (orgId !== undefined && !isUuid(orgId)) return res.status(400).json({ error: 'invalid_orgId' });
+    const active = req.query.active === undefined ? undefined : String(req.query.active) === 'true';
+    const isOrgAdmin = req.query.isOrgAdmin === undefined ? undefined : String(req.query.isOrgAdmin) === 'true';
+    const out = await listPlatformUsers({ q: String(req.query.q || ''), orgId, active, isOrgAdmin, limit, offset });
+    noStore(res);
+    res.json({ ...out, limit, offset });
+  });
+
+  app.get('/v1/platform/users/:userId', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'auditor');
+    if (!ctx) return;
+    if (!isUuid(req.params.userId)) return res.status(400).json({ error: 'invalid_id' });
+    const user = await getUserById(req.params.userId);
+    if (!user) return res.status(404).json({ error: 'user_not_found' });
+    const org = await getOrgById(user.org_id);
+    if (!org || (org.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'user_not_found' });
+    const [roles, policies, mfa, sessions] = await Promise.all([
+      rolesForUser(user.id),
+      policiesForUser(user.id),
+      getMfa(user.id),
+      listRefreshSessions(user.id),
+    ]);
+    const lockedForSeconds = await lockRemaining(user.id);
+    const orgAdminCount = (await listUsers(user.org_id)).filter((u) => u.is_org_admin && u.active !== false).length;
+    noStore(res);
+    res.json({
+      user: { ...publicUser(user), passwordSet: !!user.password_hash },
+      organization: org,
+      orgAdminCount,
+      roles,
+      policies: policies.map((document, index) => ({ index, document })),
+      mfa: { enabled: !!mfa?.enabled, recoveryCodesRemaining: mfa?.enabled ? mfa.recovery_hashes.length : 0 },
+      lockedForSeconds,
+      sessions: sessions.map((s) => ({ id: s.id, created_at: s.created_at, expires_at: s.expires_at, revoked_at: s.revoked_at })),
+    });
+  });
+
+  app.post('/v1/platform/users/:userId/invite', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.userId)) return res.status(400).json({ error: 'invalid_id' });
+    const target = await getUserById(req.params.userId);
+    if (!target) return res.status(404).json({ error: 'user_not_found' });
+    const targetOrg = await getOrgById(target.org_id);
+    if (!targetOrg || (targetOrg.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'user_not_found' });
+    if (target.active === false) return res.status(409).json({ error: 'account_deactivated' });
+    if (target.password_hash) return res.status(409).json({ error: 'password_already_set' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'user:invite'))) return;
+    const inviteToken = await withTransaction(async () => {
+      const token = await issueInvite(target);
+      await auditPlatformAction(req, ctx.user.id, 'platform:user:invite', target.org_id, { targetUserId: target.id });
+      return token;
+    });
+    noStore(res);
+    res.json({ ok: true, inviteToken });
+  });
+
+  app.put('/v1/platform/users/:userId/org-admin', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.userId)) return res.status(400).json({ error: 'invalid_id' });
+    const flag = (req.body || {}).isOrgAdmin;
+    if (typeof flag !== 'boolean') return res.status(400).json({ error: 'invalid_body', message: 'isOrgAdmin (boolean) required' });
+    const target = await getUserById(req.params.userId);
+    if (!target) return res.status(404).json({ error: 'user_not_found' });
+    const targetOrg = await getOrgById(target.org_id);
+    if (!targetOrg || (targetOrg.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'user_not_found' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'user:org-admin'))) return;
+    if (!flag && target.is_org_admin) {
+      const admins = (await listUsers(target.org_id)).filter((u) => u.is_org_admin && u.active !== false);
+      if (admins.length <= 1) return res.status(409).json({ error: 'last_admin', message: 'an organization needs at least one active administrator' });
+    }
+    const reason = typeof (req.body || {}).reason === 'string' ? String((req.body || {}).reason).slice(0, 500) : '';
+    const updated = await withTransaction(async () => {
+      const u = await setOrgAdmin(target.id, flag);
+      await auditPlatformAction(req, ctx.user.id, 'platform:user:org-admin', target.org_id, {
+        targetUserId: target.id, oldValue: !!target.is_org_admin, newValue: flag, ...(reason ? { reason } : {}),
+      });
+      return u;
+    });
+    res.json(updated ? publicUser(updated) : { ok: true });
+  });
+
+  app.post('/v1/platform/users/:userId/reset-mfa', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.userId)) return res.status(400).json({ error: 'invalid_id' });
+    const target = await getUserById(req.params.userId);
+    if (!target) return res.status(404).json({ error: 'user_not_found' });
+    const targetOrg = await getOrgById(target.org_id);
+    if (!targetOrg || (targetOrg.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'user_not_found' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'user:reset-mfa'))) return;
+    const result = await withTransaction(async () => {
+      const removed = await removeMfa(target.id);
+      await clearLoginFailures(target.id);
+      const revoked = await revokeAllRefresh(target.id);
+      const revokedKeys = await revokeApiKeysForUser(target.id);
+      await auditPlatformAction(req, ctx.user.id, 'platform:user:reset-mfa', target.org_id, { targetUserId: target.id, removed, revoked, revokedKeys });
+      return { removed, revoked, revokedKeys };
+    });
+    res.json({ ok: true, ...result });
+  });
+
+  app.post('/v1/platform/users/:userId/unlock', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.userId)) return res.status(400).json({ error: 'invalid_id' });
+    const target = await getUserById(req.params.userId);
+    if (!target) return res.status(404).json({ error: 'user_not_found' });
+    const targetOrg = await getOrgById(target.org_id);
+    if (!targetOrg || (targetOrg.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'user_not_found' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'user:unlock'))) return;
+    await withTransaction(async () => {
+      await clearLoginFailures(target.id);
+      await auditPlatformAction(req, ctx.user.id, 'platform:user:unlock', target.org_id, { targetUserId: target.id });
+    });
+    res.json({ ok: true });
+  });
+
+  app.post('/v1/platform/users/:userId/revoke-sessions', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.userId)) return res.status(400).json({ error: 'invalid_id' });
+    const target = await getUserById(req.params.userId);
+    if (!target) return res.status(404).json({ error: 'user_not_found' });
+    const targetOrg = await getOrgById(target.org_id);
+    if (!targetOrg || (targetOrg.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'user_not_found' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'user:revoke-sessions'))) return;
+    const result = await withTransaction(async () => {
+      const revoked = await revokeAllRefresh(target.id);
+      const revokedKeys = await revokeApiKeysForUser(target.id);
+      await auditPlatformAction(req, ctx.user.id, 'platform:user:revoke-sessions', target.org_id, { targetUserId: target.id, revoked, revokedKeys });
+      return { revoked, revokedKeys };
+    });
+    res.json({ ok: true, ...result });
+  });
+
+  app.post('/v1/platform/users/:userId/disable', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.userId)) return res.status(400).json({ error: 'invalid_id' });
+    const target = await getUserById(req.params.userId);
+    if (!target) return res.status(404).json({ error: 'user_not_found' });
+    const targetOrg = await getOrgById(target.org_id);
+    if (!targetOrg || (targetOrg.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'user_not_found' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'user:disable'))) return;
+    // Disabling the last active organization administrator is equivalent to
+    // revoking the last admin: it would leave the tenant without an operator.
+    if (target.active !== false && target.is_org_admin) {
+      const admins = (await listUsers(target.org_id)).filter((u) => u.is_org_admin && u.active !== false);
+      if (admins.length <= 1) {
+        await auditPlatformDenied(req, ctx.user.id, target.org_id, 'user:disable', 'last_admin');
+        return res.status(409).json({ error: 'last_admin', message: 'an organization needs at least one active administrator' });
+      }
+    }
+    const result = await withTransaction(async () => {
+      await setUserActive(target.id, false);
+      const revoked = await revokeAllRefresh(target.id);
+      const revokedKeys = await revokeApiKeysForUser(target.id);
+      await auditPlatformAction(req, ctx.user.id, 'platform:user:disable', target.org_id, { targetUserId: target.id, revoked, revokedKeys });
+      return { revoked, revokedKeys };
+    });
+    res.json({ ok: true, ...result });
+  });
+
+  app.post('/v1/platform/users/:userId/enable', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.userId)) return res.status(400).json({ error: 'invalid_id' });
+    const target = await getUserById(req.params.userId);
+    if (!target) return res.status(404).json({ error: 'user_not_found' });
+    const targetOrg = await getOrgById(target.org_id);
+    if (!targetOrg || (targetOrg.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'user_not_found' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'user:enable'))) return;
+    await withTransaction(async () => {
+      await setUserActive(target.id, true);
+      await auditPlatformAction(req, ctx.user.id, 'platform:user:enable', target.org_id, { targetUserId: target.id });
+    });
+    res.json({ ok: true });
+  });
+
+  app.get('/v1/platform/usage/summary', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'auditor');
+    if (!ctx) return;
+    const parsed = parseUsageFilter(req);
+    if (!parsed.filter) return res.status(400).json({ error: 'invalid_query', message: parsed.error });
+    const orgId = req.query.orgId === undefined ? undefined : String(req.query.orgId);
+    if (orgId !== undefined && !isUuid(orgId)) return res.status(400).json({ error: 'invalid_orgId' });
+    noStore(res);
+    res.json(await usageSummary({ ...parsed.filter, ...(orgId ? { orgId } : {}) }));
+  });
+
+  app.get('/v1/platform/usage/events', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'auditor');
+    if (!ctx) return;
+    const parsed = parseUsageFilter(req);
+    if (!parsed.filter) return res.status(400).json({ error: 'invalid_query', message: parsed.error });
+    const orgId = req.query.orgId === undefined ? undefined : String(req.query.orgId);
+    if (orgId !== undefined && !isUuid(orgId)) return res.status(400).json({ error: 'invalid_orgId' });
+    noStore(res);
+    res.json(await listUsageEvents({ ...parsed.filter, ...(orgId ? { orgId } : {}) }));
+  });
+
+  app.get('/v1/platform/audit', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'auditor');
+    if (!ctx) return;
+    const limit = Number(req.query.limit || 50);
+    const offset = Number(req.query.offset || 0);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) return res.status(400).json({ error: 'invalid_limit' });
+    if (!Number.isInteger(offset) || offset < 0 || offset > 100_000) return res.status(400).json({ error: 'invalid_offset' });
+    const actor = typeof req.query.actor === 'string' && req.query.actor ? req.query.actor : undefined;
+    if (actor && !isUuid(actor)) return res.status(400).json({ error: 'invalid_actor' });
+    const orgId = typeof req.query.orgId === 'string' && req.query.orgId ? req.query.orgId : undefined;
+    if (orgId && !isUuid(orgId)) return res.status(400).json({ error: 'invalid_orgId' });
+    const rawAllowed = req.query.allowed;
+    const allowed = rawAllowed === undefined ? undefined : String(rawAllowed).toLowerCase() === 'true';
+    if (rawAllowed !== undefined && !['true', 'false'].includes(String(rawAllowed).toLowerCase())) {
+      return res.status(400).json({ error: 'invalid_allowed' });
+    }
+    const action = typeof req.query.action === 'string' && req.query.action ? req.query.action.slice(0, 200) : undefined;
+    const resource = typeof req.query.resource === 'string' && req.query.resource ? req.query.resource.slice(0, 512) : undefined;
+    const from = req.query.from ? new Date(String(req.query.from)) : undefined;
+    const to = req.query.to ? new Date(String(req.query.to)) : undefined;
+    if ((from && !Number.isFinite(from.getTime())) || (to && !Number.isFinite(to.getTime()))) {
+      return res.status(400).json({ error: 'invalid_time' });
+    }
+    noStore(res);
+    res.json(await queryAudit({ limit, offset, actor, allowed, orgId, action, resource, from, to }));
+  });
+
+  app.get('/v1/platform/admins', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'owner');
+    if (!ctx) return;
+    const rows = await listPlatformAdmins();
+    const items = await Promise.all(rows.map(async (a) => {
+      const u = await getUserById(a.user_id);
+      return { ...a, email: u?.email || '', display_name: u?.display_name || '', active: u?.active !== false };
+    }));
+    noStore(res);
+    res.json({ items });
+  });
+
+  app.post('/v1/platform/admins', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'owner');
+    if (!ctx) return;
+    const role = String((req.body || {}).role || 'auditor');
+    if (!['owner', 'operator', 'auditor'].includes(role)) return res.status(400).json({ error: 'invalid_role' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'admin:grant'))) return;
+    const email = typeof (req.body || {}).email === 'string' ? String((req.body || {}).email).trim().toLowerCase() : '';
+    const userId = typeof (req.body || {}).userId === 'string' ? String((req.body || {}).userId) : '';
+    if (email && !z.string().email().max(320).safeParse(email).success) {
+      return res.status(400).json({ error: 'invalid_email' });
+    }
+    const platformOrg = await getOrgBySlug(process.env.PLATFORM_ORG_SLUG || 'synapseone-platform');
+    if (!platformOrg || (platformOrg.kind || 'tenant') !== 'platform') {
+      return res.status(409).json({ error: 'platform_org_missing', message: 'initialize the platform organization first' });
+    }
+    let target: User | null = null;
+    if (userId) {
+      if (!isUuid(userId)) return res.status(400).json({ error: 'invalid_userId' });
+      target = await getUserById(userId);
+      const org = target ? await getOrgById(target.org_id) : null;
+      if (!target || !org || (org.kind || 'tenant') !== 'platform') {
+        return res.status(403).json({ error: 'platform_user_required', message: 'platform administrators must be members of the platform organization' });
+      }
+    } else if (email) {
+      target = await findUserByOrgEmail(platformOrg.id, email);
+      if (!target) target = await upsertUser(platformOrg.id, email, email);
+    } else {
+      return res.status(400).json({ error: 'email_or_userId_required' });
+    }
+    if (target.active === false) {
+      return res.status(409).json({ error: 'platform_user_inactive', message: 'the target platform account is inactive' });
+    }
+    const previous = await getPlatformAdmin(target.id);
+    if (previous && !previous.revoked_at && previous.role === 'owner' && role !== 'owner'
+        && (await countActivePlatformOwners()) <= 1) {
+      await auditPlatformDenied(req, ctx.user.id, target.org_id, 'admin:grant', 'last_owner_demotion');
+      return res.status(409).json({ error: 'last_owner', message: 'at least one platform owner must remain' });
+    }
+    const reason = typeof (req.body || {}).reason === 'string' ? String((req.body || {}).reason).slice(0, 500) : '';
+    const result = await withTransaction(async () => {
+      const admin = await grantPlatformAdmin({
+        userId: target.id,
+        role: role as PlatformAdmin['role'],
+        grantedBy: ctx.user.id,
+        reason,
+      });
+      const inviteToken = await issueInvite(target);
+      await auditPlatformAction(req, ctx.user.id, 'platform:admin:grant', target.org_id, {
+        targetUserId: target.id,
+        oldRole: previous?.role || null,
+        role,
+        inviteIssued: !!inviteToken,
+        ...(reason ? { reason } : {}),
+      });
+      return { admin, inviteToken };
+    });
+    res.status(201).json({ ...result.admin, email: target.email, display_name: target.display_name || '', inviteToken: result.inviteToken });
+  });
+
+  app.delete('/v1/platform/admins/:userId', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'owner');
+    if (!ctx) return;
+    if (!isUuid(req.params.userId)) return res.status(400).json({ error: 'invalid_id' });
+    const target = await getUserById(req.params.userId);
+    if (!target) return res.status(404).json({ error: 'user_not_found' });
+    const targetAdmin = await getPlatformAdmin(target.id);
+    if (!targetAdmin || targetAdmin.revoked_at) return res.status(404).json({ error: 'platform_admin_not_found' });
+    if (targetAdmin.role === 'owner' && target.active !== false && (await countActivePlatformOwners()) <= 1) {
+      await auditPlatformDenied(req, ctx.user.id, target.org_id, 'admin:revoke', 'last_owner');
+      return res.status(409).json({ error: 'last_owner', message: 'at least one platform owner must remain' });
+    }
+    if (!(await requirePlatformStepUp(req, res, ctx, 'admin:revoke'))) return;
+    if (targetAdmin.role === 'owner' && target.active !== false && (await countActivePlatformOwners()) <= 1) {
+      await auditPlatformDenied(req, ctx.user.id, target.org_id, 'admin:revoke', 'last_owner');
+      return res.status(409).json({ error: 'last_owner', message: 'at least one platform owner must remain' });
+    }
+    const ok = await revokePlatformAdmin(target.id);
+    if (!ok) {
+      await auditPlatformDenied(req, ctx.user.id, target.org_id, 'admin:revoke', 'revoke_failed');
+      return res.status(404).json({ error: 'platform_admin_not_found' });
+    }
+    const reason = typeof (req.body || {}).reason === 'string' ? String((req.body || {}).reason).slice(0, 500) : '';
+    const result = await withTransaction(async () => {
+      const revoked = await revokeAllRefresh(target.id);
+      const revokedKeys = await revokeApiKeysForUser(target.id);
+      await auditPlatformAction(req, ctx.user.id, 'platform:admin:revoke', target.org_id, {
+        targetUserId: target.id,
+        revoked,
+        revokedKeys,
+        previousRole: targetAdmin.role,
+        ...(reason ? { reason } : {}),
+      });
+      return { revoked, revokedKeys };
+    });
+    res.json({ ok: true, ...result });
+  });
+
+  // One-time bootstrap, called directly over the internal network. No gateway
+  // route exists. Requires PLATFORM_BOOTSTRAP_SECRET and an empty platform
+  // administrator set.
+  // ---------- internal: platform (owner-scoped) runners ----------
+  // Workflow-service is the only caller (internal secret + no public gateway
+  // route). It has already authorized a platform owner before minting a key or
+  // requesting a per-execution delegation.
+  const RUNNER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+
+  app.post('/internal/platform-runners/keys', async (req, res) => {
+    const parsed = z.object({
+      runnerId: z.string().trim().min(1).max(128),
+      name: z.string().trim().max(100).optional(),
+      scopes: z.array(z.string().min(1).max(80)).max(100).optional(),
+      createdBy: z.string().uuid().nullish(),
+      expiresAt: z.string().datetime().nullish(),
+    }).safeParse(req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    const { runnerId, name, scopes: rawScopes, createdBy, expiresAt } = parsed.data;
+    if (!RUNNER_ID_RE.test(runnerId)) return res.status(400).json({ error: 'invalid_runner', message: 'runnerId must be 1..128 printable chars' });
+    const scopes = normalizePlatformRunnerScopes(rawScopes ?? PLATFORM_RUNNER_DEFAULT_SCOPES);
+    if (!scopes) {
+      return res.status(400).json({ error: 'invalid_scopes', message: 'platform runner keys may only hold workflow/queue/inference scopes' });
+    }
+    let expiry: Date | null = null;
+    if (expiresAt) {
+      expiry = new Date(expiresAt);
+      if (Number.isNaN(expiry.getTime()) || expiry.getTime() <= Date.now()) {
+        return res.status(400).json({ error: 'invalid_expiry', message: 'expiresAt must be a future timestamp' });
+      }
+    }
+    const key = await createPlatformRunnerKey({
+      runnerId,
+      name: String(name || `platform-runner-${runnerId}`).slice(0, 100),
+      scopes,
+      createdBy: createdBy || null,
+      expiresAt: expiry,
+    });
+    await writeAuditStrict({
+      actor_type: 'platform-admin',
+      actor_id: createdBy || 'platform-runner-service',
+      action: 'platform:runner-key:create',
+      resource: `runner:${runnerId}`,
+      decision: true,
+      context: { keyId: key.id, prefix: key.prefix, scopes, expiresAt: expiry?.toISOString() || null },
+    }).catch(() => undefined);
+    noStore(res);
+    res.status(201).json({
+      id: key.id,
+      apiKey: key.value,
+      prefix: key.prefix,
+      runnerId,
+      scopes,
+      expiresAt: expiry?.toISOString() || null,
+    });
+  });
+
+  app.delete('/internal/platform-runners/keys/:id', async (req, res) => {
+    if (!isUuid(req.params.id)) return res.status(400).json({ error: 'invalid_id', message: 'key id must be a UUID' });
+    const revoked = await revokePlatformRunnerKey(req.params.id);
+    await writeAuditStrict({
+      actor_type: 'platform-admin',
+      actor_id: 'platform-runner-service',
+      action: 'platform:runner-key:revoke',
+      resource: `runner-key:${req.params.id}`,
+      decision: true,
+      context: { revoked },
+    }).catch(() => undefined);
+    res.json({ ok: true, id: req.params.id, revoked });
+  });
+
+  app.delete('/internal/platform-runners/keys/runner/:runnerId', async (req, res) => {
+    const runnerId = String(req.params.runnerId || '');
+    if (!RUNNER_ID_RE.test(runnerId)) return res.status(400).json({ error: 'invalid_runner' });
+    const revoked = await revokePlatformRunnerKeysForRunner(runnerId);
+    await writeAuditStrict({
+      actor_type: 'platform-admin',
+      actor_id: 'platform-runner-service',
+      action: 'platform:runner-key:revoke-all',
+      resource: `runner:${runnerId}`,
+      decision: true,
+      context: { revoked },
+    }).catch(() => undefined);
+    res.json({ ok: true, runnerId, revoked });
+  });
+
+  app.get('/internal/platform-runners/keys', async (req, res) => {
+    const runnerId = typeof req.query.runnerId === 'string' ? req.query.runnerId : undefined;
+    if (runnerId && !RUNNER_ID_RE.test(runnerId)) return res.status(400).json({ error: 'invalid_runner' });
+    res.json({ items: await listPlatformRunnerKeys(runnerId) });
+  });
+
+  /** Mint the short-lived user delegation used by a platform runner for one
+   *  claimed execution. The runner's own key is system-scoped and has no
+   *  tenant; this token carries the execution principal's tenant/scopes so
+   *  data-plane nodes stay tenant-correct and auditable (`act` = runner). */
+  app.post('/internal/platform-runners/delegate', async (req, res) => {
+    const parsed = z.object({
+      userId: z.string().uuid(),
+      runnerId: z.string().trim().min(1).max(128),
+      executionId: z.string().trim().min(1).max(128),
+      instanceId: z.string().trim().min(1).max(128),
+      accountId: z.string().uuid().nullish(),
+      scopes: z.array(z.string().min(1).max(200)).max(100).nullish(),
+      /** Bound to the runner's persisted lease; 1s is allowed so a 1s lease
+       *  cannot mint a 60s data grant. */
+      ttlSeconds: z.number().int().min(1).max(300).optional(),
+    }).safeParse(req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    const { userId, runnerId, executionId, instanceId, accountId, scopes: requested, ttlSeconds } = parsed.data;
+    if (!RUNNER_ID_RE.test(runnerId) || !RUNNER_ID_RE.test(executionId) || !RUNNER_ID_RE.test(instanceId)) {
+      return res.status(400).json({ error: 'invalid_id' });
+    }
+    // Never let a system runner acquire platform-control authority.
+    const scopes = (requested === undefined || requested === null ? ['*'] : requested)
+      .map((s) => String(s))
+      .filter((s) => !/^platform:/i.test(s));
+    if (requested !== undefined && requested !== null && scopes.length !== requested.length) {
+      return res.status(403).json({ error: 'platform_scope_forbidden' });
+    }
+    const user = await getUserById(userId);
+    if (!user) return res.status(404).json({ error: 'user_not_found' });
+    if (user.active === false) return res.status(403).json({ error: 'account_deactivated' });
+    const org = await getOrgById(user.org_id);
+    if (!org || org.status === 'suspended') {
+      return res.status(403).json({ error: 'org_suspended', message: 'The target organization is suspended or missing' });
+    }
+    let account = accountId ? await getAccountById(accountId) : null;
+    if (account && account.org_id !== user.org_id) {
+      return res.status(403).json({ error: 'cross_tenant', message: 'account does not belong to the target user organization' });
+    }
+    if (!account) {
+      const accounts = await listAccounts(user.org_id);
+      account = accounts[0] || null;
+    }
+    const ttl = Math.min(Math.max(Number(ttlSeconds) || 300, 1), 300);
+    const jti = randomUUID();
+    const expiresAt = new Date(Date.now() + ttl * 1000);
+    await storeExecutionDelegation({
+      jti,
+      executionId,
+      runnerId,
+      instanceId,
+      userId: user.id,
+      orgId: user.org_id,
+      accountId: account?.id || null,
+      scopes,
+      expiresAt,
+    });
+    const session = signAccess({
+      sub: user.id,
+      email: user.email,
+      org: user.org_id,
+      ...(account ? { account: account.id } : {}),
+      scopes,
+      kind: 'exec-delegated',
+      ver: Number(user.auth_version) || 0,
+      delegated: true,
+      jti,
+      exec: executionId,
+      runner: runnerId,
+      instance: instanceId,
+      act: { sub: `platform-runner:${runnerId}`, kind: 'platform-runner', exec: executionId, instance: instanceId },
+    }, { expiresIn: ttl, minExpiresIn: 1 });
+    await writeAuditStrict({
+      actor_type: 'platform-runner',
+      actor_id: `platform-runner:${runnerId}`,
+      action: 'iam:token:platform-runner-delegate',
+      resource: `execution:${executionId}`,
+      decision: true,
+      org_id: user.org_id,
+      context: {
+        userId: user.id,
+        account: account?.id || null,
+        executionId,
+        runnerId,
+        instanceId,
+        jti,
+        scopes,
+        ttlSeconds: session.expiresIn,
+      },
+    }).catch(() => undefined);
+    noStore(res);
+    res.json({
+      accessToken: session.token,
+      expiresIn: session.expiresIn,
+      tokenType: 'Bearer',
+      delegated: true,
+      kind: 'exec-delegated',
+      jti,
+      userId: user.id,
+      orgId: user.org_id,
+      accountId: account?.id || null,
+      runnerId,
+      instanceId,
+      executionId,
+      scopes,
+    });
+  });
+
+  app.post('/internal/platform-runners/delegations/revoke', async (req, res) => {
+    const parsed = z.object({
+      executionId: z.string().trim().min(1).max(128).optional(),
+      runnerId: z.string().trim().min(1).max(128).optional(),
+    }).safeParse(req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    if (!parsed.data.executionId && !parsed.data.runnerId) {
+      return res.status(400).json({ error: 'invalid_body', message: 'executionId or runnerId is required' });
+    }
+    const revoked = await revokeExecutionDelegations(parsed.data);
+    await writeAuditStrict({
+      actor_type: 'platform-runner',
+      actor_id: parsed.data.runnerId ? `platform-runner:${parsed.data.runnerId}` : 'platform-runner-service',
+      action: 'iam:token:platform-runner-delegate-revoke',
+      resource: parsed.data.executionId ? `execution:${parsed.data.executionId}` : `runner:${parsed.data.runnerId}`,
+      decision: true,
+      context: { ...parsed.data, revoked },
+    }).catch(() => undefined);
+    res.json({ ok: true, revoked, ...parsed.data });
+  });
+
+  app.post('/internal/platform/bootstrap', async (req, res) => {
+    const secret = process.env.PLATFORM_BOOTSTRAP_SECRET || '';
+    if (!secret) return res.status(503).json({ error: 'bootstrap_disabled' });
+    if (!secretsEqual(firstHeader(req.headers['x-platform-bootstrap-secret'] as any), secret)) {
+      return res.status(401).json({ error: 'invalid_bootstrap_secret' });
+    }
+    const active = (await listPlatformAdmins()).filter((a) => !a.revoked_at);
+    if (active.length) return res.status(409).json({ error: 'bootstrap_completed' });
+    const parsed = z.object({
+      email: z.string().trim().toLowerCase().email().max(320),
+      displayName: z.string().trim().max(200).nullish(),
+    }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    const slug = process.env.PLATFORM_ORG_SLUG || 'synapseone-platform';
+    let org = await getOrgBySlug(slug);
+    if (org && (org.kind || 'tenant') !== 'platform') {
+      return res.status(409).json({ error: 'platform_org_conflict', message: 'the reserved slug already belongs to a tenant organization' });
+    }
+    if (!org) org = await createOrganization(slug, 'SynapseOne Platform', 'platform');
+    const user = await upsertUser(org.id, parsed.data.email, parsed.data.displayName ? sanitizeName(parsed.data.displayName) : undefined);
+    if (user.active === false) await setUserActive(user.id, true);
+    const admin = await grantPlatformAdmin({ userId: user.id, role: 'owner', grantedBy: user.id, reason: 'initial bootstrap' });
+    const inviteToken = await issueInvite((await getUserById(user.id)) || user);
+    await writeAuditStrict({
+      actor_type: 'platform-bootstrap', actor_id: 'bootstrap', action: 'platform:bootstrap', resource: 'platform',
+      decision: true, org_id: org.id, context: { platformAdmin: true, targetUserId: user.id, email: user.email },
+    });
+    noStore(res);
+    res.status(201).json({ organization: org, user: publicUser(user), admin, inviteToken });
+  });
+
+  // Break-glass recovery for a platform administrator who lost their second
+  // factor. Called directly over the internal network with a separate secret.
+  app.post('/internal/platform/recovery', async (req, res) => {
+    const secret = process.env.PLATFORM_RECOVERY_SECRET || '';
+    if (!secret) return res.status(503).json({ error: 'recovery_disabled' });
+    if (!secretsEqual(firstHeader(req.headers['x-platform-recovery-secret'] as any), secret)) {
+      return res.status(401).json({ error: 'invalid_recovery_secret' });
+    }
+    const parsed = z.object({
+      userId: z.string().uuid(),
+      action: z.enum(['reset-mfa', 'revoke-sessions']),
+    }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    const admin = await getPlatformAdmin(parsed.data.userId);
+    if (!admin || admin.revoked_at) return res.status(404).json({ error: 'platform_admin_not_found' });
+    const user = await getUserById(parsed.data.userId);
+    if (!user) return res.status(404).json({ error: 'user_not_found' });
+    let result: any = { ok: true };
+    if (parsed.data.action === 'reset-mfa') {
+      result.removed = await removeMfa(user.id);
+      await clearLoginFailures(user.id);
+    } else {
+      result.revoked = await revokeAllRefresh(user.id);
+    }
+    await writeAuditStrict({
+      actor_type: 'platform-recovery', actor_id: 'recovery', action: `platform:recovery:${parsed.data.action}`,
+      resource: `user:${user.id}`, decision: true, org_id: user.org_id,
+      context: { platformAdmin: true, targetUserId: user.id, action: parsed.data.action },
+    });
+    noStore(res);
+    res.json(result);
+  });
+
   app.use((_req, res) => res.status(404).json({ error: 'not_found' }));
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
@@ -2732,11 +4698,14 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (err?.status === 413 || err?.type === 'entity.too.large') {
       return res.status(413).json({ error: 'payload_too_large', message: 'Request body exceeds the size limit' });
     }
-    if (err?.code === '23505' || err?.status === 409) {
+    if (err?.code === 'audit_write_failed') {
+      return res.status(503).json({ error: 'audit_write_failed', message: 'The administrative audit record could not be persisted; the request was not acknowledged.' });
+    }
+    if (isUniqueViolation(err) || err?.status === 409) {
       return res.status(409).json({ error: 'conflict', message: 'duplicate slug' });
     }
     // Malformed UUID in Postgres (invalid_text_representation): 400, not 500.
-    if (err?.code === '22P02' || /invalid_text_representation|invalid input syntax for.*uuid/i.test(err?.message || '')) {
+    if (err?.code === '22P02' || err?.cause?.code === '22P02' || /invalid_text_representation|invalid input syntax for.*uuid/i.test(err?.message || '')) {
       return res.status(400).json({ error: 'invalid_id', message: 'malformed UUID' });
     }
     // Race check-then-insert (id bị xóa giữa chừng) → FK violation → 404, không 500.

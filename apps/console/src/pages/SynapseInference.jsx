@@ -70,7 +70,7 @@ export default function SynapseInference() {
     setHealthLoading(true);
     setErr(null);
     try {
-      const data = await api.inferenceHealth(headers());
+      const data = await api.inferenceHealth(headers);
       setHealth(data);
     } catch (e) {
       setErr(e.message || 'Failed to load inference engine health');
@@ -104,7 +104,7 @@ export default function SynapseInference() {
           choices: choiceDict,
           instruction: routeInstruction,
         },
-        headers()
+        headers
       );
       setRoutingResult(data);
     } catch (e) {
@@ -123,7 +123,7 @@ export default function SynapseInference() {
         {
           input: lines.length > 1 ? lines : embInput,
         },
-        headers()
+        headers
       );
       setEmbResult(data);
     } catch (e) {
@@ -149,7 +149,7 @@ export default function SynapseInference() {
           max_tokens: Number(llmMaxTokens),
           stream: false,
         },
-        headers()
+        headers
       );
       setLlmResult(data);
     } catch (e) {
@@ -166,6 +166,12 @@ export default function SynapseInference() {
   const removeChoice = (idx) => {
     setChoices(choices.filter((_, i) => i !== idx));
   };
+
+  const healthy = health?.status === 'ok';
+  const healthKnown = !!health;
+  const emb = health?.components?.embedding || {};
+  const dec = health?.components?.decision || {};
+  const llm = health?.components?.llm || {};
 
   return (
     <div className="space-y-6">
@@ -185,7 +191,7 @@ export default function SynapseInference() {
         </div>
       </div>
 
-      {err && <Err error={err} />}
+      {err && <Err e={err} />}
 
       {/* Subsystem Health Cards */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -196,14 +202,14 @@ export default function SynapseInference() {
               <FontAwesomeIcon icon={faComments} />
               LLM Engine
             </span>
-            <Badge variant="success">Online</Badge>
+            <Badge variant={!healthKnown ? 'neutral' : healthy ? 'success' : 'warning'}>{!healthKnown ? 'Unknown' : healthy ? 'Online' : 'Degraded'}</Badge>
           </div>
-          <div className="text-sm font-medium text-slate-800 truncate" title={health?.models?.llm || 'OpenRouter'}>
-            {health?.models?.llm || 'liquid/lfm-2.5-2.6b:free'}
+          <div className="text-sm font-medium text-slate-800 truncate" title={health?.models?.llm || 'Not reported'}>
+            {health?.models?.llm || '—'}
           </div>
           <div className="text-xs text-slate-500 mt-1 flex items-center justify-between">
-            <span>Provider: {health?.components?.llm?.provider || 'OpenRouter'}</span>
-            <span className="text-emerald-600 font-medium">Ready</span>
+            <span>Provider: {llm.provider || '—'}</span>
+            <span className={llm.configured ? 'text-emerald-600 font-medium' : 'text-amber-600 font-medium'}>{llm.configured ? 'Configured' : 'No API key'}</span>
           </div>
         </Card>
 
@@ -214,14 +220,14 @@ export default function SynapseInference() {
               <FontAwesomeIcon icon={faLayerGroup} />
               Embedding Model
             </span>
-            <Badge variant="info">384 Dim</Badge>
+            <Badge variant={!healthKnown ? 'neutral' : emb.loaded ? 'info' : 'warning'}>{emb.dimensions || emb.dim ? `${emb.dimensions || emb.dim} Dim` : 'Embedding'}</Badge>
           </div>
-          <div className="text-sm font-medium text-slate-800 truncate" title={health?.models?.embedding || 'all-MiniLM-L6-v2'}>
-            {health?.models?.embedding || 'sentence-transformers/all-MiniLM-L6-v2'}
+          <div className="text-sm font-medium text-slate-800 truncate" title={health?.models?.embedding || 'Not reported'}>
+            {health?.models?.embedding || '—'}
           </div>
           <div className="text-xs text-slate-500 mt-1 flex items-center justify-between">
-            <span>Device: {health?.components?.embedding?.device || 'CPU'}</span>
-            <span className="text-cyan-700 font-medium">Self-hosted</span>
+            <span>Device: {emb.device || '—'}</span>
+            <span className={emb.loaded ? 'text-cyan-700 font-medium' : 'text-amber-600 font-medium'}>{emb.loaded ? 'Ready' : healthKnown ? 'Degraded' : 'Unknown'}</span>
           </div>
         </Card>
 
@@ -232,14 +238,14 @@ export default function SynapseInference() {
               <FontAwesomeIcon icon={faBrain} />
               Decision Model
             </span>
-            <Badge variant="warning">0.8B SLM</Badge>
+            <Badge variant={!healthKnown ? 'neutral' : dec.loaded ? 'info' : 'warning'}>{dec.loaded ? 'Loaded' : 'Decision'}</Badge>
           </div>
-          <div className="text-sm font-medium text-slate-800 truncate" title={health?.models?.decision || 'Decision-2.0-Eos-0.8B'}>
-            {health?.models?.decision || 'vllm-sr/Decision-2.0-Eos-0.8B'}
+          <div className="text-sm font-medium text-slate-800 truncate" title={health?.models?.decision || 'Not reported'}>
+            {health?.models?.decision || '—'}
           </div>
           <div className="text-xs text-slate-500 mt-1 flex items-center justify-between">
-            <span>Architecture: Qwen3.5-0.8B</span>
-            <span className="text-amber-700 font-medium">system_one</span>
+            <span>Architecture: {dec.architecture || '—'}</span>
+            <span className={dec.loaded ? 'text-amber-700 font-medium' : 'text-amber-600 font-medium'}>{dec.loaded ? 'Ready' : healthKnown ? 'Degraded' : 'Unknown'}</span>
           </div>
         </Card>
       </div>

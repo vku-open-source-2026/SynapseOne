@@ -76,6 +76,49 @@ routes:
     auth: either
     service: iam
 
+  # Owner-scoped (platform) runners. Served by workflow-service, but only a
+  # platform administrator JWT may reach it; workflow-service re-checks that
+  # the administrator still holds the `owner` role. Mutations require
+  # platform:Admin (operator/auditor tokens cannot manage system compute).
+  - path: /v1/platform/runners
+    target: ${WORKFLOW_SERVICE_URL:http://workflow:4002}
+    auth: jwt
+    service: platform
+    timeoutMs: 30000
+    actions:
+      - { method: POST, path: /v1/platform/runners, action: platform:Admin }
+      - { method: POST, path: /v1/platform/runners/*, action: platform:Admin }
+      - { method: POST, path: /v1/platform/runners/*/*, action: platform:Admin }
+      - { method: PATCH, path: /v1/platform/runners/*, action: platform:Admin }
+      - { method: DELETE, path: /v1/platform/runners/*, action: platform:Admin }
+      - { method: DELETE, path: /v1/platform/runners/*/*/*, action: platform:Admin }
+
+  # Platform Super Admin control plane. Only JWT credentials are accepted
+  # (API keys/service accounts are rejected at the gateway); normal user JWTs
+  # are allowed only on /session to exchange for a short-lived platform token.
+  - path: /v1/platform
+    target: ${IAM_SERVICE_URL:http://iam:4001}
+    auth: jwt
+    service: platform
+    timeoutMs: 30000
+    actions:
+      - { method: POST, path: /v1/platform/session, action: platform:Read }
+      - { method: POST, path: /v1/platform/step-up, action: platform:Write }
+      - { method: POST, path: /v1/platform/admins, action: platform:Admin }
+      - { method: DELETE, path: /v1/platform/admins/*, action: platform:Admin }
+
+  - path: /v1/workflow-runners
+    target: ${WORKFLOW_SERVICE_URL:http://workflow:4002}
+    auth: either
+    service: workflow
+
+  # Self-hosted runner job protocol (claim/complete/heartbeat/credentials).
+  # API-key authenticated; never exposed without the gateway's key verification.
+  - path: /v1/runner
+    target: ${WORKFLOW_SERVICE_URL:http://workflow:4002}
+    auth: either
+    service: workflow
+
   - path: /v1/workflows
     target: ${WORKFLOW_SERVICE_URL:http://workflow:4002}
     auth: either
@@ -109,6 +152,13 @@ routes:
     auth: either
     service: workflow
 
+  # MCP (Model Context Protocol) server: active workflows with an mcpTrigger
+  # node are exposed as MCP tools. Clients use Bearer JWT or X-API-Key.
+  - path: /mcp
+    target: ${WORKFLOW_SERVICE_URL:http://workflow:4002}
+    auth: none
+    timeoutMs: 120000
+
   # Public inbound webhooks (P0-5): no gateway auth — the workflow-service
   # enforces per-workflow auth/rate-limit/idempotency itself.
   - path: /webhook
@@ -128,6 +178,14 @@ routes:
     # agent room instead of cutting it off at the 30s global default.
     timeoutMs: 120000
 
+  # Queued inference jobs for self-hosted inference/hybrid runners.
+  - path: /v1/inference-jobs
+    target: ${WORKFLOW_SERVICE_URL:http://workflow:4002}
+    auth: either
+    service: inference
+    actions:
+      - { method: POST, path: /v1/inference-jobs, action: inference:Invoke }
+
   # Synapse Inference Engine — LLM proxy (OpenRouter), local embeddings, Decision-2.0-Eos-0.8B
   - path: /v1/inference
     target: ${INFERENCE_SERVICE_URL:http://inference:4008}
@@ -135,6 +193,14 @@ routes:
     service: inference
     actions:
       - { method: POST, path: /v1/inference/*, action: inference:Invoke }
+
+  - path: /v1/warehouse
+    target: ${WAREHOUSE_SERVICE_URL:http://warehouse:4012}
+    auth: either
+    service: warehouse
+    actions:
+      - { method: POST, path: /v1/warehouse/query, action: warehouse:Read }
+      - { method: GET, path: /v1/warehouse/*, action: warehouse:Read }
     timeoutMs: 120000
 
   # SynapseLDS — linked data service (NGSI-LD datasources + licensed exports).
@@ -163,6 +229,8 @@ routes:
     actions:
       - { method: POST, path: /v1/base/collections/*/query, action: base:Read }
       - { method: POST, path: /v1/base/collections/*/vector-search, action: base:Read }
+      - { method: POST, path: /v1/base/databases/*/collections/*/query, action: base:Read }
+      - { method: POST, path: /v1/base/databases/*/collections/*/vector-search, action: base:Read }
 
   # Synapse Faststore — tenant-scoped cache, counters, data structures and locks.
   - path: /v1/faststore

@@ -1,6 +1,6 @@
 {
   "name": "@synapseone/cli",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "license": "Apache-2.0",
   "description": "synapseone CLI - zero-dependency command line for Tier-1 PaaS (Node 18+)",
   "homepage": "https://synapseone.space",

@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="apps/console/public/brand/logo-lockup-dark.png">
+    <img src="apps/console/public/brand/logo-lockup-light.png" width="420" alt="SynapseOne">
+  </picture>
+</p>
+
 # SynapseOne — the open PaaS for your infrastructure
 
 [![CI](https://github.com/vku-open-source-2026/SynapseOne/actions/workflows/ci.yml/badge.svg)](https://github.com/vku-open-source-2026/SynapseOne/actions/workflows/ci.yml)
@@ -9,14 +16,14 @@
 
 **SynapseOne is an open-source Tier-1 PaaS (Apache-2.0): one API gateway, AWS-style access
 management, a core data cluster (documents, cache and queue), and native workflows —
-operated through a web Console, SDKs in three languages, and a zero-dependency CLI.**
+operated through a web Console, SDKs in four languages, and a zero-dependency CLI.**
 
 No lock-in: Authentik/Keycloak runs as an optional external IdP over
 standard OIDC. Everything else is SynapseOne code, pure Apache-2.0.
 
 - 🌐 **Live demo:** [synapseone.space](https://synapseone.space) · Console: [cloud.synapseone.space](https://cloud.synapseone.space) · API: `https://api.synapseone.space/health`
-- 📦 **Install:** `npm i @synapseone/sdk` · `pip install synapseone-sdk` · `npx @synapseone/cli` · Go SDK via the monorepo (see below)
-- 🚀 **Self-host:** `docker compose up -d --build` (details below)
+- 📦 **Install:** `npm i @synapseone/sdk` · `pip install synapseone-sdk` · `npx @synapseone/cli` · Go and Rust SDKs via the monorepo (see below)
+- 🚀 **Self-host:** public GHCR images (`docker compose pull`) or build from source (`docker compose up -d --build`) — see [Self-host](#self-host)
 
 ## Why SynapseOne
 
@@ -25,17 +32,18 @@ standard OIDC. Everything else is SynapseOne code, pure Apache-2.0.
 | **API Gateway** | Single entry point: JWT/API-key auth, principal propagation (`x-synapseone-*`), edge rate limiting, tracing, aggregate `/ready`, Prometheus `/metrics` |
 | **AWS-style IAM** | Organization → Account → User → Role → JSON Policy (Allow/Deny + Condition), enforced per-route scopes, `authorize` API + dry-run simulator, mutation audit trail, tenant isolation on every write (role-based, same-org fallback) |
 | **Flexible identity** | First-party password lifecycle (register/login/change/reset/verify), TOTP MFA with recovery codes, sign-in lockout, short-lived JWT, atomic rotating refresh tokens, API keys, service accounts, delegated user-token exchange for Tier 2, and real OIDC Authorization Code flow (Authentik/Keycloak) with shadow users |
-| **Core data** | Postgres (source of truth) + Redis + SeaweedFS (S3-compatible, Apache-2.0) object storage, versioned schema, idempotent seed, daily Postgres dumps and incremental object snapshots with restore |
-| **SynapseBase** | Self-managed document database: collections, object↔data mapping with validation, filters/cursors, optimistic concurrency, atomic counters, batches and a change feed (`/v1/base`) |
-| **Synapse Faststore** | Redis-backed cache/KV and data structures: TTL strings, counters, hashes, lists, sets, sorted sets, scans, batches and distributed locks (`/v1/faststore`) |
+| **Core data** | Postgres (source of truth) + Valkey (Redis-protocol) + SeaweedFS (S3-compatible, Apache-2.0) object storage, versioned schema, idempotent seed, daily Postgres dumps and incremental object snapshots with restore |
+| **SynapseBase** | Self-managed document database with tenant → database → collection → document namespaces, object↔data mapping with validation, filters/cursors, optimistic concurrency, atomic counters, batches and a change feed (`/v1/base`) |
+| **Synapse Faststore** | Valkey-backed cache/KV and data structures: TTL strings, counters, hashes, lists, sets, sorted sets, scans, batches and distributed locks (`/v1/faststore`) |
 | **SynapseQueue** | At-least-once messaging: delayed/deduplicated publishing, visibility-timeout leases, ack/nack/heartbeat, retries, dead letters and replay (`/v1/queue`) |
-| **SynapseStream** | Tenant-scoped event log over Redis Streams/Kafka with consumer groups, acks and retention (`/v1/stream`) |
+| **SynapseStream** | Tenant-scoped event log over Valkey/Redis Streams or Kafka with consumer groups, acks and retention (`/v1/stream`) |
+| **Synapse Warehouse** | Tenant-scoped OLAP: DuckDB datasets, read-only SQL, batch SQL transforms and SynapseStream-driven stream ETL, plus workflow templates (`/v1/warehouse`) |
 | **SynapseOCS** | Tenant-scoped buckets/objects with direct + multipart upload, presigned URLs, checksums, size/type limits and quotas (`/v1/ocs`, legacy `/v1/storage`) |
 | **SynapseNotifications** | Durable outbox + `{{var}}` templates, per-recipient preferences/unsubscribe, email/SMS/push relays, webhooks, retries and dead letters (`/v1/notifications`) |
-| **Workflows** | Built-in workflow engine (Apache-2.0): DAG runner, versioned templates, activate/deactivate/execute (real webhook & cron triggers), sandboxed code execution, execution history, visual graph editor |
+| **Workflows** | Built-in workflow engine (Apache-2.0): queue-backed DAG runner, versioned templates, activate/deactivate/execute (real webhook & cron triggers), sandboxed code execution, execution history, visual graph editor, and self-hosted runner image for hybrid/private execution |
 | **Linked Data (SynapseLDS)** | Licence-picked NGSI-LD datasources: structural-allowlist projection (`_core` never serialized), per-attribute visibility (public/restricted/internal), default-deny schema registry, workflow publish node (`lds.publish-record`) |
 | **AI assistant** | Chatbot on the API Docs page: decision model picks the endpoint, LLM pre-fills the try-it form (server-side key, guidance-only, never public) |
-| **Clients** | TypeScript, Python and Go SDKs with full API parity, zero-dependency CLI, admin Console |
+| **Clients** | TypeScript, Python, Go and Rust SDKs with full API parity, zero-dependency CLI, admin Console |
 
 ## Try it in 30 seconds
 
@@ -94,11 +102,14 @@ await c.faststore.set('cache:demo', { ok: true }, { ttlSeconds: 300 });
 await c.queue.publish('emails', { to: 'demo@acme.local' });
 ```
 
-All clients cover the full API (`docs/api.md`): password lifecycle + OIDC,
+The TypeScript, Python and Go clients cover the full API (`docs/api.md`): password lifecycle + OIDC,
 refresh/logout, delegated token exchange, orgs/accounts/users, roles/policies,
 authorize + dry-run, audit, API keys, service accounts, workflows/templates/
 executions, LDS, Base, Faststore, Queue, Stream, Object Storage, Notifications,
-AI and inference (streaming). The SDKs are split per service namespace
+AI and inference (streaming). A Rust SDK (`sdks/sdk-rust`, crate `synapseone`,
+version `0.9.0`) covers the same service namespaces and is ready for crates.io
+publication.
+The SDKs are split per service namespace
 (`c.iam`, `c.workflow`, `c.lds`, `c.base`, `c.faststore`, `c.queue`,
 `c.stream`, `c.storage`, `c.notifications`, `c.ai`, `c.inference`, `c.health`);
 legacy flat methods still work with a deprecation warning. See the parity
@@ -106,13 +117,62 @@ matrix in `docs/sdk-js.md` for the few intentional differences.
 
 ## Self-host
 
+Two supported paths produce the same stack. Every first-party image is published
+to the public GitHub Container Registry as
+`ghcr.io/vku-open-source-2026/synapseone-<service>:<tag>` (Apache-2.0, no
+registry login needed). Pin a release tag for reproducible deployments, or use
+`latest`.
+
+### 1. Run the published images (recommended)
+
+Requirements: Docker Engine 24+, Docker Compose v2.24+, ~4 GB RAM.
+
 ```bash
-cp .env.example .env   # then replace every *_change_me_* secret
-docker compose up -d --build
-curl localhost:8080/health && curl localhost:4001/health && curl localhost:4002/health
-curl localhost:4005/health && curl localhost:4006/health && curl localhost:4007/health
+git clone https://github.com/vku-open-source-2026/SynapseOne.git
+cd SynapseOne
+cp .env.example .env      # replace every *_change_me_* secret
+export SYNAPSEONE_VERSION=v0.9.0   # or latest
+docker compose pull
+docker compose up -d --no-build
+curl localhost:8080/health && curl localhost:8080/ready
 open http://localhost:3000   # sign in: demo@acme.local / org acme
 ```
+
+The release publishes these public images (same names as the Compose services):
+
+| Images | Purpose |
+|---|---|
+| `synapseone-gateway`, `synapseone-console` | public API edge and admin UI |
+| `synapseone-iam`, `synapseone-workflow`, `synapseone-ai` | identity, workflows, docs assistant |
+| `synapseone-lds`, `synapseone-base`, `synapseone-faststore` | linked data, documents, cache |
+| `synapseone-queue`, `synapseone-stream`, `synapseone-notifications` | messaging, event log, outbox |
+| `synapseone-ocs`, `synapseone-inference` | object storage, LLM/embeddings/decision |
+| `synapseone-postgres`, `synapseone-edge` | Postgres 16 + pgvector/PostGIS, TLS edge |
+
+> If `docker pull` returns `unauthorized`, the GHCR packages have not been
+> switched to public yet. An organization admin must add a `GHCR_PAT` secret
+> (package admin) and run the `packages-public` workflow once; releases also try
+> to flip visibility automatically when that secret exists.
+
+### 2. Build from source
+
+```bash
+git clone https://github.com/vku-open-source-2026/SynapseOne.git
+cd SynapseOne
+cp .env.example .env      # replace every *_change_me_* secret
+
+# Node 20+ monorepo build (services, SDKs, CLI, Console)
+npm ci
+npm run build
+
+# Build every image locally and start the stack
+docker compose build
+docker compose up -d --no-build
+```
+
+`docker compose up -d --build` combines the last two steps. The previous
+`synapseone/*` image names are replaced by the GHCR names above; a local build
+tags them with the same names so `up` never needs a registry round-trip.
 
 Production (TLS, edge rate limiting, hardened secrets): `docker-compose.prod.yml` +
 `infra/prod/` (nginx + Let's Encrypt via Certbot). Full checklist: `docs/production.md`.
@@ -127,6 +187,11 @@ Production (TLS, edge rate limiting, hardened secrets): `docker-compose.prod.yml
 | Base | `http://localhost:4005` | Internal — SynapseBase documents + mapping (behind gateway in prod) |
 | Faststore | `http://localhost:4006` | Internal — cache/KV/data structures (behind gateway in prod) |
 | Queue | `http://localhost:4007` | Internal — SynapseQueue messaging (behind gateway in prod) |
+| Stream | `http://localhost:4009` | Internal — SynapseStream event log (behind gateway in prod) |
+| Warehouse | `http://localhost:4012` | Internal — Synapse Warehouse OLAP + ETL (behind gateway in prod) |
+| OCS | `http://localhost:4010` | Internal — buckets, objects and presigned URLs |
+| Notifications | `http://localhost:4011` | Internal — durable notification outbox |
+| Inference | `http://localhost:4008` | Internal — LLM proxy, embeddings, decision |
 
 ## Architecture
 
@@ -141,7 +206,7 @@ Client → Gateway :8080 ─┬─► IAM :4001           (Org/Account/Role/Poli
                          ├─► Stream :4009        (event log / consumer groups)
                          ├─► Storage :4010       (objects, multipart, presign)
                          └─► Notifications :4011 (outbox + delivery)
-                         Postgres :5432 / Redis :6379 / SeaweedFS (S3) :9090
+                         Postgres :5432 / Valkey :6379 / SeaweedFS (S3) :9090
                          pg-backup + s3-backup → volumes pgbackups / s3backups
 ```
 
@@ -152,23 +217,26 @@ user and all authorization. Details: `docs/architecture.md`, `docs/iam-model.md`
 
 ```
 apps/console               Admin UI (React + Vite + Tailwind)
-apps/gateway               API gateway (proxy, JWT/API-key, principal headers, /metrics)
+apps/gateway               API gateway (Rust/Axum; proxy, JWT/API-key, principal headers, /metrics)
 apps/iam-service           IAM + tokens + authorize/simulator + real OIDC code flow
 apps/workflow-service      Workflow engine (local built-in DAG runner, sandboxed code, triggers)
-apps/lds-service           SynapseLDS — NGSI-LD datasources, registry, licensed exports
-apps/base-service          SynapseBase — documents, mapping, queries, change feed
-apps/faststore-service     Synapse Faststore — cache/KV, data structures, locks
-apps/queue-service         SynapseQueue — publish/consume, leases, retries, DLQ
-apps/stream-service        SynapseStream — topics, consumer groups, acks
-apps/ocs-service       SynapseOCS — objects, multipart, presign, quotas
-apps/notifications-service SynapseNotifications — outbox, templates, preferences
+apps/lds-service           SynapseLDS — NGSI-LD datasources, registry, licensed exports (Rust)
+apps/base-service          SynapseBase — documents, mapping, queries, change feed (Rust)
+apps/faststore-service     Synapse Faststore — cache/KV, data structures, locks (Rust)
+apps/queue-service         SynapseQueue — publish/consume, leases, retries, DLQ (Rust)
+apps/stream-service        SynapseStream — topics, consumer groups, acks (Rust)
+apps/warehouse-service     Synapse Warehouse — OLAP datasets, SQL, batch/stream ETL (Rust)
+apps/ocs-service           SynapseOCS — objects, multipart, presign, quotas (Rust)
+apps/notifications-service SynapseNotifications — outbox, templates, preferences (Rust)
+apps/ai-service            SynapseOne AI assistant — LLM routing + call generation (Rust)
 sdks/sdk-js                @synapseone/sdk (TypeScript, zero runtime deps)
 sdks/sdk-python            synapseone-sdk (Python, requests only)
 sdks/sdk-go                synapseone-sdk-go (Go, stdlib only)
+sdks/sdk-rust              synapseone (Rust, async reqwest/tokio)
 tools/cli                  synapseone CLI (zero deps, Node 18+) + install.sh
 tools/backup               pg-backup.sh / pg-restore.sh / s3-backup.mjs (backup + restore)
 infra/prod                 Production edge: nginx + Certbot overlay
-infra/monitoring           Prometheus (scrape gateway/PG/Redis + alert rules)
+infra/monitoring           Prometheus (scrape gateway/PG/Valkey + alert rules)
 infra/k8s/base             Kustomize manifests for Kubernetes
 infra/postgres/init.sql    Database bootstrap (extensions + journal schema; services own migrations)
 examples/quickstart        End-to-end demo script
@@ -216,3 +284,9 @@ docs                       Start at docs/README.md
 - Issue tracker: [GitHub Issues](https://github.com/vku-open-source-2026/SynapseOne/issues).
 - Change history: [`CHANGELOG.md`](CHANGELOG.md). Versioned release tags are published on GitHub.
 - Dependency inventory: [`THIRD-PARTY.md`](THIRD-PARTY.md); dependencies are not modified or bundled into the repository.
+
+## Brand
+
+Logo, icon and social-preview assets live in [`apps/console/public/brand`](apps/console/public/brand). The console serves the favicon, web app manifest and icons from `apps/console/public`.
+
+To set the GitHub repository social preview, upload [`apps/console/public/brand/social-preview.png`](apps/console/public/brand/social-preview.png) in **Settings → Social preview**.

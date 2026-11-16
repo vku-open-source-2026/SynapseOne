@@ -5,6 +5,10 @@ Ports assume Compose defaults. Apart from explicit public gateway routes
 (`/v1/auth/*`, LDS public reads, `/webhook/*`), services are internal in
 production and require `x-synapseone-internal` when the shared secret is set.
 
+Implementation: `ai`, `stream`, `lds` and `notifications` are Rust/Axum
+services (`apps/*/Cargo.toml`). This document describes their HTTP contract,
+which is unchanged; the TypeScript sources remain as a behavioural reference.
+
 ---
 
 ## Gateway — `apps/gateway` (:8080)
@@ -80,6 +84,12 @@ accessors + seed), `src/tokens.ts` (JWT/refresh/API keys), `src/policy.ts`
   `POST /v1/service-accounts/:id/token`.
 - Usage: `POST /v1/usage/ingest` (internal), `GET /v1/usage/summary`,
   `GET /v1/usage/events`.
+- Platform Super Admin: `/v1/platform/session`, `/step-up` (one-time,
+  session/action-bound), `/me`, `/overview`, `/orgs`, `/orgs/:id/accounts`,
+  `/users`, `/usage/*`, `/audit`, `/admins`; internal one-time
+  `/internal/platform/bootstrap|recovery`. Requires a `kind=platform-admin`
+  token; invited users activate with `/v1/auth/invite/accept` or Console
+  `/register`. See `docs/platform-superadmin.md`.
 
 **Data:** `organizations`, `accounts`, `users`, `roles`, `policies`,
 `role_policies`, `user_roles`, `api_keys`, `service_accounts`,
@@ -123,16 +133,28 @@ Migrations seed demo org `acme` and account `prod`; the memory fallback seeds
 **API:**
 - `GET/POST /v1/workflows`, `GET/PUT/DELETE /v1/workflows/:id`,
   `POST /v1/workflows/:id/execute|activate|deactivate`,
-  `POST /v1/workflows/test-run`.
+  `POST /v1/workflows/test-run` (`execute` returns 202 queued in queue mode;
+  `?wait=1` blocks).
 - `GET /v1/executions`, `GET /v1/executions/:id`.
+- `GET/POST /v1/workflow-runners`, `GET/PATCH/DELETE /v1/workflow-runners/:id`,
+  `GET /v1/workflow-runners/options`, `GET .../config|connection`,
+  `POST .../heartbeat|command`, `DELETE .../instances/:instanceId`,
+  `POST /v1/runner/jobs/:id/claim|heartbeat|complete|release|credentials`.
+- `POST/GET /v1/inference-jobs`, `GET /v1/inference-jobs/:id`,
+  `POST /v1/runner/inference/jobs/:id/claim|heartbeat|complete|release`
+  (inference/hybrid runner lane).
 - `GET /v1/templates`, `GET /v1/templates/:name`.
 - `GET/POST /v1/credentials`, `DELETE /v1/credentials/:id` (secrets never
   returned).
 - Public `ALL /webhook/:path` (no gateway auth; per-workflow auth/method).
+- `POST /mcp` MCP JSON-RPC server for active `mcpTrigger` workflows.
 - `GET /health`, `GET /metrics`.
 
 **Engine:** executes a DAG with a queue/fan-out model; expressions support
-`={{ ... }}` and `{{ ... }}` with `$json`, `$input`, `$now`. Node families:
+`={{ ... }}` and `{{ ... }}` with `$json`, `$input`, `$now`. In queue execution
+mode the *trigger* publishes a SynapseQueue job and workers run the DAG
+(`queue.ts`, `worker.ts`, `runner.ts`); the in-memory node queue remains the DAG
+fan-out mechanism. Node families:
 - native/aliases: `webhook`, `cron`, `manualTrigger`, `noOp`, `set`, `if`,
   `httpRequest`, `code`, `decision`, `aiAgent`, `synapseone.api`;
 - integration nodes: `synapseone.iam|base|faststore|queue|lds|inference|flow`;
@@ -145,7 +167,22 @@ Migrations seed demo org `acme` and account `prod`; the memory fallback seeds
 **Triggers:** manual execute/test; public webhooks with `secret-header`,
 `hmac-sha256`, or `jwt` auth, per-workflow rate limit and optional idempotency
 header/TTL; cron scheduler tick (`WORKFLOW_CRON_TICK_MS`, default 15 s) runs
-active cron workflows. Activation gates cron + webhooks, not manual runs.
+active cron workflows; `mcpTrigger` exposes active workflows as MCP tools at public
+`POST /mcp` (JSON-RPC `initialize`/`tools/list`/`tools/call`). Tools marked
+`public:true` + `readOnly:true` are anonymous (docs readers); private/write
+tools require Bearer JWT/X-API-Key. Public tool names are globally unique,
+private names per tenant; template `mcp-docs-reader`.
+Activation gates cron + webhooks + MCP, not manual runs.
+With `QUEUE_SERVICE_URL` set (default in Compose), triggers enqueue a job:
+platform worker (`WORKFLOW_WORKER_ENABLED`, concurrency 4), tenant custom
+runner, or hybrid shared queue. `WORKFLOW_EXECUTION_MODE=queue|inline|auto`
+controls the transport; tests/unit runs stay inline.
+
+**Self-hosted runners:** `POST/GET /v1/workflow-runners`, heartbeat/connection
+check, and `/v1/runner/jobs/*` claim/heartbeat/complete/release/credentials.
+The runner image is `apps/workflow-runner/Dockerfile` (release + CD publish
+`synapseone-workflow-runner`). Credentials are resolved per claimed execution,
+never embedded in queue messages. See `docs/workflow-runners.md`.
 
 **Templates (10):** `webhook-to-log`, `cron-etl`, `iam-webhook`,
 `code-transform`, `manual-starter`, `synapseone-self-check`, `webhook-to-lds`,
@@ -153,7 +190,12 @@ active cron workflows. Activation gates cron + webhooks, not manual runs.
 
 **Data:** `synapseone_workflows` (nodes/connections/settings/active/tenant/
 run_as/revision), `synapseone_executions` (input/output/node runs/principal/
-trigger), `synapseone_credentials` (AES-256-GCM envelope, `SYNAPSEONE_CREDENTIAL_KEY`
+trigger + queue/runner/worker/attempt/lease/resume), `synapseone_workflow_runners`
+(kind workflow/inference/hybrid, queues, tenant/API-key metadata),
+`synapseone_workflow_runner_instances` (per-connector hostname/version/
+concurrency/last heartbeat), `synapseone_inference_jobs` (queued inference
+chat/embeddings/decision work for inference/hybrid runners),
+`synapseone_credentials` (AES-256-GCM envelope, `SYNAPSEONE_CREDENTIAL_KEY`
 32-byte hex required in prod; dev uses an ephemeral key).
 
 **Rules:**
@@ -184,8 +226,9 @@ trigger), `synapseone_credentials` (AES-256-GCM envelope, `SYNAPSEONE_CREDENTIAL
 **Purpose:** SynapseLDS — publish licensed data as NGSI-LD with a default-deny
 attribute registry.
 
-**Files:** `src/index.ts` (routes/visibility), `src/projector.ts` (security core),
-`src/store.ts`, `src/licenses.ts`, `src/schema.ts`, `drizzle/`.
+**Files:** `src/main.rs` (Rust routes/visibility), `src/projector.rs` (security
+core), `src/store.rs`, `src/licenses.rs`; the original `src/index.ts` remains as
+the behavioural reference.
 
 **API:**
 - Public: `GET /v1/lds/licenses`,
@@ -226,13 +269,18 @@ projector comments call the metadata `_core`).
 object↔data mapping, validation, queries, vector search, optimistic concurrency,
 atomic counters, batches and a change feed.
 
-**Files:** `src/index.ts` (routes/scope/limits), `src/mapping.ts` (mapping +
-validation), `src/query.ts` (filters/order/cursor/vector), `src/store.ts`
-(Postgres/memory), `src/schema.ts`, `drizzle/`.
+**Files:** Rust ships: `src/api.rs` (routes/scope/limits), `src/mapping.rs`
+(mapping + validation), `src/query.rs` (filters/order/cursor/vector),
+`src/store.rs` (Postgres/memory), `src/schema.ts` + `drizzle/` (schema
+reference/migrations). The TypeScript sources are the behavioural reference.
 
 **API:**
-- `GET/POST /v1/base/collections`, `GET/PATCH/DELETE
-  /v1/base/collections/:collection`, `GET .../stats`.
+- `GET/POST /v1/base/databases`, `GET/PATCH/DELETE
+  /v1/base/databases/:database` (delete is 409 unless `?cascade=true`).
+- Collections: `GET/POST /v1/base/collections`, `GET/PATCH/DELETE
+  /v1/base/collections/:collection`, `GET .../stats`. The same routes exist
+  under `/v1/base/databases/:database/collections/...`; flat routes target the
+  tenant `default` database or `?database=<name>`.
 - Documents: `POST .../documents`, `GET/PUT/PATCH/DELETE
   .../documents/:id`, `GET .../documents`, `POST .../query`,
   `POST .../vector-search`, `POST .../documents/:id/increment`,
@@ -269,12 +317,14 @@ validation), `src/query.ts` (filters/order/cursor/vector), `src/store.ts`
 - Limits: document ≤ `BASE_MAX_DOCUMENT_BYTES` (default 256 KB, max 4 MB),
   nesting ≤32, arrays ≤10k; prototype keys rejected.
 
-**Data:** `synapseone_base_collections` (scope + name unique, mapping),
-`synapseone_base_documents` (PK collection+id, JSONB, version, GIN index),
-`synapseone_base_vectors` (collection+document+field, embedding text,
-dimension). Memory backend for dev/tests.
+**Data:** `synapseone_base_databases` (scope + name unique),
+`synapseone_base_collections` (`database_id`, name unique per database,
+mapping), `synapseone_base_documents` (PK collection+id, JSONB, version, GIN
+index), `synapseone_base_vectors` (collection+document+field, embedding text,
+dimension). Memory backend for dev/tests. Migration `0008_base_databases`
+backfills existing collections into per-tenant `default` databases.
 
-**Rules:** collection visibility = platform all, org-bound same org,
+**Rules:** database/collection visibility = platform all, org-bound same org,
 account-bound same account. Production requires DB + internal secret.
 
 **Env:** `PORT`, `DATABASE_URL`, `BASE_MAX_DOCUMENT_BYTES`,
@@ -285,9 +335,9 @@ account-bound same account. Production requires DB + internal secret.
 
 ## Faststore — `apps/faststore-service` (:4006)
 
-**Purpose:** tenant-scoped Redis data API.
+**Purpose:** tenant-scoped Valkey/Redis data API.
 
-**Files:** `src/index.ts` (routes/tenant), `src/store.ts` (Redis/memory).
+**Files:** `src/index.ts` (routes/tenant), `src/store.ts` (Valkey/memory).
 
 **API groups:**
 - Strings: `GET/PUT/POST/DELETE /v1/faststore/keys/:key`, `GET .../ttl`,
@@ -309,10 +359,10 @@ batch ≤100. Conditional writes `ifNotExists`/`ifExists`. Locks are token-owned
 and must be released/extended with the returned token. Keys live under
 `synapseone:faststore:v1:<tenant>:`; locks under `...:__lock__:<name>`.
 
-**Rules:** anonymous rejected; platform callers must pass tenant. Redis required
+**Rules:** anonymous rejected; platform callers must pass tenant. Valkey required
 in production (else split-brain). Memory fallback for tests/dev.
 
-**Env:** `PORT`, `FASTSTORE_REDIS_URL`/`REDIS_URL`,
+**Env:** `PORT`, `FASTSTORE_VALKEY_URL`/`FASTSTORE_REDIS_URL` (`VALKEY_URL`/`REDIS_URL` fallback),
 `SYNAPSEONE_INTERNAL_SECRET`, `HSTS_ENABLED`, `CORS_ORIGIN`.
 
 ---
@@ -322,7 +372,7 @@ in production (else split-brain). Memory fallback for tests/dev.
 **Purpose:** at-least-once queue with delayed/deduped publish, visibility
 leases, retries, DLQ and replay.
 
-**Files:** `src/index.ts` (routes/limits), `src/store.ts` (Redis Lua/memory).
+**Files:** `src/index.ts` (routes/limits), `src/store.ts` (Valkey Lua/memory).
 
 **API:**
 - Queues: `GET/PUT /v1/queue/queues`, `GET/DELETE /v1/queue/queues/:queue`,
@@ -330,6 +380,7 @@ leases, retries, DLQ and replay.
 - Publish: `POST /v1/queue/queues/:queue/messages`,
   `POST .../messages:batch`.
 - Consume: `POST .../consume` → message + `receipt` + lease expiry;
+  `waitSeconds` (0..20) blocks until work exists (long-poll);
   `POST .../ack|nack|heartbeat`.
 - Inspect/DLQ: `GET .../messages`, `GET .../dead`,
   `POST .../dead/:id/replay`, `DELETE .../dead/:id`.
@@ -346,8 +397,16 @@ leases, retries, DLQ and replay.
 - Keys: `synapseone:queue:v1:<tenant>:...`.
 - At-least-once by design → consumers must be idempotent; dedupe keys are the
   tool for duplicate suppression.
+- Long-poll wake-ups use a **dedicated** Valkey subscriber connection
+  (`store.ts: armActivitySignal`); the shared client cannot be subscribed.
+  Publish/nack-retry/replay announce on `...:signal`; delayed messages and lease
+  expiry are timed via `nextActivityAt` (next pending `available_at` or lease
+  deadline), so a parked consume wakes exactly when work can appear. If the
+  subscriber is unavailable the service degrades to short polls.
+- The queue-service pods are stateless for waits: any replica can answer any
+  wait because the signal is broadcast over pub/sub.
 
-**Env:** `PORT`, `QUEUE_REDIS_URL`/`REDIS_URL`, `QUEUE_MAX_PAYLOAD_BYTES`,
+**Env:** `PORT`, `QUEUE_VALKEY_URL`/`QUEUE_REDIS_URL` (`VALKEY_URL`/`REDIS_URL` fallback), `QUEUE_MAX_PAYLOAD_BYTES`,
 `SYNAPSEONE_INTERNAL_SECRET`, `HSTS_ENABLED`, `CORS_ORIGIN`.
 
 ---
@@ -357,9 +416,10 @@ leases, retries, DLQ and replay.
 **Purpose:** Console API-docs chatbot. Two-step: decision model picks a catalog
 endpoint; LLM fills path/body or returns guidance.
 
-**Files:** `src/index.ts` (route/limits/internal auth), `src/agent.ts`
-(orchestration + validation), `src/catalog.ts` (allowed endpoints), `src/llm.ts`
-(OpenAI-compatible client, retries/fallback).
+**Files:** `src/main.rs` (Rust route/limits/internal auth), `src/agent.rs`
+(orchestration + validation), `src/catalog.json` (allowed endpoints), `src/llm.rs`
+(OpenAI-compatible client, retries/fallback). The TypeScript sources remain as
+the behavioural reference.
 
 **API:** `POST /v1/ai/agent` only, plus `/health`. Internal secret required on
 `/v1/*`; per-principal rate limit (`AI_RATE_LIMIT`, default 30/min); API key
@@ -369,6 +429,36 @@ stays server-side. Output is validated against the catalog and fails closed
 **Env:** `PORT`, `AI_BASE_URL`, `AI_API_KEY`, `AI_DECISION_MODEL`,
 `AI_LLM_MODEL`, `AI_LLM_FALLBACK_MODEL`, `AI_TIMEOUT_MS`, `AI_RETRIES`,
 `AI_RATE_LIMIT`, `SYNAPSEONE_INTERNAL_SECRET`, `HSTS_ENABLED`, `CORS_ORIGIN`.
+
+---
+
+## Warehouse — `apps/warehouse-service` (:4012, Rust/Axum)
+
+**Purpose:** Tier-1 OLAP store behind the gateway's `/v1/warehouse` route.
+Tenant-scoped DuckDB databases hold datasets, SQL query results and ETL jobs.
+Batch jobs transform one dataset into another; stream jobs consume a
+SynapseStream topic and append event payloads to a dataset.
+
+**Files:** `src/main.rs` (boot/healthcheck), `src/api.rs` (routes),
+`src/store.rs` (tenant DuckDB store and metadata), `src/sql.rs`
+(identifier/SQL safety), `src/stream.rs`, `src/usage.rs`, `src/templates.rs`;
+tests in `src/tests.rs`.
+
+**API:** `GET /health`, `/ready`, `/metrics`; datasets
+(`GET/POST /v1/warehouse/datasets`, `GET/DELETE /v1/warehouse/datasets/:id`,
+`POST .../rows`), read-only SQL (`POST /v1/warehouse/query`), ETL templates
+(`GET /v1/warehouse/templates`) and jobs (`GET/POST /v1/warehouse/jobs`,
+`GET/DELETE .../:id`, `POST .../:id/run|pause|resume`), plus internal usage
+rollup/watermark/summary.
+
+**Invariants:** one DuckDB file per tenant (`WAREHOUSE_DATA_DIR`); every SQL
+statement is a single read-only `SELECT`/`WITH` with file/DDL functions denied;
+dataset ids are lower-case slugs and physical table names; stream jobs are
+single-writer (`replicas: 1`); deleting a dataset stops its stream workers
+before dropping its jobs/table.
+
+**Env:** `PORT`, `WAREHOUSE_DATA_DIR`, `WAREHOUSE_THREADS`,
+`STREAM_SERVICE_URL`, `SYNAPSEONE_INTERNAL_SECRET`, `CORS_ORIGIN`.
 
 ---
 
@@ -386,8 +476,10 @@ stays server-side. Output is validated against the catalog and fails closed
 at `/docs`.
 
 **Models/defaults:** OpenRouter-compatible LLM (default
-`liquid/lfm-2.5-2.6b:free`), sentence-transformers `all-MiniLM-L6-v2`
-(384-dim), Decision-2.0-Eos-0.8B. Device auto-detected.
+`liquid/lfm-2.5-2.6b:free`) with a fallback model, sentence-transformers
+`all-MiniLM-L6-v2` (384-dim, ONNX int8 on CPU, torch/mock fallbacks), and
+Decision-2.0-Eos-0.8B (FP32 CPU, ~3 GB RAM; `DECISION_ENABLED=false` disables).
+Device auto-detected.
 
 **Rules:** `/v1/*` requires `x-synapseone-internal` when configured; production
 requires the secret. Not tenant-aware — callers must not send tenant data.
@@ -396,7 +488,12 @@ No auth beyond the internal secret.
 **Env:** `PORT`, `OPENROUTER_BASE_URL`, `OPENROUTER_API_KEY`,
 `OPENROUTER_MODEL`, `OPENROUTER_FALLBACK_MODEL`, `OPENROUTER_TIMEOUT_MS`,
 `OPENROUTER_RETRIES`, `EMBEDDING_MODEL_NAME`, `EMBEDDING_DIM`,
-`DECISION_MODEL_NAME`, `INFERENCE_DEVICE`, `INFERENCE_MOCK_MODELS`,
+`EMBEDDING_BACKEND`, `EMBEDDING_ONNX_PATH`, `EMBEDDING_ONNX_FILE`,
+`EMBEDDING_BATCH_SIZE`, `EMBEDDING_MAX_LENGTH`, `DECISION_BACKEND`,
+`DECISION_MODEL_NAME`, `OPENROUTER_DECISIONS_URL`, `DECISION_ENABLED`,
+`DECISION_THREADS`, `DECISION_WARMUP`, `INFERENCE_DEVICE`,
+`INFERENCE_CPU_THREADS`, `INFERENCE_MODEL_DOWNLOAD`, `INFERENCE_WARMUP`,
+`MODEL_LOAD_RETRY_SECONDS`, `INFERENCE_MOCK_MODELS`,
 `SYNAPSEONE_INTERNAL_SECRET`.
 
 ---
@@ -408,16 +505,22 @@ No auth beyond the internal secret.
 **Files:** `src/App.jsx` (routes), `src/pages/*` (Dashboard, Orgs, Accounts,
 Users, Roles, Policies, Keys, ServiceAccounts, Workflows, SynapseBase,
 SynapseQueue, SynapseFaststore, SynapseInference, LinkedData, Authorize, Audit,
-ApiDocs, Docs, Login, OidcCallback, Landing), `src/lib/api.js` (fetch client +
-single-flight refresh rotation), `src/lib/auth.jsx` (session context),
+ApiDocs, Docs, Login, OidcCallback, Landing), `src/pages/admin/*` (platform
+Overview, Organizations, Users, Service Health, Usage, Audit, Platform Admins),
+`src/lib/api.js` (fetch client + single-flight refresh rotation),
+`src/lib/platform-auth.jsx` (isolated platform session/step-up),
+`src/lib/auth.jsx` (session context),
 `src/components/WorkflowEditor.jsx`, `src/components/Chatbot.jsx`,
 `public/config.js` (runtime `SYNAPSEONE_CONFIG.BASE_URL`), `nginx.conf`,
 `docker-entrypoint.sh`.
 
 **Rules:** calls the gateway only; API base URL comes from runtime config
 (`SYNAPSEONE_PUBLIC_BASE_URL` substituted at container start) or
-`VITE_SYNAPSEONE_BASE_URL` in dev. Auth tokens in local storage; 401 triggers one
-single-flight refresh, then clears session. Dev proxy: `/api` → gateway.
+`VITE_SYNAPSEONE_BASE_URL` in dev. Tenant auth tokens live in local storage;
+the platform token is sessionStorage-only and only used on `/v1/platform/*`.
+401 triggers one single-flight refresh, then clears session. Dev proxy:
+`/api` → gateway. Platform admin access is documented in
+`docs/platform-superadmin.md`.
 
 ---
 
@@ -443,7 +546,7 @@ surface is user-facing.
 
 ## Infra
 
-- `docker-compose.yml` — postgres, redis, s3 + s3-init, Authentik
+- `docker-compose.yml` — postgres, valkey, s3 + s3-init, Authentik
   server/worker + DB init, all services, console, Prometheus + exporters.
 - `docker-compose.prod.yml`/`.tls.yml` — production edge (nginx/Certbot),
   hardened secrets; `infra/prod/`.

@@ -13,7 +13,7 @@ import { promises as dns } from 'node:dns';
 
 const BLOCKED_EXACT_HOSTS = new Set([
   'localhost', 'metadata.google.internal',
-  'iam', 'gateway', 'workflow', 'postgres', 'redis', 'n8n', 's3', 'minio',
+  'iam', 'gateway', 'workflow', 'postgres', 'valkey', 'redis', 'n8n', 's3', 'minio',
   'ocs', 'base', 'lds', 'faststore', 'queue', 'stream', 'notifications',
   'inference', 'ai', 'console', 'authentik-server', 'authentik-worker',
 ]);

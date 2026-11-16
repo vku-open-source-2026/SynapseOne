@@ -55,8 +55,66 @@ export class WorkflowService {
   }
   activateWorkflow(id: string) { return this.http.req(`/v1/workflows/${encodeURIComponent(id)}/activate`, { method: 'POST' }); }
   deactivateWorkflow(id: string) { return this.http.req(`/v1/workflows/${encodeURIComponent(id)}/deactivate`, { method: 'POST' }); }
-  executeWorkflow(id: string, payload: Record<string, unknown> = {}) {
-    return this.http.req(`/v1/workflows/${encodeURIComponent(id)}/execute`, { method: 'POST', body: JSON.stringify(payload) });
+  executeWorkflow(id: string, payload: Record<string, unknown> = {}, opts: { wait?: boolean; timeoutMs?: number; expectedRevision?: number } = {}) {
+    const params = new URLSearchParams();
+    if (opts.wait) {
+      params.set('wait', '1');
+      params.set('timeoutMs', String(Math.min(Math.max(Number(opts.timeoutMs) || 30000, 1000), 300000)));
+    }
+    if (opts.expectedRevision !== undefined) {
+      if (!Number.isSafeInteger(opts.expectedRevision) || opts.expectedRevision < 1 || opts.expectedRevision > 2147483647) {
+        throw new RangeError('expectedRevision must be a positive 32-bit integer');
+      }
+      params.set('expectedRevision', String(opts.expectedRevision));
+    }
+    const qs = params.size ? `?${params}` : '';
+    return this.http.req(`/v1/workflows/${encodeURIComponent(id)}/execute${qs}`, { method: 'POST', body: JSON.stringify(payload) });
+  }
+
+  /** Poll an execution until it leaves queued/running (queue mode). */
+  async waitForExecution(id: string, opts: { timeoutMs?: number; pollMs?: number } = {}): Promise<any> {
+    const timeoutMs = Math.min(Math.max(Number(opts.timeoutMs) || 30000, 1000), 300000);
+    const pollMs = Math.min(Math.max(Number(opts.pollMs) || 500, 100), 5000);
+    const deadline = Date.now() + timeoutMs;
+    let current: any = await this.getExecution(id, true);
+    while (current && (current.status === 'queued' || current.status === 'running') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, pollMs));
+      current = await this.getExecution(id, true);
+    }
+    return current;
+  }
+
+  // ---- self-hosted workflow runners ----
+  listWorkflowRunners() { return this.http.req('/v1/workflow-runners'); }
+  getWorkflowRunnerOptions() { return this.http.req('/v1/workflow-runners/options'); }
+  getWorkflowRunner(id: string) { return this.http.req(`/v1/workflow-runners/${encodeURIComponent(id)}`); }
+  updateWorkflowRunner(id: string, patch: { name?: string; mode?: 'custom' | 'hybrid'; queue?: string; metadata?: Record<string, unknown> }) {
+    return this.http.req(`/v1/workflow-runners/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(patch) });
+  }
+  createWorkflowRunner(body: {
+    name: string;
+    mode?: 'custom' | 'hybrid';
+    queue?: string;
+    apiKeyId?: string;
+    keyPrefix?: string;
+    scopes?: string[];
+    metadata?: Record<string, unknown>;
+  }) {
+    return this.http.req('/v1/workflow-runners', { method: 'POST', body: JSON.stringify(body) });
+  }
+  getWorkflowRunnerConnection(id: string) {
+    return this.http.req(`/v1/workflow-runners/${encodeURIComponent(id)}/connection`);
+  }
+  getWorkflowRunnerCommand(id: string, apiKey?: string) {
+    return this.http.req(`/v1/workflow-runners/${encodeURIComponent(id)}/command`, {
+      method: 'POST', body: JSON.stringify(apiKey ? { apiKey } : {}),
+    });
+  }
+  deleteWorkflowRunner(id: string) {
+    return this.http.req(`/v1/workflow-runners/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  }
+  deleteWorkflowRunnerInstance(id: string, instanceId: string) {
+    return this.http.req(`/v1/workflow-runners/${encodeURIComponent(id)}/instances/${encodeURIComponent(instanceId)}`, { method: 'DELETE' });
   }
 
   // ---- executions ----

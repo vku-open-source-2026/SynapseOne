@@ -501,14 +501,17 @@ def deactivate_workflow(self, wf_id: str) -> Any
 ```
 Deactivates a workflow.
 
-#### `execute_workflow(wf_id, payload=None)`
+#### `execute_workflow(wf_id, payload=None, *, wait=False, timeout_ms=30000)`
 ```python
-def execute_workflow(self, wf_id: str, payload: dict | None = None) -> Any
+def execute_workflow(self, wf_id: str, payload: dict | None = None, *, wait: bool = False, timeout_ms: int = 30000) -> Any
 ```
-Triggers a manual execution (proxied to the engine).
+Triggers a manual execution. Queue mode returns `202 {queued: true,
+executionId}`; `wait=True` blocks for the final result. `wait_for_execution`
+polls a queued/running execution.
 
 ```python
-c.execute_workflow(wf_id, {"url": "https://example.com/hook"})
+run = c.workflow.execute_workflow(wf_id, {"url": "https://example.com/hook"}, wait=True)
+same = c.workflow.wait_for_execution(run["executionId"])
 ```
 
 #### `update_workflow(wf_id, name=None, definition=None)`
@@ -637,6 +640,10 @@ token required for the public projection; a token earns same-tenant
 Collections of JSON documents with a logical object↔data mapping, queries,
 optimistic concurrency, counters, batches and a change feed. Full guide:
 [synapsebase.md](synapsebase.md).
+
+Use `c.base.database("analytics")` to address a database namespace (or
+`c.base.collection("parks", database="analytics")` for typed use). Without it,
+calls use the legacy flat routes and the tenant `default` database.
 
 ```python
 from dataclasses import dataclass

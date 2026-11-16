@@ -34,7 +34,8 @@ export async function getStreamEngine(): Promise<StreamEngine> {
   if (initializingPromise) return initializingPromise;
 
   initializingPromise = (async () => {
-    const redisUrl = process.env.STREAM_REDIS_URL || process.env.REDIS_URL || '';
+    const redisUrl = process.env.STREAM_VALKEY_URL || process.env.VALKEY_URL
+      || process.env.STREAM_REDIS_URL || process.env.REDIS_URL || '';
     const isProd = process.env.NODE_ENV === 'production';
     const explicitEngine = (process.env.STREAM_ENGINE || '').toLowerCase().trim();
 
@@ -45,29 +46,32 @@ export async function getStreamEngine(): Promise<StreamEngine> {
       targetEngineName = 'redis';
     } else if (isProd) {
       // Never silently keep events in process memory in production.
-      throw new Error('[stream] In production one of STREAM_ENGINE or STREAM_REDIS_URL/REDIS_URL is required (no memory fallback)');
+      throw new Error('[stream] In production one of STREAM_ENGINE or STREAM_VALKEY_URL/STREAM_REDIS_URL/VALKEY_URL/REDIS_URL is required (no memory fallback)');
     }
     if (isProd && targetEngineName === 'memory') {
       throw new Error('[stream] STREAM_ENGINE=memory is forbidden in production (events are lost on restart)');
     }
 
+    // `valkey` is an alias: the engine speaks Redis Streams, and Valkey is
+    // the deployment target.
+    if (targetEngineName === 'valkey') targetEngineName = 'redis';
     let engine: StreamEngine;
 
     if (targetEngineName === 'redis') {
       if (!redisUrl) {
         if (isProd) {
-          throw new Error('[stream] In production, STREAM_REDIS_URL or REDIS_URL is required for Redis engine');
+          throw new Error('[stream] In production, STREAM_VALKEY_URL/VALKEY_URL (or legacy STREAM_REDIS_URL/REDIS_URL) is required for the Valkey/Redis engine');
         }
-        console.warn('[stream] No Redis URL provided, falling back to in-memory engine');
+        console.warn('[stream] No Valkey/Redis URL provided, falling back to in-memory engine');
         engine = new MemoryStreamEngine();
       } else {
         const redisEngine = new RedisStreamsEngine(redisUrl);
         const ok = await redisEngine.init();
         if (!ok) {
           if (isProd) {
-            throw new Error('[stream] Failed to connect to Redis Streams in production (fail-closed)');
+            throw new Error('[stream] Failed to connect to Valkey Streams in production (fail-closed)');
           }
-          console.warn('[stream] Redis connection failed, falling back to in-memory engine');
+          console.warn('[stream] Valkey/Redis connection failed, falling back to in-memory engine');
           engine = new MemoryStreamEngine();
         } else {
           engine = redisEngine;

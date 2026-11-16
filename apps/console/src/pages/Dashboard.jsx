@@ -33,6 +33,7 @@ import {
   faChevronLeft,
   faChevronRight,
   faServer,
+  faWarehouse,
 } from '@fortawesome/free-solid-svg-icons';
 import { useAuth } from '../lib/auth.jsx';
 import { api, baseUrl } from '../lib/api.js';
@@ -59,6 +60,7 @@ const SERVICE_DEFS = [
   { key: 'base', label: 'SynapseBase', hint: 'Document collections & query engine' },
   { key: 'faststore', label: 'Faststore', hint: 'Low-latency key-value & tenant cache' },
   { key: 'queue', label: 'SynapseQueue', hint: 'Message queues, worker jobs & dead-letters' },
+  { key: 'warehouse', label: 'Synapse Warehouse', hint: 'OLAP datasets · read-only SQL · batch & stream ETL' },
 ];
 
 const FEATURE_META = {
@@ -70,6 +72,7 @@ const FEATURE_META = {
   base: { label: 'SynapseBase', icon: faBoxes, hint: 'Document collections, queries & change feed' },
   faststore: { label: 'Faststore', icon: faBolt, hint: 'Low-latency key-value cache & distributed locks' },
   queue: { label: 'SynapseQueue', icon: faListCheck, hint: 'Message queues, worker jobs & dead-letters' },
+  warehouse: { label: 'Synapse Warehouse', icon: faWarehouse, hint: 'OLAP datasets, SQL studio & batch/stream ETL' },
   auth: { label: 'Auth & Session', icon: faKey, hint: 'User login, token refresh, OIDC & verification' },
   usage: { label: 'Telemetry', icon: faChartSimple, hint: 'Usage metrics & request logging' },
 };
@@ -285,8 +288,12 @@ export default function Dashboard() {
     setReadyLoading(true);
     try {
       const r = await fetch(`${baseUrl()}/ready`);
-      if (!r.ok) throw new Error(`gateway /ready → HTTP ${r.status}`);
-      setReady(await r.json());
+      // A degraded stack returns HTTP 503 with a valid readiness body. Parse it
+      // before deciding whether the gateway is unreachable.
+      const body = await r.json().catch(() => null);
+      if (!body) throw new Error(`gateway /ready → HTTP ${r.status}`);
+      setReady(body);
+      if (!r.ok && !Array.isArray(body.upstreams)) throw new Error(`gateway /ready → HTTP ${r.status}`);
     } catch (e) {
       setReady(null);
       setReadyErr(e);
@@ -560,6 +567,7 @@ export default function Dashboard() {
                       <option value="base">SynapseBase</option>
                       <option value="faststore">Faststore</option>
                       <option value="queue">SynapseQueue</option>
+                      <option value="warehouse">Synapse Warehouse</option>
                       <option value="auth">Auth & Session</option>
                     </select>
 
@@ -1239,7 +1247,7 @@ export default function Dashboard() {
             ))}
           </section>
 
-          {/* Service health, all 8 platform services probed from /ready */}
+          {/* Service health, all platform services probed from /ready */}
           <section aria-label="Service health" className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
             <Card className="min-w-0">
               <div className="flex items-center justify-between gap-2">

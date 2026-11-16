@@ -238,6 +238,36 @@ describe('SynapseBase', () => {
     assert.equal(lastMethod, 'DELETE');
   });
 
+  it('database handles scope collection and document paths', async () => {
+    const c = new SynapseOneClient({ baseUrl: base });
+    const analytics = c.base.database('analytics');
+
+    await analytics.createCollection({ name: 'users' });
+    assert.equal(lastPath, '/v1/base/databases/analytics/collections');
+    assert.equal(lastMethod, 'POST');
+
+    await c.base.createCollection({ name: 'events', database: 'analytics' });
+    assert.equal(lastPath, '/v1/base/databases/analytics/collections');
+    assert.deepEqual(JSON.parse(lastBody), { name: 'events' });
+
+    await analytics.getCollection('users');
+    assert.equal(lastPath, '/v1/base/databases/analytics/collections/users');
+
+    await analytics.createDocument('users', { data: { name: 'Ada' }, id: 'u1' });
+    assert.equal(lastPath, '/v1/base/databases/analytics/collections/users/documents');
+
+    const typed = c.base.collection<{ name: string }>('users', {
+      database: 'analytics',
+      mapping: { name: 'profile.name' },
+    });
+    await typed.get('u1');
+    assert.equal(lastPath, '/v1/base/databases/analytics/collections/users/documents/u1?as=object');
+
+    await c.base.database('analytics').deleteDatabase('analytics', { cascade: true });
+    assert.equal(lastPath, '/v1/base/databases/analytics?cascade=true');
+    assert.equal(lastMethod, 'DELETE');
+  });
+
   it('documents accept exactly one of data or object', async () => {
     const c = new SynapseOneClient({ baseUrl: base });
     await c.base.createDocument('parks', { object: { name: 'Central' }, id: 'p1' });

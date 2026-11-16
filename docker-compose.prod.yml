@@ -4,7 +4,7 @@
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 # Edge cong khai duy nhat: nginx :80/:443 (synapseone.space, cloud.*, api.* + LE).
 # Moi service khac bind 127.0.0.1 qua .env (debug local), khong public.
-# Authentik/s3/postgres/redis: chi trong network noi bo.
+# Authentik/s3/postgres/valkey: chi trong network noi bo.
 
 services:
   gateway:
@@ -12,6 +12,9 @@ services:
       NODE_ENV: production
       HSTS_ENABLED: "true"
       GATEWAY_VERIFY_APIKEY: "true"
+      # Central policy enforcement must be explicit in production.
+      AUTHZ_MODE: ${AUTHZ_MODE:-audit}
+      AUTHZ_MODE_REQUIRED: ${AUTHZ_MODE_REQUIRED:-true}
       # nginx is the only edge: one trusted proxy hop for the real client IP.
       TRUST_PROXY: ${TRUST_PROXY:-1}
     networks:
@@ -24,6 +27,15 @@ services:
       HSTS_ENABLED: "true"
       IAM_ALLOW_DEV_LOGIN: "false"
       IAM_ALLOW_OIDC_DEMO_CALLBACK: "false"
+      # Never echo reset/verification tokens on the public API.
+      IAM_EXPOSE_LIFECYCLE_TOKENS: "false"
+      # Privileged IAM mutations require an org administrator in production.
+      IAM_SENSITIVE_MUTATION_MODE: ${IAM_SENSITIVE_MUTATION_MODE:-enforce}
+      IAM_ALLOW_DIRECT_ORG_CREATE: "false"
+      # Super Admin control plane; bootstrap the first owner explicitly.
+      PLATFORM_ADMIN_ENABLED: ${PLATFORM_ADMIN_ENABLED:-true}
+      PLATFORM_ADMIN_REQUIRE_MFA: "true"
+      PLATFORM_ADMIN_REQUIRE_STEP_UP: "true"
     # Unpublish internal API in prod (gateway-only access via docker network).
     # Requires Compose v2.24+ (!reset). Fallback is .env bind 127.0.0.1.
     ports: !reset []
@@ -69,7 +81,8 @@ services:
       NODE_ENV: production
       HSTS_ENABLED: "true"
       # Durable engine + explicit CORS + internal secret (fail-closed at boot).
-      STREAM_ENGINE: redis
+      # `valkey` is an alias for the Redis-Streams engine.
+      STREAM_ENGINE: valkey
       CORS_ORIGIN: ${CORS_ORIGIN:?CORS_ORIGIN must be set in production}
       SYNAPSEONE_INTERNAL_SECRET: ${SYNAPSEONE_INTERNAL_SECRET:?SYNAPSEONE_INTERNAL_SECRET must be set in production}
     ports: !reset []
@@ -94,6 +107,9 @@ services:
       STORAGE_S3_BUCKET: ${STORAGE_S3_BUCKET:?STORAGE_S3_BUCKET must be set in production}
       STORAGE_S3_ACCESS_KEY: ${STORAGE_S3_ACCESS_KEY:?STORAGE_S3_ACCESS_KEY must be set in production}
       STORAGE_S3_SECRET_KEY: ${STORAGE_S3_SECRET_KEY:?STORAGE_S3_SECRET_KEY must be set in production}
+      # Signed release uploads (APK/AAB) are larger than the 25 MiB API default;
+      # the public edge allows this only on /v1/ocs/.
+      STORAGE_MAX_OBJECT_BYTES: ${STORAGE_MAX_OBJECT_BYTES:-134217728}
       CORS_ORIGIN: ${CORS_ORIGIN:?CORS_ORIGIN must be set in production}
       SYNAPSEONE_INTERNAL_SECRET: ${SYNAPSEONE_INTERNAL_SECRET:?SYNAPSEONE_INTERNAL_SECRET must be set in production}
     ports: !reset []
@@ -138,7 +154,7 @@ services:
   nginx:
     build:
       context: ./infra/prod
-    image: synapseone/edge:0.7.1
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-edge:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       DOMAIN: ${DOMAIN:-synapseone.space}

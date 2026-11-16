@@ -19,6 +19,8 @@ import {
   faBrain,
   faStream,
   faCloud,
+  faServer,
+  faWarehouse,
 } from '@fortawesome/free-solid-svg-icons';
 import { useI18n } from '../lib/i18n-context.js';
 
@@ -34,6 +36,18 @@ export const PLATFORM_SERVICES = [
     shadowColor: 'rgba(245, 158, 11, 0.28)',
     match: (p) => p.startsWith('/workflows'),
     keywords: ['synapseflow', 'workflow', 'ai agent', 'decision', 'dag', 'automation', 'cron', 'trigger', 'pipeline', 'execution'],
+  },
+  {
+    to: '/runner-engine',
+    label: 'Runner Engine',
+    category: 'Automation & AI Agents',
+    desc: 'Queue-backed platform or self-hosted DAG workers',
+    icon: faServer,
+    iconColor: 'from-orange-400 to-amber-500',
+    bgGradient: 'linear-gradient(135deg, #fb923c 0%, #d97706 100%)',
+    shadowColor: 'rgba(251, 146, 60, 0.28)',
+    match: (p) => p.startsWith('/runner-engine') || p.startsWith('/workflow-runners'),
+    keywords: ['runner', 'runner engine', 'worker', 'self-hosted', 'queue', 'synapsequeue', 'docker', 'api key', 'hybrid', 'workflow', 'inference', 'connector'],
   },
   {
     to: '/base',
@@ -70,6 +84,18 @@ export const PLATFORM_SERVICES = [
     shadowColor: 'rgba(244, 63, 94, 0.28)',
     match: (p) => p.startsWith('/stream'),
     keywords: ['stream', 'streaming', 'kafka', 'events', 'consumer group', 'replay', 'telemetry', 'topic', 'log'],
+  },
+  {
+    to: '/warehouse',
+    label: 'Synapse Warehouse',
+    category: 'OLAP & ETL',
+    desc: 'DuckDB datasets, read-only SQL studio, batch & stream ETL jobs',
+    icon: faWarehouse,
+    iconColor: 'from-lime-500 to-emerald-600',
+    bgGradient: 'linear-gradient(135deg, #84cc16 0%, #059669 100%)',
+    shadowColor: 'rgba(16, 185, 129, 0.28)',
+    match: (p) => p.startsWith('/warehouse'),
+    keywords: ['warehouse', 'olap', 'duckdb', 'sql', 'dataset', 'etl', 'analytics', 'batch', 'stream', 'aggregate', 'rollup'],
   },
   {
     to: '/ocs',

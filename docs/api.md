@@ -43,22 +43,30 @@ tenant. Platform calls without a tenant fail with `400 tenant_required`.
 - `POST /v1/auth/register {email, password, orgSlug?, displayName?}` → token set (201).
   A brand-new org is self-service; joining an existing org requires an invitation
   (`403 org_membership_required` otherwise). Password policy: 12–128 chars.
+- `POST /v1/auth/invite/accept {token, password, displayName?}` → activate a one-time invited account and return a session
 - `POST /v1/auth/password/change {currentPassword, newPassword}` → `{ok, revokedSessions}`
 - `POST /v1/auth/password/forgot {email, orgSlug?}` → `202 {ok}` (no account enumeration;
-  dev responses may include `resetToken` when no mailer is configured)
+  responses include `resetToken` only when the deployment opts in with
+  `IAM_EXPOSE_LIFECYCLE_TOKENS=true` outside production)
 - `POST /v1/auth/password/reset {token, newPassword}` → `{ok, revokedSessions}`
 - `POST /v1/auth/email/verify {token}` → `{ok, emailVerified}`
 - `POST /v1/auth/email/verify/request` (Bearer) → `{ok, emailVerificationToken?}`
 - `GET /v1/auth/sessions` (Bearer) → refresh-token sessions
 - `DELETE /v1/auth/sessions/:id` (Bearer) → revoke one session
 - `POST /v1/auth/exchange {userId, accountId?, orgId?, scopes?, audience?, ttlSeconds?}`
-  (service-account Bearer or API key) → `{accessToken (kind=delegated), expiresIn, ...}`.
-  Refuses cross-tenant targets (`403 cross_tenant`) and scope escalation; audited.
+  (**account-level** operator API key or service-account Bearer) → `{accessToken
+  (kind=delegated), expiresIn, ...}`. User-bound API keys are refused
+  (`403 exchange_requires_account_key`); service accounts are rechecked for
+  revocation, account binding and org status. Refuses inactive/suspended target
+  users or orgs, cross-tenant targets (`403 cross_tenant`) and scope escalation;
+  audited.
 - `POST /v1/auth/refresh {refreshToken}` → `{accessToken, refreshToken}` (rotation: the old token is revoked)
 - `POST /v1/auth/logout {refreshToken}` → `{ok}`
 - `POST /v1/auth/logout-all {refreshToken}` → `{ok, revoked}` (revokes all of your own sessions)
-- `GET /v1/auth/verify` (Bearer or X-API-Key) → `{valid, ...}`
+- `GET /v1/auth/verify` (Bearer or X-API-Key) → `{valid, ...}`; API-key responses include the verified owning `org_id`
 - `GET /v1/auth/me` (Bearer) → `{user, kind}` (`user.is_org_admin` tells whether the caller administers its org)
+- `GET /v1/auth/contexts` (Bearer) → `{current, contexts, preferred}` — the caller's own context is always included; other same-email contexts are included only after `email_verified` (password login alone does not verify). Suspended organizations are omitted.
+- `POST /v1/auth/contexts/switch {orgId, password}` (Bearer) → tenant token only after the **target row's own** password is verified (and its TOTP/recovery challenge completed, when enrolled). User-bound rows with no password return `403 target_login_required`; a suspended caller is refused. Platform context is never minted here; it returns `409 platform_context_login_required` and requires the platform-org login + MFA.
 - `GET /v1/auth/sessions` (user Bearer) → `[{id, created_at, expires_at}]` — your active sessions (one per live refresh token), newest first
 - `DELETE /v1/auth/sessions/:id` (user Bearer) → `{ok}` — revoke one session (its refresh token stops working); other users' ids → `404`
 - `GET /v1/auth/oidc/config` → `{issuer, clientId, redirectUri, codeExchange, ...}`
@@ -211,6 +219,14 @@ rest and NEVER returned: create/rotate accept a `secret` once; list/get return
 metadata only (`{id, name, kind, accountId, createdAt, updatedAt}`). Implemented
 `kind` values: `bearer|api-key|basic|hmac` (legacy alias `type` accepted).
 
+New credentials are bound to their creator's verified principal (`owner` in
+metadata). Listing, lookup, rotation, deletion and execution-time resolution
+require that owner as well as the account/organization boundary. A user-bound
+API key acts as its owning user, and cannot resolve an account machine's private
+credential. Existing credentials with no owner retain their prior sharing rules;
+create a new credential for a private service connector. Ownership is never
+accepted from request JSON.
+
 - `POST /v1/accounts/:accountId/credentials {name, kind|type, secret}` → metadata (201)
 - `GET /v1/accounts/:accountId/credentials` → `[metadata]`
 - `GET /v1/credentials/:id` → metadata
@@ -283,6 +299,17 @@ Deactivation sets `active:false`, revokes refresh tokens and API keys.
 
 ## Workflows (local built-in engine)
 
+`settings.access = {"mode":"owner-only"}` restricts a workflow to its stored
+creator inside its tenant. This policy covers list/get/update/delete, activation,
+manual and nested execution, execution history, linked human tasks, and custom
+runner jobs. Public webhooks cannot invoke an owner-only workflow; public MCP
+declarations do not override its policy. Only its creator may change the access
+mode. Missing access settings (or explicit `mode: "tenant"`) retain tenant
+sharing. An authenticated creator is required for owner-only mode. Capability
+services should create protected workflows and credentials using their own
+organization-bound technical identity, then enforce member roles before invoking
+them. A payload field claiming to be an actor does not grant Tier-1 permission.
+
 - `GET /v1/templates` / `GET /v1/templates/:name`
 - `GET /v1/workflows` (list: `[{id,name,active,nodes,connections,settings,orgId?,accountId?,owner?,runAs?,revision,createdAt,updatedAt}]`;
   gateway-authenticated callers see their org slice + legacy-global rows; `?orgId=` / `?accountId=` filter exactly)
@@ -296,16 +323,17 @@ Deactivation sets `active:false`, revokes refresh tokens and API keys.
   explicit org/account must stay inside the caller's own org, else `403 cross_tenant`;
   every create stamps `owner` from the caller)
 - `PUT /v1/workflows/:id {name?, definition?, settings?, orgId?, accountId?, runAs?}` (structural/SSRF/size/cycle-validated, ≤200KB, ≤50 nodes, every node needs a 1..128 char `name`; every update bumps `revision`)
-- `POST /v1/workflows/:id/execute {input}` (manual run — works for ANY trigger type, active or not; the body IS the input; returns `{ok, output, executionId, status}`; `500 {ok:false, error}` when a node fails; records the caller principal + `actor: "workflow:<id> principal:<sub>"`)
-- `POST /v1/workflows/test-run {definition, input, workflowId?}` (try a definition without saving; validates + executes in the sandbox; persisted as a `triggered_by=test` execution — pass `workflowId` to attach it to that workflow's history; returns `{ok, output, nodeRuns, executionId}`)
-- `GET /v1/executions` (`limit,offset,workflowId,status,triggeredBy,includeData`; `limit/offset` 0..9999, `offset=0` = first page; `triggeredBy` is `manual|webhook|cron|test`; secret-looking keys in payloads are masked to `***`; always returns the envelope `{data: [...]}` — SDKs/Console/CLI unwrap `.data` and also accept a bare array) / `GET /v1/executions/:id` (`?includeData=true` for per-node input/output; also carries `principal` + `actor`)
+- `POST /v1/workflows/:id/execute {input}` (manual run — works for ANY trigger type, active or not; the body IS the input). With queue transport enabled (default when `QUEUE_SERVICE_URL` is set) this returns `202 {ok, queued:true, executionId, queue, runner}` after publishing a SynapseQueue job; add `?wait=1&timeoutMs=60000` for the old blocking shape `{ok, output, executionId, status}`. `500 {ok:false, error}` when a node fails. Records the caller principal + `actor: "workflow:<id> principal:<sub>"`.)
+  Optional `expectedRevision=<positive integer>` checks the revision of the exact definition being executed/enqueued. A mismatch returns `409 workflow_revision_conflict` without publishing a job; malformed values return `400 invalid_revision`. The precondition is a query parameter, separate from workflow input. Platform workers and custom runner claims also reject queued jobs if the definition revision changed while waiting, including resumed jobs. They finish those executions with an error and run no nodes; submit a new execution after reviewing the new definition. Existing queued jobs without revision metadata retain legacy behavior.
+- `POST /v1/workflows/test-run {definition, input, workflowId?}` (try a definition without saving; validates + executes inline in the sandbox; persisted as a `triggered_by=test` execution — pass `workflowId` to attach it to that workflow's history; returns `{ok, output, nodeRuns, executionId}`)
+- `GET /v1/executions` (`limit,offset,workflowId,status,triggeredBy,includeData`; `limit/offset` 0..9999, `offset=0` = first page; `status` is `queued|running|paused|success|error|cancelled`; `triggeredBy` is `manual|webhook|cron|test|human-task|workflow|mcp`; secret-looking keys in payloads are masked to `***`; always returns the envelope `{data: [...]}` — SDKs/Console/CLI unwrap `.data` and also accept a bare array) / `GET /v1/executions/:id` (`?includeData=true` for per-node input/output; also carries `principal`, `actor`, `queue`, `runner`, `workerId`, `attempt`, `leaseExpiresAt`, `workflowRevision`)
 - `GET/POST/DELETE /v1/credentials[?accountId=]` (account-scoped secrets, AES-256-GCM at rest via `SYNAPSEONE_CREDENTIAL_KEY`; list/create return metadata only, never secrets; duplicate names per account are `409`)
-- Public inbound webhooks: `ANY /webhook/:path` triggers the ACTIVE workflow whose webhook node declares that `path` (also proxied at the gateway as `/webhook`, auth none — per-workflow auth below still applies):
-  ```bash
+- Public inbound webhooks: `ANY /webhook/:path` triggers the ACTIVE workflow whose webhook node declares that `path` (also proxied at the gateway as `/webhook`, auth none — per-workflow auth below still applies):  ```bash
   curl -X POST http://localhost:4002/webhook/transform \
     -H 'Content-Type: application/json' \
     -d '{"value":21}'
-  # → {ok, output, executionId}
+  # → {ok, queued:true, executionId, queue}   (queue mode)
+  # → {ok, output, executionId}               (inline mode / ?wait=1)
   ```
   Per-workflow hardening from the webhook node's params: `auth` (`none` |
   `secret-header` | `hmac-sha256` over the raw body | `jwt` HS256 with exp/nbf +
@@ -322,6 +350,20 @@ Deactivation sets `active:false`, revokes refresh tokens and API keys.
   `issues`, `pull_request` all land as the run input. Replying back (comment,
   dispatch) is a plain `httpRequest` to `https://api.github.com/...` with a PAT
   stored as a `bearer` credential (never in the URL).
+- **MCP trigger** (`mcpTrigger`, alias `synapseone.mcpTrigger`): an ACTIVE
+  workflow that declares `parameters.toolName` is exposed as an MCP tool.
+  `POST /mcp` is a public JSON-RPC 2.0 server (`initialize`, `tools/list`,
+  `tools/call`, `ping`). Tools marked `public: true` **and** `readOnly: true`
+  are callable anonymously (docs/read-only use). Private or write-capable
+  tools require a gateway Bearer JWT or `X-API-Key`; anonymous `tools/list`
+  only returns public read-only tools. Calls run the workflow inline with
+  `triggered_by=mcp` and return
+  `{content:[{type:"text",text}], structuredContent?}`. Public tool names are
+  globally unique and all tool names are unique per tenant
+  (`409 mcp_tool_conflict` on activate). Built-in template `mcp-docs-reader`
+  exposes public read-only `read_synapseone_docs` and fetches the requested
+  public docs file. MCP clients can use `Authorization: Bearer <api-key>` on
+  authenticated routes as a fallback.
 - `GET /metrics` (Prometheus: `synapseone_workflow_runs_total{triggered_by,status}`,
   `synapseone_workflow_webhook_rejected_total{reason}`)
 
@@ -332,14 +374,15 @@ origins bypass the block AND forward the run principal as `x-synapseone-*`
 headers so downstream services can authorize. Redirects are followed manually
 with every hop re-checked (max 5).
 
-Node types: `webhook` (trigger, `parameters.path/httpMethod`), `cron` (trigger, `rule.interval` or `cronExpression`), `manualTrigger`, `httpRequest` (`url/method/headers/body`, SSRF-blocked, 15s timeout), `code` (sandboxed JS, `parameters.code`, 5s timeout, `$input/$json/input/$now` + `console` capture), `set` (`values/assignments`, supports `={{ $json.x }}` templating), `if` (`condition` JS or `value1/operation/value2` or n8n `conditions[]`; `main[0]`=true, `main[1]`=false), `noOp` (passthrough). `synapseone.api` (first-party SynapseOne block: `parameters.resource/operation/input` — resources `orgs/users/roles/policies/authorize/audit/keys/service-accounts/workflows/executions/templates/lds`; runs as your login, values support `={{ $json.x }}`; `lds` = `list-datasources` | `publish-record`). Unknown types pass data through but are recorded as `skipped` (visible in `nodeRuns`), not silent success.
+Node types: `webhook` (trigger, `parameters.path/httpMethod`), `cron` (trigger, `rule.interval` or `cronExpression`), `manualTrigger`, `mcpTrigger` (trigger; `parameters.toolName/description/inputSchema` exposes the workflow as an MCP tool at `POST /mcp`), `httpRequest` (`url/method/headers/body`, SSRF-blocked, 15s timeout), `code` (sandboxed JS, `parameters.code`, 5s timeout, `$input/$json/input/$now` + `console` capture), `set` (`values/assignments`, supports `={{ $json.x }}` templating), `if` (`condition` JS or `value1/operation/value2` or n8n `conditions[]`; `main[0]`=true, `main[1]`=false), `noOp` (passthrough). `synapseone.api` (first-party SynapseOne block: `parameters.resource/operation/input` — resources `orgs/users/roles/policies/authorize/audit/keys/service-accounts/workflows/executions/templates/lds`; runs as your login, values support `={{ $json.x }}`; `lds` = `list-datasources` | `publish-record`). Unknown types pass data through but are recorded as `skipped` (visible in `nodeRuns`), not silent success.
 
 | Node | Key `parameters` | Notes |
 | --- | --- | --- |
 | `webhook` | `path` (1..128, `[A-Za-z0-9_./-]`, no `..`), `httpMethod` (`GET\|POST\|PUT\|PATCH\|DELETE\|HEAD`, default `POST`), `auth` (`{mode: none\|secret-header\|hmac-sha256\|jwt, header?, credentialId?}`), `rateLimit: {rpm}` (default 600), `idempotency: {header, ttlSeconds}` | `ANY /webhook/:path` routes to the ACTIVE workflow with that path; activating with a taken path is `409`; auth/rate/idempotency enforced per node config |
 | `cron` | `rule.interval[]` (`{field: seconds\|minutes\|hours\|days, <field>Interval: N}`), or `cronExpression` (`"*/N * * * *"`, `"M H * * *"` wall-clock, `@hourly`, `@daily`), or `intervalMs`, plus optional `timezone` (wall-clock only) | Minimum 10s — faster schedules and other cron formats are rejected at save/activate; the editor shows the next run |
 | `manualTrigger` | — | Run from Console/CLI with any JSON input |
-| `httpRequest` | `url` (public `http(s)` or allowlisted self origin), `method`, `headers` (object), `body`/`jsonBody` (sent only when configured — the input is NOT auto-forwarded), `auth: {credentialId, header?}` (secret resolved server-side), `retry: {attempts 1–5, delayMs}`, `timeoutMs` (1–30s) | Redirects followed manually, max 5 hops, every hop re-checked against the SSRF blocklist; default 15s timeout; ≤200KB body, ≤500KB response |
+| `mcpTrigger` | `toolName` (`[A-Za-z0-9_.-]{1,64}`), `description` (≤500), `inputSchema` (JSON Schema, ≤8KB), `public` (bool), `readOnly` (bool, default true; `public` requires readOnly) | Active workflow becomes an MCP tool; names unique among active workflows; `POST /mcp` JSON-RPC |
+| `httpRequest` | `url` (public `http(s)` or allowlisted self origin), `method`, `headers` (object), `body`/`jsonBody` (sent only when configured — the input is NOT auto-forwarded), `auth: {credentialId, header?}` (secret resolved server-side), `retry: {attempts 1–5, delayMs}`, `timeoutMs` (1–30s), `includeInput` (optional; `true` returns `{statusCode, body, input}` where `input` is a clone of the incoming node value, and the same 500KB combined output limit applies) | Redirects followed manually, max 5 hops, every hop re-checked against the SSRF blocklist; default 15s timeout; ≤200KB body, ≤500KB response |
 | `code` | `code` (JS, ≤50KB, default 5s timeout), `timeoutMs` (1–15s), `retry` | `$input`/`$json`/`input` in scope, `$now` ISO time, `console.*` captured; bare expressions get an implicit `return (…)`; result `_logs` key is yours — console output then lands in `_consoleLogs` |
 | `set` | `values` (object), `assignments` (`[{name, value}]`), legacy `values.assignments`/`fields` | Values support `={{ $json.x }}` / `{{ … }}` / `=expr` templating against the incoming item; merged over the input |
 | `if` | `condition` (JS), or `value1` + `operation` + `value2` (`equals|notEquals|contains|notContains|startsWith|endsWith|larger|largerEqual|smaller|smallerEqual|isEmpty|isNotEmpty`), or n8n `conditions[]` | Output branch 0 = true, 1 = false; an unwired side stops the run there (the editor warns) |
@@ -353,6 +396,137 @@ update bumps `revision`. Export/import via the Console (portable
 `{name, nodes, connections, settings}` JSON) or the raw API payloads.
 
 Execution semantics: non-`if` nodes fan out to every branch; a diamond (`A→B, A→C, B→D, C→D`) runs `D` once per incoming edge with that edge's data. With several terminal nodes the final `output` is keyed by terminal node name (`{Left: …, Right: …}`); with one terminal it is that node's output directly. Per-node `nodeRuns[]` carry `status` (`success|error|skipped`), `input`, `output`, `error`, `durationMs`, `attempts?`.
+
+### Queue transport and self-hosted runners
+
+Triggers (manual, webhook, cron, human-task resume) create a `queued`
+execution row and publish a tiny `{v,kind:"workflow.run",executionId}` message
+to SynapseQueue. Inputs and definitions stay in Postgres; workers fetch them
+after an authenticated claim. Queue delivery is at-least-once and
+`POST /v1/runner/jobs/:id/claim` is the exactly-one-runner guard.
+
+Per-workflow mode (`settings.execution.mode`, also accepted as
+`settings.runner`):
+
+| Mode | Queue | Who runs it |
+| --- | --- | --- |
+| `platform` (default) | `synapseone-wf-platform` (`WORKFLOW_QUEUE_PLATFORM`) | Built-in worker in workflow-service (`WORKFLOW_WORKER_ENABLED=true`) |
+| `custom` | `synapseone-wf-custom` (`WORKFLOW_QUEUE_CUSTOM`) | A tenant-deployed runner |
+| `hybrid` | `synapseone-wf-shared` (`WORKFLOW_QUEUE_SHARED`) | Platform worker + tenant runners compete |
+| `inline` | — | Runs in the request (dev/test, nested calls) |
+
+`settings.execution.queue` overrides the queue name (1..64 chars,
+`[A-Za-z][A-Za-z0-9_-]*`) to dedicate a runner. `maxAttempts` and
+`visibilityTimeoutSeconds` are also read from `settings.execution`.
+
+Runner management (JWT or a runner-scoped API key):
+
+- `POST /v1/workflow-runners {name, kind?, mode?, queue?, inferenceQueue?, apiKeyId?, keyPrefix?, scopes?, apiKey?}`
+  → `{runner, kind, queue, inferenceQueue, scopes, command, options}`.
+  `kind` is `workflow|inference|hybrid`; default key scopes:
+  `workflow:*,queue:*,*:read,base:query,base:vector-search,inference:*`.
+  `command` is a copy-paste `docker run` with the API key **when the caller
+  passes `apiKey`**; the key is echoed only in this response and never stored.
+  Inference/hybrid commands include `INFERENCE_RUNNER_URL` placeholder.
+- `GET /v1/workflow-runners/options` → public URL, image, queues, heartbeat /
+  stale windows, max concurrency and built-in platform-worker config.
+- `GET /v1/workflow-runners` → `{data: [{...runner, instances, connected,
+  connectedInstances, instanceCount, status}], options}`.
+  `GET /v1/workflow-runners/:id` also returns `command` + `config`;
+  `PATCH /v1/workflow-runners/:id {name?, mode?, queue?, metadata?}` (queue/mode
+  changes are `409 runner_connected` while a connector is online);
+  `DELETE /v1/workflow-runners/:id`.
+- `GET /v1/workflow-runners/:id/config` (runner bootstrap: queue/mode/base URL,
+  heartbeat/stale/max-concurrency, image)
+- `POST /v1/workflow-runners/:id/heartbeat {instanceId, hostname?, version?,
+  queue?, concurrency?, startedAt?, status?: connected|offline, metadata?}`
+  upserts a **connector instance**; `offline` is sent on graceful shutdown.
+- `GET /v1/workflow-runners/:id/connection`
+  → `{connected, status: waiting|connected|degraded|offline, checkedAt,
+  instances[], connectedInstances, instanceCount, lastSeenAt, queue, mode,
+  version, heartbeatIntervalSeconds, staleAfterSeconds}`.
+  A connector is fresh for `WORKFLOW_RUNNER_STALE_SECONDS` (default 60s).
+- `DELETE /v1/workflow-runners/:id/instances/:instanceId` (remove a stale connector)
+- `POST /v1/workflow-runners/:id/command {apiKey?}` (render the command later)
+
+Owner-scoped (platform) runners — platform-admin JWT, workflow-service requires
+an active `owner` role. Mutations are `platform:Admin` at the gateway:
+
+- `GET /v1/platform/runners/options` → tenant options + `platformRunner`
+  (`queue: synapseone-wf-system`, `inferenceQueue: synapseone-inference-system`,
+  allowed scopes).
+- `GET /v1/platform/runners` → every platform runner with live connectors.
+- `POST /v1/platform/runners {name, kind?}` → `201 {runner, apiKey, command,
+  queue, scopes}`. `kind` is `workflow|inference|hybrid`; scope/mode/queue are
+  fixed (`platform` / `system`). `apiKey` is a **platform runner key**
+  (`synapseone_pr_…`) returned once and never stored by workflow-service.
+- `GET /v1/platform/runners/:id` and `/:id/connection`.
+- `PATCH /v1/platform/runners/:id {name?, kind?}` (no tenant/queue override).
+- `POST /v1/platform/runners/:id/rotate-key` → new `apiKey` + `command`; the
+  previous key is revoked.
+- `POST /v1/platform/runners/:id/disable` / `enable` / `revoke-key`.
+  Disable blocks config/heartbeat/claims with `409 runner_disabled`; revoke-key
+  clears the key and requires rotate before reconnecting.
+- `POST /v1/platform/runners/:id/test {type: workflow|embeddings|decision|route}`
+  → `202 {ok:false,status:"queued",jobId,runnerId:null,targetRunnerId,pollUrl,...}`.
+  Poll `GET /v1/platform/runners/:id/test/:jobId` until terminal:
+  `{ok,status,type,runnerId:<actual executor>,targetRunnerId,model,dimensions,
+  vectorCount,output|result,error}`. `ok:true` only for success by the selected
+  registration; a different registration gets `409 runner_not_target`.
+- `POST /v1/platform/runners/:id/command {apiKey?}`.
+- `DELETE /v1/platform/runners/:id` (revokes every key/grant for the runner first).
+- `DELETE /v1/platform/runners/:id/instances/:instanceId`.
+
+Platform runners persist `resource_requirements` on executions/inference jobs
+(defaults `{cpu:0.5,memoryMb:128}` / `{cpu:1,memoryMb:256}`). Workflows set
+`settings.execution.resources {cpu:0.05..64, memoryMb:32..262144}`; inference
+`POST /v1/inference-jobs` accepts `resources`. Heartbeats report sanitized
+`metadata.resources` and per-instance `metadata.resourceHistory` (≤120 samples).
+Set `WORKFLOW_RUNNER_RESOURCE_ADMISSION=enforce` after the telemetry-capable
+runner image is live; enforced claims return `409 runner_resources_unavailable`
+or `409 runner_capacity_unavailable` and the runner nacks/requeues.
+
+Platform runners claim only `settings.execution.mode: "system"` executions on
+the shared platform queue. The claim response additionally carries
+`delegatedToken`, `delegatedTokenExpiresIn` and `delegatedScopes`; data-plane
+nodes use that short-lived user/tenant token, not the system key.
+
+Runner job protocol (API key + `X-Workflow-Runner-Id`):
+
+- `POST /v1/runner/jobs/:id/claim {runnerId, leaseSeconds}` → job snapshot
+  `{executionId, workflow, input, principal, triggeredBy, attempt, leaseExpiresAt, resumeFrom}`;
+  `409 not_claimable` when another worker owns it. Platform runners also receive
+  the delegation fields above.
+- `POST /v1/runner/jobs/:id/heartbeat {runnerId, leaseSeconds}` (extends the DB lease)
+- `POST /v1/runner/jobs/:id/complete {runnerId, status: success|error|paused, output, nodeRuns, error?, pause?}`
+- `POST /v1/runner/jobs/:id/release {runnerId, error?}` (retryable failure; nack the queue message)
+- `POST /v1/runner/jobs/:id/credentials {runnerId, credentialId}`
+  → `{kind, secret}` for exactly this claimed execution. Custom runners hold
+  plaintext credentials only in memory for that run.
+
+### Inference jobs (inference / hybrid runners)
+
+- `POST /v1/inference-jobs {type, payload, queue?, wait?, timeoutMs?}` →
+  `202 {ok, jobId, status: queued, queue, type}`. Types:
+  `chat|embeddings|decision|route|generic`. `wait: true` blocks and returns
+  `{ok, jobId, status, result}`. Gateway action `inference:Invoke`.
+- `GET /v1/inference-jobs[?status=&limit=]` and
+  `GET /v1/inference-jobs/:id[?includeData=true]` (tenant-scoped).
+- Runner protocol:
+  - `POST /v1/runner/inference/jobs/:id/claim {runnerId, instanceId?, leaseSeconds}`
+    → `{jobId, type, request, attempt, leaseExpiresAt}`; idempotent for the
+    same runner after a lost response.
+  - `POST .../heartbeat` and `POST .../release`.
+  - `POST .../complete {runnerId, instanceId?, status: success|error, result?, error?}`.
+
+Runner types: `workflow` (workflow lane only), `inference` (inference lane
+only), `hybrid` (both). The inference lane calls a local OpenAI-compatible
+backend configured by `INFERENCE_RUNNER_URL`; the SynapseOne API key is only
+used for the queue/claim/report path (and any workflow nodes, for hybrid).
+
+The published image is `ghcr.io/<owner>/synapseone-workflow-runner:<tag>`
+(also built as `:main` on CD). See [`workflow-runners.md`](workflow-runners.md)
+for the operational guide.
 
 ## Linked Data (SynapseLDS — `lds-service:4004`, gateway `/v1/lds`)
 
@@ -431,9 +605,20 @@ Collections of JSON documents with server-side validation, a logical
 object↔data mapping, queries, optimistic concurrency, atomic counters, batch
 writes and a change feed. Full guide: [synapsebase.md](synapsebase.md).
 
-- `GET /v1/base/collections` (`?orgId` / `?accountId` narrow the list)
-- `POST /v1/base/collections {name, description?, mapping?, orgId?, accountId?}`
-  (201; name `[A-Za-z][A-Za-z0-9_-]{0,63}`, unique per tenant scope)
+Databases namespace collections: `tenant → database → collection → documents`.
+Every collection route below also works under
+`/v1/base/databases/:database/collections/...`; flat routes target the tenant's
+`default` database (or `?database=<name>`).
+
+- `GET /v1/base/databases` (`?orgId` / `?accountId` narrow the list) → database
+  namespaces with `stats: {collections, documents, bytes, lastUpdatedAt}`
+- `POST /v1/base/databases {name, description?, orgId?, accountId?}` (201)
+- `GET|PATCH|DELETE /v1/base/databases/:database` — `DELETE` requires
+  `?cascade=true` when the database still has collections
+- `GET /v1/base/databases/:database/stats`
+- `GET /v1/base/collections` (`?orgId` / `?accountId` / `?database` narrow the list)
+- `POST /v1/base/collections {name, description?, database?, mapping?, orgId?, accountId?}`
+  (201; name `[A-Za-z][A-Za-z0-9_-]{0,63}`, unique per database)
 - `GET /v1/base/collections/:collection` → collection + `stats`
 - `PATCH /v1/base/collections/:collection {name?, description?, mapping?}`
   (mapping replace is a view/validation change, not a data migration)
@@ -513,9 +698,10 @@ shorthand `{logical: "dot.path"}`. Types `string|number|boolean|date|array|objec
 `additional:false` rejects undeclared keys on object writes. Write `object` to store
 at mapped paths, read `?as=object` to get logical keys.
 
-Tenancy: org principal → org-bound collections; account-only → `org_id=null,
-account_id=<acct>`; platform callers see only unbound collections unless they pass
-`?orgId=`/`?accountId=` (ambiguous name → `409 ambiguous_collection`).
+Tenancy: org principal → org-bound databases/collections; account-only →
+`org_id=null, account_id=<acct>`; platform callers see only unbound namespaces
+unless they pass `?orgId=`/`?accountId=` (ambiguous database name →
+`409 ambiguous_database`).
 
 ## Faststore — cache, key/value and data structures (`faststore-service:4006`, gateway `/v1/faststore`)
 
@@ -621,7 +807,7 @@ Full guide: [queue.md](queue.md).
 
 ## Stream — distributed event streaming (`stream-service:4009`, gateway `/v1/stream`)
 
-Tenant-scoped distributed event streaming log (pluggable Redis Streams / Kafka backend) with consumer groups, time-range replay and retention trimming.
+Tenant-scoped distributed event streaming log (pluggable Valkey/Redis Streams or Kafka backend) with consumer groups, time-range replay and retention trimming.
 
 - `GET /v1/stream/topics` → list topics for tenant
 - `PUT /v1/stream/topics/:topic {maxLen?, minId?, retentionMs?}` — create or update stream topic
@@ -719,6 +905,79 @@ from telemetry.
   `limit` 1..200 (default 20), `offset` ≤ 10 000.
 - Retention: sweep every hour, `USAGE_RETENTION_DAYS` (default 30, `0` keeps
   events forever).
+
+## AI assistant and inference (`ai-service:4003`, `inference-service:4008`)
+
+The assistant is guidance-only: it suggests an endpoint and drafts a request,
+but never executes it. Inference is an OpenAI-compatible LLM proxy plus local
+embeddings and Decision-2.0 routing used by the workflow AI nodes.
+
+| Method | Route | Description |
+| --- | --- | --- |
+| POST | `/v1/ai/agent` | Docs assistant: `{question (1..2000), history?}` → endpoint suggestion, path values, body and explanation. Requires `AI_API_KEY`; `503 ai_not_configured` otherwise. |
+| GET | `/v1/inference/health` | LLM/embedding/decision subsystem health. |
+| POST | `/v1/inference/chat/completions` | OpenAI-compatible chat completion; SSE when `stream:true`; supports `tools`, `tool_choice` and `response_format`. |
+| POST | `/v1/inference/embeddings` | Self-hosted embeddings: `{input: string|string[], model?}` → OpenAI-shaped vectors. |
+| POST | `/v1/inference/decision` | Structured evaluation: `{state, questions:{id:{type:"choice"|"noul"|"score", instructions, criteria?}}}`. |
+| POST | `/v1/inference/decision/route` | Semantic router: `{input, choices:{id:description}, instruction?}` → `{best_choice, confidence, probabilities}`. |
+
+The chat proxy is also mounted at `/v1/chat/completions`; the other inference
+handlers accept the `/v1/embeddings` and `/v1/decision*` aliases. The public
+gateway only exposes `/v1/ai` and `/v1/inference` (the aliases stay internal).
+
+## Platform Super Admin (`/v1/platform`)
+
+These routes are **not** part of the tenant API catalog and are not exposed to
+the AI assistant. They require a platform-administrator token
+(`kind=platform-admin`, audience `synapseone-platform-admin`) obtained from
+`POST /v1/platform/session` with a normal user JWT **and a fresh TOTP code**.
+Tenant JWTs, API keys and service-account tokens are rejected.
+
+| Method | Route | Description |
+| --- | --- | --- |
+| POST | `/v1/platform/session` | Exchange a normal user JWT + TOTP for a 15-minute platform token. |
+| POST | `/v1/platform/step-up` | `{code|recoveryCode, action}` → one-time step-up proof bound to this platform session and action (`x-platform-step-up`). |
+| GET | `/v1/platform/me` | Current platform role, user and MFA state. |
+| GET | `/v1/platform/overview?from&to` | Cross-tenant counts, usage totals and audit signals. |
+| GET | `/v1/platform/orgs?q&limit&offset` | Tenant organizations with counts. |
+| POST | `/v1/platform/orgs` | Create an organization and its first org admin. |
+| GET | `/v1/platform/accounts?q&orgId&limit&offset` | Cross-tenant account list. |
+| GET | `/v1/platform/orgs/:orgId` | Organization detail, accounts and admins. |
+| GET | `/v1/platform/orgs/:orgId/resources` | Accounts, users, roles, policies, API-key metadata and service accounts for one organization. |
+| GET | `/v1/platform/orgs/:orgId/audit?limit&offset` | Organization-scoped audit trail. |
+| POST | `/v1/platform/orgs/:orgId/accounts` | Create a tenant account (step-up `org:account:create`). |
+| POST | `/v1/platform/orgs/:orgId/suspend` | Suspend a tenant organization (step-up `org:suspend`); revokes refresh sessions and API keys. |
+| POST | `/v1/platform/orgs/:orgId/reactivate` | Reactivate a suspended organization (step-up `org:reactivate`). |
+| POST | `/v1/platform/orgs/:orgId/roles` | Create a role in an organization account (step-up `org:role:create`). |
+| POST | `/v1/platform/orgs/:orgId/policies` | Create a policy in an organization account (step-up `org:policy:create`). |
+| POST | `/v1/platform/orgs/:orgId/keys/:keyId/revoke` | Revoke a tenant API key (step-up `org:key:revoke`). |
+| POST | `/v1/platform/orgs/:orgId/service-accounts/:id/revoke` | Revoke a tenant service account (step-up `org:service-account:revoke`). |
+| GET | `/v1/platform/users?q&orgId&active&isOrgAdmin&limit&offset` | Cross-tenant users. |
+| GET | `/v1/platform/users/:userId` | User, roles, policies, MFA and sessions. |
+| PUT | `/v1/platform/users/:userId/org-admin` | Grant/revoke org admin (step-up). |
+| POST | `/v1/platform/users/:userId/reset-mfa` | Reset MFA and revoke sessions/API keys (step-up). |
+| POST | `/v1/platform/users/:userId/invite` | Re-issue a one-time activation code for a passwordless tenant user (step-up). |
+| POST | `/v1/platform/users/:userId/unlock` | Clear a sign-in lockout (step-up `user:unlock`). |
+| POST | `/v1/platform/users/:userId/revoke-sessions` | Revoke refresh sessions (step-up). |
+| POST | `/v1/platform/users/:userId/disable` | Deactivate a user (step-up). |
+| POST | `/v1/platform/users/:userId/enable` | Reactivate a user (step-up `user:enable`). |
+| GET | `/v1/platform/usage/summary` | Platform-wide usage summary (optional `orgId`). |
+| GET | `/v1/platform/usage/events` | Platform-wide request log (optional `orgId`). |
+| GET | `/v1/platform/audit` | Platform-wide audit (optional `orgId`). |
+| GET/POST/DELETE | `/v1/platform/admins[/:userId]` | Owner-only platform administrator management. |
+
+Tenant organizations carry `status=active|suspended`. Suspension is reversible,
+requires a reason plus step-up, revokes refresh sessions/API keys and bumps each
+user's credential epoch; `/v1/auth/login`, `/v1/auth/refresh`,
+`/v1/auth/verify`, API-key verification and the gateway all fail closed while
+suspended. The reserved platform organization cannot be suspended
+(`403 platform_org_protected`). Reactivation requires a fresh tenant sign-in.
+
+Internal bootstrap/recovery endpoints (`/internal/platform/bootstrap`,
+`/internal/platform/recovery`) are reachable only over the service network and
+require the internal service header plus their separate bootstrap/recovery
+secret. They issue/consume one-time activation codes; see
+[`platform-superadmin.md`](platform-superadmin.md).
 
 ## Health / Metrics
 

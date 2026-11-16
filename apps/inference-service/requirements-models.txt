@@ -1,5 +1,8 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-torch>=2.2.0
-transformers>=4.40.0
-sentence-transformers>=2.6.0
-accelerate>=0.29.0
+# CPU inference stack for the embedding service (no torch, no CUDA).
+# ONNX Runtime + the tokenizer is all that is needed for the int8 MiniLM path.
+# Verify the exact ONNX graph with EMBEDDING_ONNX_FILE / EMBEDDING_ONNX_PATH.
+onnxruntime>=1.18.0
+transformers>=5.17.0
+huggingface-hub>=0.30.0
+numpy>=1.26.0
+safetensors>=0.4.0

@@ -20,6 +20,7 @@ import WorkflowEditor from './components/WorkflowEditor.jsx';
 const ROUTES = [
   '/',
   '/login',
+  '/register',
   '/about',
   '/oidc/callback',
   '/dashboard',
@@ -31,6 +32,8 @@ const ROUTES = [
   '/keys',
   '/service-accounts',
   '/workflows',
+  '/runner-engine',
+  '/workflow-runners',
   '/base',
   '/queue',
   '/faststore',
@@ -40,6 +43,14 @@ const ROUTES = [
   '/api-docs',
   '/docs',
   '/nope-not-a-route',
+  '/admin/overview',
+  '/admin/orgs',
+  '/admin/users',
+  '/admin/health',
+  '/admin/usage',
+  '/admin/audit',
+  '/admin/access',
+  '/admin/not-a-route',
 ];
 
 const SESSIONS = {
@@ -57,12 +68,22 @@ const GUARDED = new Set([
   '/keys',
   '/service-accounts',
   '/workflows',
+  '/runner-engine',
+  '/workflow-runners',
   '/base',
   '/queue',
   '/faststore',
   '/lds',
   '/authorize',
   '/audit',
+  '/admin/overview',
+  '/admin/orgs',
+  '/admin/users',
+  '/admin/health',
+  '/admin/usage',
+  '/admin/audit',
+  '/admin/access',
+  '/admin/not-a-route',
 ]);
 
 let failures = 0;

@@ -18,7 +18,7 @@
  * existing integrations working once enforcement is switched on.
  */
 import type { PolicyDoc } from './db';
-import { getUserById, policiesForServiceAccount, policiesForUser, getServiceAccount, rolesForServiceAccount } from './db';
+import { getUserById, policiesForServiceAccount, policiesForUser, getServiceAccount, rolesForServiceAccount, getPlatformAdmin } from './db';
 import { evaluatePolicies, matchPattern, type ConditionContext } from './policy';
 import { findApiKeyById } from './tokens';
 
@@ -40,6 +40,7 @@ export interface PrincipalInput {
 
 export type DecisionReason =
   | 'org-admin'
+  | 'platform-admin'
   | 'policy-allow'
   | 'scope-only'
   | 'explicit-deny'
@@ -131,6 +132,13 @@ async function decideForUser(userId: string, action: string, resource: string, c
   const verdict = evaluatePolicies(docs, { action, resource }, { ...ctx, user: user.id, org: user.org_id, email: user.email });
   const who = { principal: userId, org: user.org_id };
   if (verdict.matchedBy === 'Deny') return { allowed: false, reason: 'explicit-deny', ...who };
+  // Platform-plane actions are never granted by tenant org-admin status or
+  // tenant policies. They require an active row in platform_admins.
+  if (String(action).toLowerCase().startsWith('platform:')) {
+    const pa = await getPlatformAdmin(userId);
+    if (pa && !pa.revoked_at) return { allowed: true, reason: 'platform-admin', ...who };
+    return { allowed: false, reason: 'implicit-deny', ...who };
+  }
   if (user.is_org_admin) return { allowed: true, reason: 'org-admin', ...who };
   return verdict.allowed
     ? { allowed: true, reason: 'policy-allow', ...who }

@@ -9,14 +9,19 @@
 | [synapsebase.md](synapsebase.md) | SynapseBase — documents, object↔data mapping, queries, changes |
 | [faststore.md](faststore.md) | Synapse Faststore — cache, key/value, hashes, lists, sets, locks |
 | [queue.md](queue.md) | SynapseQueue — publish, consume, leases, retries, dead letters |
+| [workflow-runners.md](workflow-runners.md) | Runner Engine: workflow/inference/hybrid connectors, network hardening |
 | [configuration.md](configuration.md) | Environment table for the whole stack |
 | [object-storage.md](object-storage.md) | SynapseOCS bucket/object API, SeaweedFS backend, object backups |
 | [notifications.md](notifications.md) | SynapseNotifications — outbox, templates, preferences, delivery, retries |
 | [troubleshooting.md](troubleshooting.md) | Busy ports, Windows curl, gateway 404s, backup/restore, OIDC errors |
 | [console.md](console.md) | Management UI (run, configure, SSO, frontend dev) |
+| [platform-superadmin.md](platform-superadmin.md) | Platform Super Admin dashboard: bootstrap, MFA, platform admins, rollback |
+| [platform-superadmin-login.md](platform-superadmin-login.md) | Provisioned local Platform Owner: login, MFA, modules, recovery, verification |
 | [ai-assistant.md](ai-assistant.md) | AI testing assistant (agent design, models, limits, chatbot) |
+| [database-performance.md](database-performance.md) | PgBouncer, Postgres tuning, SynapseBase Faststore read cache |
 | [monitoring.md](monitoring.md) | Prometheus (run, targets, alerts, useful queries) |
 | [production.md](production.md) | Production checklist (secrets, TLS, backups, image pinning) |
+| [authentication-sso.md](authentication-sso.md) | Public SSO/OIDC: activation, security invariants, verification, error reference |
 | [sdk-js.md](sdk-js.md) | JavaScript/TypeScript SDK — install, auth, full API reference |
 | [sdk-python.md](sdk-python.md) | Python SDK — install, auth, full API reference |
 | [sdk-go.md](sdk-go.md) | Go SDK — install, auth, full API reference |

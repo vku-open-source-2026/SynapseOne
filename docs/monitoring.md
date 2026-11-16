@@ -5,7 +5,7 @@ metrics at `GET /metrics` (`gateway_requests_total` + Node runtime metrics),
 `lds-service` exposes `synapseone_lds_http_requests_total` +
 `synapseone_lds_datasources_total` / `synapseone_lds_records_total`,
 `workflow-service` exposes `synapseone_workflow_runs_total`, and compose adds
-Prometheus (scrape + graph/alerts UI) + PG/Redis exporters.
+Prometheus (scrape + graph/alerts UI) + PG/Valkey exporters.
 
 ## Run
 
@@ -22,13 +22,13 @@ open http://localhost:9091  # Prometheus graph + /alerts + /targets
 | `workflow` | `workflow:4002/metrics` | in-process counters in `apps/workflow-service` |
 | `lds` | `lds:4004/metrics` | in-process counters in `apps/lds-service` |
 | `postgres` | `postgres-exporter:9187` | `prometheuscommunity/postgres-exporter` |
-| `redis` | `redis-exporter:9121` | `oliver006/redis_exporter` |
+| `valkey` | `valkey-exporter:9121` | `oliver006/redis_exporter` (Valkey speaks the Redis protocol) |
 | `prometheus` | self | built-in |
 
 Config: `infra/monitoring/prometheus/prometheus.yml` (mounted read-only —
 `docker compose restart prometheus` to pick up config changes). Alert rules in
 `infra/monitoring/prometheus/alerts.yml` (`GatewayDown`, `PostgresDown`,
-`RedisDown` — visible on Prometheus `/alerts`; wire Alertmanager when needed).
+`ValkeyDown` — visible on Prometheus `/alerts`; wire Alertmanager when needed).
 
 ## Request telemetry (usage analytics)
 
@@ -70,7 +70,7 @@ process_resident_memory_bytes{job="gateway"}
 ## Disable
 
 ```bash
-docker compose stop prometheus postgres-exporter redis-exporter
+docker compose stop prometheus postgres-exporter valkey-exporter
 ```
 
 ## Troubleshooting
