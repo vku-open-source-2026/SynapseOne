@@ -553,3 +553,30 @@ def test_credential_lifecycle_and_delegated_exchange_paths():
         assert json.loads(_seen["body"])["scopes"] == ["*:read"]
     finally:
         srv.shutdown()
+
+
+def test_ocs_namespace_routes_bucket_and_object_calls():
+    srv = _server()
+    try:
+        base = f"http://127.0.0.1:{srv.server_port}"
+        c = SynapseOneClient(base)
+        assert c.ocs.create_bucket("media", quota_bytes=1024) == {"ok": True}
+        assert _seen["method"] == "POST"
+        assert _seen["path"] == "/v1/ocs/buckets"
+        assert json.loads(_seen["body"]) == {"name": "media", "quotaBytes": 1024}
+
+        assert c.ocs.put_object(
+            "media", "a/b.txt", b"hello", content_type="text/plain"
+        ) == {"ok": True}
+        assert _seen["method"] == "PUT"
+        assert _seen["path"] == "/v1/ocs/buckets/media/objects/a/b.txt"
+
+        assert c.ocs.list_objects("media", prefix="a/", delimiter="/") == {"ok": True}
+        assert _seen["path"].startswith("/v1/ocs/buckets/media/objects?")
+        assert "prefix=a%2F" in _seen["path"]
+        assert "delimiter=%2F" in _seen["path"]
+
+        assert c.ocs.delete_bucket("media", force=True) == {"ok": True}
+        assert _seen["path"] == "/v1/ocs/buckets/media?force=true"
+    finally:
+        srv.shutdown()

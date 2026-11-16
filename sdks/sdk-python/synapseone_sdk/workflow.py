@@ -105,10 +105,122 @@ class WorkflowService:
         """Deactivate a workflow (triggers stop, history is kept)."""
         return self._req("POST", f"/v1/workflows/{quote(wf_id, safe='')}/deactivate")
 
-    def execute_workflow(self, wf_id: str, payload: dict | None = None) -> Any:
-        """Trigger a manual execution (local engine)."""
+    def execute_workflow(
+        self,
+        wf_id: str,
+        payload: dict | None = None,
+        *,
+        wait: bool = False,
+        timeout_ms: int = 30000,
+    ) -> Any:
+        """Trigger a manual execution.
+
+        Queue mode returns 202 with an ``executionId``. Pass ``wait=True`` to
+        block until the worker finishes (bounded by ``timeout_ms``).
+        """
+        qs = ""
+        if wait:
+            bounded = max(1000, min(int(timeout_ms), 300000))
+            qs = f"?wait=1&timeoutMs={bounded}"
         return self._req(
-            "POST", f"/v1/workflows/{quote(wf_id, safe='')}/execute", payload or {}
+            "POST", f"/v1/workflows/{quote(wf_id, safe='')}/execute{qs}", payload or {}
+        )
+
+    def wait_for_execution(
+        self, exec_id: str, timeout_ms: int = 30000, poll_ms: int = 500
+    ) -> Any:
+        """Poll an execution until it leaves queued/running."""
+        import time as _time
+
+        deadline = _time.time() + max(1000, min(int(timeout_ms), 300000)) / 1000
+        current = self.get_execution(exec_id, include_data=True)
+        while (
+            isinstance(current, dict)
+            and current.get("status") in ("queued", "running")
+            and _time.time() < deadline
+        ):
+            _time.sleep(max(100, min(int(poll_ms), 5000)) / 1000)
+            current = self.get_execution(exec_id, include_data=True)
+        return current
+
+    # ---- self-hosted workflow runners ----
+    def list_workflow_runners(self) -> Any:
+        return self._req("GET", "/v1/workflow-runners")
+
+    def get_workflow_runner_options(self) -> Any:
+        return self._req("GET", "/v1/workflow-runners/options")
+
+    def get_workflow_runner(self, runner_id: str) -> Any:
+        return self._req("GET", f"/v1/workflow-runners/{quote(runner_id, safe='')}")
+
+    def update_workflow_runner(
+        self,
+        runner_id: str,
+        *,
+        name: str | None = None,
+        mode: str | None = None,
+        queue: str | None = None,
+        metadata: dict | None = None,
+    ) -> Any:
+        body: dict = {}
+        if name is not None:
+            body["name"] = name
+        if mode is not None:
+            body["mode"] = mode
+        if queue is not None:
+            body["queue"] = queue
+        if metadata is not None:
+            body["metadata"] = metadata
+        return self._req(
+            "PATCH", f"/v1/workflow-runners/{quote(runner_id, safe='')}", body
+        )
+
+    def create_workflow_runner(
+        self,
+        name: str,
+        mode: str = "custom",
+        queue: str | None = None,
+        api_key_id: str | None = None,
+        key_prefix: str | None = None,
+        scopes: list[str] | None = None,
+        metadata: dict | None = None,
+    ) -> Any:
+        body: dict = {"name": name, "mode": mode}
+        if queue:
+            body["queue"] = queue
+        if api_key_id:
+            body["apiKeyId"] = api_key_id
+        if key_prefix:
+            body["keyPrefix"] = key_prefix
+        if scopes:
+            body["scopes"] = scopes
+        if metadata:
+            body["metadata"] = metadata
+        return self._req("POST", "/v1/workflow-runners", body)
+
+    def get_workflow_runner_connection(self, runner_id: str) -> Any:
+        return self._req(
+            "GET", f"/v1/workflow-runners/{quote(runner_id, safe='')}/connection"
+        )
+
+    def get_workflow_runner_command(
+        self, runner_id: str, api_key: str | None = None
+    ) -> Any:
+        body = {"apiKey": api_key} if api_key else {}
+        return self._req(
+            "POST",
+            f"/v1/workflow-runners/{quote(runner_id, safe='')}/command",
+            body,
+        )
+
+    def delete_workflow_runner(self, runner_id: str) -> Any:
+        return self._req("DELETE", f"/v1/workflow-runners/{quote(runner_id, safe='')}")
+
+    def delete_workflow_runner_instance(self, runner_id: str, instance_id: str) -> Any:
+        return self._req(
+            "DELETE",
+            f"/v1/workflow-runners/{quote(runner_id, safe='')}/instances/"
+            f"{quote(instance_id, safe='')}",
         )
 
     # ---- executions ----
@@ -201,6 +313,133 @@ class WorkflowService:
     def delete_credential(self, cred_id: str) -> dict:
         """Delete a credential."""
         return self._req("DELETE", f"/v1/credentials/{quote(cred_id, safe='')}")
+
+    # ---- durable human tasks (#44) ----
+    def create_human_task(
+        self,
+        title: str,
+        *,
+        description: str = "",
+        assignee: str | None = None,
+        candidate_roles: list[str] | None = None,
+        deadline: str | None = None,
+        decision_schema: dict | None = None,
+        payload: dict | None = None,
+        workflow_id: str | None = None,
+        execution_id: str | None = None,
+        node: str | None = None,
+    ) -> dict:
+        """Create a durable human task (claim/complete/reject/expire)."""
+        body: dict[str, Any] = {
+            "title": title,
+            "description": description,
+            "candidateRoles": candidate_roles or [],
+            "decisionSchema": decision_schema or {},
+            "payload": payload or {},
+        }
+        if assignee:
+            body["assignee"] = assignee
+        if deadline:
+            body["deadline"] = deadline
+        if workflow_id:
+            body["workflowId"] = workflow_id
+        if execution_id:
+            body["executionId"] = execution_id
+        if node:
+            body["node"] = node
+        return self._req("POST", "/v1/human-tasks", body)
+
+    def list_human_tasks(self, status: str | None = None, **filters: Any) -> list:
+        """List tenant-scoped human tasks. Filters: executionId, workflowId, assignee, limit, offset."""
+        params: dict[str, Any] = {k: v for k, v in filters.items() if v is not None}
+        if status:
+            params["status"] = status
+        qs = urlencode(params) if params else ""
+        raw = self._req("GET", f"/v1/human-tasks{('?' + qs) if qs else ''}")
+        return raw.get("items", []) if isinstance(raw, dict) else (raw or [])
+
+    def get_human_task(self, task_id: str) -> dict:
+        return self._req("GET", f"/v1/human-tasks/{quote(task_id, safe='')}")
+
+    def claim_human_task(self, task_id: str) -> dict:
+        return self._req("POST", f"/v1/human-tasks/{quote(task_id, safe='')}/claim", {})
+
+    def complete_human_task(
+        self, task_id: str, decision: dict | None = None, note: str | None = None
+    ) -> dict:
+        body: dict[str, Any] = {"decision": decision or {}}
+        if note:
+            body["note"] = note
+        return self._req(
+            "POST", f"/v1/human-tasks/{quote(task_id, safe='')}/complete", body
+        )
+
+    def reject_human_task(
+        self, task_id: str, note: str, decision: dict | None = None
+    ) -> dict:
+        return self._req(
+            "POST",
+            f"/v1/human-tasks/{quote(task_id, safe='')}/reject",
+            {"note": note, "decision": decision or {}},
+        )
+
+    def expire_human_task(self, task_id: str, force: bool = False) -> dict:
+        return self._req(
+            "POST",
+            f"/v1/human-tasks/{quote(task_id, safe='')}/expire",
+            {"force": force},
+        )
+
+    # ---- tenant secret vault (#47) ----
+    def create_secret(
+        self,
+        name: str,
+        value: str,
+        *,
+        description: str = "",
+        scope: str = "tenant",
+        account_id: str | None = None,
+    ) -> dict:
+        body: dict[str, Any] = {
+            "name": name,
+            "value": value,
+            "description": description,
+            "scope": scope,
+        }
+        if account_id:
+            body["accountId"] = account_id
+        return self._req("POST", "/v1/secrets", body)
+
+    def list_secrets(self) -> list:
+        raw = self._req("GET", "/v1/secrets")
+        return raw.get("items", []) if isinstance(raw, dict) else (raw or [])
+
+    def get_secret(self, name: str) -> dict:
+        return self._req("GET", f"/v1/secrets/{quote(name, safe='')}")
+
+    def read_secret(self, name: str, version: int | None = None) -> dict:
+        return self._req(
+            "POST",
+            f"/v1/secrets/{quote(name, safe='')}/read",
+            {"version": version} if version else {},
+        )
+
+    def rotate_secret(self, name: str, value: str, grace_seconds: int = 86400) -> dict:
+        return self._req(
+            "POST",
+            f"/v1/secrets/{quote(name, safe='')}/rotate",
+            {"value": value, "graceSeconds": grace_seconds},
+        )
+
+    def revoke_secret(self, name: str, version: int | None = None) -> dict:
+        return self._req(
+            "POST",
+            f"/v1/secrets/{quote(name, safe='')}/revoke",
+            {"version": version} if version else {},
+        )
+
+    def delete_secret(self, name: str) -> dict:
+        return self._req("DELETE", f"/v1/secrets/{quote(name, safe='')}")
 
     def trigger_webhook(
         self,

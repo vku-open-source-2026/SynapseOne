@@ -75,11 +75,9 @@ async function req(path, { method = 'GET', body, token, apiKey, _retried } = {})
   }
   // Silent refresh: expired access token + live refresh token → rotate once,
   // persist via the store, and retry the original call. Never loops (one retry).
-  // Skipped only for the token-minting endpoints themselves (login/refresh/
-  // logout/callback) — /v1/auth/me and /v1/auth/verify DO retry.
-  // NOTE: NO_RETRY matches exact paths; endpoints WITH query strings (audit,
-  // executions, oidc/start) intentionally fall through to refresh+retry —
-  // they are authenticated data calls (or tokenless), never token minters.
+  // Credential challenges also return 401 for wrong passwords/MFA codes.
+  // Replaying them would consume two lockout attempts for one user action.
+  // /v1/auth/me and /v1/auth/verify remain eligible for session rotation.
   // Cross-tab race: refresh tokens are single-use, so a sibling tab may have
   // already rotated while this call was in flight. The store reads localStorage
   // (shared across tabs) — if it already holds a newer access token, retry with
@@ -88,8 +86,9 @@ async function req(path, { method = 'GET', body, token, apiKey, _retried } = {})
   const NO_RETRY = new Set([
     '/v1/auth/login', '/v1/auth/refresh', '/v1/auth/logout',
     '/v1/auth/logout-all', '/v1/auth/oidc/callback',
+    '/v1/auth/contexts/switch', '/v1/platform/session', '/v1/auth/mfa/verify',
   ]);
-  if (r.status === 401 && !_retried && token && !NO_RETRY.has(path)) {
+  if (r.status === 401 && !_retried && token && !NO_RETRY.has(path.split(/[?#]/, 1)[0])) {
     const stored = authStore.get()?.token;
     if (stored && stored !== token) {
       return req(path, { method, body, token: stored, apiKey, _retried: true });
@@ -123,9 +122,56 @@ const del = (path, auth) => req(path, { method: 'DELETE', ...auth });
 // Pages that fetch() directly bypass token rotation — use this instead.
 const call = (method, path, body, auth) => req(path, { method, body, ...auth });
 
+async function uploadBinary(path, body, contentType, auth) {
+  const headers = { 'Content-Type': contentType || 'application/octet-stream' };
+  const token = auth?.token || authStore.get()?.token;
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const response = await fetch(`${baseUrl()}${path}`, { method: 'PUT', headers, body });
+  const text = await response.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  if (!response.ok) throw new SynapseOneError(response.status, path, data);
+  return data;
+}
+
+function ocsObjectPath(bucket, key) {
+  const encodedBucket = encodeURIComponent(bucket);
+  const encodedKey = String(key || '').split('/').map((part) => encodeURIComponent(part)).join('/');
+  return `/v1/ocs/buckets/${encodedBucket}/objects/${encodedKey}`;
+}
+
+function baseCollectionsPath(db) {
+  return db
+    ? `/v1/base/databases/${encodeURIComponent(db)}/collections`
+    : '/v1/base/collections';
+}
+
+function baseCollectionPath(col, db) {
+  return db
+    ? `${baseCollectionsPath(db)}/${encodeURIComponent(col)}`
+    : `/v1/base/collections/${encodeURIComponent(col)}`;
+}
+
 export const api = {
   call,
-  login: (email, orgSlug) => post('/v1/auth/login', { email, orgSlug }),
+  login: (email, orgSlug, password) => post('/v1/auth/login', {
+    email,
+    orgSlug,
+    ...(typeof password === 'string' && password.length ? { password } : {}),
+  }),
+  verifyMfa: (mfaToken, code, recoveryCode) => post('/v1/auth/mfa/verify', code ? { mfaToken, code } : { mfaToken, recoveryCode }),
+  acceptInvite: (token, password, displayName) => post('/v1/auth/invite/accept', {
+    token,
+    password,
+    ...(displayName ? { displayName } : {}),
+  }),
+  mfaStatus: (auth) => get('/v1/auth/mfa', auth),
+  mfaSetup: (auth) => post('/v1/auth/mfa/totp/setup', {}, auth),
+  mfaEnable: (code, auth) => post('/v1/auth/mfa/totp/enable', { code }, auth),
+  mfaRecoveryCodes: (code, auth) => post('/v1/auth/mfa/recovery-codes', { code }, auth),
+  mfaDisable: (body, auth) => post('/v1/auth/mfa/disable', body, auth),
+  resetUserMfa: (userId, auth) => del(`/v1/users/${encodeURIComponent(userId)}/mfa`, auth),
+  unlockUser: (userId, auth) => post(`/v1/users/${encodeURIComponent(userId)}/unlock`, {}, auth),
   oidcStart: (orgSlug) => get(`/v1/auth/oidc/start${orgSlug ? `?org=${encodeURIComponent(orgSlug)}` : ''}`),
   oidcCallback: (code, state) => post('/v1/auth/oidc/callback', { code, state }),
   oidcConfig: () => get('/v1/auth/oidc/config'),
@@ -134,6 +180,8 @@ export const api = {
   logoutServer: (refreshToken) =>
     post('/v1/auth/logout', { refreshToken }).catch(() => ({ ok: false })),
   me: (a) => get('/v1/auth/me', a),
+  authContexts: (a) => get('/v1/auth/contexts', a),
+  switchContext: (orgId, password, a) => post('/v1/auth/contexts/switch', { orgId, password }, a),
   orgs: (a) => get('/v1/orgs', a),
   createOrg: (slug, displayName, a) => post('/v1/orgs', { slug, displayName }, a),
   accounts: (orgId, a) => get(`/v1/orgs/${encodeURIComponent(orgId)}/accounts`, a),
@@ -163,7 +211,22 @@ export const api = {
     post('/v1/authorize/dry-run', { documents, action, resource, context }, a),
   audit: (limit, actor, a, allowed) =>
     get(`/v1/audit?limit=${limit || 50}${actor ? `&actor=${encodeURIComponent(actor)}` : ''}${allowed === undefined ? '' : `&allowed=${allowed ? 'true' : 'false'}`}`, a),
-  createKey: (accountId, name, a) => post(`/v1/accounts/${encodeURIComponent(accountId)}/keys`, { name, scopes: ['*'] }, a),
+  createKey: (accountId, name, a, opts = {}) =>
+    post(`/v1/accounts/${encodeURIComponent(accountId)}/keys`, {
+      name,
+      scopes: opts.scopes && opts.scopes.length ? opts.scopes : ['*:read'],
+      ...(opts.userId ? { userId: opts.userId } : {}),
+    }, a),
+  rotateKey: (id, graceSeconds, a) => post(`/v1/keys/${encodeURIComponent(id)}/rotate`, { graceSeconds: graceSeconds || 0 }, a),
+  sessions: (a) => get('/v1/auth/sessions', a),
+  revokeSession: (id, a) => del(`/v1/auth/sessions/${encodeURIComponent(id)}`, a),
+  managedPolicies: (a) => get('/v1/managed-policies', a),
+  createManagedPolicy: (accountId, slug, managed, a) =>
+    post(`/v1/accounts/${encodeURIComponent(accountId)}/policies`, { slug, managed }, a),
+  setOrgAdmin: (userId, isOrgAdmin, a) => put(`/v1/users/${encodeURIComponent(userId)}/org-admin`, { isOrgAdmin }, a),
+  saRoles: (id, a) => get(`/v1/service-accounts/${encodeURIComponent(id)}/roles`, a),
+  saGrantRole: (id, roleId, a) => post(`/v1/service-accounts/${encodeURIComponent(id)}/roles`, { roleId }, a),
+  saRevokeRole: (id, roleId, a) => del(`/v1/service-accounts/${encodeURIComponent(id)}/roles/${encodeURIComponent(roleId)}`, a),
   listKeys: (accountId, a) => get(`/v1/accounts/${encodeURIComponent(accountId)}/keys`, a),
   serviceAccounts: (accountId, a) => get(`/v1/accounts/${encodeURIComponent(accountId)}/service-accounts`, a),
   createSA: (accountId, slug, a) => post(`/v1/accounts/${encodeURIComponent(accountId)}/service-accounts`, { slug }, a),
@@ -178,6 +241,16 @@ export const api = {
   activateWorkflow: (id, a) => post(`/v1/workflows/${encodeURIComponent(id)}/activate`, {}, a),
   deactivateWorkflow: (id, a) => post(`/v1/workflows/${encodeURIComponent(id)}/deactivate`, {}, a),
   executeWorkflow: (id, input, a) => post(`/v1/workflows/${encodeURIComponent(id)}/execute`, input ?? {}, a),
+  executeWorkflowWait: (id, input, a, timeoutMs = 60000) => post(`/v1/workflows/${encodeURIComponent(id)}/execute?wait=1&timeoutMs=${encodeURIComponent(timeoutMs)}`, input ?? {}, a),
+  workflowRunners: (a) => get('/v1/workflow-runners', a),
+  workflowRunnerOptions: (a) => get('/v1/workflow-runners/options', a),
+  createWorkflowRunner: (body, a) => post('/v1/workflow-runners', body, a),
+  workflowRunner: (id, a) => get(`/v1/workflow-runners/${encodeURIComponent(id)}`, a),
+  updateWorkflowRunner: (id, body, a) => patch(`/v1/workflow-runners/${encodeURIComponent(id)}`, body, a),
+  deleteWorkflowRunner: (id, a) => del(`/v1/workflow-runners/${encodeURIComponent(id)}`, a),
+  deleteWorkflowRunnerInstance: (id, instanceId, a) => del(`/v1/workflow-runners/${encodeURIComponent(id)}/instances/${encodeURIComponent(instanceId)}`, a),
+  workflowRunnerConnection: (id, a) => get(`/v1/workflow-runners/${encodeURIComponent(id)}/connection`, a),
+  workflowRunnerCommand: (id, apiKey, a) => post(`/v1/workflow-runners/${encodeURIComponent(id)}/command`, { apiKey }, a),
   testRun: (definition, input, a, workflowId) => post('/v1/workflows/test-run', { definition, input: input ?? {}, ...(workflowId ? { workflowId } : {}) }, a),
   executions: (params, a) => {
     const qs = new URLSearchParams();
@@ -193,6 +266,26 @@ export const api = {
   createCredential: (accountId, name, kind, secret, a) => post('/v1/credentials', { accountId, name, kind, secret }, a),
   deleteCredential: (id, a) => del(`/v1/credentials/${encodeURIComponent(id)}`, a),
   agent: (question, history, a) => post('/v1/ai/agent', { question, history }, a),
+  // ---- SynapseOCS (object cloud storage) ----
+  ocsBuckets: (a) => get('/v1/ocs/buckets?withStats=1', a),
+  ocsCreateBucket: (name, quotaBytes, a) =>
+    post('/v1/ocs/buckets', { name, ...(quotaBytes ? { quotaBytes: Number(quotaBytes) } : {}) }, a),
+  ocsBucket: (name, a) => get(`/v1/ocs/buckets/${encodeURIComponent(name)}`, a),
+  ocsDeleteBucket: (name, force, a) =>
+    del(`/v1/ocs/buckets/${encodeURIComponent(name)}${force ? '?force=true' : ''}`, a),
+  ocsObjects: (bucket, params, a) => {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(params || {})) {
+      if (v !== undefined && v !== null && String(v) !== '') qs.set(k, String(v));
+    }
+    const s = qs.toString();
+    return get(`/v1/ocs/buckets/${encodeURIComponent(bucket)}/objects${s ? `?${s}` : ''}`, a);
+  },
+  ocsPutObject: (bucket, key, file, contentType, a) =>
+    uploadBinary(ocsObjectPath(bucket, key), file, contentType, a),
+  ocsDeleteObject: (bucket, key, a) => del(ocsObjectPath(bucket, key), a),
+  ocsPresign: (bucket, key, method, expiresIn, a) =>
+    post(`/v1/ocs/buckets/${encodeURIComponent(bucket)}/presign`, { key, method: method || 'GET', expiresIn: expiresIn || 300 }, a),
   // ---- SynapseLDS (linked data service) ----
   ldsLicenses: (a) => get('/v1/lds/licenses', a),
   ldsDatasources: (a) => get('/v1/lds/datasources', a),
@@ -214,41 +307,49 @@ export const api = {
   ldsEntity: (id, entityId, a) => get(`/v1/lds/datasources/${encodeURIComponent(id)}/entities/${encodeURIComponent(entityId)}`, a),
   ldsStats: (id, a) => get(`/v1/lds/datasources/${encodeURIComponent(id)}/stats`, a),
   // ---- SynapseBase (document database) ----
-  baseCollections: (a) => get('/v1/base/collections', a),
-  baseCreateCollection: (body, a) => post('/v1/base/collections', body, a),
-  baseCollection: (col, a) => get(`/v1/base/collections/${encodeURIComponent(col)}`, a),
-  baseUpdateCollection: (col, body, a) => patch(`/v1/base/collections/${encodeURIComponent(col)}`, body, a),
-  baseDeleteCollection: (col, a) => del(`/v1/base/collections/${encodeURIComponent(col)}`, a),
-  baseCollectionStats: (col, a) => get(`/v1/base/collections/${encodeURIComponent(col)}/stats`, a),
-  baseDocuments: (col, params, a) => {
+  baseDatabases: (a) => get('/v1/base/databases', a),
+  baseCreateDatabase: (body, a) => post('/v1/base/databases', body, a),
+  baseDatabase: (db, a) => get(`/v1/base/databases/${encodeURIComponent(db)}`, a),
+  baseUpdateDatabase: (db, body, a) =>
+    patch(`/v1/base/databases/${encodeURIComponent(db)}`, body, a),
+  baseDeleteDatabase: (db, a) =>
+    del(`/v1/base/databases/${encodeURIComponent(db)}?cascade=true`, a),
+  baseCollections: (a, db) => get(baseCollectionsPath(db), a),
+  baseCreateCollection: (body, a, db) => post(baseCollectionsPath(db), body, a),
+  baseCollection: (col, a, db) => get(baseCollectionPath(col, db), a),
+  baseUpdateCollection: (col, body, a, db) => patch(baseCollectionPath(col, db), body, a),
+  baseDeleteCollection: (col, a, db) => del(baseCollectionPath(col, db), a),
+  baseCollectionStats: (col, a, db) => get(`${baseCollectionPath(col, db)}/stats`, a),
+  baseDocuments: (col, params, a, db) => {
     const qs = new URLSearchParams();
-    for (const [k, v] of Object.entries(params || {})) {
+    const merged = { withTotal: '1', ...(params || {}) };
+    for (const [k, v] of Object.entries(merged)) {
       if (v !== undefined && v !== null && String(v) !== '') qs.set(k, String(v));
     }
     const s = qs.toString();
-    return get(`/v1/base/collections/${encodeURIComponent(col)}/documents${s ? `?${s}` : ''}`, a);
+    return get(`${baseCollectionPath(col, db)}/documents${s ? `?${s}` : ''}`, a);
   },
-  baseDocument: (col, id, as, a) =>
-    get(`/v1/base/collections/${encodeURIComponent(col)}/documents/${encodeURIComponent(id)}${as ? `?as=${encodeURIComponent(as)}` : ''}`, a),
-  baseCreateDocument: (col, body, a) =>
-    post(`/v1/base/collections/${encodeURIComponent(col)}/documents`, body, a),
-  baseUpdateDocument: (col, id, body, a) =>
-    put(`/v1/base/collections/${encodeURIComponent(col)}/documents/${encodeURIComponent(id)}`, body, a),
-  basePatchDocument: (col, id, body, a) =>
-    patch(`/v1/base/collections/${encodeURIComponent(col)}/documents/${encodeURIComponent(id)}`, body, a),
-  baseDeleteDocument: (col, id, a) =>
-    del(`/v1/base/collections/${encodeURIComponent(col)}/documents/${encodeURIComponent(id)}`, a),
-  baseQuery: (col, body, a) =>
-    post(`/v1/base/collections/${encodeURIComponent(col)}/query`, body, a),
-  baseIncrement: (col, id, body, a) =>
-    post(`/v1/base/collections/${encodeURIComponent(col)}/documents/${encodeURIComponent(id)}/increment`, body, a),
-  baseChanges: (col, params, a) => {
+  baseDocument: (col, id, as, a, db) =>
+    get(`${baseCollectionPath(col, db)}/documents/${encodeURIComponent(id)}${as ? `?as=${encodeURIComponent(as)}` : ''}`, a),
+  baseCreateDocument: (col, body, a, db) =>
+    post(`${baseCollectionPath(col, db)}/documents`, body, a),
+  baseUpdateDocument: (col, id, body, a, db) =>
+    put(`${baseCollectionPath(col, db)}/documents/${encodeURIComponent(id)}`, body, a),
+  basePatchDocument: (col, id, body, a, db) =>
+    patch(`${baseCollectionPath(col, db)}/documents/${encodeURIComponent(id)}`, body, a),
+  baseDeleteDocument: (col, id, a, db) =>
+    del(`${baseCollectionPath(col, db)}/documents/${encodeURIComponent(id)}`, a),
+  baseQuery: (col, body, a, db) =>
+    post(`${baseCollectionPath(col, db)}/query`, body, a),
+  baseIncrement: (col, id, body, a, db) =>
+    post(`${baseCollectionPath(col, db)}/documents/${encodeURIComponent(id)}/increment`, body, a),
+  baseChanges: (col, params, a, db) => {
     const qs = new URLSearchParams();
     for (const [k, v] of Object.entries(params || {})) {
       if (v !== undefined && v !== null && String(v) !== '') qs.set(k, String(v));
     }
     const s = qs.toString();
-    return get(`/v1/base/collections/${encodeURIComponent(col)}/changes${s ? `?${s}` : ''}`, a);
+    return get(`${baseCollectionPath(col, db)}/changes${s ? `?${s}` : ''}`, a);
   },
   // ---- SynapseQueue (messaging) ----
   queueList: (a) => get('/v1/queue/queues', a),
@@ -307,6 +408,20 @@ export const api = {
     post(`/v1/stream/topics/${encodeURIComponent(name)}/groups/${encodeURIComponent(group)}/read`, body, a),
   streamGroupAck: (name, group, body, a) =>
     post(`/v1/stream/topics/${encodeURIComponent(name)}/groups/${encodeURIComponent(group)}/ack`, body, a),
+  // ---- Synapse Warehouse (OLAP + ETL) ----
+  warehouseDatasets: (a) => get('/v1/warehouse/datasets', a),
+  warehouseDataset: (id, a) => get(`/v1/warehouse/datasets/${encodeURIComponent(id)}`, a),
+  warehouseCreateDataset: (body, a) => post('/v1/warehouse/datasets', body, a),
+  warehouseDeleteDataset: (id, a) => del(`/v1/warehouse/datasets/${encodeURIComponent(id)}`, a),
+  warehouseIngest: (id, rows, a) => post(`/v1/warehouse/datasets/${encodeURIComponent(id)}/rows`, { rows }, a),
+  warehouseQuery: (sql, limit, a) => post('/v1/warehouse/query', { sql, limit }, a),
+  warehouseTemplates: (a) => get('/v1/warehouse/templates', a),
+  warehouseJobs: (a) => get('/v1/warehouse/jobs', a),
+  warehouseCreateJob: (body, a) => post('/v1/warehouse/jobs', body, a),
+  warehouseRunJob: (id, a) => post(`/v1/warehouse/jobs/${encodeURIComponent(id)}/run`, {}, a),
+  warehousePauseJob: (id, a) => post(`/v1/warehouse/jobs/${encodeURIComponent(id)}/pause`, {}, a),
+  warehouseResumeJob: (id, a) => post(`/v1/warehouse/jobs/${encodeURIComponent(id)}/resume`, {}, a),
+  warehouseDeleteJob: (id, a) => del(`/v1/warehouse/jobs/${encodeURIComponent(id)}`, a),
   // ---- Synapse Faststore (cache / KV) ----
   faststoreStats: (a) => get('/v1/faststore/stats', a),
   faststoreKeys: (params, a) => {

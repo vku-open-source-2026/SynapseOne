@@ -21,7 +21,7 @@ curl localhost:4007/health      # queue (messaging)
 ```
 
 - First pull takes a while (authentik). For a lighter start:
-  `docker compose up -d --build postgres redis s3 s3-init iam workflow base faststore queue gateway`
+  `docker compose up -d --build postgres valkey s3 s3-init iam workflow base faststore queue gateway`
   (authentik only starts when named).
 - Host port busy? Change `GATEWAY_HOST_PORT` (or any `*_HOST_PORT`) in `.env` —
   see `docs/troubleshooting.md`.
@@ -112,17 +112,29 @@ curl -s -XPOST localhost:8080/v1/queue/queues/emails/consume \
 ```
 
 Guides: [synapsebase.md](synapsebase.md) · [faststore.md](faststore.md) ·
-[queue.md](queue.md). Base persists to Postgres, Faststore and Queue to Redis;
+[queue.md](queue.md). Base persists to Postgres, Faststore and Queue to Valkey;
 without those env vars they fall back to per-process memory (dev only).
 
 ## 7. Object storage (S3)
 
-- S3 endpoint `http://localhost:9090` (S3Mock, S3-compatible), bucket `synapseone-core`
+- S3 endpoint `http://localhost:9090` (SeaweedFS, S3-compatible), bucket `synapseone-core`
   auto-created by the `s3-init` service.
 - Try it: `aws --endpoint-url http://localhost:9090 s3 ls` (keys in `.env`:
-  `S3_ACCESS_KEY` / `S3_SECRET_KEY`).
-- Production: switch to MinIO (`quay.io/minio/minio`) or real AWS S3 by replacing the
-  `s3` service + `S3_ENDPOINT` — SDK/API code doesn't change since everything speaks S3.
+  `STORAGE_S3_ACCESS_KEY` / `STORAGE_S3_SECRET_KEY`, `test`/`test` in dev).
+- Production: the same SeaweedFS service with real keys (the prod overlay requires
+  them), or point `STORAGE_S3_ENDPOINT` at AWS S3; SDK/API code doesn't change.
+
+## 7b. Backups
+
+`pg-backup` and `s3-backup` start with the stack and run daily (7-day retention):
+
+```bash
+docker compose run --rm --no-deps pg-backup --once     # dump Postgres now
+docker compose run --rm --no-deps s3-backup once       # snapshot object storage now
+docker compose run --rm --no-deps s3-backup list
+```
+Restore: `tools/backup/pg-restore.sh <file.dump>` and
+`docker compose run --rm --no-deps s3-backup restore latest` (`docs/object-storage.md`).
 
 ## 8. Stop
 

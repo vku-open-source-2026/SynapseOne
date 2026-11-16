@@ -38,6 +38,7 @@ await c.workflow.createWorkflowFromTemplate('webhook-to-log', 'demo');
 
 ```ts
 import { SynapseOneClient } from '@synapseone/sdk';
+import { OcsService } from '@synapseone/sdk/ocs';
 import { StorageService } from '@synapseone/sdk/storage';
 import { NotificationsService } from '@synapseone/sdk/notifications';
 import { InferenceService, parseChatDelta } from '@synapseone/sdk/inference';
@@ -145,6 +146,32 @@ Checks the current Bearer token or API key without fetching the user.
 me(): Promise<any>
 ```
 Returns the user record behind the current Bearer token.
+
+### Multi-factor authentication (`c.iam`)
+
+When an account has MFA, `loginWithPassword` (or dev `login`) rejects with a
+`SynapseOneError` whose `status` is `401` and `body.error` is `'mfa_required'`;
+finish with the `mfaToken` from that body.
+
+```ts
+try {
+  await c.iam.loginWithPassword({ email, password, orgSlug: 'acme' });
+} catch (e) {
+  const body = e instanceof SynapseOneError ? (e.body as { error?: string; mfaToken?: string }) : undefined;
+  if (e instanceof SynapseOneError && e.status === 401 && body?.error === 'mfa_required') {
+    const s = await c.iam.verifyMfa({ mfaToken: body.mfaToken!, code: '492039' }); // or recoveryCode
+    c.setToken(s.accessToken);
+  } else throw e;
+}
+
+const { secret, otpauthUrl } = await c.iam.setupTotp();     // show otpauthUrl as a QR code
+const { recoveryCodes } = await c.iam.enableTotp('123456'); // shown once
+await c.iam.mfaStatus();                                    // {enabled, recoveryCodesRemaining, ...}
+await c.iam.regenerateRecoveryCodes('123456');
+await c.iam.disableMfa({ code: '123456' });                 // or { recoveryCode }
+await c.iam.resetUserMfa(userId);                           // org admins: lost device
+await c.iam.unlockUser(userId);                             // org admins: clear a lockout
+```
 
 ### Organizations
 
@@ -480,14 +507,23 @@ deactivateWorkflow(id: string): Promise<any>
 ```
 Deactivates a workflow.
 
-#### `executeWorkflow(id, payload?)`
+#### `executeWorkflow(id, payload?, opts?)`
 ```ts
-executeWorkflow(id: string, payload?: Record<string, unknown>): Promise<any>
+executeWorkflow(id: string, payload?: Record<string, unknown>, opts?: { wait?: boolean; timeoutMs?: number; expectedRevision?: number }): Promise<any>
 ```
-Triggers a manual execution (proxied to the engine).
+Triggers a manual execution. Queue mode returns `202 {queued:true, executionId}`;
+pass `{ wait: true }` to block for the final result. `waitForExecution(id)`
+polls a queued/running execution.
+
+In the next SDK release, `expectedRevision` is a positive 32-bit integer
+precondition, sent separately from the payload. The service rejects a changed
+revision with `409 workflow_revision_conflict`; queued jobs also fail before
+execution if the definition changes while waiting. This option is not present
+in published SDK 0.9.0; release the updated SDK before using it in dependent tiers.
 
 ```ts
-await c.executeWorkflow(wfId, { url: 'https://example.com/hook' });
+const run = await c.executeWorkflow(wfId, { url: 'https://example.com/hook' }, { wait: true });
+const same = await c.workflow.waitForExecution(run.executionId);
 ```
 
 #### `updateWorkflow(id, patch)`
@@ -620,6 +656,10 @@ Collections of JSON documents with a logical object↔data mapping, queries,
 optimistic concurrency, counters, batches and a change feed. Full guide:
 [synapsebase.md](synapsebase.md).
 
+Use `c.base.database('analytics')` to address a database namespace (or
+`c.base.collection('parks', { database: 'analytics' })` for typed use). Without
+it, calls use the legacy flat routes and the tenant `default` database.
+
 ```ts
 type Park = { name: string; capacity?: number };
 
@@ -659,6 +699,26 @@ Document methods: `createDocument`, `getDocument` (`as: 'data' | 'object'`),
 
 The typed `BaseCollection` takes `mapping` as `{logical: 'dot.path'}` for the
 raw-data endpoints (list/increment/changes) and sends writes as `object`.
+
+Graph and GIS methods live on the same service:
+
+```ts
+await c.base.graphUpsertNodes('knowledge', [
+  { id: 'doc:1', labels: ['Document'], properties: { title: 'Bão số 12' } },
+]);
+await c.base.graphUpsertEdges('knowledge', [
+  { from: 'doc:1', to: 'province:hanoi', type: 'MENTIONS' },
+]);
+const sub = await c.base.graphNode('knowledge', 'doc:1', { depth: 2 });
+const stats = await c.base.graphStats('knowledge');
+
+await c.base.geoUpsert('knowledge', [{
+  id: 'p1', properties: { name: 'Hà Nội' },
+  geometry: { type: 'Point', coordinates: [105.85, 21.03] },
+}]);
+const nearby = await c.base.geoNear('knowledge', { lat: 21.03, lng: 105.85, radiusMeters: 5000 });
+const extent = await c.base.geoStats('knowledge');
+```
 
 ### Synapse Faststore (`c.faststore`)
 

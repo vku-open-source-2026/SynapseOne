@@ -404,7 +404,7 @@ describe('engine: disabled, retry, onError, credentials, principal (P0/P2)', () 
     };
     try {
       const r = await runWorkflow({
-        nodes: [N('Start', 'n8n-nodes-base.manualTrigger'), N('H', 'n8n-nodes-base.httpRequest', { url: 'https://api.example.com/x', method: 'GET', auth: { credentialId: 'cred-1' } })],
+        nodes: [N('Start', 'n8n-nodes-base.manualTrigger'), N('H', 'n8n-nodes-base.httpRequest', { url: 'https://api.example.com/x', method: 'GET', auth: { credentialId: 'cred-1', allowedOrigins: ['https://api.example.com'] } })],
         connections: { Start: { main: [[{ node: 'H' }]] } } as any,
       }, {}, { credentialResolver: async (id) => (id === 'cred-1' ? { kind: 'bearer', secret: 's3cr3t' } : null) });
       assert.equal(r.status, 'success');

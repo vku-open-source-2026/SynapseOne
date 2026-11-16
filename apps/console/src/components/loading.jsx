@@ -163,7 +163,7 @@ export function LoadingOverlay({ text = 'Loading…', transparent = false }) {
 
 /**
  * Thin gradient progress bar pinned to the top of the viewport.
- * Auto-plays on every route change, then fades out — gives instant
+ * Auto-plays on every route change, then fades out, gives instant
  * feedback even when a lazy chunk resolves in <300ms.
  */
 export function RouteProgress() {

@@ -5,8 +5,9 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
 import React, { useEffect, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useAuth } from '../lib/auth.jsx';
-import { api } from '../lib/api.js';
+import { api, baseUrl } from '../lib/api.js';
 import { Badge, Btn, Card, Code, Empty, Err, Field, Input, ListSkeleton, Modal, PageTitle, Spinner, Table, TableSkeleton } from '../components/ui.jsx';
 import WorkflowEditor from '../components/WorkflowEditor.jsx';
 import { uid, webhookPathOf, describeCron, isWebhookType, isCronType } from '../lib/workflow-graph.js';
@@ -33,6 +34,11 @@ export default function Workflows() {
   const [execMore, setExecMore] = useState(false);
   const [execBusy, setExecBusy] = useState(false);
   const [execStatus, setExecStatus] = useState('');
+  const [runnerMode, setRunnerMode] = useState('platform');
+  const [runnerQueue, setRunnerQueue] = useState('');
+  const [runnerCpu, setRunnerCpu] = useState(0.5);
+  const [runnerMemory, setRunnerMemory] = useState(128);
+  const [runnerBusy, setRunnerBusy] = useState(false);
   const EXEC_PAGE = 20;
 
   const execQuery = (id, offset) => ({
@@ -56,6 +62,38 @@ export default function Workflows() {
   const [expandedNode, setExpandedNode] = useState(null);
   const selSeq = useRef(0);
   const selRef = useRef(null);
+
+  useEffect(() => {
+    if (!detail) return;
+    const execution = detail.settings && typeof detail.settings === 'object' && detail.settings.execution && typeof detail.settings.execution === 'object'
+      ? detail.settings.execution
+      : {};
+    const mode = String(execution.mode || detail.settings?.runner || 'platform').toLowerCase();
+    setRunnerMode(['platform', 'custom', 'hybrid', 'system', 'inline'].includes(mode) ? mode : 'platform');
+    setRunnerQueue(String(execution.queue || ''));
+    setRunnerCpu(execution.resources?.cpu ?? 0.5);
+    setRunnerMemory(execution.resources?.memoryMb ?? 128);
+  }, [detail?.id, detail?.revision]);
+
+  const saveRunnerSettings = async () => {
+    if (!sel || !detail || runnerBusy) return;
+    setRunnerBusy(true);
+    setDetailErr(null);
+    try {
+      const settings = { ...(detail.settings || {}) };
+      if (!Number.isFinite(Number(runnerCpu)) || Number(runnerCpu) <= 0 || !Number.isInteger(Number(runnerMemory)) || Number(runnerMemory) < 1) throw new Error('Enter positive CPU cores and memory in MiB.');
+      const execution = { ...(settings.execution || {}), mode: runnerMode, resources: { cpu: Number(runnerCpu), memoryMb: Number(runnerMemory) } };
+      if (runnerQueue.trim()) execution.queue = runnerQueue.trim();
+      else delete execution.queue;
+      settings.execution = execution;
+      const updated = await api.updateWorkflow(sel, { settings }, headers);
+      setDetail(updated);
+    } catch (e) {
+      setDetailErr(e);
+    } finally {
+      setRunnerBusy(false);
+    }
+  };
 
   // Webhook trigger + cron summary for the detail header (M7/M8).
   const webhookTrigger = (() => {
@@ -141,7 +179,7 @@ export default function Workflows() {
 
   const list = Array.isArray(flows) ? flows : flows?.data || [];
 
-  // P2: file import/export — portable JSON {name, nodes, connections, settings}.
+  // P2: file import/export, portable JSON {name, nodes, connections, settings}.
   const importRef = useRef(null);
   const exportWorkflow = () => {
     if (!detail) return;
@@ -246,7 +284,7 @@ export default function Workflows() {
     setDetailErr(null);
     try {
       const r = await fn();
-      if (selRef.current !== id) return r; // user moved on — don't paint stale detail
+      if (selRef.current !== id) return r; // user moved on, don't paint stale detail
       setActionOut({ label, body: r });
       const d = await api.workflow(id, headers);
       if (selRef.current !== id) return r;
@@ -275,7 +313,7 @@ export default function Workflows() {
       setDetailErr(new Error('Execute input is not valid JSON'));
       return;
     }
-    const r = await doAction(() => api.executeWorkflow(sel, input, headers), 'Executed');
+    const r = await doAction(() => api.executeWorkflowWait(sel, input, headers, 60000), 'Executed');
     if (!r) return;
     reloadExecs(sel);
     // Pull the fresh execution so per-node input/output shows immediately.
@@ -310,7 +348,7 @@ export default function Workflows() {
       // mapping off node ids; two active workflows must share neither ids
       // nor webhook path, or routing is ambiguous).
       // Sibling paths are scanned so duplicate-of-duplicate gets -copy-2, ….
-      // The copy's trigger URL changes — the UI names it "<name> copy".
+      // The copy's trigger URL changes, the UI names it "<name> copy".
       let siblingPaths = new Set();
       try {
         const all = await api.workflows(headers);
@@ -396,7 +434,7 @@ export default function Workflows() {
 
   return (
     <>
-      <PageTitle title="SynapseFlow" sub="Next-generation workflow & autonomous AI agent automation engine — click a workflow to interact" right={<><Btn onClick={createBlank} disabled={createBusy}>+ Blank</Btn> <Btn onClick={() => setOpen(true)}>+ From template</Btn> <Btn onClick={() => importRef.current?.click()} disabled={createBusy}>Import</Btn><input ref={importRef} type="file" accept="application/json,.json" onChange={importWorkflow} className="hidden" aria-label="Import workflow JSON" /></>} />
+      <PageTitle title="SynapseFlow" sub="Next-generation workflow & autonomous AI agent automation engine, click a workflow to interact" right={<><Btn onClick={createBlank} disabled={createBusy}>+ Blank</Btn> <Btn onClick={() => setOpen(true)}>+ From template</Btn> <Btn onClick={() => importRef.current?.click()} disabled={createBusy}>Import</Btn><input ref={importRef} type="file" accept="application/json,.json" onChange={importWorkflow} className="hidden" aria-label="Import workflow JSON" /></>} />
       <Err e={err} />
       <div className="grid md:grid-cols-2 gap-4">
         <Card>
@@ -455,9 +493,9 @@ export default function Workflows() {
               </span>
             )}
             {webhookTrigger && (
-              <span className="ml-2 text-xs text-normal-text inline-flex items-center gap-1 flex-wrap" title={detail.active ? 'Live — external systems can call this (no auth)' : 'Activate the workflow to make this URL live'}>
+              <span className="ml-2 text-xs text-normal-text inline-flex items-center gap-1 flex-wrap" title={detail.active ? 'Live, external systems can call this (no auth)' : 'Activate the workflow to make this URL live'}>
                 <code className="font-mono text-main-text">{webhookTrigger.method} /webhook/{webhookTrigger.path}</code>
-                {!detail.active && <span>(dormant — activate to serve)</span>}
+                {!detail.active && <span>(dormant, activate to serve)</span>}
                 <WebhookCopy path={webhookTrigger.path} />
                 {detail.active && <WebhookPing path={webhookTrigger.path} method={webhookTrigger.method} onDone={(r) => setActionOut({ label: 'Webhook ping', body: r })} />}
               </span>
@@ -509,6 +547,32 @@ export default function Workflows() {
                   Export
                 </button>
               </div>
+              <div className="mb-3 p-3 rounded-2xl border border-slate-200 bg-slate-50">
+                <div className="flex flex-wrap items-end gap-2">
+                  <div className="min-w-[180px]">
+                    <label className="block text-[11px] text-normal-text mb-1">Execution runner</label>
+                    <select value={runnerMode} onChange={(e) => setRunnerMode(e.target.value)} className="w-full px-3 py-1.5 rounded-xl border border-slate-200 text-xs bg-white outline-none">
+                      <option value="platform">SynapseOne platform worker</option>
+                      <option value="custom">Self-hosted runner (custom queue)</option>
+                      <option value="hybrid">Hybrid (platform + self-hosted share queue)</option>
+                      <option value="system">System runner pool (owner-managed, all tenants)</option>
+                      <option value="inline">Inline (bypass queue)</option>
+                    </select>
+                  </div>
+                  <div className="flex-1 min-w-[180px]">
+                    <label className="block text-[11px] text-normal-text mb-1">Queue override (optional)</label>
+                    <input value={runnerQueue} onChange={(e) => setRunnerQueue(e.target.value)} placeholder="synapseone-wf-custom" spellCheck={false} className="w-full px-3 py-1.5 rounded-xl border border-slate-200 text-xs font-mono bg-white outline-none" />
+                  </div>
+                  <Field label="CPU reservation (cores)"><Input type="number" min="0.05" max="64" step="0.05" value={runnerCpu} onChange={e => setRunnerCpu(e.target.value)} className="max-w-[140px]" /></Field>
+                  <Field label="Memory reservation (MiB)"><Input type="number" min="32" max="262144" step="1" value={runnerMemory} onChange={e => setRunnerMemory(e.target.value)} className="max-w-[160px]" /></Field>
+                  <button onClick={saveRunnerSettings} disabled={runnerBusy} className="px-3 py-1.5 rounded-xl text-xs font-medium bg-slate-200 text-main-text disabled:opacity-60">
+                    {runnerBusy ? 'Saving…' : 'Save runner'}
+                  </button>
+                </div>
+                <p className="text-[11px] text-normal-text mt-1">
+                  System runners admit jobs only when current CPU and RAM can cover these reservations. Jobs wait in the queue while capacity is unavailable. <Link className="text-main-blue" to="/runner-engine">Create a self-hosted runner</Link> to get a copy-paste command with its API key.
+                </p>
+              </div>
               <Field label="Execute input (JSON)">
                 <textarea
                   value={execInput}
@@ -527,7 +591,7 @@ export default function Workflows() {
                 {actionBusy && <Spinner size="xs" className="sdx-spinner-on-dark" />}
                 {actionBusy ? 'Running…' : 'Execute'}
               </button>
-              <p className="text-[11px] text-normal-text mb-3">Execute runs the DAG now with this input — any trigger type, active or not. Activate only gates cron + public webhooks.</p>
+              <p className="text-[11px] text-normal-text mb-3">Execute queues a run with this input (any trigger type, active or not) and waits up to 60s; slower runs stay queued/running in history. Activate only gates cron + public webhooks.</p>
               {actionOut && (
                 <div className="mb-3">
                   <Badge tone="blue">{actionOut.label}</Badge>
@@ -540,9 +604,11 @@ export default function Workflows() {
                 <h4 className="font-semibold text-main-text text-sm">Recent executions ({execs.length})</h4>
                 <select value={execStatus} onChange={(e) => applyExecStatus(e.target.value)} title="Filter by status" className="ml-auto px-2 py-1 rounded-xl border border-slate-200 text-xs bg-white outline-none">
                   <option value="">All statuses</option>
+                  <option value="queued">Queued</option>
+                  <option value="running">Running</option>
+                  <option value="paused">Paused</option>
                   <option value="success">Success</option>
                   <option value="error">Error</option>
-                  <option value="running">Running</option>
                 </select>
               </div>
               {execs.length ? (
@@ -556,7 +622,7 @@ export default function Workflows() {
                           {x.status || x.mode || '?'}
                         </Badge>
                       </td>
-                      <td className="py-2 pr-4 text-xs text-normal-text">{x.startedAt || '—'}</td>
+                      <td className="py-2 pr-4 text-xs text-normal-text">{x.startedAt || '–'}</td>
                     </tr>
                   ))}
                 </Table>
@@ -685,8 +751,8 @@ function WebhookPing({ path, method, onDone }) {
     setBusy(true);
     try {
       // Same-origin /webhook/* only works when the edge proxies it (dev vite
-      // does not by default) — the catch block says exactly where to curl.
-      const r = await fetch(`/webhook/${path}`, {
+      // does not by default), the catch block says exactly where to curl.
+      const r = await fetch(`${baseUrl()}/webhook/${path}`, {
         method: method === 'GET' ? 'GET' : 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: method === 'GET' ? undefined : JSON.stringify({ ping: true }),
