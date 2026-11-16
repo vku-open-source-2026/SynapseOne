@@ -67,7 +67,8 @@ async function main() {
     since: '1970-01-01T00:00:00.000Z',
     as: 'object',
   });
-  assert.equal(changes.changes.find((ch) => ch.id === 'park-2').object.capacity, 9);
+  const park2 = changes.changes.filter((ch) => ch.id === 'park-2');
+  assert.equal(park2[park2.length - 1].object.capacity, 9);
 
   await c.base.deleteDocument(collection, 'park-2');
   await c.base.deleteCollection(collection);

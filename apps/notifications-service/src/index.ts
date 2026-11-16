@@ -159,7 +159,10 @@ async function consumeFromQueue(consumer: string): Promise<void> {
   }
   for (const item of page.messages || []) {
     const receipt = item.receipt;
-    const payload = item.message?.payload || {};
+    // SynapseQueue returns apiMessage() fields at the top level (payload,
+    // headers, ...). Accept the legacy nested shape too so a rolling deploy
+    // cannot silently drop deliveries.
+    const payload = item.payload ?? item.message?.payload ?? {};
     const notification = await getNotification(payload.tenant, payload.notificationId);
     if (!notification) {
       await queueCall(`/v1/queue/queues/${encodeURIComponent(QUEUE_NAME)}/ack`, { receipt }).catch(() => undefined);

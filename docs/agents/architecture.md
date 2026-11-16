@@ -19,8 +19,8 @@ Browser / CLI / SDK
  :4001  :4002  :4004 :4005  :4006   :4007
     │      │      │      │                 │
     └──────┴──────┴──────┴─── Postgres 16 ─┘
-                  Redis 7 (Faststore + Queue)
-                  S3-compatible object storage (storage-service)
+                  Valkey 8 (Faststore + Queue)
+                  S3-compatible object storage (SynapseOCS)
 ```
 
 - Console is a static React SPA served by nginx (`:3000` in Compose, `:80`
@@ -42,7 +42,7 @@ Browser / CLI / SDK
 | Workflow | workflow definitions, DAG execution, triggers, executions, encrypted credentials | global authz (uses IAM nodes when needed) |
 | LDS | datasources, attribute registry, records, NGSI-LD exports, license headers | tenant identity (from gateway headers) |
 | Base | collections, mappings, documents, queries, vector search, change feed | authn |
-| Faststore | Redis data structures, TTLs, counters, locks | durability beyond Redis |
+| Faststore | Valkey data structures, TTLs, counters, locks | durability beyond the cache |
 | Queue | queue configs, publish/consume leases, retries, DLQ | exactly-once delivery |
 | AI | Console API-docs assistant; picks an endpoint + fills a try-it form | public API, authorization decisions |
 | Inference | OpenAI-compatible chat proxy, embeddings, Decision-2.0 routing | tenant data |
@@ -147,7 +147,7 @@ else                     -> "user:<sub>"
   caller's org. Anonymous direct calls keep a dev/test global view.
 - **LDS** datasources are org/account-bound; cross-tenant access returns 404
   rather than 403 to avoid existence leaks. Anonymous export is public-only.
-- **Faststore/Queue** keys are namespaced by tenant, so one Redis can serve all
+- **Faststore/Queue** keys are namespaced by tenant, so one Valkey can serve all
   tenants without key collisions.
 
 ## 5. Data plane
@@ -168,18 +168,18 @@ the `drizzle` schema; services create tables at startup.
 Migrations run on startup under a per-service PostgreSQL advisory lock. Never
 edit an applied migration; add a new one.
 
-### Redis
+### Valkey
 
 - Faststore keys: `synapseone:faststore:v1:<tenant>:...`; locks use
   `...:__lock__:<name>` and token-owned release/extend.
 - Queue keys: `synapseone:queue:v1:<tenant>:...`; sorted sets + hashes + Lua make
-  consume/ack/nack atomic. One Redis can back both services.
-- Gateway does **not** currently use Redis (edge limiting is in-memory).
+  consume/ack/nack atomic. One Valkey can back both services.
+- Gateway does **not** currently use Valkey/Redis (edge limiting is in-memory).
 
 ### Object storage
 
-`storage-service` exposes tenant-scoped object storage at `/v1/storage`
-(direct + multipart upload, presigned URLs, checksums, quotas) over S3Mock in
+`SynapseOCS` exposes bucket-aware object storage at `/v1/ocs` (legacy `/v1/storage` remains the default bucket)
+(direct + multipart upload, presigned URLs, checksums, quotas) over the S3-compatible backend in
 dev and MinIO/AWS S3 in production. Tier-3 products upload files and store the
 returned key instead of embedding base64 data URLs.
 
@@ -187,7 +187,7 @@ returned key instead of embedding base64 data URLs.
 
 Every stateful service falls back to an in-memory store when its backend env is
 missing. This is for unit tests/dev only; production boot rejects missing
-`DATABASE_URL` (IAM, Workflow, LDS, Base) and missing Redis URL (Faststore,
+`DATABASE_URL` (IAM, Workflow, LDS, Base) and missing Valkey URL (Faststore,
 Queue) to avoid split-brain behavior.
 
 ## 6. Gateway routing details
@@ -256,13 +256,19 @@ headers; `_core` is never read.
   `tenantBinding`). Treat the doc as historical.
 - `docs/configuration.md` claims Redis-backed gateway rate limiting. The current
   gateway uses an in-memory per-IP limiter; no Redis client is imported there.
-- API-key **scopes** are stored and returned by IAM, but the gateway does not
-  enforce them yet (roadmap). Do not assume scope-based restrictions.
-- Object storage is exposed by `storage-service` (`/v1/storage`); notifications by
+- API-key **scopes** are enforced by the gateway. The required service is
+  derived from the matched route (including action overrides), so keep
+  `routes.yaml` `service` fields accurate. `AUTHZ_MODE` adds policy enforcement
+  on top; production should set `AUTHZ_MODE=enforce` and
+  `AUTHZ_MODE_REQUIRED=true`.
+- The Platform Super Admin control plane lives at `/v1/platform` and `/admin`;
+  it uses a separate `platform_admins` identity, MFA session exchange and
+  step-up. It is documented in `docs/platform-superadmin.md`.
+- Object storage is exposed by `SynapseOCS` (`/v1/ocs`; legacy `/v1/storage`); notifications by
   `notifications-service` (`/v1/notifications`).
 - `apps/tunnel-service/` contains only stale `dist/` artifacts and no source or
   package manifest; it is not part of the workspace.
-- `/ready` probes IAM, Workflow, AI, LDS, Base, Faststore, Queue, but not
-  Inference.
+- `/ready` probes IAM, Workflow, AI, LDS, Base, Faststore, Queue and, when their
+  URLs are configured, Stream, Inference, OCS and Notifications.
 - The AI service is guidance-only and intentionally absent from the public API
   catalog used for authorization decisions.

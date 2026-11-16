@@ -30,8 +30,10 @@ jobs:
         with: { go-version: "1.22" }
       - run: npm install --workspaces
       - run: npm run build --workspaces --if-present
+      - run: npm run workflows:validate
       - run: npm run test --workspaces --if-present
       # API catalog drift gate (console try-it + AI agent + docs/api.md).
+      - run: node tools/migration-check.mjs
       - run: node tools/catalog-check.mjs
       # Prod-dep audit: fails only on CRITICAL (the known HIGH `braces` advisory is
       # accepted + tracked in SECURITY.md — fix would be a breaking downgrade).
@@ -50,19 +52,47 @@ jobs:
       - run: pip install -r apps/inference-service/requirements.txt
       - run: pytest apps/inference-service/tests -q
       - run: ruff check sdks/sdk-python apps/inference-service && ruff format --check sdks/sdk-python apps/inference-service
+      - name: Edge nginx config guard
+        run: |
+          if grep -RIn '^[[:space:]]*//' infra/prod/*.conf apps/console/nginx.conf; then
+            echo 'nginx configs must use # comments, not //' >&2
+            exit 1
+          fi
       - run: docker compose config
+  rust-services:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [base-service, queue-service, gateway, ocs-service, faststore-service]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo test
+        run: cargo test --locked
+        working-directory: apps/${{ matrix.service }}
+
   docker:
     runs-on: ubuntu-latest
     needs: build-test
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - run: docker compose build
+      # Build the control/data services that carry the release contract.
+      # Inference/model images are built and published by their own release
+      # pipeline; rebuilding the multi-GB model stack on every PR is not a gate.
+      - run: docker compose build iam workflow queue base gateway console
+      - name: Build self-hosted workflow runner image (CI fallback model stage)
+        run: |
+          docker build -f apps/workflow-runner/Dockerfile \
+            --build-arg MODEL_STACK_IMAGE=python:3.11-slim-bookworm \
+            -t synapseone-workflow-runner:ci .
   e2e-compose:
     runs-on: ubuntu-latest
     needs: build-test
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -70,7 +100,26 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
       - run: cp .env.example .env
-      - run: docker compose up -d --build postgres redis s3 s3-init iam workflow inference gateway
+      - name: Compose up (single retry for transient registry/health failures)
+        run: |
+          set -e
+          ok=0
+          for attempt in 1 2; do
+            echo "docker compose up — attempt ${attempt}"
+            if docker compose up -d --build postgres valkey s3 s3-init iam workflow queue inference ocs gateway; then
+              ok=1
+              break
+            fi
+            echo "compose attempt ${attempt} failed; collecting diagnostics" >&2
+            docker compose ps || true
+            docker compose logs --tail=120 || true
+            docker compose down -v || true
+            sleep 10
+          done
+          if [ "$ok" != "1" ]; then
+            echo "docker compose up failed after retry" >&2
+            exit 1
+          fi
       - run: |
           set -e
           for i in $(seq 1 36); do
@@ -83,8 +132,16 @@ jobs:
           echo E2E_OK
       - run: bash tests/e2e/api-check.sh
       - run: pip install ./sdks/sdk-python -q && SYNAPSEONE_BASE_URL=http://localhost:8080 python tests/e2e/sdk-check.py
-      - run: npm install --workspaces --no-audit --no-fund -q && npm run build --workspaces --if-present -q && SYNAPSEONE_BASE_URL=http://localhost:8080 node tests/e2e/sdk-check.js
+      - name: Install workspaces
+        run: npm install --workspaces --no-audit --no-fund -q
+      - name: Build workflow runner and JS SDK
+        run: npm run build --workspace=apps/workflow-service --workspace=sdks/sdk-js -q
+      - name: JS SDK e2e
+        run: SYNAPSEONE_BASE_URL=http://localhost:8080 node tests/e2e/sdk-check.js
       - run: SYNAPSEONE_BASE_URL=http://localhost:8080 node tests/e2e/services-check.js
+      - run: SYNAPSEONE_BASE_URL=http://localhost:8080 WORKFLOW_HEALTH_URL=http://localhost:4002/health node tests/e2e/workflow-runner-e2e.mjs
+      - run: SYNAPSEONE_BASE_URL=http://localhost:8080 node tests/e2e/mcp-docs-e2e.mjs
+      - run: SYNAPSEONE_BASE_URL=http://localhost:8080 node tests/e2e/ocs-check.js
       # IAM integration nodes authenticate as the workflow service with a real
       # API key (the internal secret alone is not a caller identity).
       - name: Configure workflow IAM service key

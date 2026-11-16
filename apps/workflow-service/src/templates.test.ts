@@ -29,6 +29,15 @@ describe('workflow templates', () => {
       assert.ok(def.connections, t.name);
     }
   });
+  it('ships warehouse ETL templates (batch + stream)', () => {
+    const batch: any = buildTemplate('etl-batch-warehouse');
+    assert.ok(batch.nodes.some((node: any) => node.type === 'synapseone.api' && node.parameters.operation === 'run-batch'));
+    const micro: any = buildTemplate('etl-stream-microbatch');
+    assert.ok(micro.nodes.some((node: any) => node.parameters.operation === 'consume'));
+    assert.ok(micro.nodes.some((node: any) => node.parameters.operation === 'ack'));
+    const stream: any = buildTemplate('etl-stream-warehouse');
+    assert.ok(stream.nodes.some((node: any) => node.parameters.operation === 'ensure-stream'));
+  });
   it('unknown template returns null', () => {
     assert.equal(buildTemplate('nope'), null);
   });
@@ -1094,10 +1103,11 @@ describe('credentials, webhook hardening, tenant, revision, metrics (P0/P2)', ()
     const foreignDel = await fetch(`${base}/v1/credentials/${cred.id}`, {
       method: 'DELETE', headers: P({ 'x-synapseone-user': 'ub', 'x-synapseone-org': 'org-b' }),
     });
-    assert.equal(foreignDel.status, 403);
-    // Anonymous dev view is unchanged (no principal) but never leaks the secret.
+    assert.equal(foreignDel.status, 404);
+    // Newly created owner-only credentials are hidden even from the anonymous
+    // dev view; legacy shared rows retain their compatibility behavior.
     const anonList: any = await (await fetch(`${base}/v1/credentials?accountId=acc-a`, { headers: H })).json();
-    assert.equal(anonList.data.length, 1);
+    assert.equal(anonList.data.length, 0);
     assert.ok(!JSON.stringify(anonList).includes('TOPSECRET-A'));
     // Owning org still sees and deletes it.
     const ownList: any = await (await fetch(`${base}/v1/credentials?accountId=acc-a`, {

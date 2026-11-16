@@ -301,6 +301,41 @@ def test_base_collection_lifecycle_paths_and_bodies():
         srv.shutdown()
 
 
+def test_base_database_handle_scopes_collection_paths():
+    srv = _server()
+    try:
+        c = _client(srv)
+        analytics = c.base.database("analytics")
+        assert analytics.database_name == "analytics"
+        assert c.base.database_name is None
+
+        analytics.create_collection("users")
+        assert _seen["path"] == "/v1/base/databases/analytics/collections"
+        assert _seen["method"] == "POST"
+
+        c.base.create_collection("events", database="analytics")
+        assert _seen["path"] == "/v1/base/databases/analytics/collections"
+
+        analytics.get_collection("users")
+        assert _seen["path"] == "/v1/base/databases/analytics/collections/users"
+
+        analytics.create_document("users", data={"name": "Ada"}, id="u1")
+        assert (
+            _seen["path"] == "/v1/base/databases/analytics/collections/users/documents"
+        )
+
+        typed = c.base.collection(
+            "users", model=None, mapping={"name": "profile.name"}, database="analytics"
+        )
+        assert isinstance(typed, BaseCollection)
+
+        c.base.delete_database("analytics", cascade=True)
+        assert _seen["path"] == "/v1/base/databases/analytics?cascade=true"
+        assert _seen["method"] == "DELETE"
+    finally:
+        srv.shutdown()
+
+
 def test_base_documents_data_and_object_are_exclusive():
     srv = _server()
     try:
@@ -804,5 +839,44 @@ def test_webhook_still_module_level():
         assert trigger_webhook(base, "transform", {"value": 21}) == {"ok": True}
         assert _seen["path"] == "/webhook/transform", _seen
         assert _seen["auth"] is None, _seen
+    finally:
+        srv.shutdown()
+
+
+def test_iam_mfa_methods():
+    srv = _server()
+    try:
+        c = _client(srv)
+        seen = []
+
+        def call(fn, *args, **kwargs):
+            fn(*args, **kwargs)
+            body = json.loads(_seen["body"]) if _seen["body"] else None
+            seen.append((_seen["method"], _seen["path"], body))
+
+        call(c.iam.verify_mfa, "m", code="123456")
+        call(c.iam.verify_mfa, "m", recovery_code="abcd-efgh")
+        call(c.iam.mfa_status)
+        call(c.iam.setup_totp)
+        call(c.iam.enable_totp, "111111")
+        call(c.iam.regenerate_recovery_codes, "222222")
+        call(c.iam.disable_mfa, code="333333")
+        call(c.iam.reset_user_mfa, "u/1")
+        call(c.iam.unlock_user, "u1")
+        assert seen == [
+            ("POST", "/v1/auth/mfa/verify", {"mfaToken": "m", "code": "123456"}),
+            (
+                "POST",
+                "/v1/auth/mfa/verify",
+                {"mfaToken": "m", "recoveryCode": "abcd-efgh"},
+            ),
+            ("GET", "/v1/auth/mfa", None),
+            ("POST", "/v1/auth/mfa/totp/setup", {}),
+            ("POST", "/v1/auth/mfa/totp/enable", {"code": "111111"}),
+            ("POST", "/v1/auth/mfa/recovery-codes", {"code": "222222"}),
+            ("POST", "/v1/auth/mfa/disable", {"code": "333333"}),
+            ("DELETE", "/v1/users/u%2F1/mfa", None),
+            ("POST", "/v1/users/u1/unlock", {}),
+        ], seen
     finally:
         srv.shutdown()

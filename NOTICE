@@ -25,12 +25,12 @@ Third-party components (each under its own license — see also THIRD-PARTY.md):
 - Authentik (https://goauthentik.io) — MIT-licensed identity provider, used as optional external IdP via OIDC.
 - Keycloak (https://www.keycloak.org) — Apache-2.0 identity provider, supported as alternative external IdP via OIDC.
 - Workflow engine is SynapseOne's own Apache-2.0 code (no external engine in the default stack).
-- PostgreSQL (PostgreSQL Licence), Redis (RSALv2/SSPL — check your Redis distribution),
+- PostgreSQL (PostgreSQL Licence), Valkey (BSD-3-Clause; Redis-protocol compatible),
   each consumed as container images, not linked code.
 - Node.js runtime dependencies (Express, jsonwebtoken, http-proxy-middleware, …) — MIT/ISC/Apache-2.0;
   see each package.json + package-lock.json for the exact resolved tree.
 - React + Vite + Tailwind (console) — MIT; FontAwesome free icons —
   CC-BY-4.0 (attribution: Fonticons, Inc., https://fontawesome.com/license/free).
 - Python `requests` (sdk-python) — Apache-2.0 (incl. `certifi` MPL-2.0 CA bundle). Go stdlib only (sdk-go) — BSD-3-Clause.
-- Monitoring images: Prometheus — Apache-2.0; PG/Redis exporters —
+- Monitoring images: Prometheus — Apache-2.0; PG/Valkey exporters —
   Apache-2.0/MIT. Optional MinIO backend — AGPL-3.0 (opt-in only).

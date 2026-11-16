@@ -229,6 +229,62 @@ test('visibility timeout, heartbeat and redelivery', async () => {
   await call('POST', '/v1/queue/queues/jobs/ack', { receipt: redelivered.json.messages[0].receipt });
 });
 
+test('long-poll consume returns as soon as work arrives', async () => {
+  await createQueue();
+  const started = Date.now();
+  const waiting = call('POST', '/v1/queue/queues/jobs/consume', { maxMessages: 1, waitSeconds: 5 });
+  // Publish while the request is parked: the waiter must wake immediately
+  // instead of sleeping out the whole wait.
+  await new Promise((r) => setTimeout(r, 120));
+  await call('POST', '/v1/queue/queues/jobs/messages', { payload: { hello: 'world' } });
+  const startedAt = Date.now();
+  const got = await waiting;
+  const elapsed = Date.now() - startedAt;
+  assert.equal(got.status, 200);
+  assert.equal(got.json.count, 1);
+  assert.equal(got.json.messages[0].payload.hello, 'world');
+  assert.equal(got.json.waitSeconds, 5);
+  assert.ok(got.json.waitedMs >= 100, `waitedMs=${got.json.waitedMs}`);
+  assert.ok(elapsed < 2000, `wake-up took ${elapsed}ms`);
+  assert.ok(Date.now() - started < 5000, 'must not sleep out the full wait');
+  await call('POST', '/v1/queue/queues/jobs/ack', { receipt: got.json.messages[0].receipt });
+});
+
+test('long-poll consume honours the wait budget and delayed messages', async () => {
+  await createQueue();
+  const empty = await call('POST', '/v1/queue/queues/jobs/consume', { maxMessages: 1, waitSeconds: 1 });
+  assert.equal(empty.json.count, 0);
+  assert.ok(empty.json.waitedMs >= 900, `waitedMs=${empty.json.waitedMs}`);
+  assert.ok(empty.json.waitedMs < 2500, `waitedMs=${empty.json.waitedMs}`);
+
+  // A delayed message is not announced over pub/sub; the waiter must compute
+  // the next availability time and pick it up without a scan loop.
+  const started = Date.now();
+  const delayed = call('POST', '/v1/queue/queues/jobs/messages', { payload: 'later', delaySeconds: 1 });
+  const got = await call('POST', '/v1/queue/queues/jobs/consume', { maxMessages: 1, waitSeconds: 3 });
+  await delayed;
+  const elapsed = Date.now() - started;
+  assert.equal(got.json.count, 1);
+  assert.equal(got.json.messages[0].payload, 'later');
+  assert.ok(elapsed >= 900 && elapsed < 2500, `delayed pickup took ${elapsed}ms`);
+  await call('POST', '/v1/queue/queues/jobs/ack', { receipt: got.json.messages[0].receipt });
+});
+
+test('waitSeconds is validated and bounded', async () => {
+  await createQueue();
+  const tooLong = await call('POST', '/v1/queue/queues/jobs/consume', { maxMessages: 1, waitSeconds: 21 });
+  assert.equal(tooLong.status, 400);
+  assert.equal(tooLong.json.error, 'invalid_request');
+  const negative = await call('POST', '/v1/queue/queues/jobs/consume', { maxMessages: 1, waitSeconds: -1 });
+  assert.equal(negative.status, 400);
+  // waitSeconds=0 keeps the old immediate-return contract.
+  const immediate = await call('POST', '/v1/queue/queues/jobs/consume', { maxMessages: 1 });
+  assert.equal(immediate.status, 200);
+  assert.equal(immediate.json.count, 0);
+  assert.ok(immediate.json.waitedMs < 500, `waitedMs=${immediate.json.waitedMs}`);
+  assert.equal(immediate.json.waitSeconds, undefined);
+});
+
 test('batch publish and tenant isolation', async () => {
   await createQueue();
   const batch = await call('POST', '/v1/queue/queues/jobs/messages:batch', {
