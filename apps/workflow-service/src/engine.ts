@@ -2471,11 +2471,41 @@ export async function execCodeSandbox(node: EngineNode, input: any, opts?: { tim
 
 // ---------- DAG runner ----------
 
+/** Credential ids literally referenced by a workflow definition. A node may
+ *  only resolve a secret that its own graph declares; tenant-wide credential
+ *  ids are not enough. */
+export function referencedCredentialIds(value: unknown): Set<string> {
+  const ids = new Set<string>();
+  const walk = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item);
+      return;
+    }
+    if (!node || typeof node !== 'object') return;
+    for (const [key, item] of Object.entries(node as Record<string, unknown>)) {
+      if (key === 'credentialId' && typeof item === 'string' && item.trim()) ids.add(item.trim());
+      else walk(item);
+    }
+  };
+  walk(value);
+  return ids;
+}
+
 export async function runWorkflow(
   definition: { nodes?: EngineNode[]; connections?: Connections; name?: string; settings?: Record<string, any> },
   input: any,
   opts?: RunOpts,
 ): Promise<RunResult> {
+  // P2 hardening: scope credential resolution to the ids this graph declares.
+  // A compromised or mistaken node cannot read an arbitrary tenant credential.
+  if (opts?.credentialResolver) {
+    const allowed = referencedCredentialIds(definition);
+    const resolve = opts.credentialResolver;
+    opts = {
+      ...opts,
+      credentialResolver: (id: string) => allowed.has(id) ? resolve(id) : Promise.resolve(null),
+    };
+  }
   const nodes = Array.isArray(definition?.nodes) ? definition.nodes : [];
   // Accept workflows saved before the rebrand: normalise legacy node types
   // once at the boundary so every downstream switch sees `synapseone.*`.

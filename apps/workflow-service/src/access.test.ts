@@ -5,6 +5,7 @@ import { after, before, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import { createApp, synapseoneCall, makeCredentialResolver, workflowRunPrincipal } from './index';
+import { referencedCredentialIds } from './engine';
 import { __clearMem, createHumanTaskRec, createCredentialRec } from './store';
 
 const INTERNAL = 'workflow-access-regression';
@@ -155,6 +156,19 @@ describe('owner-only capability workflow isolation', () => {
     assert.equal(rotated.data.owner, 'apikey:technical-a');
     assert.equal((await makeCredentialResolver(ownPrincipal)(id))?.secret, 'rotated-test-value');
     assert.equal((await request(`/v1/credentials/${id}`, OWNER, 'DELETE')).status, 200);
+  });
+
+  it('scopes credential resolution to the ids a workflow graph declares', () => {
+    const definition = {
+      nodes: [
+        { name: 'Start', type: 'manualTrigger', parameters: {} },
+        { name: 'Call', type: 'httpRequest', parameters: { url: 'https://example.invalid', auth: { credentialId: 'cred-declared' } } },
+        { name: 'Unrelated', type: 'noOp', parameters: { note: 'credentialId must only count as a real key', value: 'not-a-credential' } },
+      ],
+      connections: {},
+    };
+    assert.deepEqual([...referencedCredentialIds(definition)], ['cred-declared']);
+    assert.deepEqual([...referencedCredentialIds({ nodes: [{ parameters: { nested: [{ credentialId: 'cred-nested' }] } }] })], ['cred-nested']);
   });
 
   it('preserves intentionally shared legacy credentials without granting access to new private ones', async () => {

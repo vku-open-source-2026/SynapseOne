@@ -27,6 +27,7 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     needs: ci
+    timeout-minutes: 90
     if: "!contains(github.event.head_commit.message, '[skip publish]')"
     permissions:
       contents: read
@@ -80,30 +81,41 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build + push images (main channel)
         run: |
+          set -euo pipefail
           OWNER="${{ github.repository_owner }}"
           SHA="${{ steps.ver.outputs.sha }}"
-          for SVC in gateway iam workflow warehouse console; do
+          # Dev channel publishes the control-plane services. The heavy
+          # warehouse/inference/runner artifacts are published by the tagged
+          # release pipeline, which has the model/toolchain build budget.
+          for SVC in gateway iam workflow console; do
             case "$SVC" in
               gateway) CTX=apps/gateway ;;
               iam) CTX=apps/iam-service ;;
               workflow) CTX=apps/workflow-service ;;
-              warehouse) CTX=apps/warehouse-service ;;
               console) CTX=apps/console ;;
             esac
-            docker build -t "ghcr.io/$OWNER/synapseone-$SVC:main" -t "ghcr.io/$OWNER/synapseone-$SVC:main-$SHA" "$CTX"
+            echo "::group::build $SVC"
+            df -h /
+            docker build --progress=plain \
+              -t "ghcr.io/$OWNER/synapseone-$SVC:main" \
+              -t "ghcr.io/$OWNER/synapseone-$SVC:main-$SHA" "$CTX"
             docker push "ghcr.io/$OWNER/synapseone-$SVC:main"
             docker push "ghcr.io/$OWNER/synapseone-$SVC:main-$SHA"
+            docker builder prune -f >/dev/null || true
+            docker image prune -f >/dev/null || true
+            echo "::endgroup::"
           done
-          docker build -f apps/workflow-runner/Dockerfile \
-            -t "ghcr.io/$OWNER/synapseone-workflow-runner:main" \
-            -t "ghcr.io/$OWNER/synapseone-workflow-runner:main-$SHA" .
-          docker push "ghcr.io/$OWNER/synapseone-workflow-runner:main"
-          docker push "ghcr.io/$OWNER/synapseone-workflow-runner:main-$SHA"
+          # The runner image bakes the inference model stack and is published by
+          # the tagged release pipeline after that image exists. A main-channel
+          # build here would either pull a missing local tag or ship a model-less
+          # runner, so do not publish it here.
+          echo "::notice::warehouse and workflow-runner are published by release.yml."
 
       - name: Summary
         run: |
           {
             echo "## CD (dev channel) — ${{ github.sha }}";
             echo "- npm: \`@synapseone/sdk@${{ steps.ver.outputs.npm }}\`, \`@synapseone/cli@${{ steps.ver.outputs.npm }}\` (tag \`dev\`)";
-            echo "- GHCR: \`ghcr.io/${{ github.repository_owner }}/synapseone-{gateway,iam,workflow,workflow-runner,console}:main(-${{ steps.ver.outputs.sha }})\`";
+            echo "- GHCR: \`ghcr.io/${{ github.repository_owner }}/synapseone-{gateway,iam,workflow,console}:main(-${{ steps.ver.outputs.sha }})\`";
+            echo "- warehouse/workflow-runner: published by the tagged release pipeline.";
           } >> "$GITHUB_STEP_SUMMARY"

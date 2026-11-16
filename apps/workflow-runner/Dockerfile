@@ -46,6 +46,8 @@ RUN npm ci --omit=dev
 # Baked CPU model stack (ONNX MiniLM + Decision-2.0) — copy source only
 # ---------------------------------------------------------------------------
 FROM ${MODEL_STACK_IMAGE} AS modelstack
+# Keep a CI smoke build (no local model image) able to copy an empty cache.
+RUN mkdir -p /app/.cache/huggingface
 
 # ---------------------------------------------------------------------------
 # Final: clean Python base (no inherited PORT/EXPOSE/HEALTHCHECK)
