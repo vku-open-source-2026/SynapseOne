@@ -7,14 +7,20 @@
 import React, { Suspense, useState } from 'react';
 import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import { useAuth } from './lib/auth.jsx';
+import { PlatformAuthProvider } from './lib/platform-auth.jsx';
 import Sidebar from './components/Sidebar.jsx';
 import ServicesSidebar from './components/ServicesSidebar.jsx';
 import Topbar from './components/Topbar.jsx';
+import AdminLayout from './components/AdminLayout.jsx';
+import PlatformGuard from './components/PlatformGuard.jsx';
 import PublicHeader from './components/PublicHeader.jsx';
+import PublicFooter from './components/PublicFooter.jsx';
+import ConsoleFooter from './components/ConsoleFooter.jsx';
 import ErrorBoundary from './components/ErrorBoundary.jsx';
 import { ScopeProvider } from './components/Scope.jsx';
 import { PageSkeleton, RouteProgress, ScrollToTop } from './components/loading.jsx';
 import Login from './pages/Login.jsx';
+import Register from './pages/Register.jsx';
 import OidcCallback from './pages/OidcCallback.jsx';
 import Landing from './pages/Landing.jsx';
 import About from './pages/About.jsx';
@@ -30,18 +36,36 @@ const Policies = React.lazy(() => import('./pages/Policies.jsx'));
 const Keys = React.lazy(() => import('./pages/Keys.jsx'));
 const ServiceAccounts = React.lazy(() => import('./pages/ServiceAccounts.jsx'));
 const Workflows = React.lazy(() => import('./pages/Workflows.jsx'));
+const WorkflowRunners = React.lazy(() => import('./pages/WorkflowRunners.jsx'));
 const SynapseBase = React.lazy(() => import('./pages/SynapseBase.jsx'));
 const SynapseQueue = React.lazy(() => import('./pages/SynapseQueue.jsx'));
 const SynapseStream = React.lazy(() => import('./pages/SynapseStream.jsx'));
+const SynapseWarehouse = React.lazy(() => import('./pages/SynapseWarehouse.jsx'));
 const SynapseFaststore = React.lazy(() => import('./pages/SynapseFaststore.jsx'));
+const SynapseOCS = React.lazy(() => import('./pages/SynapseOCS.jsx'));
 const SynapseInference = React.lazy(() => import('./pages/SynapseInference.jsx'));
 const LinkedData = React.lazy(() => import('./pages/LinkedData.jsx'));
 const Authorize = React.lazy(() => import('./pages/Authorize.jsx'));
 const Audit = React.lazy(() => import('./pages/Audit.jsx'));
+const Security = React.lazy(() => import('./pages/Security.jsx'));
 const ApiDocs = React.lazy(() => import('./pages/ApiDocs.jsx'));
 const Docs = React.lazy(() => import('./pages/Docs.jsx'));
+const NotFound = React.lazy(() => import('./pages/NotFound.jsx'));
+const AdminOverview = React.lazy(() => import('./pages/admin/Overview.jsx'));
+const AdminOrganizations = React.lazy(() => import('./pages/admin/Organizations.jsx'));
+const AdminAccounts = React.lazy(() => import('./pages/admin/Accounts.jsx'));
+const AdminOrganizationDetail = React.lazy(() => import('./pages/admin/OrganizationDetail.jsx'));
+const AdminUsers = React.lazy(() => import('./pages/admin/Users.jsx'));
+const AdminUserDetail = React.lazy(() => import('./pages/admin/UserDetail.jsx'));
+const AdminServiceHealth = React.lazy(() => import('./pages/admin/ServiceHealth.jsx'));
+const AdminUsage = React.lazy(() => import('./pages/admin/Usage.jsx'));
+const AdminAudit = React.lazy(() => import('./pages/admin/Audit.jsx'));
+const AdminPlatformAdmins = React.lazy(() => import('./pages/admin/PlatformAdmins.jsx'));
+const AdminRunners = React.lazy(() => import('./pages/admin/Runners.jsx'));
 
 import { appLoginUrl, isCanonicalAppHost } from './lib/site.js';
+import { LanguageProvider } from './lib/i18n.jsx';
+import { ThemeProvider } from './lib/theme.jsx';
 
 function Guard({ children }) {
   const { auth } = useAuth();
@@ -60,9 +84,10 @@ function Guard({ children }) {
 // Public pages: primary navigation via the header above.
 function PublicLayout({ children }) {
   return (
-    <div className="min-h-screen">
+    <div className="min-h-screen bg-s1-bg text-s1-fg">
       <PublicHeader />
-      <main className="mx-auto max-w-6xl px-4 pt-24 pb-12 sdx-page-enter">{children}</main>
+      <main className="mx-auto max-w-6xl px-4 pt-28 pb-16 sdx-page-enter">{children}</main>
+      <PublicFooter />
     </div>
   );
 }
@@ -100,10 +125,12 @@ function ConsoleLayout({ children }) {
         <main
           className={`transition-all duration-200 ${
             servicesOpen ? 'console-layout-dual' : 'console-layout-single'
-          } px-4 lg:px-6 pt-20 pb-12 min-w-0 sdx-page-enter`}
+          } px-4 lg:px-6 pt-20 pb-8 min-w-0 min-h-screen flex flex-col sdx-page-enter`}
         >
-          <div className="max-w-6xl mx-auto w-full">
-            {children}
+          {/* Column fills the window so the footer sits at the bottom even on short pages. */}
+          <div className="max-w-6xl mx-auto w-full flex-1 flex flex-col">
+            <div className="flex-1">{children}</div>
+            <ConsoleFooter />
           </div>
         </main>
       </ScopeProvider>
@@ -126,6 +153,18 @@ function ResettingBoundary({ children }) {
 
 export default function App() {
   return (
+    <ThemeProvider>
+      <LanguageProvider>
+        <PlatformAuthProvider>
+          <AppRoutes />
+        </PlatformAuthProvider>
+      </LanguageProvider>
+    </ThemeProvider>
+  );
+}
+
+function AppRoutes() {
+  return (
     <ResettingBoundary>
       <ScrollToTop />
       <RouteProgress />
@@ -135,6 +174,7 @@ export default function App() {
           <Route path="/welcome" element={<Navigate to="/" replace />} />
           <Route path="/about" element={<About />} />
           <Route path="/login" element={<Login />} />
+          <Route path="/register" element={<Register />} />
           <Route path="/oidc/callback" element={<OidcCallback />} />
           <Route path="/api-docs" element={<DocsLayout><ApiDocs /></DocsLayout>} />
           <Route path="/docs" element={<DocsLayout><Docs /></DocsLayout>} />
@@ -147,18 +187,46 @@ export default function App() {
           <Route path="/keys" element={<Guard><ConsoleLayout><Keys /></ConsoleLayout></Guard>} />
           <Route path="/service-accounts" element={<Guard><ConsoleLayout><ServiceAccounts /></ConsoleLayout></Guard>} />
           <Route path="/workflows" element={<Guard><ConsoleLayout><Workflows /></ConsoleLayout></Guard>} />
+          <Route path="/runner-engine" element={<Guard><ConsoleLayout><WorkflowRunners /></ConsoleLayout></Guard>} />
+          <Route path="/workflow-runners" element={<Guard><ConsoleLayout><WorkflowRunners /></ConsoleLayout></Guard>} />
           <Route path="/base" element={<Guard><ConsoleLayout><SynapseBase /></ConsoleLayout></Guard>} />
           <Route path="/queue" element={<Guard><ConsoleLayout><SynapseQueue /></ConsoleLayout></Guard>} />
           <Route path="/stream" element={<Guard><ConsoleLayout><SynapseStream /></ConsoleLayout></Guard>} />
+          <Route path="/warehouse" element={<Guard><ConsoleLayout><SynapseWarehouse /></ConsoleLayout></Guard>} />
           <Route path="/faststore" element={<Guard><ConsoleLayout><SynapseFaststore /></ConsoleLayout></Guard>} />
+          <Route path="/ocs" element={<Guard><ConsoleLayout><SynapseOCS /></ConsoleLayout></Guard>} />
           <Route path="/inference" element={<Guard><ConsoleLayout><SynapseInference /></ConsoleLayout></Guard>} />
           <Route path="/lds" element={<Guard><ConsoleLayout><LinkedData /></ConsoleLayout></Guard>} />
           <Route path="/authorize" element={<Guard><ConsoleLayout><Authorize /></ConsoleLayout></Guard>} />
           <Route path="/audit" element={<Guard><ConsoleLayout><Audit /></ConsoleLayout></Guard>} />
-          <Route path="*" element={<Landing />} />
+          <Route path="/security" element={<Guard><ConsoleLayout><Security /></ConsoleLayout></Guard>} />
+          <Route path="/admin" element={<Navigate to="/admin/overview" replace />} />
+          <Route path="/admin/overview" element={<PlatformGuard><AdminLayout><AdminOverview /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/orgs" element={<PlatformGuard><AdminLayout><AdminOrganizations /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/accounts" element={<PlatformGuard><AdminLayout><AdminAccounts /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/orgs/:orgId" element={<PlatformGuard><AdminLayout><AdminOrganizationDetail /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/users" element={<PlatformGuard><AdminLayout><AdminUsers /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/users/:userId" element={<PlatformGuard><AdminLayout><AdminUserDetail /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/health" element={<PlatformGuard><AdminLayout><AdminServiceHealth /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/usage" element={<PlatformGuard><AdminLayout><AdminUsage /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/audit" element={<PlatformGuard><AdminLayout><AdminAudit /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/access" element={<PlatformGuard><AdminLayout><AdminPlatformAdmins /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/runners" element={<PlatformGuard><AdminLayout><AdminRunners /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/*" element={<PlatformGuard><AdminLayout><AdminNotFound /></AdminLayout></PlatformGuard>} />
+          <Route path="*" element={<NotFound />} />
         </Routes>
       </Suspense>
     </ResettingBoundary>
+  );
+}
+
+function AdminNotFound() {
+  return (
+    <div className="max-w-xl">
+      <h1 className="text-2xl font-semibold text-main-text">Admin page not found</h1>
+      <p className="text-sm text-normal-text mt-2">The requested platform administration route does not exist.</p>
+      <a href="/admin/overview" className="inline-block mt-4 text-sm text-main-blue hover:underline">Back to Platform Overview</a>
+    </div>
   );
 }
 

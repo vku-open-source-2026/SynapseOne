@@ -20,6 +20,9 @@ bootstrap:
 build:
 	npm run build --workspaces --if-present
 
+runner-image:
+	docker build -f apps/workflow-runner/Dockerfile -t synapseone-workflow-runner:latest .
+
 test:
 	npm run test --workspaces --if-present
 
@@ -41,6 +44,8 @@ compose-logs:
 e2e:
 	bash tests/e2e/smoke.sh || powershell -File tests/e2e/smoke.ps1
 	bash tests/e2e/api-check.sh
+	node tests/e2e/workflow-runner-e2e.mjs
+	node tests/e2e/mcp-docs-e2e.mjs
 
 sdk-check:
 	node tests/e2e/sdk-check.js

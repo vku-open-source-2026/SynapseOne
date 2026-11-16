@@ -1,0 +1,12 @@
+# Root-context builds (apps/workflow-runner/Dockerfile) only need the workflow
+# service sources. Ignore everything heavy and local-only.
+.git
+node_modules
+**/node_modules
+**/dist
+**/.pytest_cache
+**/__pycache__
+.env
+.env.*
+*.log
+*.test.ts

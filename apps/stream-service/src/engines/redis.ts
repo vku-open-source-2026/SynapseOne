@@ -3,7 +3,8 @@
 /*
  * Copyright 2026 SynapseOne Contributors
  * Licensed under the Apache License, Version 2.0 (the "License").
- * Redis Streams backend — High-throughput event streaming engine using Redis 7 native streams.
+ * Valkey/Redis Streams backend — high-throughput event streaming on Valkey 8
+ * (or any Redis-protocol server that implements native streams).
  */
 
 import Redis from 'ioredis';
@@ -21,17 +22,17 @@ export class RedisStreamsEngine implements StreamEngine {
       enableOfflineQueue: false,
       retryStrategy: () => null,
     });
-    this.redis.on('error', (e: any) => console.error('[stream][redis]', e?.message || e));
+    this.redis.on('error', (e: any) => console.error('[stream][valkey]', e?.message || e));
   }
 
   async init(): Promise<boolean> {
     try {
       await this.redis.connect();
       await this.redis.ping();
-      console.log('[stream] connected to Redis Streams backend');
+      console.log('[stream] connected to Valkey Streams backend');
       return true;
     } catch (e: any) {
-      console.warn('[stream] Redis connection failed:', e?.message || e);
+      console.warn('[stream] Valkey/Redis connection failed:', e?.message || e);
       return false;
     }
   }

@@ -4,35 +4,50 @@
  * Copyright 2026 SynapseOne Contributors
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
-import React from 'react';
+import React, { useEffect } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { Badge, Card, Code, PageTitle, Table } from '../components/ui.jsx';
+import { ArrowLeft, ArrowRight, Bell, Boxes, Brain, Cloud, Database, FileCode2, Gauge, GitBranch, Inbox, Network, Radio, ShieldCheck, Zap } from 'lucide-react';
+import DocsShell, { CodeBlock, DocHeader, DocTable, MethodBadge, slugify } from '../components/DocsShell.jsx';
+import { useI18n } from '../lib/i18n-context.js';
 
+// Sidebar order; `group` keys map to m.docsPage.groups.
 const TABS = [
-  { id: 'overview', label: 'Overview' },
-  { id: 'base', label: 'SynapseBase' },
-  { id: 'faststore', label: 'Faststore' },
-  { id: 'queue', label: 'SynapseQueue' },
-  { id: 'javascript', label: 'JavaScript' },
-  { id: 'python', label: 'Python' },
-  { id: 'go', label: 'Go' },
-  { id: 'cli', label: 'CLI' },
+  { id: 'overview', group: 'start' },
+  { id: 'iam', group: 'platform' },
+  { id: 'workflow', group: 'platform' },
+  { id: 'ai', group: 'platform' },
+  { id: 'lds', group: 'data', label: 'SynapseLDS' },
+  { id: 'base', group: 'data', label: 'SynapseBase' },
+  { id: 'faststore', group: 'data', label: 'Faststore' },
+  { id: 'queue', group: 'data', label: 'SynapseQueue' },
+  { id: 'stream', group: 'data', label: 'SynapseStream' },
+  { id: 'ocs', group: 'data', label: 'SynapseOCS' },
+  { id: 'notifications', group: 'data', label: 'SynapseNotifications' },
+  { id: 'javascript', group: 'clients', label: 'JavaScript' },
+  { id: 'python', group: 'clients', label: 'Python' },
+  { id: 'go', group: 'clients', label: 'Go' },
+  { id: 'cli', group: 'clients', label: 'CLI' },
 ];
 
-const METHOD_TONE = { GET: 'blue', POST: 'green', PUT: 'amber', PATCH: 'amber', DELETE: 'red' };
-
+/** One documentation section; its title feeds the "On this page" list. */
 function DocSection({ title, kicker, children }) {
+  const id = slugify(title);
   return (
-    <Card className="mb-4">
-      {kicker && <p className="text-xs font-semibold uppercase tracking-wide text-main-blue mb-1">{kicker}</p>}
-      <h3 className="font-semibold text-main-text mb-3">{title}</h3>
-      <div className="text-sm text-normal-text leading-relaxed space-y-3">{children}</div>
-    </Card>
+    <section className="border-t border-s1-line pt-10 first:border-t-0 first:pt-0">
+      {kicker && <p className="font-mono text-xs text-s1-muted">{kicker}</p>}
+      <h2 id={id} data-toc={title} className="mt-1 scroll-mt-24 text-xl font-semibold tracking-tight text-s1-fg">
+        <a href={`#${id}`} className="group inline-flex items-center gap-2">
+          {title}
+          <span aria-hidden="true" className="text-s1-muted opacity-0 transition group-hover:opacity-100">#</span>
+        </a>
+      </h2>
+      <div className="s1-prose mt-4 space-y-4 text-[15px] leading-7 text-s1-muted">{children}</div>
+    </section>
   );
 }
 
-function DocCode({ limit = 4000, ...props }) {
-  return <Code {...props} limit={limit} wrap />;
+function DocCode({ data }) {
+  return <CodeBlock code={data} />;
 }
 
 function Text({ children }) {
@@ -41,7 +56,7 @@ function Text({ children }) {
 
 function Bullets({ items }) {
   return (
-    <ul className="list-disc pl-5 space-y-1.5">
+    <ul className="list-disc space-y-2 pl-5 marker:text-s1-accent">
       {items.map((item) => (
         <li key={typeof item === 'string' ? item : item.join(' ')}>{item}</li>
       ))}
@@ -51,54 +66,34 @@ function Bullets({ items }) {
 
 function EndpointTable({ rows, columns = ['Method', 'Endpoint', 'Purpose'] }) {
   return (
-    <Table head={columns}>
+    <DocTable head={columns}>
       {rows.map(([method, path, desc]) => (
-        <tr key={`${method}:${path}`} className="border-t border-slate-100 align-top">
-          <td className="py-2 pr-4 whitespace-nowrap">
-            {String(method).includes('/') || String(method).includes('·') ? (
-              <span className="text-xs font-medium text-normal-text">{method}</span>
-            ) : (
-              <Badge tone={METHOD_TONE[method] || 'gray'}>{method}</Badge>
-            )}
+        <tr key={`${method}:${path}`} className="border-t border-s1-line align-top">
+          <td className="whitespace-nowrap px-4 py-2.5">
+            <MethodBadge method={method} />
           </td>
-          <td className="py-2 pr-4 min-w-[14rem]">
-            <code className="text-xs text-main-text break-all">{path}</code>
+          <td className="min-w-[14rem] px-4 py-2.5">
+            <code className="break-all font-mono text-xs text-s1-fg">{path}</code>
           </td>
-          <td className="py-2 text-xs">{desc}</td>
+          <td className="px-4 py-2.5 text-xs">{desc}</td>
         </tr>
       ))}
-    </Table>
+    </DocTable>
   );
 }
 
 function OperatorTable({ rows }) {
   return (
-    <Table head={['Operator', 'Meaning']}>
+    <DocTable head={['Operator', 'Meaning']}>
       {rows.map(([op, meaning]) => (
-        <tr key={op} className="border-t border-slate-100">
-          <td className="py-2 pr-4">
-            <code className="text-xs text-main-text">{op}</code>
+        <tr key={op} className="border-t border-s1-line">
+          <td className="px-4 py-2.5">
+            <code className="font-mono text-xs text-s1-fg">{op}</code>
           </td>
-          <td className="py-2 text-xs">{meaning}</td>
+          <td className="px-4 py-2.5 text-xs">{meaning}</td>
         </tr>
       ))}
-    </Table>
-  );
-}
-
-function TabButton({ tab, active, onClick, children }) {
-  return (
-    <button
-      type="button"
-      role="tab"
-      aria-selected={active}
-      onClick={() => onClick(tab)}
-      className={`px-4 py-2 rounded-2xl text-sm font-medium transition-colors ${
-        active ? 'bg-gradient-to-b from-main-start to-main-end text-white shadow-sm' : 'bg-white text-normal-text shadow-sm hover:text-main-blue'
-      }`}
-    >
-      {children}
-    </button>
+    </DocTable>
   );
 }
 
@@ -108,14 +103,23 @@ cp .env.example .env
 docker compose up -d --build
 docker compose ps
 
-# Gateway health + aggregate readiness (iam, workflow, ai, lds, base, faststore, queue)
+# Gateway health + aggregate readiness (iam, workflow, ai, lds, base, faststore,
+# queue, stream, inference, ocs, notifications)
 curl http://localhost:8080/health
 curl http://localhost:8080/ready
 
 # Individual services
+curl http://localhost:4001/health   # IAM
+curl http://localhost:4002/health   # Workflow
+curl http://localhost:4003/health   # AI assistant
+curl http://localhost:4004/health   # SynapseLDS
 curl http://localhost:4005/health   # SynapseBase
 curl http://localhost:4006/health   # Faststore
-curl http://localhost:4007/health   # SynapseQueue`;
+curl http://localhost:4007/health   # SynapseQueue
+curl http://localhost:4008/health   # Inference
+curl http://localhost:4009/health   # SynapseStream
+curl http://localhost:4010/health   # SynapseOCS
+curl http://localhost:4011/health   # SynapseNotifications`;
 
 const OVERVIEW_FLOW = `# 1. Sign in (dev login; use SSO/API keys in production)
 TOKEN=$(curl -s -XPOST http://localhost:8080/v1/auth/login \\
@@ -140,7 +144,33 @@ curl -s -XPOST http://localhost:8080/v1/faststore/keys/visits/incr \\
 # 4. SynapseQueue: publish a message
 curl -s -XPOST http://localhost:8080/v1/queue/queues/emails/messages \\
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
-  -d '{"payload":{"to":"alice@acme.test"},"dedupeKey":"welcome:alice"}'`;
+  -d '{"payload":{"to":"alice@acme.test"},"dedupeKey":"welcome:alice"}'
+
+# 5. SynapseLDS: publish a licensed NGSI-LD record
+DS=$(curl -s -XPOST http://localhost:8080/v1/lds/datasources \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"name":"Business Registry","entityType":"Organization","license":"CC-BY-4.0"}' | jq -r .id)
+curl -s -XPOST http://localhost:8080/v1/lds/datasources/$DS/records \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"id":"55001","name":"ABC"}'
+
+# 6. SynapseStream: create a topic and publish an event
+curl -s -XPUT http://localhost:8080/v1/stream/topics/telemetry \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"maxLen":100000}'
+curl -s -XPOST http://localhost:8080/v1/stream/topics/telemetry/events \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"payload":{"sensor":"temp-1","value":25.4},"key":"sensor-1"}'
+
+# 7. SynapseOCS: create a bucket and upload an object
+curl -s -XPOST http://localhost:8080/v1/ocs/buckets \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"name":"city-assets"}'
+curl -s -XPUT http://localhost:8080/v1/ocs/buckets/city-assets/objects/hello.txt \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: text/plain' --data-binary 'hello'
+
+# 8. SynapseNotifications: queue an email
+curl -s -XPOST http://localhost:8080/v1/notifications \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"channel":"email","recipient":{"email":"alice@acme.test"},"subject":"Welcome","body":"Hi {{name}}","data":{"name":"Alice"}}'`;
 
 const BASE_MAPPING = `{
   "fields": {
@@ -215,6 +245,26 @@ curl -s -XPOST localhost:8080/v1/base/collections/parks/documents:batch \\
     {"op":"increment","id":"park-1","field":"profile.capacity","by":5},
     {"op":"delete","id":"park-3","ifVersion":4}
   ]}'`;
+
+const BASE_SEARCH_ENDPOINTS = [
+  ['POST', '/v1/search', 'Full-text, semantic or hybrid search across collections'],
+  ['GET', '/v1/search?q=…', 'Convenience query form for the same search'],
+  ['POST', '/v1/search/reindex', 'Idempotently rebuild the tenant-visible index'],
+  ['GET', '/v1/search/status', 'Indexed documents, collection count and freshness'],
+];
+
+const BASE_SEARCH = `curl -s -XPOST http://localhost:8080/v1/search \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{
+    "query": "central park",
+    "mode": "hybrid",
+    "collections": ["parks"],
+    "filters": { "capacity": { "gte": 100 } },
+    "limit": 10
+  }'
+
+# Results include score, highlighted snippets, ACL metadata, facets and nextCursor.
+# Semantic mode uses deterministic local embeddings; hybrid blends both scores.`;
 
 const BASE_LIMITS = `BASE_MAX_DOCUMENT_BYTES=262144   # default 256 KiB, clamped 1 KiB..4 MiB
 BASE_QUERY_SCAN_LIMIT=10000       # default 10k, clamped 100..100k
@@ -457,6 +507,38 @@ for (const m of messages) {
 const dead = await c.queue.deadLetters('emails', { limit: 50 });
 await c.queue.replayDead('emails', dead.messages[0].id, { resetAttempts: true });`;
 
+const JS_EXTRA = `// SynapseStream
+await c.stream.createTopic('telemetry', { maxLen: 100000, retentionMs: 86400000 });
+await c.stream.publish('telemetry', { sensor: 'temp-1', value: 25.4 }, { key: 'sensor-1' });
+await c.stream.createGroup('telemetry', 'analytics', { startId: '$' });
+const { events } = await c.stream.readGroup('telemetry', 'analytics', { consumer: 'worker-1', count: 10 });
+await c.stream.ack('telemetry', 'analytics', events.map((e) => e.id));
+
+// SynapseOCS
+await c.ocs.createBucket('city-assets', { quotaBytes: 1024 ** 3 });
+await c.ocs.putObject('city-assets', 'docs/a.txt', 'hello', { contentType: 'text/plain' });
+const list = await c.ocs.listObjects('city-assets', { prefix: 'docs/' });
+const { url } = await c.ocs.presign('city-assets', 'docs/a.txt', { method: 'GET', expiresIn: 900 });
+
+// SynapseNotifications
+await c.notifications.send({
+  channels: ['email'],
+  recipient: { email: 'ops@example.com' },
+  subject: 'Flood alert in {{city}}',
+  body: 'Level {{level}}m',
+  data: { city: 'Hanoi', level: 2.5 },
+  idempotencyKey: 'alert:s1',
+});
+
+// AI assistant and inference
+const draft = await c.ai.agent('How do I create a Base collection?');
+const chat = await c.inference.chat([{ role: 'user', content: 'Hello' }]);
+const embeddings = await c.inference.embeddings('flood alert');
+const route = await c.inference.route('water rising at S1', {
+  ops: 'dispatch a field crew',
+  alert: 'notify residents',
+});`;
+
 const JS_ERRORS = `import { SynapseOneError } from '@synapseone/sdk';
 
 try {
@@ -597,6 +679,35 @@ for m in result["messages"]:
 
 dead = c.queue.dead_letters("emails", limit=50)
 c.queue.replay_dead("emails", dead["messages"][0]["id"], reset_attempts=True)`;
+
+const PYTHON_EXTRA = `# SynapseStream
+c.stream.create_topic("telemetry", max_len=100000, retention_ms=86400000)
+c.stream.publish("telemetry", {"sensor": "temp-1", "value": 25.4}, key="sensor-1")
+c.stream.create_group("telemetry", "analytics", start_id="$")
+result = c.stream.read_group("telemetry", "analytics", consumer="worker-1", count=10)
+c.stream.ack("telemetry", "analytics", [e["id"] for e in result["events"]])
+
+# SynapseOCS
+c.ocs.create_bucket("city-assets", quota_bytes=1024 ** 3)
+c.ocs.put_object("city-assets", "docs/a.txt", b"hello", content_type="text/plain")
+listing = c.ocs.list_objects("city-assets", prefix="docs/")
+url = c.ocs.presign("city-assets", "docs/a.txt", method="GET", expires_in=900)["url"]
+
+# SynapseNotifications
+c.notifications.send(
+    recipient={"email": "ops@example.com"},
+    channels=["email"],
+    subject="Flood alert in {{city}}",
+    body="Level {{level}}m",
+    data={"city": "Hanoi", "level": 2.5},
+    idempotency_key="alert:s1",
+)
+
+# AI assistant and inference
+draft = c.ai.agent("How do I create a Base collection?")
+chat = c.inference.chat([{"role": "user", "content": "Hello"}])
+embeddings = c.inference.embeddings("flood alert")
+route = c.inference.route("water rising at S1", {"ops": "dispatch", "alert": "notify"})`;
 
 const PYTHON_ERRORS = `from synapseone_sdk import SynapseOneError
 
@@ -753,6 +864,43 @@ first := dead["messages"].([]any)[0].(map[string]any)
 _, err = c.ReplayDeadMessage("emails", first["id"].(string), 0, true)
 if err != nil { log.Fatal(err) }`;
 
+const GO_EXTRA = `// SynapseStream
+_, err = c.CreateStreamTopic("telemetry", 100000, "", 86400000)
+_, err = c.PublishStreamEvent("telemetry", map[string]any{"sensor": "temp-1"},
+    synapseone.StreamPublishOptions{Key: "sensor-1"})
+_, err = c.CreateStreamGroup("telemetry", "analytics", "$")
+out, err := c.ReadStreamGroup("telemetry", "analytics",
+    synapseone.StreamGroupReadOptions{Consumer: "worker-1", Count: 10})
+var ids []string
+for _, raw := range out["events"].([]any) {
+    ids = append(ids, raw.(map[string]any)["id"].(string))
+}
+_, err = c.AckStreamEvents("telemetry", "analytics", ids)
+
+// SynapseOCS
+_, err = c.CreateOcsBucket("city-assets", 1<<30)
+_, err = c.PutOcsObject("city-assets", "docs/a.txt", []byte("hello"), "text/plain", "")
+listing, err := c.ListOcsObjects("city-assets", "docs/", "", 100, "")
+signed, err := c.PresignOcs("city-assets", "docs/a.txt", "GET", 900)
+
+// SynapseNotifications
+_, err = c.SendNotification(synapseone.SendNotificationInput{
+    Channels:  []string{"email"},
+    Recipient: synapseone.NotificationRecipient{Email: "ops@example.com"},
+    Subject:   "Flood alert in {{city}}",
+    Body:      "Level {{level}}m",
+    Data:      map[string]any{"city": "Hanoi", "level": 2.5},
+    IdempotencyKey: "alert:s1",
+})
+
+// AI assistant and inference
+draft, err := c.AIAgent("How do I create a Base collection?")
+chat, err := c.InferenceChat([]synapseone.ChatMessage{{Role: "user", Content: "Hello"}})
+embeddings, err := c.InferenceEmbeddings("flood alert")
+route, err := c.InferenceRoute("water rising at S1",
+    map[string]string{"ops": "dispatch", "alert": "notify"})
+if err != nil { log.Fatal(err) }`;
+
 const GO_ERRORS = `// Every call returns (result, error). HTTP failures carry status + body text.
 result, err := c.GetBaseDocument("parks", "missing", "object")
 if err != nil {
@@ -861,13 +1009,69 @@ synapseone lds entities <id> [--limit N] [--visibility public|restricted]
 synapseone lds entity <id> <entity-id>
 synapseone lds stats <id>`;
 
-const CLI_CALL = `# Base, Faststore and Queue are available through the generic gateway call:
-synapseone call POST /v1/base/collections --data '{"name":"parks"}'
-synapseone call GET /v1/base/collections
-synapseone call PUT /v1/faststore/keys/cache:demo --data '{"value":{"ok":true},"ttlSeconds":300}'
-synapseone call POST /v1/queue/queues/emails/messages --data '{"payload":{"to":"a@b.c"}}'
+const CLI_BASE_FASTSTORE_QUEUE = `# SynapseBase
+synapseone base collections create parks
+synapseone base collections list
+synapseone base documents insert parks --id park-1 --data '{"name":"Central"}'
+synapseone base vector-search parks --query "central park" --limit 5
 
-# Raw paths include gateway prefixes; use --file for larger JSON payloads.`;
+# Synapse Faststore
+synapseone faststore set cache:demo --value '{"ok":true}' --ttl 300
+synapseone faststore get cache:demo
+synapseone faststore hashes set session --data '{"u1":"alice"}'
+synapseone faststore lists push jobs --values a,b
+synapseone faststore sets add tags --members a,b
+synapseone faststore zsets add leaderboard --members alice,bob --score 10
+synapseone faststore locks acquire deploy:prod --ttl 30
+
+# SynapseQueue
+synapseone queue create emails --max-attempts 5
+synapseone queue send emails --payload '{"to":"a@b.c"}'
+synapseone queue consume emails --count 10
+synapseone queue ack emails <receipt>
+synapseone queue dead emails`;
+
+const CLI_STREAM_OCS_NOTIFICATIONS = `# SynapseStream
+synapseone stream create telemetry --max-len 100000
+synapseone stream publish telemetry --payload '{"value":25.4}'
+synapseone stream read telemetry --count 100
+synapseone stream group create telemetry workers
+synapseone stream group read telemetry workers --consumer w1
+
+# SynapseOCS
+synapseone ocs bucket create city-assets
+synapseone ocs ls city-assets --prefix maps/
+synapseone ocs put city-assets maps/a.png --file ./a.png
+synapseone ocs get city-assets maps/a.png --output ./a.png
+synapseone ocs presign city-assets maps/a.png --expires 3600
+
+# SynapseNotifications
+synapseone notifications send a@b.c --channel email --subject Hi --body Hello
+synapseone notifications list --status queued
+synapseone notifications prefs set a@b.c --channels email,sms`;
+
+const CLI_PLATFORM_SERVICES = `# Search, secrets, inference
+synapseone search "authentication guide" --mode hybrid --collection kb
+synapseone secrets create stripe --value-file ./secret.txt
+synapseone secrets read stripe
+synapseone inference chat "summarize the incident"
+synapseone inference embeddings "authentication guide"
+synapseone inference route --input "payment failed" \\
+  --choice billing="billing question" --choice tech="technical issue"
+
+# Warehouse and human tasks
+synapseone warehouse dataset create incidents \\
+  --column id:string --column severity:string --column opened_at:timestamp
+synapseone warehouse query --sql 'SELECT severity, count(*) FROM incidents GROUP BY 1'
+synapseone human-tasks list --status pending
+synapseone human-tasks approve <id> --note "LGTM"
+
+# Usage and SCIM
+synapseone usage summary --from 2026-01-01T00:00:00Z --feature base
+synapseone scim token create --description okta
+
+# Escape hatch for endpoints without a first-class command:
+synapseone call GET /v1/accounts/acc_abc123/credentials`;
 
 const JS_INSTALL = `npm install @synapseone/sdk
 # or: yarn add @synapseone/sdk
@@ -886,6 +1090,7 @@ const JS_SECTIONS = [
   { title: 'SynapseBase', code: JS_BASE },
   { title: 'Synapse Faststore', code: JS_FASTSTORE },
   { title: 'SynapseQueue', code: JS_QUEUE },
+  { title: 'Stream, OCS, notifications, AI & inference', code: JS_EXTRA },
   { title: 'Errors, escape hatch & deprecations', code: JS_ERRORS },
 ];
 
@@ -911,6 +1116,7 @@ const PYTHON_SECTIONS = [
   { title: 'SynapseBase', code: PYTHON_BASE },
   { title: 'Synapse Faststore', code: PYTHON_FASTSTORE },
   { title: 'SynapseQueue', code: PYTHON_QUEUE },
+  { title: 'Stream, OCS, notifications, AI & inference', code: PYTHON_EXTRA },
   { title: 'Errors, escape hatch & deprecations', code: PYTHON_ERRORS },
 ];
 
@@ -931,6 +1137,7 @@ const GO_SECTIONS = [
   { title: 'SynapseBase', code: GO_BASE },
   { title: 'Synapse Faststore', code: GO_FASTSTORE },
   { title: 'SynapseQueue', code: GO_QUEUE },
+  { title: 'Stream, OCS, notifications, AI & inference', code: GO_EXTRA },
   { title: 'Errors, escape hatch & deprecations', code: GO_ERRORS },
 ];
 
@@ -942,7 +1149,9 @@ const CLI_SECTIONS = [
   { title: 'API keys, service accounts & credentials', code: CLI_ACCESS },
   { title: 'Workflows, templates & executions', code: CLI_WORKFLOWS },
   { title: 'Linked Data (LDS)', code: CLI_LDS },
-  { title: 'Base, Faststore & Queue (generic call)', code: CLI_CALL },
+  { title: 'Base, Faststore & Queue', code: CLI_BASE_FASTSTORE_QUEUE },
+  { title: 'Stream, OCS & notifications', code: CLI_STREAM_OCS_NOTIFICATIONS },
+  { title: 'Search, secrets, inference, warehouse & tasks', code: CLI_PLATFORM_SERVICES },
 ];
 
 const BASE_COLLECTION_ENDPOINTS = [
@@ -1026,75 +1235,445 @@ const QUEUE_INSPECT_ENDPOINTS = [
   ['DELETE', '/v1/queue/queues/:queue/dead/:id', 'Delete a dead letter permanently'],
 ];
 
-const SERVICE_MAP = [
-  ['Gateway', '8080', '—', 'JWT/API-key auth, principal headers, rate limits, routing, /metrics'],
-  ['IAM', '4001', '/v1/auth, /v1/orgs, …', 'Orgs, accounts, users, roles, policies, keys, OIDC'],
-  ['Workflow', '4002', '/v1/workflows, /v1/templates', 'Built-in workflow engine, executions, webhooks'],
-  ['AI', '4003', '/v1/ai', 'Documentation assistant and model gateway'],
-  ['LDS', '4004', '/v1/lds', 'NGSI-LD datasources, attribute registry, licensed exports'],
-  ['SynapseBase', '4005', '/v1/base', 'Documents, object ↔ data mapping, queries, change feed'],
-  ['Faststore', '4006', '/v1/faststore', 'Redis-backed cache/KV, structures, distributed locks'],
-  ['SynapseQueue', '4007', '/v1/queue', 'At-least-once messaging, retries, dead letters, replay'],
+const IAM_QUICKSTART = `# Password sign-in (SSO/OIDC and API keys are the other paths)
+TOKEN=$(curl -s -XPOST http://localhost:8080/v1/auth/login \\
+  -H 'Content-Type: application/json' \\
+  -d '{"email":"demo@acme.local","orgSlug":"acme"}' | jq -r .accessToken)
+
+curl -s http://localhost:8080/v1/auth/me \\
+  -H "Authorization: Bearer $TOKEN"
+
+# Refresh tokens are single-use; logout-all revokes every session of the user
+curl -s -XPOST http://localhost:8080/v1/auth/refresh \\
+  -H 'Content-Type: application/json' -d '{"refreshToken":"<rt>"}'
+curl -s -XPOST http://localhost:8080/v1/auth/logout-all \\
+  -H 'Content-Type: application/json' -d '{"refreshToken":"<rt>"}'`;
+
+const IAM_POLICY = `# An org owns accounts; accounts own roles, policies, keys and service accounts
+ORG=$(curl -s -XPOST http://localhost:8080/v1/orgs \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"slug":"acme","displayName":"ACME Corp"}' | jq -r .id)
+ACCOUNT=$(curl -s -XPOST http://localhost:8080/v1/orgs/$ORG/accounts \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"slug":"prod","displayName":"Production"}' | jq -r .id)
+USER=$(curl -s -XPOST http://localhost:8080/v1/orgs/$ORG/users \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"email":"alice@acme.local","displayName":"Alice"}' | jq -r .id)
+
+ROLE=$(curl -s -XPOST http://localhost:8080/v1/accounts/$ACCOUNT/roles \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"slug":"runner","description":"Workflow runner"}' | jq -r .id)
+POLICY=$(curl -s -XPOST http://localhost:8080/v1/accounts/$ACCOUNT/policies \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"slug":"exec","document":{"Version":"2026-01-01","Statement":[{"Effect":"Allow","Action":["workflow:Execute"],"Resource":"*"}]}}' | jq -r .id)
+
+curl -s -XPOST http://localhost:8080/v1/roles/$ROLE/attach \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "{\\"policyId\\":\\"$POLICY\\"}"
+curl -s -XPOST http://localhost:8080/v1/users/$USER/assign \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "{\\"roleId\\":\\"$ROLE\\"}"
+
+curl -s -XPOST http://localhost:8080/v1/authorize \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d "{\\"userId\\":\\"$USER\\",\\"action\\":\\"workflow:Execute\\",\\"resource\\":\\"*\\"}"
+
+# Scoped machine credential; the secret is shown once
+curl -s -XPOST http://localhost:8080/v1/accounts/$ACCOUNT/keys \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"name":"ci","scopes":["workflow:Execute"]}'`;
+
+const IAM_ENDPOINTS = [
+  ['POST', '/v1/auth/login', 'Password sign-in → access + refresh token (MFA may answer 401 mfa_required)'],
+  ['POST', '/v1/auth/refresh · /logout · /logout-all', 'Rotate a single-use refresh token or revoke sessions'],
+  ['GET', '/v1/auth/me · /v1/auth/verify', 'Current principal, or verify any Bearer/API key'],
+  ['GET · POST', '/v1/auth/oidc/*', 'OIDC issuer discovery, start and callback (Authentik/Keycloak)'],
+  ['GET · POST', '/v1/auth/mfa/*', 'TOTP enrolment, recovery codes, verify and disable'],
+  ['GET · POST', '/v1/orgs, /v1/orgs/:id/accounts, /v1/orgs/:id/users', 'Orgs, accounts and users'],
+  ['GET · POST', '/v1/accounts/:id/roles, /v1/accounts/:id/policies', 'Roles and AWS-style policies'],
+  ['GET', '/v1/managed-policies', 'AWS-style managed policy catalog'],
+  ['POST', '/v1/roles/:id/attach, /v1/users/:id/assign', 'Bind policies to roles and roles to users'],
+  ['POST', '/v1/authorize · /v1/authorize/*', 'Evaluate Allow/Deny (+Condition) for a principal'],
+  ['GET · POST · DELETE', '/v1/accounts/:id/keys, /v1/keys/*', 'API keys; secrets are shown once, rotation has a grace window'],
+  ['GET · POST', '/v1/accounts/:id/service-accounts', 'Machine identities and per-account tokens'],
+  ['GET', '/v1/audit, /v1/usage/summary, /v1/usage/events', 'Audit trail and request/feature telemetry'],
 ];
 
+const WORKFLOW_QUICKSTART = `# Templates ship with the engine
+curl -s http://localhost:8080/v1/templates -H "Authorization: Bearer $TOKEN"
+
+# Create from a template (or a raw definition), then activate it
+curl -s -XPOST http://localhost:8080/v1/workflows \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"name":"demo","template":"webhook-to-log"}'
+WF=<workflow-id>
+curl -s -XPOST http://localhost:8080/v1/workflows/$WF/activate \\
+  -H "Authorization: Bearer $TOKEN"
+
+# Manual run: the request body IS the input
+curl -s -XPOST http://localhost:8080/v1/workflows/$WF/execute \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"value":21}'
+
+# Try an unsaved definition, then read execution history with per-node I/O
+curl -s -XPOST http://localhost:8080/v1/workflows/test-run \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"definition":{"nodes":[],"connections":{}},"input":{"value":21}}'
+curl -s "http://localhost:8080/v1/executions?limit=10&includeData=true" \\
+  -H "Authorization: Bearer $TOKEN"`;
+
+const WORKFLOW_WEBHOOK = `# Any active workflow whose webhook node declares path "transform"
+curl -s -XPOST http://localhost:8080/webhook/transform \\
+  -H 'Content-Type: application/json' -d '{"value":21}'
+# -> {"ok":true,"output":...,"executionId":"..."}
+
+# Per-workflow hardening lives on the webhook node parameters:
+#   auth: none | secret-header | hmac-sha256 | jwt (credentialId, optional header)
+#   rateLimit: {rpm} (default 600)
+#   idempotency: {header, ttlSeconds} -> 409 duplicate_delivery on replay
+# GitHub: Payload URL https://<host>/webhook/<path>,
+#   header x-hub-signature-256, store the secret as an hmac credential.`;
+
+const WORKFLOW_MCP = `# MCP server: active workflows with an mcpTrigger node become tools
+curl -s -XPOST http://localhost:8080/mcp \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}'
+
+# Discover tools, then call one with JSON arguments
+curl -s -XPOST http://localhost:8080/mcp \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+curl -s -XPOST http://localhost:8080/mcp \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_synapseone_docs","arguments":{"path":"docs/api.md"}}}'
+
+# Public read-only tools (mcp-docs-reader) need no credential.
+# Private/write tools require: Authorization: Bearer $TOKEN or X-API-Key: <key>
+# Built-in template: mcp-docs-reader -> AI reads the public docs repository.`;
+
+const WORKFLOW_ENDPOINTS = [
+  ['GET', '/v1/templates · /v1/templates/:name', 'Built-in templates (webhook-to-log, cron-etl, mcp-docs-reader, …)'],
+  ['GET · POST', '/v1/workflows', 'List or create from {name, template} or {name, definition}'],
+  ['GET · PUT · DELETE', '/v1/workflows/:id', 'Read, update (bumps revision) or delete a workflow'],
+  ['POST', '/v1/workflows/:id/activate · /deactivate', 'Gate cron, webhook and MCP triggers; webhook paths/tool names must be unique'],
+  ['POST', '/v1/workflows/:id/execute', 'Manual run for any trigger type, active or not'],
+  ['POST', '/v1/workflows/test-run', 'Validate and run an unsaved definition in the sandbox'],
+  ['GET', '/v1/executions · /v1/executions/:id', 'History; ?includeData=true adds per-node input/output'],
+  ['GET · POST · DELETE', '/v1/credentials', 'Account-scoped node credentials, encrypted at rest'],
+  ['GET · POST · PUT', '/v1/human-tasks, /v1/human-tasks/:id/*', 'Durable human waits: claim, complete, reject, expire'],
+  ['GET · POST · DELETE', '/v1/secrets, /v1/secrets/:name/*', 'Versioned secret vault with audited reads and rotation'],
+  ['ANY', '/webhook/:path', 'Public inbound trigger with per-node auth, rate limit and idempotency'],
+  ['POST', '/mcp', 'MCP JSON-RPC server: active mcpTrigger workflows become AI tools'],
+];
+
+const WORKFLOW_NODES = [
+  ['webhook', 'Trigger on ANY /webhook/:path; path, httpMethod, auth, rateLimit, idempotency'],
+  ['cron', 'Schedules from 10s: interval fields, 5-field cron, @hourly/@daily, timezone'],
+  ['manualTrigger', 'Run from the Console, CLI or /execute with any JSON input'],
+  ['mcpTrigger', 'Expose the workflow as an MCP tool (toolName, description, inputSchema) at POST /mcp'],
+  ['httpRequest', 'Public HTTP(S) with SSRF guard, credentials, retry and timeout'],
+  ['code', 'Sandboxed JavaScript (≤50 KB, 5 s default) with $input/$json/$now'],
+  ['set', 'Merge or assign values with {{ $json.x }} templating'],
+  ['if', 'JS condition or value1/operation/value2; branch 0 = true, 1 = false'],
+  ['synapseone.api', 'First-party IAM/LDS/Workflow operations under the run principal'],
+  ['humanTask', 'Durable wait; resumes exactly once on complete/reject'],
+  ['decision · aiAgent', 'Decision routing and AI agent nodes used by the AI templates'],
+];
+
+const WORKFLOW_SECRETS = `# Versioned secret vault: values are encrypted, list returns metadata only
+curl -s -XPOST http://localhost:8080/v1/secrets \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"name":"smtp-password","value":"<secret>","description":"SMTP relay"}'
+curl -s -XPOST http://localhost:8080/v1/secrets/smtp-password/read \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{}'
+curl -s -XPOST http://localhost:8080/v1/secrets/smtp-password/rotate \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"value":"<new-secret>","graceSeconds":86400}'
+
+# Durable human tasks: create, claim, then complete (resumes the run once)
+curl -s -XPOST http://localhost:8080/v1/human-tasks \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"title":"Approve flood alert","assignee":"alice@acme.local","decisionSchema":{"type":"object"}}'
+TASK=<task-id>
+curl -s -XPOST http://localhost:8080/v1/human-tasks/$TASK/claim \\
+  -H "Authorization: Bearer $TOKEN"
+curl -s -XPOST http://localhost:8080/v1/human-tasks/$TASK/complete \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"decision":{"approved":true},"note":"go ahead"}'`;
+
+const LDS_QUICKSTART = `# Public license catalog (no token needed)
+curl -s http://localhost:8080/v1/lds/licenses
+
+# Datasource + attribute registry (unregistered fields are default-deny)
+curl -s -XPOST http://localhost:8080/v1/lds/datasources \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"name":"Business Registry","entityType":"Organization","license":"CC-BY-4.0"}'
+DS=<datasource-id>
+curl -s -XPUT http://localhost:8080/v1/lds/datasources/$DS/attributes \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"attributes":[{"name":"name","ngsiLdType":"Property","visibility":"public"}]}'
+
+# Ingest; the export URL also serves anonymous open-data consumers
+curl -s -XPOST http://localhost:8080/v1/lds/datasources/$DS/records \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"id":"55001","name":"Công ty ABC"}'
+curl -s "http://localhost:8080/v1/lds/datasources/$DS/entities?visibility=public" \\
+  -H "Authorization: Bearer $TOKEN"`;
+
+const LDS_ENDPOINTS = [
+  ['GET', '/v1/lds/licenses', 'Built-in SPDX license catalog (public)'],
+  ['GET · POST', '/v1/lds/datasources', 'List (?orgId&accountId) or create a datasource'],
+  ['GET · PATCH · DELETE', '/v1/lds/datasources/:id', 'Details + registry + stats, update or cascade delete'],
+  ['GET · PUT', '/v1/lds/datasources/:id/attributes', 'Read or atomically replace the attribute registry'],
+  ['POST', '/v1/lds/datasources/:id/records', 'Ingest one record, {record} or {records} (≤1000)'],
+  ['GET', '/v1/lds/datasources/:id/entities', 'NGSI-LD export; ?limit 1..500, ?offset, ?visibility'],
+  ['GET', '/v1/lds/datasources/:id/entities/:entityId', 'Single NGSI-LD entity (404 outside the tenant)'],
+  ['GET', '/v1/lds/datasources/:id/stats', 'Record count and public/restricted/internal attribute buckets'],
+];
+
+const STREAM_QUICKSTART = `# Topic: cap length and/or retention window
+curl -s -XPUT http://localhost:8080/v1/stream/topics/telemetry \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"maxLen":100000,"retentionMs":86400000}'
+
+# Publish one event (or up to 100 with events:batch)
+curl -s -XPOST http://localhost:8080/v1/stream/topics/telemetry/events \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"payload":{"sensor":"temp-1","value":25.4},"key":"sensor-1"}'
+
+# Non-destructive tail from an event id
+curl -s -XPOST http://localhost:8080/v1/stream/topics/telemetry/read \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"fromId":"0-0","count":50}'`;
+
+const STREAM_GROUPS = `# Consumer group: create, read as a consumer, ack processed ids
+curl -s -XPUT http://localhost:8080/v1/stream/topics/telemetry/groups/analytics \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"startId":"$"}'
+
+curl -s -XPOST http://localhost:8080/v1/stream/topics/telemetry/groups/analytics/read \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"consumer":"worker-1","count":10,"autoAck":false}'
+
+curl -s -XPOST http://localhost:8080/v1/stream/topics/telemetry/groups/analytics/ack \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"ids":["1730000000000-0"]}'
+
+# Replay a time window without moving group offsets
+curl -s "http://localhost:8080/v1/stream/topics/telemetry/range?start=2026-11-01T00:00:00Z&end=2026-11-02T00:00:00Z&count=100" \\
+  -H "Authorization: Bearer $TOKEN"`;
+
+const STREAM_ENDPOINTS = [
+  ['GET · PUT', '/v1/stream/topics, /v1/stream/topics/:topic', 'List, create or update a topic (maxLen, minId, retentionMs)'],
+  ['GET · DELETE', '/v1/stream/topics/:topic', 'Topic configuration, stats, or delete topic + events'],
+  ['POST', '/v1/stream/topics/:topic/events', 'Publish one event (payload, key, headers, id)'],
+  ['POST', '/v1/stream/topics/:topic/events:batch', 'Publish up to 100 events with per-event results'],
+  ['POST', '/v1/stream/topics/:topic/read', 'Non-destructive raw read / tail (fromId, count, blockMs)'],
+  ['GET', '/v1/stream/topics/:topic/range', 'Historical replay by time range (?start&end&count)'],
+  ['PUT · DELETE', '/v1/stream/topics/:topic/groups/:group', 'Create or destroy a consumer group'],
+  ['POST', '/v1/stream/topics/:topic/groups/:group/read', 'Read through a group (consumer, count, autoAck)'],
+  ['POST', '/v1/stream/topics/:topic/groups/:group/ack', 'Acknowledge processed event ids'],
+];
+
+const OCS_QUICKSTART = `# Bucket (S3-style lowercase name, 3..63 chars)
+curl -s -XPOST http://localhost:8080/v1/ocs/buckets \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"name":"city-assets","quotaBytes":1073741824}'
+
+# Raw upload; checksum, range and conditional headers are supported
+curl -s -XPUT "http://localhost:8080/v1/ocs/buckets/city-assets/objects/2026/11/report.pdf" \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/pdf' \\
+  -H "x-object-checksum-sha256: <sha256>" --data-binary @report.pdf
+
+# List with common prefixes, then mint a short-lived URL
+curl -s "http://localhost:8080/v1/ocs/buckets/city-assets/objects?prefix=2026/&delimiter=/" \\
+  -H "Authorization: Bearer $TOKEN"
+curl -s -XPOST http://localhost:8080/v1/ocs/buckets/city-assets/presign \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"key":"2026/11/report.pdf","method":"GET","expiresIn":900}'`;
+
+const OCS_MULTIPART = `# 1. Start, 2. upload parts, 3. complete (or DELETE to abort)
+curl -s -XPOST http://localhost:8080/v1/ocs/buckets/city-assets/uploads \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"key":"video.mp4","contentType":"video/mp4"}'
+UPLOAD=<upload-id>
+curl -s -XPUT "http://localhost:8080/v1/ocs/buckets/city-assets/uploads/$UPLOAD/parts/1?key=video.mp4" \\
+  -H "Authorization: Bearer $TOKEN" --data-binary @part1.bin
+curl -s -XPOST http://localhost:8080/v1/ocs/buckets/city-assets/uploads/$UPLOAD/complete \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"key":"video.mp4","parts":[{"partNumber":1,"etag":"<etag>"}]}'`;
+
+const OCS_ENDPOINTS = [
+  ['GET · POST', '/v1/ocs/buckets', 'List buckets (?withStats=1) or create {name, quotaBytes}'],
+  ['GET · HEAD · DELETE', '/v1/ocs/buckets/:bucket', 'Metadata/usage, or delete (force=true removes objects)'],
+  ['GET', '/v1/ocs/buckets/:bucket/stats', '{objects, bytes, quotaBytes}'],
+  ['PUT · GET · HEAD · DELETE', '/v1/ocs/buckets/:bucket/objects/*', 'Raw object body; checksum, range and conditional headers'],
+  ['GET', '/v1/ocs/buckets/:bucket/objects', 'List with prefix, delimiter, limit and cursor'],
+  ['POST', '/v1/ocs/buckets/:bucket/objects/copy', 'Copy an object within or across buckets'],
+  ['POST', '/v1/ocs/buckets/:bucket/presign', 'HMAC-signed URL for GET/PUT with an expiry'],
+  ['POST · PUT · DELETE', '/v1/ocs/buckets/:bucket/uploads/*', 'Multipart upload: start, part, complete or abort'],
+  ['*', '/v1/storage/*', 'Legacy default-bucket compatibility API (unchanged)'],
+];
+
+const NOTIFICATIONS_QUICKSTART = `# One record per channel; placeholders use {{var}} from data
+curl -s -XPOST http://localhost:8080/v1/notifications \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{
+    "channels":["email","webhook"],
+    "recipient":{"email":"ops@example.com","url":"https://hooks.example.com/x"},
+    "subject":"Flood alert in {{city}}",
+    "body":"Level {{level}}m at {{station}}",
+    "data":{"city":"Hanoi","level":2.5,"station":"S1"},
+    "idempotencyKey":"alert-2026-11-04-s1"
+  }'
+
+# Status, attempt history and cancellation
+curl -s "http://localhost:8080/v1/notifications?status=dead&limit=50" \\
+  -H "Authorization: Bearer $TOKEN"
+curl -s http://localhost:8080/v1/notifications/<id> \\
+  -H "Authorization: Bearer $TOKEN"
+curl -s -XPOST http://localhost:8080/v1/notifications/<id>/cancel \\
+  -H "Authorization: Bearer $TOKEN"
+
+# Preferences and unsubscribe
+curl -s http://localhost:8080/v1/notifications/preferences/ops@example.com \\
+  -H "Authorization: Bearer $TOKEN"`;
+
+const NOTIFICATIONS_ENDPOINTS = [
+  ['POST', '/v1/notifications', 'Queue one notification per channel (202 {notifications})'],
+  ['GET', '/v1/notifications', 'Recent notifications (?status&limit)'],
+  ['GET', '/v1/notifications/:id', 'Status and the full attempt history'],
+  ['POST', '/v1/notifications/:id/cancel', 'Cancel a queued/failed delivery (409 when not cancellable)'],
+  ['GET · PUT', '/v1/notifications/preferences/:recipient', 'Allowed channels and unsubscribed flag'],
+  ['POST', '/v1/notifications/unsubscribe', 'Unsubscribe a recipient and cancel pending sends'],
+];
+
+const NOTIFICATION_CHANNELS = [
+  ['webhook', 'Direct HTTPS POST to recipient.url / recipient.webhookUrl'],
+  ['email', 'HTTPS relay configured with NOTIFICATIONS_EMAIL_RELAY_URL'],
+  ['sms', 'HTTPS relay configured with NOTIFICATIONS_SMS_RELAY_URL'],
+  ['push', 'HTTPS relay configured with NOTIFICATIONS_PUSH_RELAY_URL'],
+  ['log', 'Dev-only console sink; rejected in production'],
+];
+
+const AI_QUICKSTART = `# Console assistant: guidance only, never executes a call
+curl -s -XPOST http://localhost:8080/v1/ai/agent \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"question":"How do I create a SynapseBase collection?","history":[]}'
+
+# OpenAI-compatible LLM proxy (stream:true returns SSE)
+curl -s -XPOST http://localhost:8080/v1/inference/chat/completions \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"messages":[{"role":"user","content":"Summarise NGSI-LD in one line"}],"max_tokens":128}'
+
+# Local embeddings, structured decision and the workflow semantic router
+curl -s -XPOST http://localhost:8080/v1/inference/embeddings \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"input":["flood alert","traffic jam"]}'
+curl -s -XPOST http://localhost:8080/v1/inference/decision/route \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"input":"water is rising at station S1","choices":{"ops":"dispatch field crew","alert":"notify residents","ignore":"no action"}}'`;
+
+const AI_ENDPOINTS = [
+  ['POST', '/v1/ai/agent', 'Docs assistant: picks an endpoint and drafts a try-it request (no execution)'],
+  ['GET', '/v1/inference/health', 'Model/provider health for LLM, embeddings and decision'],
+  ['POST', '/v1/inference/chat/completions', 'OpenAI-compatible chat proxy (OpenRouter); SSE with stream:true'],
+  ['POST', '/v1/inference/embeddings', 'Self-hosted embeddings (str/clause inputs, OpenAI-shaped response)'],
+  ['POST', '/v1/inference/decision', 'Structured evaluation: choice, yes/no or score questions'],
+  ['POST', '/v1/inference/decision/route', 'Semantic router: pick the best branch from {id: description}'],
+];
+
+const SERVICE_MAP = [
+  ['Gateway', '8080', '/v1/*, /webhook/*', 'JWT/API-key auth, principal stamping, scopes, rate limits, routing, /metrics'],
+  ['IAM', '4001', '/v1/auth, /v1/orgs, …', 'Orgs, accounts, users, roles, policies, keys, OIDC, MFA, audit, usage'],
+  ['Workflow', '4002', '/v1/workflows, /v1/templates', 'DAG engine, executions, webhooks, credentials, human tasks, secrets'],
+  ['AI', '4003', '/v1/ai', 'Documentation assistant and model gateway (guidance only)'],
+  ['LDS', '4004', '/v1/lds', 'NGSI-LD datasources, attribute registry, licensed exports'],
+  ['SynapseBase', '4005', '/v1/base, /v1/search', 'Documents, object ↔ data mapping, queries, change feed, search'],
+  ['Faststore', '4006', '/v1/faststore', 'Redis-backed cache/KV, structures, distributed locks'],
+  ['SynapseQueue', '4007', '/v1/queue', 'At-least-once messaging, retries, dead letters, replay'],
+  ['Inference', '4008', '/v1/inference', 'LLM proxy, local embeddings and Decision-2.0 semantic routing'],
+  ['SynapseStream', '4009', '/v1/stream', 'Event log, consumer groups, time-range replay, retention'],
+  ['SynapseOCS', '4010', '/v1/ocs, /v1/storage', 'Buckets, objects, presigned URLs, multipart, tenant quotas'],
+  ['SynapseNotifications', '4011', '/v1/notifications', 'Outbox, templates, preferences, retries and delivery status'],
+];
+
+const GUIDES = [
+  ['iam', ShieldCheck],
+  ['workflow', GitBranch],
+  ['ai', Brain],
+  ['lds', Network],
+  ['base', Database],
+  ['faststore', Gauge],
+  ['queue', Inbox],
+  ['stream', Radio],
+  ['ocs', Cloud],
+  ['notifications', Bell],
+  ['javascript', FileCode2],
+  ['python', FileCode2],
+  ['go', Boxes],
+];
+const GUIDE_CARD =
+  'group flex w-full items-center gap-3 rounded-xl border border-s1-line bg-s1-surface px-4 py-3 text-left text-sm transition hover:-translate-y-0.5 hover:border-sky-300 hover:shadow-md hover:shadow-sky-500/10 dark:hover:border-sky-700';
+const GUIDE_ICON =
+  'flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-sky-400 to-blue-600 text-white';
+
 function Overview({ setTab }) {
+  const { m } = useI18n();
+  const d = m.docsPage;
   return (
-    <div className="space-y-4">
-      <Card className="bg-gradient-to-br from-main-start to-main-end text-white">
-        <p className="text-xs font-semibold uppercase tracking-widest text-white/70 mb-2">SynapseOne platform</p>
-        <h3 className="text-2xl font-semibold mb-2">Documents, cache and messaging — self-managed.</h3>
-        <p className="text-sm text-white/85 max-w-3xl">
-          SynapseBase, Synapse Faststore and SynapseQueue run next to IAM, the workflow engine and SynapseLDS.
-          The gateway is the single public API; every client sees the same tenant-scoped data services.
-        </p>
-        <div className="mt-4 flex flex-wrap gap-2">
-          {[
-            ['base', 'SynapseBase guide'],
-            ['faststore', 'Faststore guide'],
-            ['queue', 'Queue guide'],
-            ['javascript', 'JavaScript SDK'],
-            ['python', 'Python SDK'],
-            ['go', 'Go SDK'],
-          ].map(([id, label]) => (
-            <button
-              key={id}
-              onClick={() => setTab(id)}
-              className="px-3 py-1.5 rounded-2xl text-xs font-medium bg-white/15 text-white hover:bg-white/25"
-            >
-              {label} →
-            </button>
+    <div className="space-y-10">
+      <DocHeader kicker={d.overviewKicker} title={d.overviewTitle}>
+        <p>{d.overviewLead}</p>
+      </DocHeader>
+
+      <section aria-label={d.startHere}>
+        <p className="text-sm font-semibold text-s1-fg">{d.startHere}</p>
+        <ul className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          {GUIDES.map(([id, Icon]) => (
+            <li key={id}>
+              <button type="button" onClick={() => setTab(id)} className={GUIDE_CARD}>
+                <span className={GUIDE_ICON}><Icon className="h-4 w-4" /></span>
+                <span className="min-w-0 flex-1 font-medium text-s1-fg">{d.guides[id]}</span>
+                <ArrowRight className="h-4 w-4 shrink-0 text-s1-muted transition group-hover:translate-x-0.5 group-hover:text-s1-accent" />
+              </button>
+            </li>
           ))}
-          <Link to="/api-docs" className="px-3 py-1.5 rounded-2xl text-xs font-medium bg-white text-main-blue hover:bg-white/90">
-            Try the API live →
-          </Link>
-        </div>
-      </Card>
+          <li>
+            <Link to="/api-docs" className={GUIDE_CARD}>
+              <span className={GUIDE_ICON}><Zap className="h-4 w-4" /></span>
+              <span className="min-w-0 flex-1 font-medium text-s1-fg">{d.tryApi}</span>
+              <ArrowRight className="h-4 w-4 shrink-0 text-s1-muted transition group-hover:translate-x-0.5 group-hover:text-s1-accent" />
+            </Link>
+          </li>
+        </ul>
+      </section>
 
       <DocSection title="Service map" kicker="Architecture">
-        <Table head={['Service', 'Port', 'Gateway prefix', 'Responsibility']}>
+        <DocTable head={['Service', 'Port', 'Gateway prefix', 'Responsibility']}>
           {SERVICE_MAP.map(([service, port, prefix, desc]) => (
-            <tr key={service} className="border-t border-slate-100 align-top">
-              <td className="py-2 pr-4 text-xs font-medium text-main-text whitespace-nowrap">{service}</td>
-              <td className="py-2 pr-4 text-xs tabular-nums">{port}</td>
-              <td className="py-2 pr-4 text-xs">
-                <code className="text-main-text break-all">{prefix}</code>
+            <tr key={service} className="border-t border-s1-line align-top">
+              <td className="px-4 py-2.5 text-xs font-medium text-s1-fg whitespace-nowrap">{service}</td>
+              <td className="px-4 py-2.5 text-xs tabular-nums">{port}</td>
+              <td className="px-4 py-2.5 text-xs">
+                <code className="text-s1-fg break-all">{prefix}</code>
               </td>
-              <td className="py-2 text-xs">{desc}</td>
+              <td className="px-4 py-2.5 text-xs">{desc}</td>
             </tr>
           ))}
-        </Table>
+        </DocTable>
         <Text>
           Only the gateway is public in production. Direct service calls additionally require
-          <code className="mx-1 text-main-text">x-synapseone-internal</code>
-          when <code className="text-main-text">SYNAPSEONE_INTERNAL_SECRET</code> is configured.
+          <code className="mx-1 text-s1-fg">x-synapseone-internal</code>
+          when <code className="text-s1-fg">SYNAPSEONE_INTERNAL_SECRET</code> is configured.
+          SynapseBase also serves <code className="mx-1 text-s1-fg">/v1/search</code>; the workflow
+          service owns <code className="mx-1 text-s1-fg">/v1/secrets</code> and
+          <code className="mx-1 text-s1-fg">/v1/human-tasks</code>.
         </Text>
       </DocSection>
 
       <DocSection title="Run the stack with Docker" kicker="Getting started">
         <Text>
-          The repository ships a complete Compose stack. SynapseBase persists to Postgres, while
-          Faststore and SynapseQueue use Redis; each service falls back to in-memory storage only when
-          its backend URL is absent (dev/tests).
+          The repository ships a complete Compose stack. SynapseBase, Notifications, IAM and the
+          workflow service persist to Postgres; Faststore, SynapseQueue and SynapseStream use Redis;
+          SynapseOCS writes to S3-compatible storage. Each service falls back to in-memory storage
+          only when its backend URL is absent (dev/tests).
         </Text>
         <DocCode data={OVERVIEW_RUN} />
         <Bullets
@@ -1102,7 +1681,7 @@ function Overview({ setTab }) {
             'Replace every *_change_me_* secret in .env before exposing the stack.',
             'docker compose up -d --build rebuilds the Console, gateway and services after source changes.',
             'Production: use docker-compose.prod.yml with the infra/prod TLS overlay; see docs/production.md in the repository.',
-            'Console: http://localhost:3000 — sign in with demo@acme.local / org acme, or an API key.',
+            'Console: http://localhost:3000; sign in with demo@acme.local / org acme, or an API key.',
           ]}
         />
       </DocSection>
@@ -1110,7 +1689,7 @@ function Overview({ setTab }) {
       <DocSection title="One request per data service" kicker="First flow">
         <DocCode data={OVERVIEW_FLOW} />
         <Text>
-          All snippets use the gateway at <code className="text-main-text">:8080</code>. Swap in your own
+          All snippets use the gateway at <code className="text-s1-fg">:8080</code>. Swap in your own
           token (or an API key) and the examples work unchanged against a Docker deployment.
         </Text>
       </DocSection>
@@ -1118,7 +1697,7 @@ function Overview({ setTab }) {
       <DocSection title="Authentication and tenancy" kicker="Security model">
         <Bullets
           items={[
-            'Call the gateway with Authorization: Bearer <JWT> or X-API-Key. /v1/auth/* and the public LDS export routes are the only unauthenticated endpoints.',
+            'Call the gateway with Authorization: Bearer <JWT> or X-API-Key. Public routes are /v1/auth/*, /v1/lds/licenses, public LDS entity exports, /v1/ocs/signed, /webhook/* and the SCIM token plane; everything else needs a credential.',
             'The gateway strips client-sent x-synapseone-* headers and re-stamps them from the verified principal, so services never re-verify the JWT.',
             'Principal callers are scoped automatically: org → org:<id>, otherwise account → account:<id>, otherwise user → user:<sub>.',
             'Platform callers (no principal) select a tenant with x-synapseone-tenant or ?tenant=. Missing tenant is 400 tenant_required.',
@@ -1129,28 +1708,408 @@ function Overview({ setTab }) {
       </DocSection>
 
       <DocSection title="SDK namespaces at a glance" kicker="Clients">
-        <Table head={['Namespace', 'Covers']}>
+        <DocTable head={['Namespace', 'Covers']}>
           {[
-            ['client.iam', 'Auth/OIDC, orgs, accounts, users, roles, policies, keys, service accounts, credentials'],
+            ['client.iam', 'Auth/OIDC/MFA, orgs, accounts, users, roles, policies, keys, service accounts, credentials'],
             ['client.workflow', 'Templates, workflow CRUD/lifecycle, executions, test runs'],
+            ['client.ai', 'Documentation assistant guidance (never executes the drafted call)'],
+            ['client.inference', 'Chat completions, embeddings, decision and semantic routing'],
             ['client.lds', 'Datasources, attribute registry, ingest, NGSI-LD entities, licenses'],
             ['client.base', 'Collections, documents, mapped objects, queries, counters, batch, changes'],
+            ['client.search', 'Full-text, semantic and hybrid search over Base documents'],
             ['client.faststore', 'Strings/counters, hashes, lists, sets, sorted sets, scans, locks'],
             ['client.queue', 'Queues, publish/consume, ack/nack/heartbeat, dead letters, replay'],
+            ['client.stream', 'Topics, publish/batch, raw reads, consumer groups, time-range replay'],
+            ['client.ocs', 'Buckets, objects, listing, copy, presign, multipart (client.storage = legacy alias)'],
+            ['client.notifications', 'Send/fan-out, status, cancel, preferences, unsubscribe'],
           ].map(([name, covers]) => (
-            <tr key={name} className="border-t border-slate-100">
-              <td className="py-2 pr-4"><code className="text-xs text-main-text">{name}</code></td>
-              <td className="py-2 text-xs">{covers}</td>
+            <tr key={name} className="border-t border-s1-line">
+              <td className="px-4 py-2.5"><code className="text-xs text-s1-fg">{name}</code></td>
+              <td className="px-4 py-2.5 text-xs">{covers}</td>
             </tr>
           ))}
-        </Table>
+        </DocTable>
         <Text>
           Python and JavaScript use the namespaces above. Go exposes flat methods on one
-          <code className="mx-1 text-main-text">Client</code>
-          (for example <code className="text-main-text">CreateBaseCollection</code>,
-          <code className="mx-1 text-main-text">FaststoreSet</code>
-          and <code className="text-main-text">PublishMessage</code>) plus generic typed
-          <code className="mx-1 text-main-text">BaseCollection[T]</code>.
+          <code className="mx-1 text-s1-fg">Client</code>
+          (for example <code className="text-s1-fg">CreateBaseCollection</code>,
+          <code className="mx-1 text-s1-fg">FaststoreSet</code>,
+          <code className="mx-1 text-s1-fg">PublishStreamEvent</code>
+          and <code className="text-s1-fg">SendNotification</code>) plus generic typed
+          <code className="mx-1 text-s1-fg">BaseCollection[T]</code>.
+        </Text>
+      </DocSection>
+    </div>
+  );
+}
+
+function IamDoc() {
+  return (
+    <div className="space-y-10">
+      <DocHeader title="IAM & Auth" kicker="Identity · port 4001 · /v1/auth, /v1/orgs, …">
+        <Text>
+          SynapseOne IAM is the first-party identity plane: password and OIDC sign-in, TOTP MFA,
+          the tenant hierarchy, AWS-style roles and policies, API keys, service accounts, audit
+          and request telemetry. The gateway verifies every credential and stamps the verified
+          principal onto each upstream request.
+        </Text>
+        <Bullets
+          items={[
+            'Tenant scope is org-first: org:<id> > account:<id> > user:<sub>; cross-tenant reads return 404/403.',
+            'The gateway strips client-sent x-synapseone-* headers and re-stamps them from the verified principal.',
+            'Scopes are enforced per <service>:read|write|*; minting a key or service-account token never widens the caller scopes.',
+            'Password login, TOTP MFA with recovery codes, lockout, OIDC (public HTTPS issuer) and SCIM 2.0 provisioning are built in.',
+            'Org admins manage members, MFA resets, unlocks and usage; every allow/deny decision is auditable.',
+            'API keys, refresh tokens and credential values are never returned after creation.',
+          ]}
+        />
+      </DocHeader>
+
+      <DocSection title="Sign-in and sessions" kicker="Quick start">
+        <DocCode data={IAM_QUICKSTART} />
+      </DocSection>
+
+      <DocSection title="Orgs, roles and policies" kicker="Quick start">
+        <DocCode data={IAM_POLICY} />
+        <Text>
+          Actions follow the AWS shape (<code className="text-s1-fg">workflow:Execute</code>,
+          <code className="mx-1 text-s1-fg">base:Read</code>,
+          <code className="mx-1 text-s1-fg">queue:*</code>). Policies support
+          <code className="mx-1 text-s1-fg">Condition</code> blocks and the simulator at
+          <code className="mx-1 text-s1-fg">POST /v1/authorize/dry-run</code> evaluates a document
+          without a user.
+        </Text>
+      </DocSection>
+
+      <DocSection title="API reference" kicker="Identity">
+        <EndpointTable rows={IAM_ENDPOINTS} />
+      </DocSection>
+
+      <DocSection title="Credentials and machine identity" kicker="Operations">
+        <Bullets
+          items={[
+            'API keys are account-scoped and shown once; list responses return metadata/prefix only. Rotation keeps the old key valid for graceSeconds.',
+            'Service accounts are machine principals inside an account: create, grant roles, then mint a kind=service-account JWT at /v1/service-accounts/:id/token.',
+            'Workflow node credentials (bearer/basic/apiKey/oauth2/hmac) live under /v1/accounts/:id/credentials and /v1/credentials; values are encrypted at rest and write-only.',
+            'The versioned vault at /v1/secrets adds rotation, revocation and audited reads for platform secrets.',
+            'Usage telemetry (?from&to&feature&statusClass&method&q&accountId) is tenant-scoped and retained for USAGE_RETENTION_DAYS.',
+          ]}
+        />
+      </DocSection>
+    </div>
+  );
+}
+
+function WorkflowDoc() {
+  return (
+    <div className="space-y-10">
+      <DocHeader title="Workflow engine" kicker="Automation · port 4002 · /v1/workflows">
+        <Text>
+          A built-in DAG engine with n8n-compatible node types, durable human tasks, per-node
+          credentials, public webhooks and full execution history. Workflows are tenant-scoped
+          and authenticated runs carry the caller principal into every node.
+        </Text>
+        <Bullets
+          items={[
+            'Create from a template or a raw {nodes, connections} definition; every update bumps revision.',
+            'Triggers: manual, cron (10 s minimum), webhook (ANY /webhook/:path) and first-party API calls.',
+            'Executions record per-node status (success|error|skipped), input/output, duration and attempts.',
+            'Credentials are encrypted at rest with SYNAPSEONE_CREDENTIAL_KEY and never returned.',
+          ]}
+        />
+      </DocHeader>
+
+      <DocSection title="Create, run and inspect" kicker="Quick start">
+        <DocCode data={WORKFLOW_QUICKSTART} />
+      </DocSection>
+
+      <DocSection title="Public webhooks" kicker="Triggers">
+        <DocCode data={WORKFLOW_WEBHOOK} />
+        <DocCode data={WORKFLOW_MCP} />
+      </DocSection>
+
+      <DocSection title="API reference" kicker="Automation">
+        <EndpointTable rows={WORKFLOW_ENDPOINTS} />
+      </DocSection>
+
+      <DocSection title="Secrets and human tasks" kicker="Operations">
+        <DocCode data={WORKFLOW_SECRETS} />
+        <Bullets
+          items={[
+            'Secret reads are audited, values are AES-256-GCM encrypted with SYNAPSEONE_CREDENTIAL_KEY, and rotation keeps the previous version for graceSeconds (default 24 h, max 30 d).',
+            'Human tasks survive restarts in Postgres; completing or rejecting resumes the paused execution exactly once, and duplicate decisions return 409.',
+          ]}
+        />
+      </DocSection>
+
+      <DocSection title="Node types" kicker="Reference">
+        <DocTable head={['Node', 'Behaviour']}>
+          {WORKFLOW_NODES.map(([node, desc]) => (
+            <tr key={node} className="border-t border-s1-line align-top">
+              <td className="px-4 py-2.5 whitespace-nowrap"><code className="text-xs text-s1-fg">{node}</code></td>
+              <td className="px-4 py-2.5 text-xs">{desc}</td>
+            </tr>
+          ))}
+        </DocTable>
+      </DocSection>
+
+      <DocSection title="Execution semantics and limits" kicker="Operations">
+        <Bullets
+          items={[
+            'Definitions are validated for structure, SSRF URLs, size and cycles: ≤200 KB and ≤50 nodes, every node has a 1..128 char name.',
+            'Non-if nodes fan out to every branch; a diamond runs the join node once per incoming edge with that edge data.',
+            'With several terminal nodes the output is keyed by terminal name; nodeRuns always carry the per-node detail.',
+            'settings.onError:"continue" absorbs node failures into partialErrors instead of failing the run.',
+            'The httpRequest node blocks first-party hosts unless SYNAPSEONE_SELF_BASE_URLS allowlists the exact origin.',
+            'Human tasks pause an execution and resume it exactly once via /v1/human-tasks/:id/complete|reject; duplicate decisions return 409.',
+          ]}
+        />
+      </DocSection>
+    </div>
+  );
+}
+
+function LdsDoc() {
+  return (
+    <div className="space-y-10">
+      <DocHeader title="SynapseLDS" kicker="Linked data · port 4004 · /v1/lds">
+        <Text>
+          Publish licensed open data as NGSI-LD. Records are stored split into private platform
+          metadata, public entity identity and registered attributes, and the projector is a
+          structural allowlist so internal metadata can never leak.
+        </Text>
+        <Bullets
+          items={[
+            'Only entity + registered attributes are serialized; the _core metadata region never leaves the service.',
+            'Unregistered fields are stored but default-deny, and reserved names (id, type, @context, internalId, tenantId, …) are rejected.',
+            'Every export carries X-LDS-License, Link rel="license" and the license URL in @context.',
+            'Public entity routes also serve anonymous consumers the public slice; restricted requires a tenant token; internal never leaves the API.',
+          ]}
+        />
+      </DocHeader>
+
+      <DocSection title="Publish and export" kicker="Quick start">
+        <DocCode data={LDS_QUICKSTART} />
+      </DocSection>
+
+      <DocSection title="API reference" kicker="Linked data">
+        <EndpointTable rows={LDS_ENDPOINTS} />
+      </DocSection>
+
+      <DocSection title="Projection, visibility and licenses" kicker="Semantics">
+        <Bullets
+          items={[
+            'Records accept {record}, {records:[…]} or one object (≤1000/call); re-ingesting the same source id bumps version.',
+            'The source id becomes _core.sourceRecordId; the public IRI is urn:ngsi-ld:<entityType>:<id> unless ngsiLdId/@id is supplied.',
+            'Visibility is public | restricted | internal; unstated attributes inherit the datasource defaultVisibility (internal unless changed).',
+            'Built-in licenses: CC0-1.0, PDDL-1.0, CC-BY-4.0, CC-BY-SA-4.0, ODbL-1.0, LicenseRef-Proprietary; custom LicenseRef-* ids require licenseUrl.',
+            'The webhook-to-lds workflow template publishes the incoming payload with the run tenant principal.',
+          ]}
+        />
+      </DocSection>
+    </div>
+  );
+}
+
+function StreamDoc() {
+  return (
+    <div className="space-y-10">
+      <DocHeader title="SynapseStream" kicker="Event streaming · port 4009 · /v1/stream">
+        <Text>
+          A tenant-scoped distributed event log with consumer groups, non-destructive reads,
+          time-range replay and retention trimming. Redis Streams is the default durable engine;
+          the driver is pluggable (for example Kafka) and production refuses the in-memory engine.
+        </Text>
+        <Bullets
+          items={[
+            'Topics cap length (maxLen), trim by id (minId) and/or expire events by retentionMs.',
+            'Raw reads never consume: they return events from an id without moving any group offset.',
+            'Consumer groups track delivered-but-unacked ids per consumer; ack removes them from the pending list.',
+            'Payloads are capped by STREAM_MAX_PAYLOAD_BYTES (default 256 KiB); batch publish accepts up to 100 events.',
+          ]}
+        />
+      </DocHeader>
+
+      <DocSection title="Topics, publish and tail" kicker="Quick start">
+        <DocCode data={STREAM_QUICKSTART} />
+      </DocSection>
+
+      <DocSection title="Consumer groups and replay" kicker="Consume">
+        <DocCode data={STREAM_GROUPS} />
+      </DocSection>
+
+      <DocSection title="API reference" kicker="Event streaming">
+        <EndpointTable rows={STREAM_ENDPOINTS} />
+      </DocSection>
+
+      <DocSection title="Delivery notes" kicker="Operations">
+        <Bullets
+          items={[
+            'Event ids are time-ordered ("<ms>-<seq>"); use the last returned id as the next fromId or start cursor.',
+            'autoAck:true acknowledges on read; with autoAck:false call the ack route after your processor succeeds.',
+            'range?start&end accepts ISO timestamps (or ids) and is the replay path when a consumer must rebuild state.',
+            'Topic stats report length, first/last id and every group, which makes lag visible without scanning the log.',
+            'Streams are tenant-scoped; platform callers must send x-synapseone-tenant or ?tenant=.',
+          ]}
+        />
+      </DocSection>
+    </div>
+  );
+}
+
+function OcsDoc() {
+  return (
+    <div className="space-y-10">
+      <DocHeader title="SynapseOCS" kicker="Object storage · port 4010 · /v1/ocs">
+        <Text>
+          Bucket-aware object cloud storage with presigned URLs, multipart uploads, quotas and
+          S3-compatible backends (SeaweedFS in Compose; MinIO, AWS S3 and R2 are drop-in
+          alternatives). The legacy /v1/storage routes remain as the default-bucket API.
+        </Text>
+        <Bullets
+          items={[
+            'Buckets and objects are tenant-scoped; cross-tenant reads return 404 and never leak existence.',
+            'Bucket names follow S3 rules (3..63 lowercase characters); the virtual "default" bucket backs legacy /v1/storage.',
+            'Deleting a non-empty bucket requires ?force=true; quotas are enforced per bucket (quotaBytes).',
+            'Object PUT/GET support checksums, Range and conditional If-Match/If-None-Match headers.',
+            'Presigned URLs are verified by the public /v1/ocs/signed route, so the token is the credential.',
+          ]}
+        />
+      </DocHeader>
+
+      <DocSection title="Buckets, objects and presigning" kicker="Quick start">
+        <DocCode data={OCS_QUICKSTART} />
+      </DocSection>
+
+      <DocSection title="Multipart uploads" kicker="Large objects">
+        <DocCode data={OCS_MULTIPART} />
+      </DocSection>
+
+      <DocSection title="API reference" kicker="Object storage">
+        <EndpointTable rows={OCS_ENDPOINTS} />
+      </DocSection>
+
+      <DocSection title="Backends and production" kicker="Operations">
+        <Bullets
+          items={[
+            'Production requires STORAGE_BACKEND explicitly: s3 with real STORAGE_S3_* keys, or fs with a durable volume.',
+            'OCS fails closed when STORAGE_S3_ENDPOINT is missing and warns if the endpoint is a test double.',
+            'Listing supports prefix + delimiter for folder-style navigation and returns an opaque nextCursor.',
+            'Use HEAD for size/ETag/checksum metadata without downloading the body.',
+          ]}
+        />
+      </DocSection>
+    </div>
+  );
+}
+
+function NotificationsDoc() {
+  return (
+    <div className="space-y-10">
+      <DocHeader title="SynapseNotifications" kicker="Delivery · port 4011 · /v1/notifications">
+        <Text>
+          A durable notification outbox: products store a notification, Tier 1 owns templates,
+          preferences, retries and delivery status. Fan-out creates one record per channel and
+          every transition is observable through the status and attempt history.
+        </Text>
+        <Bullets
+          items={[
+            'Send one channel or several; the response is 202 with one notification record per channel.',
+            '{{var}} placeholders are filled from data; missing keys are left intact.',
+            'idempotencyKey is scoped per tenant and channel: a retry returns the existing record instead of sending twice.',
+            'Preferences can allow specific channels; unsubscribed:true cancels pending sends and blocks future ones.',
+          ]}
+        />
+      </DocHeader>
+
+      <DocSection title="Send, inspect and cancel" kicker="Quick start">
+        <DocCode data={NOTIFICATIONS_QUICKSTART} />
+      </DocSection>
+
+      <DocSection title="API reference" kicker="Delivery">
+        <EndpointTable rows={NOTIFICATIONS_ENDPOINTS} />
+      </DocSection>
+
+      <DocSection title="Channels" kicker="Reference">
+        <DocTable head={['Channel', 'Adapter']}>
+          {NOTIFICATION_CHANNELS.map(([channel, adapter]) => (
+            <tr key={channel} className="border-t border-s1-line">
+              <td className="px-4 py-2.5"><code className="text-xs text-s1-fg">{channel}</code></td>
+              <td className="px-4 py-2.5 text-xs">{adapter}</td>
+            </tr>
+          ))}
+        </DocTable>
+      </DocSection>
+
+      <DocSection title="Delivery guarantees and limits" kicker="Operations">
+        <Bullets
+          items={[
+            'The outbox row is durable; production requires DATABASE_URL.',
+            'With NOTIFICATIONS_QUEUE_URL set, jobs travel through SynapseQueue and consumers ack/nack, giving at-least-once delivery across replicas.',
+            'Without a queue (dev/tests) an in-process worker claims due rows.',
+            'Failures retry with exponential backoff up to NOTIFICATIONS_MAX_ATTEMPTS (default 5), then move to dead with deadReason.',
+            'NOTIFICATIONS_RATE_LIMIT_PER_MIN (default 120) caps sends per tenant and returns 429 + Retry-After.',
+            'Health reports the store (postgres/memory) and delivery mode (queue/local).',
+          ]}
+        />
+      </DocSection>
+    </div>
+  );
+}
+
+function AiDoc() {
+  return (
+    <div className="space-y-10">
+      <DocHeader title="AI & Inference" kicker="AI · ports 4003/4008 · /v1/ai, /v1/inference">
+        <Text>
+          Two cooperating services: the AI service answers documentation questions and drafts API
+          calls (guidance only — it never executes them), while the Python inference service owns
+          the LLM proxy, self-hosted embeddings and the Decision-2.0 semantic router used by
+          workflow nodes.
+        </Text>
+        <Bullets
+          items={[
+            'AI_API_KEY enables /v1/ai/agent; without it the route answers 503 ai_not_configured.',
+            'The agent returns an endpoint suggestion and a ready-to-edit request; the Console shows a Try it action instead of calling on your behalf.',
+            'Inference chat is OpenAI-compatible (tools, tool_choice, response_format and SSE streaming all pass through).',
+            'Embeddings and decision run locally; chat requires OPENROUTER_API_KEY (or an OpenRouter-compatible base URL).',
+            'Workflow nodes decision / aiAgent / inference.* call these routes with the run principal.',
+          ]}
+        />
+      </DocHeader>
+
+      <DocSection title="Assistant and inference calls" kicker="Quick start">
+        <DocCode data={AI_QUICKSTART} />
+      </DocSection>
+
+      <DocSection title="API reference" kicker="AI & inference">
+        <EndpointTable rows={AI_ENDPOINTS} />
+      </DocSection>
+
+      <DocSection title="Decision shapes" kicker="Reference">
+        <DocCode
+          data={`# Structured evaluation: each question is choice | noul (yes/no) | score
+curl -s -XPOST http://localhost:8080/v1/inference/decision \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{
+    "state": "Water is rising 30cm/h at station S1",
+    "questions": {
+      "severity": {
+        "type": "choice",
+        "instructions": "Classify the situation",
+        "criteria": {"low": "no action", "high": "dispatch a crew"}
+      }
+    }
+  }'
+
+# Semantic router: choices map id -> semantic description
+curl -s -XPOST http://localhost:8080/v1/inference/decision/route \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"input":"water is rising at S1","choices":{"ops":"dispatch field crew","alert":"notify residents"}}'`}
+        />
+        <Text>
+          Responses include the chosen route/confidence and the full probability map, so workflow
+          branches stay explainable.
         </Text>
       </DocSection>
     </div>
@@ -1159,8 +2118,8 @@ function Overview({ setTab }) {
 
 function BaseDoc() {
   return (
-    <div className="space-y-4">
-      <DocSection title="SynapseBase" kicker="Documents · port 4005 · /v1/base">
+    <div className="space-y-10">
+      <DocHeader title="SynapseBase" kicker="Documents · port 4005 · /v1/base">
         <Text>
           A self-managed document database with server-side validation and a first-class
           object ↔ data mapping. Write logical objects, store raw JSON, and query either view.
@@ -1173,7 +2132,7 @@ function BaseDoc() {
             'Full endpoint reference with try-it forms: open the API Docs page.',
           ]}
         />
-      </DocSection>
+      </DocHeader>
 
       <DocSection title="Mapping objects to stored data" kicker="Core concept">
         <DocCode data={BASE_MAPPING} />
@@ -1199,10 +2158,10 @@ function BaseDoc() {
       <DocSection title="Documents" kicker="API reference">
         <EndpointTable rows={BASE_DOCUMENT_ENDPOINTS} />
         <Text>
-          Document ids allow <code className="text-main-text">[A-Za-z0-9_@.:+-]</code> up to 256
-          characters; <code className="text-main-text">/</code>, <code className="text-main-text">\\</code>,
-          <code className="mx-1 text-main-text">.</code> and <code className="text-main-text">..</code> are rejected.
-          A duplicate create is <code className="text-main-text">409 document_exists</code>.
+          Document ids allow <code className="text-s1-fg">[A-Za-z0-9_@.:+-]</code> up to 256
+          characters; <code className="text-s1-fg">/</code>, <code className="text-s1-fg">\\</code>,
+          <code className="mx-1 text-s1-fg">.</code> and <code className="text-s1-fg">..</code> are rejected.
+          A duplicate create is <code className="text-s1-fg">409 document_exists</code>.
         </Text>
       </DocSection>
 
@@ -1211,11 +2170,11 @@ function BaseDoc() {
         <DocCode data={BASE_QUERY} />
         <OperatorTable rows={BASE_OPERATORS} />
         <Text>
-          <code className="text-main-text">where</code> accepts logical mapping names or dot paths,
-          shorthand <code className="text-main-text">{'{"capacity":{"gte":100}}'}</code>, and groups
-          <code className="mx-1 text-main-text">and/or/not</code>. Document metadata is addressable as
-          <code className="mx-1 text-main-text">$id/$version/$createdAt/$updatedAt</code>.
-          Query responses return <code className="text-main-text">{'{items,total,limit,offset,nextCursor}'}</code>.
+          <code className="text-s1-fg">where</code> accepts logical mapping names or dot paths,
+          shorthand <code className="text-s1-fg">{'{"capacity":{"gte":100}}'}</code>, and groups
+          <code className="mx-1 text-s1-fg">and/or/not</code>. Document metadata is addressable as
+          <code className="mx-1 text-s1-fg">$id/$version/$createdAt/$updatedAt</code>.
+          Query responses return <code className="text-s1-fg">{'{items,total,limit,offset,nextCursor}'}</code>.
         </Text>
         <DocCode data={BASE_WRITES} />
         <Bullets
@@ -1228,13 +2187,22 @@ function BaseDoc() {
         />
       </DocSection>
 
+      <DocSection title="Search across collections" kicker="API reference">
+        <DocCode data={BASE_SEARCH} />
+        <EndpointTable rows={BASE_SEARCH_ENDPOINTS} />
+        <Text>
+          Tenant and document ACLs are re-checked on every query; a reindex removes deleted
+          documents. Facets cover collection, type and status.
+        </Text>
+      </DocSection>
+
       <DocSection title="Limits and errors" kicker="Operations">
         <DocCode data={BASE_LIMITS} />
         <Text>
-          Common errors: <code className="text-main-text">400 mapping_error</code> (missing/typed/unknown field),
-          <code className="mx-1 text-main-text">409 version_conflict</code>,
-          <code className="mx-1 text-main-text">409 ambiguous_collection</code> (platform caller must pass ?orgId/?accountId),
-          <code className="mx-1 text-main-text">413 collection_too_large</code> (narrow the query or raise BASE_QUERY_SCAN_LIMIT).
+          Common errors: <code className="text-s1-fg">400 mapping_error</code> (missing/typed/unknown field),
+          <code className="mx-1 text-s1-fg">409 version_conflict</code>,
+          <code className="mx-1 text-s1-fg">409 ambiguous_collection</code> (platform caller must pass ?orgId/?accountId),
+          <code className="mx-1 text-s1-fg">413 collection_too_large</code> (narrow the query or raise BASE_QUERY_SCAN_LIMIT).
         </Text>
       </DocSection>
     </div>
@@ -1243,8 +2211,8 @@ function BaseDoc() {
 
 function FaststoreDoc() {
   return (
-    <div className="space-y-4">
-      <DocSection title="Synapse Faststore" kicker="Cache · port 4006 · /v1/faststore">
+    <div className="space-y-10">
+      <DocHeader title="Synapse Faststore" kicker="Cache · port 4006 · /v1/faststore">
         <Text>
           A tenant-scoped Redis-backed cache and key/value service: TTL strings, counters,
           hashes, lists, sets, sorted sets, scans, batches and distributed locks. Without a
@@ -1258,7 +2226,7 @@ function FaststoreDoc() {
             '0 TTL clears an existing expiry; valid TTLs are 1..2,592,000 seconds (30 days).',
           ]}
         />
-      </DocSection>
+      </DocHeader>
 
       <DocSection title="Keys, TTL and counters" kicker="Quick start">
         <DocCode data={FASTSTORE_QUICKSTART} />
@@ -1289,8 +2257,8 @@ function FaststoreDoc() {
 
 function QueueDoc() {
   return (
-    <div className="space-y-4">
-      <DocSection title="SynapseQueue" kicker="Messaging · port 4007 · /v1/queue">
+    <div className="space-y-10">
+      <DocHeader title="SynapseQueue" kicker="Messaging · port 4007 · /v1/queue">
         <Text>
           At-least-once queues with delayed and deduplicated publishing, visibility-timeout
           leases, explicit ack/nack/heartbeat, retries, dead letters and replay. Redis is the
@@ -1304,7 +2272,7 @@ function QueueDoc() {
             'Queues are tenant-scoped; platform callers pass x-synapseone-tenant or ?tenant=.',
           ]}
         />
-      </DocSection>
+      </DocHeader>
 
       <DocSection title="Publish, consume and ack" kicker="Quick start">
         <DocCode data={QUEUE_QUICKSTART} />
@@ -1326,7 +2294,7 @@ function QueueDoc() {
       <DocSection title="Delivery semantics and limits" kicker="Operations">
         <DocCode data={QUEUE_SEMANTICS} />
         <Text>
-          Nack returns <code className="text-main-text">{'{state:"retry"|"dead", attempts, availableAt|deadAt}'}</code>.
+          Nack returns <code className="text-s1-fg">{'{state:"retry"|"dead", attempts, availableAt|deadAt}'}</code>.
           Replay moves a dead letter back to ready (or delayed) and optionally resets attempts.
           Purge is destructive: it also clears in-flight and dead messages, while preserving the queue config.
         </Text>
@@ -1335,20 +2303,22 @@ function QueueDoc() {
   );
 }
 
-function SdkDoc({ sections }) {
+function SdkDoc({ title, kicker, sections }) {
   return (
-    <div className="space-y-4">
-      {sections.map((s) => (
-        <Card key={s.title}>
-          <h3 className="font-semibold text-main-text mb-2">{s.title}</h3>
-          <DocCode data={s.code} limit={4000} />
-        </Card>
+    <div className="space-y-10">
+      <DocHeader kicker={kicker} title={title} />
+      {sections.map((sec) => (
+        <DocSection key={sec.title} title={sec.title}>
+          <DocCode data={sec.code} />
+        </DocSection>
       ))}
     </div>
   );
 }
 
 export default function Docs() {
+  const { m } = useI18n();
+  const d = m.docsPage;
   const [params, setParams] = useSearchParams();
   const requested = params.get('tab');
   const tab = TABS.some((t) => t.id === requested) ? requested : 'overview';
@@ -1359,41 +2329,74 @@ export default function Docs() {
       return next;
     }, { replace: true });
   };
+  // A new tab starts at its top.
+  useEffect(() => {
+    if (typeof window !== 'undefined') window.scrollTo({ top: 0 });
+  }, [tab]);
 
+  const label = (t) => t.label || d.tabs[t.id];
   let content;
   if (tab === 'overview') content = <Overview setTab={setTab} />;
+  else if (tab === 'iam') content = <IamDoc />;
+  else if (tab === 'workflow') content = <WorkflowDoc />;
+  else if (tab === 'ai') content = <AiDoc />;
+  else if (tab === 'lds') content = <LdsDoc />;
   else if (tab === 'base') content = <BaseDoc />;
   else if (tab === 'faststore') content = <FaststoreDoc />;
   else if (tab === 'queue') content = <QueueDoc />;
-  else if (tab === 'javascript') content = <SdkDoc sections={JS_SECTIONS} />;
-  else if (tab === 'python') content = <SdkDoc sections={PYTHON_SECTIONS} />;
-  else if (tab === 'go') content = <SdkDoc sections={GO_SECTIONS} />;
-  else content = <SdkDoc sections={CLI_SECTIONS} />;
+  else if (tab === 'stream') content = <StreamDoc />;
+  else if (tab === 'ocs') content = <OcsDoc />;
+  else if (tab === 'notifications') content = <NotificationsDoc />;
+  else if (tab === 'javascript') content = <SdkDoc title="JavaScript SDK" kicker={`${d.sdkKicker} · @synapseone/sdk`} sections={JS_SECTIONS} />;
+  else if (tab === 'python') content = <SdkDoc title="Python SDK" kicker={`${d.sdkKicker} · synapseone-sdk`} sections={PYTHON_SECTIONS} />;
+  else if (tab === 'go') content = <SdkDoc title="Go SDK" kicker={`${d.sdkKicker} · synapseone-sdk-go`} sections={GO_SECTIONS} />;
+  else content = <SdkDoc title="SynapseOne CLI" kicker={`${d.cliKicker} · synapseone`} sections={CLI_SECTIONS} />;
+
+  const nav = ['start', 'platform', 'data', 'clients'].map((g) => ({
+    title: d.groups[g],
+    items: TABS.filter((t) => t.group === g).map((t) => ({
+      id: t.id,
+      label: label(t),
+      active: t.id === tab,
+      onClick: () => setTab(t.id),
+    })),
+  }));
+  nav.push({ title: d.groups.more, items: [{ id: 'api', label: m.nav.apiDocs, to: '/api-docs' }] });
+
+  const index = TABS.findIndex((t) => t.id === tab);
+  const prev = TABS[index - 1];
+  const next = TABS[index + 1];
 
   return (
-    <>
-      <PageTitle
-        title="Docs"
-        sub="Platform, data services, SDKs and CLI — organized for the running Docker stack"
-        right={
-          <Link
-            to="/api-docs"
-            className="px-4 py-2 rounded-2xl text-sm font-medium bg-white text-main-blue shadow-sm hover:bg-background"
-          >
-            API explorer →
-          </Link>
-        }
-      />
-      <div className="flex gap-2 mb-4 flex-wrap" role="tablist" aria-label="Documentation sections">
-        {TABS.map((t) => (
-          <TabButton key={t.id} tab={t.id} active={tab === t.id} onClick={setTab}>
-            {t.label}
-          </TabButton>
-        ))}
-      </div>
-      <div role="tabpanel" aria-label={TABS.find((t) => t.id === tab)?.label}>
+    <DocsShell navLabel={d.navLabel} nav={nav} toc tocKey={`${tab}:${m.meta.title}`}>
+      <div role="region" aria-label={label(TABS[index])}>
         {content}
       </div>
-    </>
+      <nav className="mt-14 grid gap-3 border-t border-s1-line pt-6 sm:grid-cols-2" aria-label={`${d.prev} / ${d.next}`}>
+        {prev ? (
+          <button type="button" onClick={() => setTab(prev.id)} className={PAGER}>
+            <span className="text-xs text-s1-muted">{d.prev}</span>
+            <span className="mt-1 flex items-center gap-2 font-medium text-s1-fg group-hover:text-s1-accent">
+              <ArrowLeft className="h-4 w-4" />
+              {label(prev)}
+            </span>
+          </button>
+        ) : (
+          <span className="hidden sm:block" />
+        )}
+        {next && (
+          <button type="button" onClick={() => setTab(next.id)} className={`${PAGER} sm:items-end sm:text-right`}>
+            <span className="text-xs text-s1-muted">{d.next}</span>
+            <span className="mt-1 flex items-center gap-2 font-medium text-s1-fg group-hover:text-s1-accent">
+              {label(next)}
+              <ArrowRight className="h-4 w-4" />
+            </span>
+          </button>
+        )}
+      </nav>
+    </DocsShell>
   );
 }
+
+const PAGER =
+  'group flex flex-col items-start rounded-xl border border-s1-line bg-s1-surface px-4 py-3 text-left transition hover:border-s1-accent';

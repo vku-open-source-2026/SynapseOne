@@ -14,12 +14,14 @@ import { and, asc, eq, gt, isNull, sql } from 'drizzle-orm';
 import { drizzle, type NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { BaseMapping, cloneJson, deepMerge, getPath, setPath } from './mapping';
-import { baseCollections, baseDocuments, baseVectors } from './schema';
+import { baseCollections, baseDatabases, baseDocuments, baseOutbox, baseVectors, searchIndex } from './schema';
 import { QuerySpec, QueryResult, VectorSearchSpec, VectorSearchResult, applyVectorSearch, formatQueryPage } from './query';
 import { compileQuery } from './pg-query';
 
 export interface StoredCollection {
   id: string;
+  database_id: string;
+  database_name?: string;
   name: string;
   description: string | null;
   mapping: BaseMapping;
@@ -51,12 +53,25 @@ export class StoreError extends Error {
 }
 
 const DATABASE_URL = process.env.DATABASE_URL || '';
+// Migrations need a stable Postgres session; bypass PgBouncer transaction mode.
+const DIRECT_DATABASE_URL = process.env.DATABASE_DIRECT_URL || DATABASE_URL;
 let pool: Pool | null = null;
+let directPool: Pool | null = null;
 let db: NodePgDatabase<typeof import('./schema')> | null = null;
 if (DATABASE_URL) {
   pool = new Pool({ connectionString: DATABASE_URL });
   pool.on('error', (e) => console.error('[base][db] pool error', e.message));
-  db = drizzle(pool, { schema: { baseCollections, baseDocuments, baseVectors } });
+  db = drizzle(pool, {
+    schema: { baseCollections, baseDatabases, baseDocuments, baseOutbox, baseVectors, searchIndex },
+  });
+}
+function getDirectPool(): Pool | null {
+  if (!DIRECT_DATABASE_URL) return null;
+  if (!directPool) {
+    directPool = new Pool({ connectionString: DIRECT_DATABASE_URL, max: 2 });
+    directPool.on('error', (e) => console.error('[base][db] direct pool error', e.message));
+  }
+  return directPool;
 }
 
 let ensured = false;
@@ -64,11 +79,11 @@ export async function ensureTables(): Promise<void> {
   if (!db || ensured) return;
   ensured = true;
   try {
-    const client = await pool!.connect();
+    const client = await getDirectPool()!.connect();
     try {
       // Hold the advisory lock on the same dedicated session that runs the
       // migration (pool connections are not guaranteed to be reused).
-      const migrationDb = drizzle(client, { schema: { baseCollections, baseDocuments, baseVectors } });
+      const migrationDb = drizzle(client, { schema: { baseCollections, baseDocuments, baseOutbox, baseVectors, searchIndex } });
       await migrationDb.execute(sql`select pg_advisory_lock(hashtext('synapseone_base_migrations'))`);
       try {
         await migrate(migrationDb, {
@@ -112,6 +127,7 @@ function iso(v: Date | string | null | undefined): string {
 function rowToCollection(r: typeof baseCollections.$inferSelect): StoredCollection {
   return {
     id: String(r.id),
+    database_id: String(r.databaseId || ''),
     name: String(r.name || ''),
     description: r.description != null ? String(r.description) : null,
     mapping: r.mapping && typeof r.mapping === 'object' ? (r.mapping as BaseMapping) : { fields: {} },
@@ -151,13 +167,48 @@ function isUniqueViolation(e: any): boolean {
 }
 
 // ---- in-memory fallback ----
+const memDatabases = new Map<string, { id: string; name: string }>();
 const memCollections = new Map<string, StoredCollection>();
-const memDocuments = new Map<string, Map<string, StoredDocument>>(); // collectionId -> id -> doc
+const memDocuments = new Map<string, Map<string, StoredDocument>>();
+const memOutbox: Array<Record<string, any>> = []; // collectionId -> id -> doc
 
 // ---------- collections ----------
 
 function sameScope(a: { org_id?: string | null; account_id?: string | null }, b: { org_id?: string | null; account_id?: string | null }): boolean {
   return (a.org_id || '') === (b.org_id || '') && (a.account_id || '') === (b.account_id || '');
+}
+
+/** TypeScript reference backend: every legacy flat collection lives in the
+ *  tenant `default` database, matching the Rust service contract. */
+async function ensureDefaultDatabaseRec(
+  org_id: string | null | undefined,
+  account_id: string | null | undefined,
+): Promise<{ id: string; name: string }> {
+  if (db) {
+    await ensureTables();
+    const scope = and(
+      eq(baseDatabases.name, 'default'),
+      org_id ? eq(baseDatabases.orgId, org_id) : isNull(baseDatabases.orgId),
+      account_id ? eq(baseDatabases.accountId, account_id) : isNull(baseDatabases.accountId),
+    );
+    const existing = await db.select().from(baseDatabases).where(scope).limit(1);
+    if (existing[0]) return { id: existing[0].id, name: existing[0].name };
+    const id = randomUUID();
+    await db
+      .insert(baseDatabases)
+      .values({ id, name: 'default', orgId: org_id ?? null, accountId: account_id ?? null })
+      .onConflictDoNothing();
+    const again = await db.select().from(baseDatabases).where(scope).limit(1);
+    if (again[0]) return { id: again[0].id, name: again[0].name };
+    throw new StoreError('invalid', 'default database could not be created');
+  }
+  const key = `${org_id || ''}/${account_id || ''}`;
+  let record = memDatabases.get(key);
+  if (!record) {
+    record = { id: randomUUID(), name: 'default' };
+    memDatabases.set(key, record);
+  }
+  return record;
 }
 
 export async function createCollectionRec(input: {
@@ -168,8 +219,11 @@ export async function createCollectionRec(input: {
   account_id?: string | null;
   created_by?: string | null;
 }): Promise<StoredCollection> {
+  const database = await ensureDefaultDatabaseRec(input.org_id, input.account_id);
   const rec: StoredCollection = {
     id: randomUUID(),
+    database_id: database.id,
+    database_name: database.name,
     name: input.name,
     description: input.description ?? null,
     mapping: input.mapping,
@@ -183,6 +237,7 @@ export async function createCollectionRec(input: {
     await ensureTables();
     const rows = await db.insert(baseCollections).values({
       id: rec.id,
+      databaseId: rec.database_id,
       name: rec.name,
       description: rec.description,
       mapping: rec.mapping,
@@ -310,6 +365,206 @@ export async function deleteCollectionRec(id: string): Promise<boolean> {
   return memCollections.delete(id);
 }
 
+
+export interface OutboxEvent {
+  event_id: string;
+  schema_version: number;
+  source: 'synapsebase';
+  resource_type: 'document';
+  organization_id: string | null;
+  account_id: string | null;
+  collection_id: string;
+  collection_name: string;
+  document_id: string;
+  operation: 'create' | 'update' | 'delete';
+  version: number;
+  occurred_at: string;
+  data?: Record<string, unknown>;
+}
+
+function outboxPayload(
+  collection: StoredCollection | null | undefined,
+  doc: StoredDocument,
+  operation: OutboxEvent['operation'],
+  eventId: string = randomUUID(),
+): OutboxEvent {
+  const payload: OutboxEvent = {
+    event_id: eventId,
+    schema_version: 1,
+    source: 'synapsebase',
+    resource_type: 'document',
+    organization_id: collection?.org_id ?? null,
+    account_id: collection?.account_id ?? null,
+    collection_id: doc.collection_id,
+    collection_name: collection?.name ?? '',
+    document_id: doc.id,
+    operation,
+    version: doc.version,
+    occurred_at: doc.updated_at,
+  };
+  if (operation !== 'delete') payload.data = doc.data;
+  return payload;
+}
+
+async function collectionMeta(tx: any, collectionId: string): Promise<StoredCollection | null> {
+  if (tx) {
+    const rows = await tx.select().from(baseCollections).where(eq(baseCollections.id, collectionId)).limit(1);
+    return rows[0] ? rowToCollection(rows[0]) : null;
+  }
+  return memCollections.get(collectionId) || null;
+}
+
+async function enqueueOutbox(tx: any, collectionId: string, doc: StoredDocument, operation: OutboxEvent['operation'], eventId?: string): Promise<void> {
+  const meta = await collectionMeta(tx, collectionId);
+  const payload = outboxPayload(meta, doc, operation, eventId);
+  if (tx) {
+    await tx.insert(baseOutbox).values({
+      eventId: payload.event_id,
+      orgId: payload.organization_id,
+      accountId: payload.account_id,
+      collectionId: payload.collection_id,
+      collectionName: payload.collection_name,
+      documentId: payload.document_id,
+      operation: payload.operation,
+      version: payload.version,
+      occurredAt: new Date(payload.occurred_at),
+      payload: payload as unknown as Record<string, unknown>,
+    });
+    return;
+  }
+  memOutbox.push({ ...payload, published_at: null, attempts: 0, last_error: null });
+}
+
+
+/** Enqueue a replayable snapshot of current documents. Deterministic event ids
+ *  make repeated backfills idempotent; relay publishes them like live changes. */
+export async function enqueueBackfill(collectionId: string, docs: StoredDocument[]): Promise<number> {
+  if (!docs.length) return 0;
+  const meta = await collectionMeta(db, collectionId);
+  let inserted = 0;
+  if (db) {
+    await ensureTables();
+    for (const doc of docs) {
+      const eventId = `backfill:${collectionId}:${doc.id}:${doc.version}`;
+      const payload = outboxPayload(meta, doc, 'create', eventId);
+      const rows = await db.insert(baseOutbox).values({
+        eventId,
+        orgId: payload.organization_id,
+        accountId: payload.account_id,
+        collectionId,
+        collectionName: payload.collection_name,
+        documentId: doc.id,
+        operation: 'create',
+        version: doc.version,
+        occurredAt: new Date(payload.occurred_at),
+        payload: payload as unknown as Record<string, unknown>,
+      }).onConflictDoNothing().returning({ eventId: baseOutbox.eventId });
+      inserted += rows.length;
+    }
+    return inserted;
+  }
+  const existing = new Set(memOutbox.map((e) => e.event_id));
+  for (const doc of docs) {
+    const eventId = `backfill:${collectionId}:${doc.id}:${doc.version}`;
+    if (existing.has(eventId)) continue;
+    const payload = outboxPayload(meta, doc, 'create', eventId);
+    memOutbox.push({ ...payload, published_at: null, attempts: 0, last_error: null });
+    existing.add(eventId);
+    inserted += 1;
+  }
+  return inserted;
+}
+
+/** Read the durable change feed. Deletes are tombstones, not omitted. */
+export async function listOutboxChanges(
+  collectionId: string,
+  opts: { since: string; afterId?: string; limit: number },
+): Promise<{ events: OutboxEvent[]; nextSince: string; nextAfter: string | null }> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.select().from(baseOutbox)
+      .where(and(
+        eq(baseOutbox.collectionId, collectionId),
+        sql`${baseOutbox.occurredAt} >= ${new Date(opts.since)}`,
+        opts.afterId ? sql`(${baseOutbox.occurredAt} > ${new Date(opts.since)} OR ${baseOutbox.eventId} > ${opts.afterId})` : sql`true`,
+      ))
+      .orderBy(asc(baseOutbox.occurredAt), asc(baseOutbox.eventId))
+      .limit(opts.limit);
+    const events = rows.map((r: any) => r.payload as OutboxEvent);
+    const last = rows[rows.length - 1];
+    return {
+      events,
+      nextSince: last ? new Date(last.occurredAt).toISOString() : opts.since,
+      nextAfter: last ? String(last.eventId) : opts.afterId ?? null,
+    };
+  }
+  const filtered = memOutbox.filter((e) => e.collection_id === collectionId
+    && (e.occurred_at > opts.since || (e.occurred_at === opts.since && (!opts.afterId || e.event_id > opts.afterId))))
+    .sort((a, b) => a.occurred_at.localeCompare(b.occurred_at) || a.event_id.localeCompare(b.event_id))
+    .slice(0, opts.limit);
+  return {
+    events: filtered.map((e) => ({ ...e, payload: undefined } as any)),
+    nextSince: filtered.length ? filtered[filtered.length - 1].occurred_at : opts.since,
+    nextAfter: filtered.length ? filtered[filtered.length - 1].event_id : opts.afterId ?? null,
+  };
+}
+
+
+export async function outboxStats(): Promise<{ pending: number; oldest: string | null }> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.select({
+      pending: sql<number>`count(*) filter (where ${baseOutbox.publishedAt} is null)::int`,
+      oldest: sql<Date | null>`min(${baseOutbox.occurredAt}) filter (where ${baseOutbox.publishedAt} is null)`,
+    }).from(baseOutbox);
+    return {
+      pending: Number(rows[0]?.pending) || 0,
+      oldest: rows[0]?.oldest ? iso(rows[0].oldest) : null,
+    };
+  }
+  const pending = memOutbox.filter((e) => !e.published_at);
+  return { pending: pending.length, oldest: pending[0]?.occurred_at || null };
+}
+
+/** Relay helpers: unpublished rows in commit order. */
+export async function listUnpublishedOutbox(limit = 100): Promise<Array<{ eventId: string; payload: OutboxEvent; attempts: number }>> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.select().from(baseOutbox)
+      .where(isNull(baseOutbox.publishedAt))
+      .orderBy(asc(baseOutbox.occurredAt), asc(baseOutbox.eventId))
+      .limit(Math.min(Math.max(limit, 1), 500));
+    return rows.map((r: any) => ({ eventId: String(r.eventId), payload: r.payload as OutboxEvent, attempts: Number(r.attempts) || 0 }));
+  }
+  return memOutbox.filter((e) => !e.published_at).slice(0, limit).map((e) => ({ eventId: e.event_id, payload: e as OutboxEvent, attempts: e.attempts || 0 }));
+}
+
+export async function markOutboxPublished(eventIds: string[]): Promise<void> {
+  if (!eventIds.length) return;
+  if (db) {
+    await ensureTables();
+    for (const eventId of eventIds) {
+      await db.update(baseOutbox).set({ publishedAt: new Date(), lastError: null }).where(eq(baseOutbox.eventId, eventId));
+    }
+    return;
+  }
+  for (const e of memOutbox) if (eventIds.includes(e.event_id)) e.published_at = nowIso();
+}
+
+export async function recordOutboxFailure(eventId: string, error: unknown): Promise<void> {
+  const message = String((error as Error)?.message || error).slice(0, 1000);
+  if (db) {
+    await ensureTables();
+    await db.update(baseOutbox).set({
+      attempts: sql`${baseOutbox.attempts} + 1`,
+      lastError: message,
+    }).where(eq(baseOutbox.eventId, eventId));
+    return;
+  }
+  const e = memOutbox.find((x) => x.event_id === eventId);
+  if (e) { e.attempts = (e.attempts || 0) + 1; e.last_error = message; }
+}
+
 // ---------- documents ----------
 
 export async function createDocumentRec(
@@ -327,19 +582,24 @@ export async function createDocumentRec(
   };
   if (db) {
     await ensureTables();
-    const rows = await db.insert(baseDocuments).values({
-      collectionId,
-      id,
-      data: rec.data,
-      version: 1,
-    }).onConflictDoNothing().returning();
-    if (!rows[0]) throw new StoreError('conflict', `document '${id}' already exists`);
-    return rowToDocument(rows[0]);
+    return db.transaction(async (tx) => {
+      const rows = await tx.insert(baseDocuments).values({
+        collectionId,
+        id,
+        data: rec.data,
+        version: 1,
+      }).onConflictDoNothing().returning();
+      if (!rows[0]) throw new StoreError('conflict', `document '${id}' already exists`);
+      const doc = rowToDocument(rows[0]);
+      await enqueueOutbox(tx, collectionId, doc, 'create');
+      return doc;
+    });
   }
   const docs = memDocuments.get(collectionId) || new Map<string, StoredDocument>();
   if (docs.has(id)) throw new StoreError('conflict', `document '${id}' already exists`);
   memDocuments.set(collectionId, docs);
   docs.set(id, rec);
+  await enqueueOutbox(null, collectionId, rec, 'create');
   return cloneJson(rec);
 }
 
@@ -505,7 +765,9 @@ export async function setDocumentRec(
           data: cloneJson(data),
           version: 1,
         }).returning();
-        return { doc: rowToDocument(rows[0]), created: true };
+        const doc = rowToDocument(rows[0]);
+        await enqueueOutbox(tx, collectionId, doc, 'create');
+        return { doc, created: true };
       }
       const prev = rowToDocument(cur[0]);
       if (opts.ifVersion !== undefined && prev.version !== opts.ifVersion) {
@@ -517,7 +779,9 @@ export async function setDocumentRec(
         version: prev.version + 1,
         updatedAt: new Date(),
       }).where(and(eq(baseDocuments.collectionId, collectionId), eq(baseDocuments.id, id))).returning();
-      return { doc: rowToDocument(rows[0]), created: false };
+      const doc = rowToDocument(rows[0]);
+      await enqueueOutbox(tx, collectionId, doc, 'update');
+      return { doc, created: false };
     });
   }
   const docs = memDocuments.get(collectionId) || new Map<string, StoredDocument>();
@@ -536,6 +800,7 @@ export async function setDocumentRec(
     };
     memDocuments.set(collectionId, docs);
     docs.set(id, rec);
+    await enqueueOutbox(null, collectionId, rec, 'create');
     return { doc: cloneJson(rec), created: true };
   }
   if (opts.ifVersion !== undefined && cur.version !== opts.ifVersion) {
@@ -548,6 +813,7 @@ export async function setDocumentRec(
     updated_at: nowIso(),
   };
   docs.set(id, rec);
+  await enqueueOutbox(null, collectionId, rec, 'update');
   return { doc: cloneJson(rec), created: false };
 }
 
@@ -558,22 +824,30 @@ export async function deleteDocumentRec(
 ): Promise<boolean> {
   if (db) {
     await ensureTables();
-    if (opts.ifVersion !== undefined) {
-      const rows = await db.delete(baseDocuments).where(and(
+    return db.transaction(async (tx) => {
+      if (opts.ifVersion !== undefined) {
+        const rows = await tx.delete(baseDocuments).where(and(
+          eq(baseDocuments.collectionId, collectionId),
+          eq(baseDocuments.id, id),
+          eq(baseDocuments.version, opts.ifVersion),
+        )).returning();
+        if (rows.length > 0) {
+          await enqueueOutbox(tx, collectionId, rowToDocument(rows[0]), 'delete');
+          return true;
+        }
+        const exists = await tx.select().from(baseDocuments)
+          .where(and(eq(baseDocuments.collectionId, collectionId), eq(baseDocuments.id, id))).limit(1);
+        if (exists[0]) throw new StoreError('version_conflict', `document version is ${exists[0].version}, expected ${opts.ifVersion}`);
+        throw new StoreError('not_found', `document '${id}' not found`);
+      }
+      const rows = await tx.delete(baseDocuments).where(and(
         eq(baseDocuments.collectionId, collectionId),
         eq(baseDocuments.id, id),
-        eq(baseDocuments.version, opts.ifVersion),
-      )).returning({ id: baseDocuments.id });
-      if (rows.length > 0) return true;
-      const exists = await getDocumentRec(collectionId, id);
-      if (exists) throw new StoreError('version_conflict', `document version is ${exists.version}, expected ${opts.ifVersion}`);
-      throw new StoreError('not_found', `document '${id}' not found`);
-    }
-    const rows = await db.delete(baseDocuments).where(and(
-      eq(baseDocuments.collectionId, collectionId),
-      eq(baseDocuments.id, id),
-    )).returning({ id: baseDocuments.id });
-    return rows.length > 0;
+      )).returning();
+      if (!rows.length) return false;
+      await enqueueOutbox(tx, collectionId, rowToDocument(rows[0]), 'delete');
+      return true;
+    });
   }
   const docs = memDocuments.get(collectionId);
   const cur = docs?.get(id);
@@ -581,7 +855,9 @@ export async function deleteDocumentRec(
   if (opts.ifVersion !== undefined && cur.version !== opts.ifVersion) {
     throw new StoreError('version_conflict', `document version is ${cur.version}, expected ${opts.ifVersion}`);
   }
-  return !!docs!.delete(id);
+  const ok = !!docs!.delete(id);
+  if (ok) await enqueueOutbox(null, collectionId, cur, 'delete');
+  return ok;
 }
 
 export async function incrementDocumentRec(
@@ -625,14 +901,18 @@ export async function incrementDocumentRec(
           data: next,
           version: 1,
         }).returning();
-        return rowToDocument(rows[0]);
+        const doc = rowToDocument(rows[0]);
+        await enqueueOutbox(tx, collectionId, doc, 'create');
+        return doc;
       }
       const rows = await tx.update(baseDocuments).set({
         data: next,
         version: prev.version + 1,
         updatedAt: new Date(),
       }).where(and(eq(baseDocuments.collectionId, collectionId), eq(baseDocuments.id, id))).returning();
-      return rowToDocument(rows[0]);
+      const doc = rowToDocument(rows[0]);
+      await enqueueOutbox(tx, collectionId, doc, 'update');
+      return doc;
     });
   }
   const docs = memDocuments.get(collectionId) || new Map<string, StoredDocument>();
@@ -651,6 +931,7 @@ export async function incrementDocumentRec(
     : { collection_id: collectionId, id, data, version: 1, created_at: nowIso(), updated_at: nowIso() };
   memDocuments.set(collectionId, docs);
   docs.set(id, rec);
+  await enqueueOutbox(null, collectionId, rec, cur ? 'update' : 'create');
   return cloneJson(rec);
 }
 
@@ -722,4 +1003,5 @@ export async function vectorSearchRec(
 export function __clearBaseMem(): void {
   memCollections.clear();
   memDocuments.clear();
+  memOutbox.length = 0;
 }

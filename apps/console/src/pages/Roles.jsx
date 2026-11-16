@@ -11,13 +11,15 @@ import { Btn, Card, Empty, Err, Field, InlineLoader, Input, Modal, PageTitle, Ta
 import { ScopeBar, useScope } from '../components/Scope.jsx';
 
 export default function Roles() {
-  const { headers } = useAuth();
+  const { headers, auth } = useAuth();
+  const canAdmin = !!auth?.user?.is_org_admin;
   const scope = useScope();
   const [rows, setRows] = useState([]);
   const [err, setErr] = useState(null);
   const [loaded, setLoaded] = useState(false);
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [formErr, setFormErr] = useState(null);
   const [deleting, setDeleting] = useState(null);
   const [slug, setSlug] = useState('');
 
@@ -51,6 +53,7 @@ export default function Roles() {
     e.preventDefault();
     if (busy) return;
     setBusy(true);
+    setFormErr(null);
     setErr(null);
     try {
       await api.createRole(scope.accountId, slug, headers);
@@ -58,7 +61,7 @@ export default function Roles() {
       setSlug('');
       load();
     } catch (ex) {
-      setErr(ex);
+      setFormErr(ex);
     } finally {
       setBusy(false);
     }
@@ -88,7 +91,7 @@ export default function Roles() {
   // Sequence guard: rapid expand A→B must not let A's slow response
   // overwrite B's list (same pattern as Scope provider).
   const attSeq = useRef(0);
-  // In-flight detach key (`roleId:policyId`) — per-item busy so concurrent
+  // In-flight detach key (`roleId:policyId`), per-item busy so concurrent
   // detaches on other rows stay enabled; double-clicks on one button block.
   const [detaching, setDetaching] = useState(null);
 
@@ -161,15 +164,15 @@ export default function Roles() {
 
   return (
     <>
-      <PageTitle title="Roles" sub="Assigned to users, policies attached (like AWS IAM roles)" right={<Btn onClick={() => setOpen(true)}>+ New</Btn>} />
+      <PageTitle title="Roles" sub="Assigned to users, policies attached (like AWS IAM roles)" right={canAdmin ? <Btn onClick={() => { setFormErr(null); setOpen(true); }}>+ New</Btn> : undefined} />
       <Err e={err} />
       <ScopeBar scope={scope} />
       {scope.accountId && rows.length > 0 && policies.length > 0 && (
         <Card className="mb-4">
-          <form onSubmit={doAttach} className="flex flex-wrap items-end gap-2">
+          <form onSubmit={doAttach} className="flex flex-wrap items-end gap-2 [&>label]:mb-0">
             <Field label="Role">
               <select value={attachRole} onChange={(e) => setAttachRole(e.target.value)} className="px-3 py-2 rounded-2xl border border-slate-200 text-sm bg-white outline-none">
-                <option value="">— pick —</option>
+                <option value="">Pick…</option>
                 {rows.map((r) => (
                   <option key={r.id} value={r.id}>{r.slug}</option>
                 ))}
@@ -177,7 +180,7 @@ export default function Roles() {
             </Field>
             <Field label="Policy">
               <select value={attachPolicy} onChange={(e) => setAttachPolicy(e.target.value)} className="px-3 py-2 rounded-2xl border border-slate-200 text-sm bg-white outline-none">
-                <option value="">— pick —</option>
+                <option value="">Pick…</option>
                 {policies.map((p) => (
                   <option key={p.id} value={p.id}>{p.slug}</option>
                 ))}
@@ -240,8 +243,8 @@ export default function Roles() {
         )}
       </Card>
       {open && (
-        <Modal title="New role" onClose={() => setOpen(false)}>
-          <form onSubmit={create}>
+        <Modal title="New role" onClose={() => { setOpen(false); setFormErr(null); }}>
+          <form onSubmit={create}><Err e={formErr} />
             <Field label="Slug">
               <Input value={slug} onChange={(e) => setSlug(e.target.value)} placeholder="etl-runner" />
             </Field>

@@ -317,3 +317,66 @@ describe('synapseone cli offline', () => {
     }
   });
 });
+
+describe('synapseone cli mfa', () => {
+  it('mfa subcommands hit the MFA routes', async () => {
+    const cases = [
+      [['mfa'], 'GET', '/v1/auth/mfa', null],
+      [['mfa', 'setup'], 'POST', '/v1/auth/mfa/totp/setup', {}],
+      [['mfa', 'enable', '111111', '--json'], 'POST', '/v1/auth/mfa/totp/enable', { code: '111111' }],
+      [['mfa', 'recovery-codes', '222222'], 'POST', '/v1/auth/mfa/recovery-codes', { code: '222222' }],
+      [['mfa', 'disable', '--recovery-code', 'abcd-efgh'], 'POST', '/v1/auth/mfa/disable', { recoveryCode: 'abcd-efgh' }],
+      [['mfa', 'reset', 'u1'], 'DELETE', '/v1/users/u1/mfa', null],
+      [['mfa', 'unlock', 'u1'], 'POST', '/v1/users/u1/unlock', {}],
+    ];
+    for (const [args, method, p, body] of cases) {
+      const r = await run('--base', stubBase, '--token', 'T', ...args);
+      assert.equal(r.code, 0, `${args.join(' ')}: ${r.stderr}`);
+      assert.deepEqual([last.method, last.path, last.body], [method, p, body], args.join(' '));
+    }
+    const bad = await run('--base', stubBase, '--token', 'T', 'mfa', 'disable');
+    assert.notEqual(bad.code, 0, 'disable needs a code');
+  });
+
+  it('login finishes the MFA step with --code', async () => {
+    const calls = [];
+    const gw = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', (c) => (body += c));
+      req.on('end', () => {
+        calls.push({ path: req.url, body: body ? JSON.parse(body) : null });
+        res.setHeader('Content-Type', 'application/json');
+        if (req.url === '/v1/auth/login') {
+          res.statusCode = 401;
+          res.end(JSON.stringify({ error: 'mfa_required', mfaToken: 'challenge-1' }));
+        } else {
+          res.end(JSON.stringify({ accessToken: 'A', refreshToken: 'R', user: { email: 'a@b.c' } }));
+        }
+      });
+    });
+    await new Promise((resolve) => gw.listen(0, '127.0.0.1', resolve));
+    const base = `http://127.0.0.1:${gw.address().port}`;
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-home-'));
+    const runHome = (...args) =>
+      new Promise((resolve) => {
+        execFile(process.execPath, [BIN, ...args], { timeout: 15000, env: { ...process.env, HOME: home, USERPROFILE: home } }, (err, stdout, stderr) => {
+          resolve({ code: err ? err.code || 1 : 0, stdout: String(stdout), stderr: String(stderr) });
+        });
+      });
+    try {
+      const noCode = await runHome('--base', base, 'login', '--email', 'a@b.c', '--password', 'pw');
+      assert.notEqual(noCode.code, 0);
+      assert.match(noCode.stderr, /uses MFA/);
+
+      const ok = await runHome('--base', base, 'login', '--email', 'a@b.c', '--password', 'pw', '--code', '123456');
+      assert.equal(ok.code, 0, ok.stderr);
+      assert.deepEqual(calls[calls.length - 1], { path: '/v1/auth/mfa/verify', body: { mfaToken: 'challenge-1', code: '123456' } });
+      assert.equal(calls[calls.length - 2].body.password, 'pw');
+      const saved = JSON.parse(fs.readFileSync(path.join(home, '.synapseone', 'config.json'), 'utf8'));
+      assert.equal(saved.token, 'A');
+    } finally {
+      await new Promise((resolve) => gw.close(resolve));
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});

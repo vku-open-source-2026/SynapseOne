@@ -9,6 +9,7 @@ import cors from 'cors';
 import morgan from 'morgan';
 import { createProxyMiddleware } from 'http-proxy-middleware';
 import jwt from 'jsonwebtoken';
+import { createHash } from 'crypto';
 import fs from 'fs';
 import yaml from 'js-yaml';
 import client from 'prom-client';
@@ -22,6 +23,7 @@ import {
   startUsageTelemetry,
 } from './usage';
 import { scopeAllows } from './scopes';
+import { authzMiddleware, registerAuthzMetrics, authzMode, actionFor, type ActionOverride } from './authz';
 
 dotenv.config();
 
@@ -76,6 +78,7 @@ const httpCounter = new client.Counter({
   labelNames: ['route', 'status'],
   registers: [register],
 });
+registerAuthzMetrics(register);
 
 export interface RouteRule {
   path: string;
@@ -84,6 +87,11 @@ export interface RouteRule {
   /** Per-route proxy timeout (ms). LLM-backed routes legitimately need longer
    *  than the 30s default (retried model calls); unset = global default. */
   timeoutMs?: number;
+  /** Service namespace for central authorization (`<service>:<Verb>` actions,
+   *  `arn:synapseone:...:<service>:...` resources). Unset = not policy-checked. */
+  service?: string;
+  /** Per-path action overrides for RPC-style endpoints (POST query → Read). */
+  actions?: ActionOverride[];
   /** Compiled matcher cache (set by loadRoutes / createApp validation). */
   compiled?: { match: (pathname: string) => boolean; specificity: number };
 }
@@ -166,18 +174,119 @@ function loadRoutes(): RouteRule[] {
   ];
 }
 
+const SESSION_CACHE = new Map<string, { exp: number; status: number; error?: string }>();
+function jwtCacheTtlMs(): number {
+  const n = Number(process.env.GATEWAY_SESSION_CACHE_MS ?? 2000);
+  return Number.isFinite(n) ? Math.min(Math.max(Math.floor(n), 0), 30_000) : 2000;
+}
+
+/** Ask IAM (the authority for users.auth_version + active state) whether this
+ *  exact access token is still valid. Positive and negative results are cached
+ *  for a very short window to avoid an IAM round-trip per request. IAM/network
+ *  failures fail closed for routes that require authentication. */
+export function clearSessionCache(): void { SESSION_CACHE.clear(); }
+export async function validateJwtSession(token: string, decoded: any, iamBase = IAM_SERVICE_URL): Promise<{ status: number; error: string } | null> {
+  if (!decoded || decoded.kind === 'platform-step-up') return null;
+  // Execution grants are verified by verifyExecGrant on every request (never
+  // cached): completion/release/runner revocation must invalidate immediately.
+  if (decoded.kind === 'exec-delegated') return null;
+  if (!decoded.sub) return { status: 401, error: 'invalid_token' };
+  const ttl = jwtCacheTtlMs();
+  const key = createHash('sha256').update(token).digest('hex');
+  const now = Date.now();
+  const hit = SESSION_CACHE.get(key);
+  if (hit && hit.exp > now) return hit.status === 200 ? null : { status: hit.status, error: hit.error || 'token_revoked' };
+  if (SESSION_CACHE.size > 20_000) SESSION_CACHE.clear();
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 2500);
+  try {
+    const r = await fetch(`${iamBase.replace(/\/$/, '')}/v1/auth/verify`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${token}` },
+      signal: ctl.signal,
+    });
+    clearTimeout(timer);
+    if (r.ok) {
+      if (ttl > 0) SESSION_CACHE.set(key, { exp: Date.now() + ttl, status: 200 });
+      return null;
+    }
+    if (r.status === 401) {
+      if (ttl > 0) SESSION_CACHE.set(key, { exp: Date.now() + ttl, status: 401, error: 'token_revoked' });
+      return { status: 401, error: 'token_revoked' };
+    }
+    if (r.status === 403) {
+      let error = 'org_suspended';
+      try { const body: any = await r.json(); if (body?.error) error = String(body.error); } catch { /* default */ }
+      if (ttl > 0) SESSION_CACHE.set(key, { exp: Date.now() + ttl, status: 403, error });
+      return { status: 403, error };
+    }
+    // IAM errors are never treated as "still valid".
+    if (ttl > 0) SESSION_CACHE.set(key, { exp: Date.now() + 500, status: 503, error: 'iam_unavailable' });
+    return { status: 503, error: 'iam_unavailable' };
+  } catch {
+    clearTimeout(timer);
+    if (ttl > 0) SESSION_CACHE.set(key, { exp: Date.now() + 500, status: 503, error: 'iam_unavailable' });
+    return { status: 503, error: 'iam_unavailable' };
+  }
+}
+
+/** Verify a per-execution delegated grant against IAM on every request.
+ *  IAM owns the execution_delegations row and must return 401/403 once the
+ *  execution completes/releases or the runner is revoked. No cache. */
+export async function verifyExecGrant(token: string, iamBase = IAM_SERVICE_URL): Promise<{ status: number; error: string } | null> {
+  if (!token) return { status: 401, error: 'invalid_token' };
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 2500);
+  try {
+    const r = await fetch(`${iamBase.replace(/\/$/, '')}/v1/auth/verify`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${token}` },
+      signal: ctl.signal,
+    });
+    clearTimeout(timer);
+    if (r.ok) {
+      // IAM must positively confirm the grant. Missing/malformed `valid`, or
+      // anything other than `true`, fails closed.
+      let body: any = null;
+      let parsed = false;
+      try { body = await r.json(); parsed = true; } catch { /* malformed */ }
+      if (parsed && body && body.valid === true) return null;
+      if (parsed && body && body.valid === false) return { status: 401, error: 'execution_grant_inactive' };
+      return { status: 401, error: 'execution_grant_invalid' };
+    }
+    if (r.status === 401) return { status: 401, error: 'execution_grant_inactive' };
+    if (r.status === 403) {
+      let error = 'execution_grant_forbidden';
+      try { const body: any = await r.json(); if (body?.error) error = String(body.error); } catch { /* default */ }
+      return { status: 403, error };
+    }
+    return { status: 503, error: 'iam_unavailable' };
+  } catch {
+    clearTimeout(timer);
+    return { status: 503, error: 'iam_unavailable' };
+  }
+}
+
 function authMiddleware(mode: RouteRule['auth']) {
-  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  return (async (req: express.Request, res: express.Response, next: express.NextFunction) => {
     if (mode === 'none') {
-      // Public routes are anonymous, BUT a Bearer token that verifies is
-      // honoured as optional auth: LDS same-tenant restricted queries and
-      // tenant tools reuse the same export paths. An invalid/absent token
-      // stays anonymous (the upstream sees the anon marker) — public flows
-      // can never break on a stray Authorization header.
+      // Public routes are anonymous, BUT a valid Bearer JWT or API key is
+      // honoured as optional auth: public read-only MCP tools and LDS
+      // exports share the same endpoint with authenticated tenant calls.
+      // An invalid/absent credential stays anonymous.
       const h = String(Array.isArray(req.headers.authorization) ? req.headers.authorization[0] : (req.headers.authorization || ''));
-      if (h.startsWith('Bearer ')) {
+      const bearer = h.startsWith('Bearer ') ? h.slice(7) : '';
+      if (bearer) {
         try {
-          const decoded: any = jwt.verify(h.slice(7), JWT_SECRET, { issuer: JWT_ISSUERS, algorithms: ['HS256'] });
+          const decoded: any = jwt.verify(bearer, JWT_SECRET, { issuer: JWT_ISSUERS, algorithms: ['HS256'] });
+          if (decoded.kind === 'platform-step-up') {
+            (req as any).synapseoneError = 'invalid_token';
+            return res.status(401).json({ error: 'invalid_token', message: 'step-up token is not an access token' });
+          }
+          if (await validateJwtSession(bearer, decoded)) {
+            // Optional auth: a revoked token falls back to anonymous, never tenant access.
+            return next();
+          }
           (req as any).principal = {
             type: 'jwt',
             kind: decoded.kind || 'user',
@@ -185,20 +294,61 @@ function authMiddleware(mode: RouteRule['auth']) {
             org: decoded.org,
             account: decoded.account,
             scopes: decoded.scopes || [],
+            ...(decoded.jti ? { jti: String(decoded.jti) } : {}),
+            ...(decoded.exec ? { exec: String(decoded.exec) } : {}),
+            ...(decoded.runner ? { runnerId: String(decoded.runner) } : {}),
+            ...(decoded.instance ? { instance: String(decoded.instance) } : {}),
+            ...(decoded.act?.sub ? { actSub: String(decoded.act.sub) } : {}),
           };
-        } catch { /* anonymous */ }
+          return next();
+        } catch { /* try API key below */ }
+      }
+      const rawKey = req.headers['x-api-key'] as string | string[] | undefined;
+      const apiKey = Array.isArray(rawKey) ? (rawKey[0] || '') : (rawKey || '') || bearer;
+      if (apiKey && isVerifyApiKeyEnabled()) {
+        verifyApiKeyUpstream(apiKey).then(
+          (info) => {
+            if (info) {
+              (req as any).principal = {
+                type: 'apikey',
+                kind: info.kind || 'apikey',
+                account: info.account_id,
+                org: (info as any).org_id,
+                scopes: info.scopes,
+                keyId: info.id,
+                owner: info.user_id,
+                ...(info.runner_id ? { runnerId: info.runner_id } : {}),
+              };
+            }
+            next();
+          },
+          () => next(),
+        );
+        return;
       }
       return next();
     }
     const h = String(Array.isArray(req.headers.authorization) ? req.headers.authorization[0] : (req.headers.authorization || ''));
     const hasBearer = h.startsWith('Bearer ');
     const apiKeyRaw = req.headers['x-api-key'] as string | string[] | undefined;
-    const apiKey = Array.isArray(apiKeyRaw) ? (apiKeyRaw[0] || '') : (apiKeyRaw || '');
+    let apiKey = Array.isArray(apiKeyRaw) ? (apiKeyRaw[0] || '') : (apiKeyRaw || '');
+    // MCP/CLI clients often only support an Authorization Bearer header.
+    // For `either` routes, allow `Bearer <api-key>` as an API-key fallback.
+    if (!apiKey && hasBearer && mode === 'either') apiKey = h.slice(7);
     if (mode === 'jwt' || mode === 'either') {
       if (hasBearer) {
         const token = h.slice(7);
         try {
           const decoded: any = jwt.verify(token, JWT_SECRET, { issuer: JWT_ISSUERS, algorithms: ['HS256'] });
+          if (decoded.kind === 'platform-step-up') {
+            (req as any).synapseoneError = 'invalid_token';
+            return res.status(401).json({ error: 'invalid_token', message: 'step-up token is not an access token' });
+          }
+          const rejected = await validateJwtSession(token, decoded);
+          if (rejected) {
+            (req as any).synapseoneError = rejected.error;
+            return res.status(rejected.status).json({ error: rejected.error, message: rejected.error === 'iam_unavailable' ? 'IAM session check unavailable' : rejected.error === 'org_suspended' ? 'This organization is suspended.' : 'This session was revoked. Sign in again.' });
+          }
           (req as any).principal = {
             type: 'jwt',
             kind: decoded.kind || 'user',
@@ -206,6 +356,11 @@ function authMiddleware(mode: RouteRule['auth']) {
             org: decoded.org,
             account: decoded.account,
             scopes: decoded.scopes || [],
+            ...(decoded.jti ? { jti: String(decoded.jti) } : {}),
+            ...(decoded.exec ? { exec: String(decoded.exec) } : {}),
+            ...(decoded.runner ? { runnerId: String(decoded.runner) } : {}),
+            ...(decoded.instance ? { instance: String(decoded.instance) } : {}),
+            ...(decoded.act?.sub ? { actSub: String(decoded.act.sub) } : {}),
           };
           return next();
         } catch (e) {
@@ -228,9 +383,13 @@ function authMiddleware(mode: RouteRule['auth']) {
               }
               (req as any).principal = {
                 type: 'apikey',
+                kind: info.kind || 'apikey',
                 account: info.account_id,
                 org: (info as any).org_id,
                 scopes: info.scopes,
+                keyId: info.id,
+                owner: info.user_id,
+                ...(info.runner_id ? { runnerId: info.runner_id } : {}),
               };
               return next();
             },
@@ -255,14 +414,22 @@ function authMiddleware(mode: RouteRule['auth']) {
     }
     (req as any).synapseoneError = 'unauthorized';
     return res.status(401).json({ error: 'unauthorized', message: 'Provide Bearer JWT and/or X-API-Key' });
-  };
+  }) as any;
 }
 
 export async function verifyApiKeyUpstream(
   apiKey: string,
   iamBase?: string,
   internalSecret: string | undefined = INTERNAL_SECRET,
-): Promise<{ account_id: string; org_id?: string; scopes: string[] } | null> {
+): Promise<{
+  id?: string;
+  account_id?: string;
+  org_id?: string;
+  user_id?: string | null;
+  scopes: string[];
+  kind?: string;
+  runner_id?: string;
+} | null> {
   const iam = (iamBase || process.env.IAM_SERVICE_URL || 'http://iam:4001').replace(/\/$/, '');
   const ctl = new AbortController();
   const to = setTimeout(() => ctl.abort(), 5000);
@@ -283,7 +450,15 @@ export async function verifyApiKeyUpstream(
     if (!r.ok) return null;
     const j: any = await r.json();
     if (!j.valid) return null;
-    return { account_id: j.account_id, ...(j.org_id ? { org_id: j.org_id } : {}), scopes: j.scopes || [] };
+    return {
+      id: j.id,
+      ...(j.account_id ? { account_id: j.account_id } : {}),
+      ...(j.org_id ? { org_id: j.org_id } : {}),
+      user_id: j.user_id ?? null,
+      scopes: j.scopes || [],
+      ...(j.kind ? { kind: j.kind } : {}),
+      ...(j.runner_id ? { runner_id: j.runner_id } : {}),
+    };
   } catch {
     clearTimeout(to);
     throw new Error('iam_unreachable');
@@ -316,6 +491,117 @@ export function parseTrustProxy(raw: string | undefined): boolean | number | str
   return v;
 }
 
+function pathUnder(pathname: string, prefix: string): boolean {
+  return pathname === prefix || pathname.startsWith(`${prefix}/`);
+}
+
+/** Decode one percent-encoding layer and resolve `.`/`..`/duplicate slashes.
+ *  Used only for policy; forwarding keeps the original URI. Returns null for
+ *  malformed/ambiguous paths (invalid encoding, residual `%` after one decode,
+ *  backslashes, controls, or an escape above the root). */
+export function canonicalPolicyPath(pathname: string): string | null {
+  const raw = String(pathname || '');
+  if (!raw.startsWith('/')) return null;
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+  if (decoded.includes('%') || decoded.includes('\\')) return null;
+  if (/[\u0000-\u001f\u007f]/.test(decoded)) return null;
+  const segments: string[] = [];
+  for (const segment of decoded.split('/')) {
+    if (segment === '' || segment === '.') continue;
+    if (segment === '..') {
+      if (!segments.length) return null;
+      segments.pop();
+      continue;
+    }
+    segments.push(segment);
+  }
+  return `/${segments.join('/')}`;
+}
+
+/** Platform runner keys are system compute, not tenant credentials. They may
+ *  only reach the runner job protocol, runner bootstrap/heartbeat, the
+ *  platform-namespaced queue, and key verification. Everything else is a hard
+ *  403 at the edge, even if the key somehow holds a broader scope. Encoded or
+ *  non-canonical spellings are refused so gateway/upstream prefix matching
+ *  cannot diverge. */
+export function platformRunnerPathAllowed(pathname: string): boolean {
+  const p = String(pathname || '');
+  const canonical = canonicalPolicyPath(p);
+  if (!canonical || canonical !== p) return false;
+  if (p === '/v1/auth/verify') return true;
+  return ['/v1/runner/', '/v1/workflow-runners/', '/v1/queue/']
+    .some((prefix) => p.startsWith(prefix));
+}
+
+/** Data-plane services an exec-delegated token may call. Everything else
+ *  (IAM, keys, credentials, workflow definitions/executions/runners, platform
+ *  admin, audit/usage, secrets, MCP) is denied. The normal scope check still
+ *  runs afterwards. */
+const EXEC_DELEGATED_DATA_PLANE_PREFIXES = [
+  '/v1/base',
+  '/v1/search',
+  '/v1/lds',
+  '/v1/faststore',
+  '/v1/ocs',
+  '/v1/storage',
+  '/v1/warehouse',
+  '/v1/stream',
+  '/v1/notifications',
+  '/v1/inference',
+];
+
+const EXEC_DELEGATED_SCOPE_FAMILIES = [
+  'base', 'search', 'lds', 'faststore', 'ocs', 'storage', 'warehouse',
+  'stream', 'notifications', 'inference', 'queue',
+];
+
+/** Execution grants may carry data-plane scope families only; universal (`*`,
+ *  `*:read`) and control-plane families are refused. */
+export function execDelegatedScopesAllowed(scopes: string[]): boolean {
+  if (!Array.isArray(scopes) || scopes.length === 0) return false;
+  return scopes.every((scope) => {
+    const family = String(scope || '').split(':')[0];
+    // Universal scopes are accepted for compatibility with the current mint,
+    // but the path allowlist still confines them to data-plane routes.
+    if (family === '*') return true;
+    return family !== '' && EXEC_DELEGATED_SCOPE_FAMILIES.includes(family);
+  });
+}
+
+function servicePrefix(pathname: string): string | null {
+  return EXEC_DELEGATED_DATA_PLANE_PREFIXES.find((prefix) => pathUnder(pathname, prefix)) || null;
+}
+
+/** Policy for `kind=exec-delegated` JWTs. Raw and canonical paths must resolve
+ *  to the same data-plane service; queue access is limited to message ops. */
+export function execDelegatedRequestAllowed(method: string, rawPath: string, canonicalPath: string): boolean {
+  if (!['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(String(method || '').toUpperCase())) {
+    return false;
+  }
+  const rawService = servicePrefix(rawPath);
+  const canonicalService = servicePrefix(canonicalPath);
+  if (rawService && canonicalService) return rawService === canonicalService;
+  if (pathUnder(rawPath, '/v1/inference-jobs') && pathUnder(canonicalPath, '/v1/inference-jobs')) {
+    return true;
+  }
+  if (String(method || '').toUpperCase() !== 'POST') return false;
+  if (!pathUnder(rawPath, '/v1/queue/queues') || !pathUnder(canonicalPath, '/v1/queue/queues')) {
+    return false;
+  }
+  const rest = canonicalPath.slice('/v1/queue/queues/'.length);
+  const slash = rest.indexOf('/');
+  if (slash <= 0) return false;
+  const queue = rest.slice(0, slash);
+  const action = rest.slice(slash + 1);
+  if (!queue || queue.includes('/')) return false;
+  return ['messages', 'consume', 'ack', 'nack', 'heartbeat'].includes(action);
+}
+
 /** Xóa x-synapseone-* do client gửi (chống spoof), ghi lại từ principal đã verify.
  *  Auth:none routes: đánh dấu `x-synapseone-anon: 1` để upstream phân biệt
  *  khách ẩn danh công khai (public LDS export) với platform context nội bộ —
@@ -328,6 +614,7 @@ export function propagatePrincipal(req: express.Request): void {
   delete h['x-synapseone-account'];
   delete h['x-synapseone-scopes'];
   delete h['x-synapseone-kind'];
+  delete h['x-synapseone-runner'];
   delete h['x-synapseone-internal'];
   delete h['x-synapseone-anon'];
   // Never let a client smuggle the legacy prefix past the new canonical names.
@@ -348,11 +635,19 @@ export function propagatePrincipal(req: express.Request): void {
     if (p.org) h['x-synapseone-org'] = String(p.org);
     if (p.account) h['x-synapseone-account'] = String(p.account);
     if (Array.isArray(p.scopes) && p.scopes.length) h['x-synapseone-scopes'] = p.scopes.join(',');
-    h['x-synapseone-kind'] = 'user';
+    h['x-synapseone-kind'] = String(p.kind || 'user');
   } else if (p?.type === 'apikey') {
-    h['x-synapseone-kind'] = 'apikey';
+    // Platform runner keys are machine credentials with no tenant. Keep the
+    // distinct kind so workflow/queue can bind them to the runner protocol.
+    h['x-synapseone-kind'] = String((p as any).kind || 'apikey');
     if ((p as any).org) h['x-synapseone-org'] = String((p as any).org);
     if ((p as any).account) h['x-synapseone-account'] = String((p as any).account);
+    if ((p as any).runnerId) h['x-synapseone-runner'] = String((p as any).runnerId);
+    // A user-bound API key (verified IAM `user_id`) acts for that user: stamp the
+    // owner so workflow/audit/owner-only policies see the real user while the
+    // credential keeps `kind=apikey`. Account-level keys have no owner and stay
+    // pure machines. Client-supplied user headers were deleted above.
+    if ((p as any).owner) h['x-synapseone-user'] = String((p as any).owner);
     if (Array.isArray((p as any).scopes) && (p as any).scopes.length) {
       h['x-synapseone-scopes'] = (p as any).scopes.join(',');
     }
@@ -364,7 +659,7 @@ export function propagatePrincipal(req: express.Request): void {
   // Mirror canonical headers onto the legacy prefix so a rolling deploy can
   // keep older upstream images working. Values are set only after the strip
   // above, so this can never amplify client-supplied identity.
-  for (const name of ['user', 'org', 'account', 'scopes', 'kind', 'internal', 'anon']) {
+  for (const name of ['user', 'org', 'account', 'scopes', 'kind', 'runner', 'internal', 'anon']) {
     const value = h[`x-synapseone-${name}`];
     if (value !== undefined) h[`x-synapsedx-${name}`] = value;
   }
@@ -373,6 +668,12 @@ export function propagatePrincipal(req: express.Request): void {
 export function createApp(): express.Express {
   if (process.env.NODE_ENV === 'production' && !isVerifyApiKeyEnabled()) {
     throw new Error('[gateway] GATEWAY_VERIFY_APIKEY=false is forbidden in production (auth bypass). Set true.');
+  }
+  if (process.env.NODE_ENV === 'production' && process.env.AUTHZ_MODE_REQUIRED === 'true' && authzMode() === 'off') {
+    throw new Error('[gateway] AUTHZ_MODE=off is forbidden when AUTHZ_MODE_REQUIRED=true. Set audit or enforce.');
+  }
+  if (process.env.NODE_ENV === 'production' && authzMode() === 'off') {
+    console.warn('[gateway][security] AUTHZ_MODE=off — central policy enforcement is disabled. Set audit/enforce before exposing multi-tenant administration.');
   }
   const app = express();
   app.disable('x-powered-by');
@@ -562,16 +863,18 @@ export function createApp(): express.Express {
     const queueUrl = process.env.QUEUE_SERVICE_URL || 'http://queue:4007';
     const streamUrl = process.env.STREAM_SERVICE_URL;
     const inferenceUrl = process.env.INFERENCE_SERVICE_URL;
-    const storageUrl = process.env.STORAGE_SERVICE_URL;
+    const ocsUrl = process.env.OCS_SERVICE_URL || process.env.STORAGE_SERVICE_URL;
     const notificationsUrl = process.env.NOTIFICATIONS_SERVICE_URL;
+    const warehouseUrl = process.env.WAREHOUSE_SERVICE_URL;
     const probeList = [
       probe('iam', iamUrl), probe('workflow', wfUrl), probe('ai', aiUrl), probe('lds', ldsUrl),
       probe('base', baseUrl), probe('faststore', faststoreUrl), probe('queue', queueUrl),
     ];
     if (streamUrl) probeList.push(probe('stream', streamUrl));
+    if (warehouseUrl) probeList.push(probe('warehouse', warehouseUrl));
     // Inference is a routed dependency; probe it whenever its URL is configured.
     if (inferenceUrl) probeList.push(probe('inference', inferenceUrl));
-    if (storageUrl) probeList.push(probe('storage', storageUrl));
+    if (ocsUrl) probeList.push(probe('ocs', ocsUrl));
     if (notificationsUrl) probeList.push(probe('notifications', notificationsUrl));
     const upstreams = await Promise.all(probeList);
     const allOk = upstreams.every((u) => u.ok);
@@ -603,7 +906,17 @@ export function createApp(): express.Express {
     if (r.timeoutMs !== undefined && (!Number.isInteger(r.timeoutMs) || r.timeoutMs < 1000 || r.timeoutMs > 300000)) {
       throw new Error(`[gateway] invalid timeoutMs '${r.timeoutMs}' for path '${r.path}' (want 1000..300000)`);
     }
+    if (r.service !== undefined && !/^[a-z][a-z0-9-]{0,31}$/.test(String(r.service))) {
+      throw new Error(`[gateway] invalid service '${r.service}' for path '${r.path}'`);
+    }
+    for (const o of r.actions || []) {
+      if (!o || typeof o.path !== 'string' || !o.path.startsWith('/') || typeof o.action !== 'string' || !/^[a-z][a-z0-9-]*:[A-Za-z]+$/.test(o.action)) {
+        throw new Error(`[gateway] invalid action override on '${r.path}': ${JSON.stringify(o)}`);
+      }
+    }
   }
+  const authz = authzMiddleware({ iamBase: IAM_SERVICE_URL, internalSecret: INTERNAL_SECRET });
+  console.log(`[gateway] central authorization mode: ${authzMode()}`);
   console.log(`[gateway] loaded ${routes.length} routes: ${routes.map((r) => `${r.path}->${expandEnv(r.target)}[${r.auth}]`).join(', ')}`);
 
   app.get('/', (_req, res) =>
@@ -622,21 +935,125 @@ export function createApp(): express.Express {
   // Sau khi xác thực, gateway XÓA header x-synapseone-* do client gửi (chống spoof) và
   // GHI header từ principal đã verify để upstream tin dùng mà không cần re-verify JWT.
   // Auth endpoints (/v1/auth/*) đi thẳng nhưng vẫn giới hạn brute-force.
-  app.use('/v1/auth/' as any, edgeLimit(120) as any);
+  // /v1/auth/verify is a server-to-server hot path used by Tier-2 for every
+  // request; it is not a password attempt and must not be throttled by the
+  // brute-force bucket.
+  app.use('/v1/auth/' as any, ((req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (req.originalUrl.split('?')[0] === '/v1/auth/verify') return next();
+    return edgeLimit(120)(req, res, next);
+  }) as any);
+  app.use('/v1/platform/' as any, edgeLimit(120) as any);
   app.use(((req: express.Request, res: express.Response, next: express.NextFunction) => {
     const urlPath = req.path; // pathname, không query
     if (urlPath === '/' || urlPath === '/health' || urlPath === '/metrics' || urlPath === '/ready') return next();
+    // Service-to-service endpoints: never reachable through the public gateway,
+    // even with a valid tenant credential. Internal callers hit the services
+    // directly over the Docker network.
+    const INTERNAL_ONLY_PATHS = new Set(['/v1/audit/ingest', '/v1/usage/ingest', '/v1/keys/verify']);
+    if (INTERNAL_ONLY_PATHS.has(urlPath)) {
+      return res.status(404).json({ error: 'not_found', message: 'No gateway route matched' });
+    }
     const route = findRoute(routes, urlPath);
     if (!route) return res.status(404).json({ error: 'not_found', message: 'No gateway route matched' });
     (req as any).synapseoneRoute = route;
     httpCounter.inc({ route: route.path, status: 'incoming' });
-    return authMiddleware(route.auth)(req, res, (err?: any) => {
+    return authMiddleware(route.auth)(req, res, async (err?: any) => {
       if (err) return next(err);
       // Per-route authorization (#23): the credential must carry a scope that
-      // covers this service+action. User JWTs hold `*`; API keys and delegated
-      // tokens are narrow, so a read-only key cannot perform writes.
+      // covers this service+action. Derive the service from the route table
+      // (not a parallel prefix list) so every route, including RPC-style POSTs
+      // with action overrides, is enforced consistently.
       const principal = (req as any).principal;
-      if (principal && route.auth !== 'none' && !scopeAllows(principal.scopes || [], req.path, req.method)) {
+      const isPlatformPath = req.path === '/v1/platform' || req.path.startsWith('/v1/platform/');
+      const isPlatformSession = req.path === '/v1/platform/session';
+      if (isPlatformPath && !isPlatformSession && principal?.kind !== 'platform-admin') {
+        (req as any).synapseoneError = 'platform_admin_required';
+        return res.status(403).json({ error: 'platform_admin_required', message: 'a platform administrator token is required' });
+      }
+      if (!isPlatformPath && principal?.kind === 'platform-admin') {
+        (req as any).synapseoneError = 'platform_token_tenant_forbidden';
+        return res.status(403).json({ error: 'platform_token_tenant_forbidden', message: 'platform tokens cannot call tenant APIs' });
+      }
+      // Legacy 1-hour platform-runner delegations minted before execution
+      // grants existed are broad user sessions with only
+      // `act.sub=platform-runner:<id>`. They must not survive the upgrade.
+      // Ordinary delegated sessions (other act.sub) keep working.
+      if (principal?.kind === 'delegated' && typeof principal.actSub === 'string'
+          && principal.actSub.startsWith('platform-runner:')) {
+        (req as any).synapseoneError = 'execution_grant_legacy_forbidden';
+        return res.status(401).json({
+          error: 'execution_grant_legacy_forbidden',
+          message: 'legacy platform-runner delegations are retired; re-run the job with an exec-delegated grant',
+        });
+      }
+      // Per-execution delegated grants are data-plane only. The control plane
+      // (IAM/keys/credentials/workflow/admin) is denied even if the minted
+      // scopes are broad, and the grant row is checked against IAM on every
+      // request so completion/release/runner revocation takes effect at once.
+      if (principal?.kind === 'exec-delegated') {
+        const canonical = canonicalPolicyPath(req.path);
+        if (!canonical || !execDelegatedRequestAllowed(req.method, req.path, canonical)) {
+          (req as any).synapseoneError = 'execution_scope_forbidden';
+          return res.status(403).json({
+            error: 'execution_scope_forbidden',
+            message: 'execution grants may only call data-plane dataset, storage, cache, stream, notification and inference APIs',
+          });
+        }
+        const grant = principal as any;
+        if (!execDelegatedScopesAllowed(grant.scopes || [])) {
+          (req as any).synapseoneError = 'execution_scope_forbidden';
+          return res.status(403).json({
+            error: 'execution_scope_forbidden',
+            message: 'execution grants must carry data-plane scopes only',
+          });
+        }
+        if (!grant.jti || !grant.exec || !grant.runnerId || !grant.instance) {
+          (req as any).synapseoneError = 'invalid_token';
+          return res.status(401).json({
+            error: 'invalid_token',
+            message: 'execution grant is missing its execution/runner/instance binding',
+          });
+        }
+        const authHeader = String(Array.isArray(req.headers.authorization) ? req.headers.authorization[0] : (req.headers.authorization || ''));
+        const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+        const rejected = await verifyExecGrant(token);
+        if (rejected) {
+          (req as any).synapseoneError = rejected.error;
+          return res.status(rejected.status).json({
+            error: rejected.error,
+            message: rejected.error === 'iam_unavailable' ? 'IAM grant check unavailable' : 'execution grant is inactive or revoked',
+          });
+        }
+        // Fall through: the normal scope check and central authorization still
+        // apply, so the grant needs the concrete data-plane scope/action.
+      }
+      // System compute credentials are deliberately not tenant policies: the
+      // runner protocol is authorized by workflow-service (runner id + queue +
+      // execution mode), and the queue only sees the platform namespace.
+      if (principal?.kind === 'platform-runner') {
+        if (!platformRunnerPathAllowed(req.path)) {
+          (req as any).synapseoneError = 'platform_runner_path_forbidden';
+          return res.status(403).json({
+            error: 'platform_runner_path_forbidden',
+            message: 'platform runner keys may only call the runner protocol, runner bootstrap and the platform queue',
+          });
+        }
+        propagatePrincipal(req);
+        return next();
+      }
+      // The session exchange is the boundary where a normal user proves platform
+      // administrator status + a fresh second factor. Central tenant-policy
+      // enforcement must not pre-empt it (a tenant admin is not a platform
+      // admin, but IAM owns that decision and writes the denial audit record).
+      if (isPlatformSession) {
+        propagatePrincipal(req);
+        return next();
+      }
+      const scopeAction = route.service ? actionFor(route as any, req.method, req.path) : null;
+      if (principal && route.auth !== 'none' && !scopeAllows(principal.scopes || [], req.path, req.method, {
+        service: route.service,
+        action: scopeAction || undefined,
+      })) {
         (req as any).synapseoneError = 'scope_denied';
         return res.status(403).json({
           error: 'scope_denied',
@@ -657,7 +1074,7 @@ export function createApp(): express.Express {
         }
       }
       propagatePrincipal(req);
-      return next();
+      return authz(req, res, next);
     });
   }) as any);
 

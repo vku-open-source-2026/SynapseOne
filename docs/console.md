@@ -13,7 +13,7 @@ Org/Account switcher, IAM CRUD, authorize simulator, workflows, audit log.
 
 ```bash
 # together with the platform (console on :3000)
-docker compose up -d --build postgres redis s3 iam workflow gateway console
+docker compose up -d --build postgres valkey s3 iam workflow gateway console
 # open http://localhost:3000 → sign in demo@acme.local / org acme
 ```
 
@@ -67,6 +67,11 @@ dangling/duplicate validation blocking Save, true/false edge labels, test-run wi
 sample input + per-node status/input/output + history, activate/deactivate/execute +
 webhook URL + next-run display + executions with status filter and per-node I/O +
 import/export + delete) · Authorize (simulator + live authorize) · Audit Log.
+**Security** (`/security`): turn on two-factor authentication (shows the TOTP secret
+and `otpauth://` link, confirms with a code, then shows 10 recovery codes once),
+replace recovery codes or turn MFA off. **Users** rows also offer *Reset MFA* and
+*Unlock sign-in* for org administrators. When an account has MFA, the Login page asks
+for the authenticator code (or a recovery code) after the email step.
 Public pages: Landing (`/`, install instructions), API Docs (try-it explorer +
 auth-gated AI chatbot bubble), Docs (SDK/CLI snippets), Login, OIDC callback.
 Signed-in users get the sidebar layout on API Docs/Docs too.
@@ -78,3 +83,16 @@ JWTs only carry an `org` claim, so per-account filtering would hide every
 user-session request. A route-level
 `ErrorBoundary` turns render failures into a recovery card (reload/dashboard)
 instead of a white screen.
+
+## Platform Super Admin (`/admin`)
+
+A separate, cross-tenant control plane reuses the same React/Tailwind design
+system but has its own `AdminLayout`, `AdminSidebar`, `AdminTopbar` and
+`PlatformGuard`. It is not linked from the tenant console and requires a user
+JWT plus a fresh TOTP code to obtain a short-lived platform token
+(`kind=platform-admin`). The six modules are Overview, Organizations, Users &
+Access, Service Health, Usage, and Audit & Security, plus owner-only Platform
+Admins. Organization creation, account creation, user actions and admin grants
+require a fresh single-use step-up proof. Platform tokens are rejected on tenant
+APIs; API keys cannot open this console. Invited users activate from `/register`.
+See [`platform-superadmin.md`](platform-superadmin.md).

@@ -55,7 +55,10 @@ type Client struct {
 	Token   string // Bearer JWT (user or service-account token)
 	APIKey  string // X-API-Key
 	Tenant  string // x-synapseone-tenant (platform callers of faststore/queue)
-	HTTP    *http.Client
+	// BaseDatabase scopes SynapseBase calls to /v1/base/databases/{name}.
+	// Empty keeps the legacy flat API (tenant default database).
+	BaseDatabase string
+	HTTP         *http.Client
 	// MaxAttempts is the total number of tries for idempotent requests on
 	// 429/502/503/504 (default 3; 1 disables retries).
 	MaxAttempts int
@@ -105,6 +108,18 @@ func (c *Client) SetAPIKey(k string) { c.APIKey = k }
 // SetTenant sets the x-synapseone-tenant header used by platform callers of
 // Synapse Faststore and SynapseQueue. An empty string clears it.
 func (c *Client) SetTenant(t string) { c.Tenant = t }
+
+// WithBaseDatabase returns a shallow copy whose SynapseBase calls address the
+// named database instead of the legacy tenant default.
+func (c *Client) WithBaseDatabase(name string) *Client {
+	clone := *c
+	clone.BaseDatabase = name
+	return &clone
+}
+
+// SetBaseDatabase scopes subsequent SynapseBase calls to a database namespace.
+// An empty string restores the legacy flat API (tenant default database).
+func (c *Client) SetBaseDatabase(name string) { c.BaseDatabase = name }
 
 func (c *Client) do(method, path string, body any) ([]byte, error) {
 	return c.doWithTimeout(method, path, body, 0)
@@ -1411,6 +1426,116 @@ func (c *Client) ExecuteWorkflow(id string, payload any) (map[string]any, error)
 		payload = map[string]any{}
 	}
 	b, err := c.do("POST", "/v1/workflows/"+pathEscape(id)+"/execute", payload)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ---------- durable human tasks (#44) ----------
+
+// CreateHumanTask creates a durable human task.
+func (c *Client) CreateHumanTask(input map[string]any) (map[string]any, error) {
+	b, err := c.do("POST", "/v1/human-tasks", input)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ListHumanTasks lists tenant-scoped human tasks.
+func (c *Client) ListHumanTasks(query map[string]string) ([]any, error) {
+	values := url.Values{}
+	for k, v := range query {
+		if v != "" {
+			values.Set(k, v)
+		}
+	}
+	path := "/v1/human-tasks"
+	if encoded := values.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	b, err := c.do("GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Items []any `json:"items"`
+	}
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out.Items, nil
+}
+
+// GetHumanTask fetches one task.
+func (c *Client) GetHumanTask(id string) (map[string]any, error) {
+	b, err := c.do("GET", "/v1/human-tasks/"+pathEscape(id), nil)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ClaimHumanTask claims an open task for the caller.
+func (c *Client) ClaimHumanTask(id string) (map[string]any, error) {
+	b, err := c.do("POST", "/v1/human-tasks/"+pathEscape(id)+"/claim", map[string]any{})
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// CompleteHumanTask approves a task and resumes its paused execution.
+func (c *Client) CompleteHumanTask(id string, decision map[string]any, note string) (map[string]any, error) {
+	body := map[string]any{"decision": decision}
+	if note != "" {
+		body["note"] = note
+	}
+	b, err := c.do("POST", "/v1/human-tasks/"+pathEscape(id)+"/complete", body)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// RejectHumanTask rejects a task and resumes its paused execution.
+func (c *Client) RejectHumanTask(id, note string, decision map[string]any) (map[string]any, error) {
+	body := map[string]any{"note": note, "decision": decision}
+	b, err := c.do("POST", "/v1/human-tasks/"+pathEscape(id)+"/reject", body)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ExpireHumanTask marks an overdue task expired (force overrides the deadline).
+func (c *Client) ExpireHumanTask(id string, force bool) (map[string]any, error) {
+	b, err := c.do("POST", "/v1/human-tasks/"+pathEscape(id)+"/expire", map[string]any{"force": force})
 	if err != nil {
 		return nil, err
 	}

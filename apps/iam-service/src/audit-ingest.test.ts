@@ -9,6 +9,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
+import { createHmac } from 'node:crypto';
 import { createApp } from './index';
 
 let base = '';
@@ -176,5 +177,28 @@ describe('data-plane audit ingest (#32)', () => {
       Authorization: `Bearer ${token}`,
     });
     assert.deepEqual(foreign.data, []);
+  });
+});
+
+
+describe('signed audit export (#45)', () => {
+  it('streams tenant-scoped NDJSON with an HMAC digest', async () => {
+    const response = await fetch(`${base}/v1/audit/export?limit=100`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert.equal(response.status, 200);
+    assert.match(String(response.headers.get('content-type')), /application\/x-ndjson/);
+    const body = await response.text();
+    const digest = response.headers.get('x-audit-digest') || '';
+    assert.match(digest, /^hmac-sha256=[0-9a-f]{64}$/);
+    const secret = process.env.AUDIT_EXPORT_SECRET || process.env.SYNAPSEONE_INTERNAL_SECRET || 'dev-audit-export-secret';
+    const expected = createHmac('sha256', secret).update(body).digest('hex');
+    assert.equal(digest, `hmac-sha256=${expected}`);
+    assert.ok(Number(response.headers.get('x-audit-count')) >= 0);
+    for (const line of body.trim().split('\n').filter(Boolean)) {
+      const row = JSON.parse(line);
+      assert.ok(row.id);
+      assert.ok(row.action);
+    }
   });
 });

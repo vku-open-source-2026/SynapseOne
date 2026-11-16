@@ -7,7 +7,7 @@
  */
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import type { Server } from 'node:http';
+import { createServer, type Server } from 'node:http';
 import { createApp } from './index';
 
 let base = '';
@@ -219,5 +219,97 @@ describe('inference token metering (#26)', () => {
 
     const events = await call('GET', `/v1/usage/events?${rangeQs('&feature=inference')}`, undefined, { Authorization: `Bearer ${token}` });
     assert.ok(events.data.items.some((e: any) => e.model === 'test/model-a' && e.totalTokens === 42));
+  });
+});
+
+describe('warehouse-backed usage summary', () => {
+  it('merges hourly rollups with the live Postgres tail', async () => {
+    // Leave a two-hour raw tail so the events ingested below are not inside
+    // the rollup-covered window (they are intentionally absent from the fake).
+    const coveredUntil = new Date(Math.floor(Date.now() / 3_600_000) * 3_600_000 - 2 * 3_600_000).toISOString();
+    const minBucket = new Date(Date.now() - 2 * 86_400_000).toISOString();
+    const wh = createServer((req, res) => {
+      res.setHeader('content-type', 'application/json');
+      if (req.method === 'GET' && req.url === '/internal/usage/watermark') {
+        res.end(JSON.stringify({ ok: true, minBucket, maxBucket: coveredUntil, coveredUntil }));
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/internal/usage/summary') {
+        res.end(JSON.stringify({
+          from: minBucket,
+          to: coveredUntil,
+          minBucket,
+          coverageEnd: coveredUntil,
+          totals: {
+            requests: 100, success: 100, clientErrors: 0, serverErrors: 0,
+            durationSum: 1000, promptTokens: 0, completionTokens: 0, totalTokens: 0,
+            lastRequestAt: coveredUntil,
+            latency: [0, 0, 0, 0, 0, 0, 100, 0, 0, 0, 0, 0, 0, 0, 0],
+            userIds: ['wh-user'], accountIds: [accountId],
+          },
+          features: [{
+            feature: 'warehouse', requests: 100, success: 100, clientErrors: 0, serverErrors: 0,
+            durationSum: 1000, promptTokens: 0, completionTokens: 0, totalTokens: 0,
+            lastRequestAt: coveredUntil,
+            latency: [0, 0, 0, 0, 0, 0, 100, 0, 0, 0, 0, 0, 0, 0, 0],
+          }],
+          series: [{ ts: coveredUntil, requests: 100, errors: 0, durationSum: 1000 }],
+          statusClasses: [{ class: '2xx', count: 100 }],
+          authKinds: [{ kind: 'user', requests: 100 }],
+          topRoutes: [],
+          models: [],
+        }));
+        return;
+      }
+      res.statusCode = 404;
+      res.end(JSON.stringify({ error: 'not_found' }));
+    });
+    await new Promise<void>((resolve) => wh.listen(0, '127.0.0.1', () => resolve()));
+    const a = wh.address();
+    const port = typeof a === 'object' && a ? a.port : 0;
+    const previous = process.env.WAREHOUSE_SERVICE_URL;
+    process.env.WAREHOUSE_SERVICE_URL = `http://127.0.0.1:${port}`;
+    try {
+      const now = Date.now();
+      const ingest = await call('POST', '/v1/usage/ingest', {
+        events: [
+          {
+            feature: 'warehouse', route: '/v1/warehouse', method: 'GET', path: '/v1/warehouse/datasets',
+            status: 200, durationMs: 30, authKind: 'user', orgId, accountId, userId,
+            createdAt: new Date(now - 10 * 60_000).toISOString(),
+          },
+          {
+            feature: 'warehouse', route: '/v1/warehouse', method: 'GET', path: '/v1/warehouse/jobs',
+            status: 200, durationMs: 60, authKind: 'user', orgId, accountId, userId,
+            createdAt: new Date(now - 20 * 60_000).toISOString(),
+          },
+        ],
+      });
+      assert.equal(ingest.status, 202, JSON.stringify(ingest.data));
+
+      const from = new Date(now - 24 * 3_600_000).toISOString();
+      const to = new Date(now + 60_000).toISOString();
+      const summary = await call(
+        'GET',
+        `/v1/usage/summary?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&feature=warehouse`,
+        undefined,
+        { Authorization: `Bearer ${token}` },
+      );
+      assert.equal(summary.status, 200, JSON.stringify(summary.data));
+      assert.equal(summary.data.totals.requests, 102);
+      assert.equal(summary.data.totals.success, 102);
+      assert.equal(summary.data.totals.uniqueUsers, 2);
+      assert.equal(summary.data.totals.uniqueAccounts, 1);
+      assert.equal(summary.data.features.length, 1);
+      assert.equal(summary.data.features[0].feature, 'warehouse');
+      assert.equal(summary.data.features[0].requests, 102);
+      const seriesTotal = summary.data.series.reduce((n: number, p: any) => n + p.requests, 0);
+      assert.equal(seriesTotal, 102);
+      assert.ok(summary.data.totals.p95Ms > 0);
+    } finally {
+      if (previous === undefined) delete process.env.WAREHOUSE_SERVICE_URL;
+      else process.env.WAREHOUSE_SERVICE_URL = previous;
+      await new Promise<void>((resolve) => wh.close(() => resolve()));
+    }
   });
 });
