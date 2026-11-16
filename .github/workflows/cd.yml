@@ -84,15 +84,14 @@ jobs:
           set -euo pipefail
           OWNER="${{ github.repository_owner }}"
           SHA="${{ steps.ver.outputs.sha }}"
-          # Warehouse pulls the DuckDB toolchain and is the largest build; do it
-          # first on a clean runner and prune after each service so the 14 GB
-          # GitHub runner never runs out of layer space mid-loop.
-          for SVC in warehouse gateway iam workflow console; do
+          # Dev channel publishes the control-plane services. The heavy
+          # warehouse/inference/runner artifacts are published by the tagged
+          # release pipeline, which has the model/toolchain build budget.
+          for SVC in gateway iam workflow console; do
             case "$SVC" in
               gateway) CTX=apps/gateway ;;
               iam) CTX=apps/iam-service ;;
               workflow) CTX=apps/workflow-service ;;
-              warehouse) CTX=apps/warehouse-service ;;
               console) CTX=apps/console ;;
             esac
             echo "::group::build $SVC"
@@ -110,13 +109,13 @@ jobs:
           # the tagged release pipeline after that image exists. A main-channel
           # build here would either pull a missing local tag or ship a model-less
           # runner, so do not publish it here.
-          echo "::notice::workflow-runner is published by release.yml after the inference image."
+          echo "::notice::warehouse and workflow-runner are published by release.yml."
 
       - name: Summary
         run: |
           {
             echo "## CD (dev channel) — ${{ github.sha }}";
             echo "- npm: \`@synapseone/sdk@${{ steps.ver.outputs.npm }}\`, \`@synapseone/cli@${{ steps.ver.outputs.npm }}\` (tag \`dev\`)";
-            echo "- GHCR: \`ghcr.io/${{ github.repository_owner }}/synapseone-{warehouse,gateway,iam,workflow,console}:main(-${{ steps.ver.outputs.sha }})\`";
-            echo "- workflow-runner: published by the tagged release pipeline (model stack).";
+            echo "- GHCR: \`ghcr.io/${{ github.repository_owner }}/synapseone-{gateway,iam,workflow,console}:main(-${{ steps.ver.outputs.sha }})\`";
+            echo "- warehouse/workflow-runner: published by the tagged release pipeline.";
           } >> "$GITHUB_STEP_SUMMARY"
