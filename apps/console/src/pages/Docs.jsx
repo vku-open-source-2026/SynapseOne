@@ -1009,20 +1009,69 @@ synapseone lds entities <id> [--limit N] [--visibility public|restricted]
 synapseone lds entity <id> <entity-id>
 synapseone lds stats <id>`;
 
-const CLI_CALL = `# Base, Faststore and Queue are available through the generic gateway call:
-synapseone call POST /v1/base/collections --data '{"name":"parks"}'
-synapseone call GET /v1/base/collections
-synapseone call PUT /v1/faststore/keys/cache:demo --data '{"value":{"ok":true},"ttlSeconds":300}'
-synapseone call POST /v1/queue/queues/emails/messages --data '{"payload":{"to":"a@b.c"}}'
+const CLI_BASE_FASTSTORE_QUEUE = `# SynapseBase
+synapseone base collections create parks
+synapseone base collections list
+synapseone base documents insert parks --id park-1 --data '{"name":"Central"}'
+synapseone base vector-search parks --query "central park" --limit 5
 
-# The same escape hatch covers LDS, Stream, OCS and Notifications:
-synapseone call GET /v1/lds/licenses
-synapseone call PUT /v1/stream/topics/telemetry --data '{"maxLen":100000}'
-synapseone call POST /v1/stream/topics/telemetry/events --data '{"payload":{"value":25.4}}'
-synapseone call POST /v1/ocs/buckets --data '{"name":"city-assets"}'
-synapseone call POST /v1/notifications --data '{"channel":"email","recipient":{"email":"a@b.c"},"subject":"Hi","body":"Hello"}'
+# Synapse Faststore
+synapseone faststore set cache:demo --value '{"ok":true}' --ttl 300
+synapseone faststore get cache:demo
+synapseone faststore hashes set session --data '{"u1":"alice"}'
+synapseone faststore lists push jobs --values a,b
+synapseone faststore sets add tags --members a,b
+synapseone faststore zsets add leaderboard --members alice,bob --score 10
+synapseone faststore locks acquire deploy:prod --ttl 30
 
-# Raw paths include gateway prefixes; use --file for larger JSON payloads.`;
+# SynapseQueue
+synapseone queue create emails --max-attempts 5
+synapseone queue send emails --payload '{"to":"a@b.c"}'
+synapseone queue consume emails --count 10
+synapseone queue ack emails <receipt>
+synapseone queue dead emails`;
+
+const CLI_STREAM_OCS_NOTIFICATIONS = `# SynapseStream
+synapseone stream create telemetry --max-len 100000
+synapseone stream publish telemetry --payload '{"value":25.4}'
+synapseone stream read telemetry --count 100
+synapseone stream group create telemetry workers
+synapseone stream group read telemetry workers --consumer w1
+
+# SynapseOCS
+synapseone ocs bucket create city-assets
+synapseone ocs ls city-assets --prefix maps/
+synapseone ocs put city-assets maps/a.png --file ./a.png
+synapseone ocs get city-assets maps/a.png --output ./a.png
+synapseone ocs presign city-assets maps/a.png --expires 3600
+
+# SynapseNotifications
+synapseone notifications send a@b.c --channel email --subject Hi --body Hello
+synapseone notifications list --status queued
+synapseone notifications prefs set a@b.c --channels email,sms`;
+
+const CLI_PLATFORM_SERVICES = `# Search, secrets, inference
+synapseone search "authentication guide" --mode hybrid --collection kb
+synapseone secrets create stripe --value-file ./secret.txt
+synapseone secrets read stripe
+synapseone inference chat "summarize the incident"
+synapseone inference embeddings "authentication guide"
+synapseone inference route --input "payment failed" \\
+  --choice billing="billing question" --choice tech="technical issue"
+
+# Warehouse and human tasks
+synapseone warehouse dataset create incidents \\
+  --column id:string --column severity:string --column opened_at:timestamp
+synapseone warehouse query --sql 'SELECT severity, count(*) FROM incidents GROUP BY 1'
+synapseone human-tasks list --status pending
+synapseone human-tasks approve <id> --note "LGTM"
+
+# Usage and SCIM
+synapseone usage summary --from 2026-01-01T00:00:00Z --feature base
+synapseone scim token create --description okta
+
+# Escape hatch for endpoints without a first-class command:
+synapseone call GET /v1/accounts/acc_abc123/credentials`;
 
 const JS_INSTALL = `npm install @synapseone/sdk
 # or: yarn add @synapseone/sdk
@@ -1100,7 +1149,9 @@ const CLI_SECTIONS = [
   { title: 'API keys, service accounts & credentials', code: CLI_ACCESS },
   { title: 'Workflows, templates & executions', code: CLI_WORKFLOWS },
   { title: 'Linked Data (LDS)', code: CLI_LDS },
-  { title: 'Base, Faststore & Queue (generic call)', code: CLI_CALL },
+  { title: 'Base, Faststore & Queue', code: CLI_BASE_FASTSTORE_QUEUE },
+  { title: 'Stream, OCS & notifications', code: CLI_STREAM_OCS_NOTIFICATIONS },
+  { title: 'Search, secrets, inference, warehouse & tasks', code: CLI_PLATFORM_SERVICES },
 ];
 
 const BASE_COLLECTION_ENDPOINTS = [
@@ -1280,11 +1331,28 @@ curl -s -XPOST http://localhost:8080/webhook/transform \\
 # GitHub: Payload URL https://<host>/webhook/<path>,
 #   header x-hub-signature-256, store the secret as an hmac credential.`;
 
+const WORKFLOW_MCP = `# MCP server: active workflows with an mcpTrigger node become tools
+curl -s -XPOST http://localhost:8080/mcp \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}'
+
+# Discover tools, then call one with JSON arguments
+curl -s -XPOST http://localhost:8080/mcp \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+curl -s -XPOST http://localhost:8080/mcp \\
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_synapseone_docs","arguments":{"path":"docs/api.md"}}}'
+
+# Public read-only tools (mcp-docs-reader) need no credential.
+# Private/write tools require: Authorization: Bearer $TOKEN or X-API-Key: <key>
+# Built-in template: mcp-docs-reader -> AI reads the public docs repository.`;
+
 const WORKFLOW_ENDPOINTS = [
-  ['GET', '/v1/templates · /v1/templates/:name', 'Built-in templates (webhook-to-log, cron-etl, ai-triage-ops, …)'],
+  ['GET', '/v1/templates · /v1/templates/:name', 'Built-in templates (webhook-to-log, cron-etl, mcp-docs-reader, …)'],
   ['GET · POST', '/v1/workflows', 'List or create from {name, template} or {name, definition}'],
   ['GET · PUT · DELETE', '/v1/workflows/:id', 'Read, update (bumps revision) or delete a workflow'],
-  ['POST', '/v1/workflows/:id/activate · /deactivate', 'Gate cron + webhook triggers; webhook paths must be unique'],
+  ['POST', '/v1/workflows/:id/activate · /deactivate', 'Gate cron, webhook and MCP triggers; webhook paths/tool names must be unique'],
   ['POST', '/v1/workflows/:id/execute', 'Manual run for any trigger type, active or not'],
   ['POST', '/v1/workflows/test-run', 'Validate and run an unsaved definition in the sandbox'],
   ['GET', '/v1/executions · /v1/executions/:id', 'History; ?includeData=true adds per-node input/output'],
@@ -1292,12 +1360,14 @@ const WORKFLOW_ENDPOINTS = [
   ['GET · POST · PUT', '/v1/human-tasks, /v1/human-tasks/:id/*', 'Durable human waits: claim, complete, reject, expire'],
   ['GET · POST · DELETE', '/v1/secrets, /v1/secrets/:name/*', 'Versioned secret vault with audited reads and rotation'],
   ['ANY', '/webhook/:path', 'Public inbound trigger with per-node auth, rate limit and idempotency'],
+  ['POST', '/mcp', 'MCP JSON-RPC server: active mcpTrigger workflows become AI tools'],
 ];
 
 const WORKFLOW_NODES = [
   ['webhook', 'Trigger on ANY /webhook/:path; path, httpMethod, auth, rateLimit, idempotency'],
   ['cron', 'Schedules from 10s: interval fields, 5-field cron, @hourly/@daily, timezone'],
   ['manualTrigger', 'Run from the Console, CLI or /execute with any JSON input'],
+  ['mcpTrigger', 'Expose the workflow as an MCP tool (toolName, description, inputSchema) at POST /mcp'],
   ['httpRequest', 'Public HTTP(S) with SSRF guard, credentials, retry and timeout'],
   ['code', 'Sandboxed JavaScript (≤50 KB, 5 s default) with $input/$json/$now'],
   ['set', 'Merge or assign values with {{ $json.x }} templating'],
@@ -1755,6 +1825,7 @@ function WorkflowDoc() {
 
       <DocSection title="Public webhooks" kicker="Triggers">
         <DocCode data={WORKFLOW_WEBHOOK} />
+        <DocCode data={WORKFLOW_MCP} />
       </DocSection>
 
       <DocSection title="API reference" kicker="Automation">

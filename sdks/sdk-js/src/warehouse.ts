@@ -126,6 +126,10 @@ export class WarehouseService {
     });
   }
 
+  pipelineStatus() {
+    return this.http.req<{ ok: boolean; datasets: number; jobs: number; running: number; paused: number; appliedEvents: number; lastRunAt: string | null; lastError: string | null }>(`${P}/pipeline/status`);
+  }
+
   templates() {
     return this.http.req<{ items: WarehouseTemplate[] }>(`${P}/templates`);
   }

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 256" width="720" height="256">
+  <title>SynapseOne — lockup light</title>
+  <g transform="translate(24 50) scale(0.61)">
+    <g fill="none" stroke="#0A72C4" stroke-width="44" stroke-linecap="butt" stroke-linejoin="round"><path d="M 180 48 H 84 A 40 40 0 0 0 84 128 H 115"/></g>
+  <circle cx="180" cy="48" r="22" fill="#0A72C4"/>
+  <g fill="none" stroke="#4FACFE" stroke-width="44" stroke-linecap="butt" stroke-linejoin="round"><path d="M 141 128 H 172 A 40 40 0 0 1 172 208 H 76"/></g>
+  <circle cx="76" cy="208" r="22" fill="#4FACFE"/>
+  </g>
+  <text x="204" y="158" font-family="Segoe UI, system-ui, -apple-system, sans-serif" font-size="88" font-weight="600" letter-spacing="-3" fill="#0F172A">Synapse<tspan fill="#0A72C4">One</tspan></text>
+</svg>

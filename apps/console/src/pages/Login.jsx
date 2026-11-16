@@ -4,17 +4,26 @@
  * Copyright 2026 SynapseOne Contributors
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
-import React, { useState } from 'react';
-import { Link, Navigate, useNavigate } from 'react-router-dom';
+import React, { useEffect, useState } from 'react';
+import { Link, Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../lib/auth.jsx';
 import { api, baseUrl } from '../lib/api.js';
 import { Btn, Err, Field, Input } from '../components/ui.jsx';
 import SiteToggles from '../components/SiteToggles.jsx';
 import { useI18n } from '../lib/i18n-context.js';
+import { landingPath } from '../lib/auth-routing.js';
 
 export default function Login() {
-  const [email, setEmail] = useState('demo@acme.local');
-  const [org, setOrg] = useState('acme');
+  const location = useLocation();
+  const [email, setEmail] = useState('');
+  // Logout + navigate can race with the route guard's own /login redirect, so
+  // the platform/tenant prefill is also carried in sessionStorage. Keep it
+  // until a successful sign-in; an early remount must still see it.
+  const [org, setOrg] = useState(() => {
+    try { return sessionStorage.getItem('synapseone.login.prefillOrg') || location.state?.prefillOrg || ''; }
+    catch { return location.state?.prefillOrg || ''; }
+  });
+  const [password, setPassword] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [mode, setMode] = useState('email');
   const [err, setErr] = useState(null);
@@ -22,21 +31,47 @@ export default function Login() {
   const [mfa, setMfa] = useState(null); // { token } after 401 mfa_required
   const [mfaCode, setMfaCode] = useState('');
   const [useRecovery, setUseRecovery] = useState(false);
+  const [sso, setSso] = useState(null);
+  const [orgError, setOrgError] = useState('');
   const { auth, login, loginWithKey, completeMfa } = useAuth();
   const nav = useNavigate();
   const { m } = useI18n();
   const t = m.login;
 
-  if (auth) return <Navigate to="/dashboard" replace />;
+  useEffect(() => {
+    if (!auth) return;
+    try { sessionStorage.removeItem('synapseone.login.prefillOrg'); } catch { /* storage blocked */ }
+  }, [auth]);
+
+  useEffect(() => {
+    let alive = true;
+    api.oidcConfig()
+      .then((cfg) => { if (alive) setSso(cfg); })
+      .catch(() => { if (alive) setSso(null); });
+    return () => { alive = false; };
+  }, []);
+
+  if (auth) return <Navigate to={landingPath(auth.currentContext, undefined, auth.preferredContext)} replace />;
+
+  const orgSlug = org.trim().toLowerCase();
+  const ssoAvailable = sso ? (sso.ssoAvailable ?? sso.issuerPublic) !== false : null;
 
   const submitSso = async () => {
     setErr(null);
+    if (!orgSlug) {
+      setOrgError(t.orgRequired);
+      return;
+    }
+    setOrgError('');
     setBusy(true);
     try {
-      const start = await api.oidcStart(org || 'acme');
-      if (!start || typeof start.authorizeUrl !== 'string' || !start.authorizeUrl) {
+      const start = await api.oidcStart(orgSlug);
+      if (!start || typeof start.authorizeUrl !== 'string' || !start.authorizeUrl || !start.state) {
         throw new Error(t.ssoMissing);
       }
+      // Bind the signed state to this browser tab; the callback refuses a
+      // state that was not issued by this tab (login CSRF protection).
+      try { sessionStorage.setItem('synapseone.oidc.state', String(start.state)); } catch { /* storage blocked */ }
       window.location.href = start.authorizeUrl;
     } catch (ex) {
       setErr(ex);
@@ -48,12 +83,21 @@ export default function Login() {
     setErr(null);
     setBusy(true);
     try {
-      if (mode === 'email') await login(email, org || 'acme');
+      if (mode === 'email') {
+        if (!orgSlug) {
+          setOrgError(t.orgRequired);
+          setBusy(false);
+          return;
+        }
+        setOrgError('');
+        const result = await login(email, orgSlug, password);
+        nav(landingPath(result?.currentContext, location.state?.from, result?.preferredContext), { replace: true });
+      }
       else {
         if (!apiKey) throw new Error(t.enterKey);
         loginWithKey(apiKey);
+        nav('/dashboard', { replace: true });
       }
-      nav('/dashboard', { replace: true });
     } catch (ex) {
       if (ex?.status === 401 && ex.body?.error === 'mfa_required' && ex.body.mfaToken) {
         setMfa({ token: ex.body.mfaToken });
@@ -71,8 +115,8 @@ export default function Login() {
     setBusy(true);
     try {
       const code = mfaCode.trim();
-      await completeMfa(mfa.token, useRecovery ? undefined : code, useRecovery ? code : undefined);
-      nav('/dashboard', { replace: true });
+      const result = await completeMfa(mfa.token, useRecovery ? undefined : code, useRecovery ? code : undefined);
+      nav(landingPath(result?.currentContext, location.state?.from, result?.preferredContext), { replace: true });
     } catch (ex) {
       if (ex?.body?.error === 'invalid_mfa_token') setMfa(null);
       setErr(ex);
@@ -135,10 +179,32 @@ export default function Login() {
           {mode === 'email' ? (
             <>
               <Field label={t.email}>
-                <Input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="demo@acme.local" />
+                <Input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" autoComplete="username" required />
               </Field>
               <Field label={t.org}>
-                <Input value={org} onChange={(e) => setOrg(e.target.value)} placeholder="acme" />
+                {/* Not `required`: the submit handler explains the missing org in the
+                    selected locale instead of the browser's generic tooltip. */}
+                <Input
+                  value={org}
+                  onChange={(e) => {
+                    setOrg(e.target.value);
+                    if (orgError) setOrgError('');
+                    try { sessionStorage.removeItem('synapseone.login.prefillOrg'); } catch { /* storage blocked */ }
+                  }}
+                  placeholder="your-org"
+                  autoComplete="organization"
+                  aria-invalid={orgError ? 'true' : undefined}
+                />
+                {orgError && <p className="text-xs text-red-600 mt-1" role="alert">{orgError}</p>}
+              </Field>
+              <Field label={t.password}>
+                <Input
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder={t.passwordPlaceholder}
+                  autoComplete="current-password"
+                />
               </Field>
             </>
           ) : (
@@ -166,15 +232,21 @@ export default function Login() {
         <button
           type="button"
           onClick={submitSso}
-          disabled={busy}
-          className="w-full py-2.5 rounded-2xl text-sm font-medium bg-background text-main-text disabled:opacity-60 disabled:cursor-wait inline-flex items-center justify-center gap-2"
+          disabled={busy || ssoAvailable === false}
+          className="w-full py-2.5 rounded-2xl text-sm font-medium bg-background text-main-text disabled:opacity-60 disabled:cursor-not-allowed inline-flex items-center justify-center gap-2"
+          title={ssoAvailable === false ? t.ssoUnavailable : undefined}
         >
           {busy && <span className="sdx-spinner h-4 w-4 border-2" />}
-          {busy ? t.redirecting : t.sso}
+          {busy ? t.redirecting : ssoAvailable === false ? t.ssoUnavailable : t.sso}
         </button>
+        {ssoAvailable === false && (
+          <p className="text-xs text-amber-600 mt-2">{t.ssoUnavailableHint}</p>
+        )}
         <p className="text-xs text-normal-text mt-4 text-center">
           {t.note}
           <br />
+          <Link to="/register" className="text-main-blue">Have an activation code? Activate your account</Link>
+          {' · '}
           <Link to="/about" className="text-main-blue">{t.about}</Link>
           {' · '}
           <Link to="/api-docs" className="text-main-blue">{m.nav.apiDocs}</Link>

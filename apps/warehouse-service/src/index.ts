@@ -15,6 +15,7 @@ import { randomUUID } from 'crypto';
 import { timingSafeEqual } from 'crypto';
 import { WarehouseError, warehouseStore } from './duck';
 import { assertReadOnlySql, DATASET_ID_RE, normalizeColumns, slugifyDatasetId } from './sql';
+import { replaceUsageRollup, usageStatsSummary, usageWatermark, UsageStatsFilter } from './usage-stats';
 import { EtlTemplate, JobMode, JobStatus, WarehouseColumn, WriteMode } from './types';
 
 dotenv.config();
@@ -283,17 +284,22 @@ async function runStreamWorker(tenant: string, jobId: string): Promise<void> {
           backoff = 1000;
           continue;
         }
-        const rows: Array<Record<string, unknown>> = [];
+        const materialized: Array<{ eventId: string; rows: Array<Record<string, unknown>> }> = [];
         for (const event of events) {
-          for (const row of payloadRows(event.payload)) {
+          const payload = event.payload && typeof event.payload === 'object' ? event.payload as Record<string, unknown> : {};
+          const eventId = typeof payload.event_id === 'string' && payload.event_id
+            ? payload.event_id
+            : event.id;
+          const rows = payloadRows(event.payload).map((row) => {
             const copy = { ...row };
             if (dataset.columns.some((column) => column.name === 'event_id') && copy.event_id === undefined) {
-              copy.event_id = event.id;
+              copy.event_id = eventId;
             }
-            rows.push(copy);
-          }
+            return copy;
+          });
+          materialized.push({ eventId, rows });
         }
-        if (rows.length) await warehouseStore.insertRows(tenant, dataset, rows);
+        await warehouseStore.ingestStreamEvents(tenant, dataset, job.id, materialized);
         await streamCall('POST', `/v1/stream/topics/${encodeURIComponent(job.streamTopic)}/groups/${encodeURIComponent(group)}/ack`, tenant, {
           ids: events.map((event) => event.id),
         });
@@ -352,6 +358,86 @@ export function createApp(): express.Express {
       return res.status(401).json({ error: 'unauthorized', message: 'missing or invalid internal credential' });
     }
     next();
+  });
+
+  // Internal telemetry rollups. There is deliberately no gateway route for
+  // /internal/*; IAM calls these service-to-service with the shared secret.
+  app.use('/internal/', (req, res, next) => {
+    const secret = process.env.SYNAPSEONE_INTERNAL_SECRET;
+    if (!secret) {
+      if (IS_PROD) {
+        return res.status(500).json({ error: 'misconfigured', message: 'SYNAPSEONE_INTERNAL_SECRET is required in production' });
+      }
+      return next();
+    }
+    if (!verifyInternal(req)) {
+      return res.status(401).json({ error: 'unauthorized', message: 'missing or invalid internal credential' });
+    }
+    next();
+  });
+
+  app.post('/internal/usage/rollup', async (req, res, next) => {
+    try {
+      const result = await replaceUsageRollup(resolveTenant(req), req.body || {});
+      res.status(201).json({ ok: true, ...result });
+    } catch (error) { next(error); }
+  });
+
+  app.get('/internal/usage/watermark', async (req, res, next) => {
+    try {
+      res.json({ ok: true, ...(await usageWatermark(resolveTenant(req))) });
+    } catch (error) { next(error); }
+  });
+
+  app.post('/internal/usage/summary', async (req, res, next) => {
+    try {
+      const body = (req.body || {}) as Record<string, unknown>;
+      const filter: UsageStatsFilter = {
+        from: String(body.from ?? ''),
+        to: String(body.to ?? ''),
+        ...(body.feature ? { feature: String(body.feature) } : {}),
+        ...(body.accountId ? { accountId: String(body.accountId) } : {}),
+        ...(body.method ? { method: String(body.method) } : {}),
+        ...(body.statusClass ? { statusClass: Number(body.statusClass) } : {}),
+      };
+      res.json(await usageStatsSummary(resolveTenant(req), filter));
+    } catch (error) { next(error); }
+  });
+
+  app.get('/v1/warehouse/pipeline/status', async (req, res, next) => {
+    try {
+      res.json({ ok: true, ...(await warehouseStore.pipelineStatus(resolveTenant(req))) });
+    } catch (error) { next(error); }
+  });
+
+  app.get('/metrics', async (_req, res) => {
+    try {
+      const tenants = await warehouseStore.listTenants();
+      let datasets = 0; let jobs = 0; let applied = 0; let running = 0;
+      for (const tenant of tenants) {
+        const s = await warehouseStore.pipelineStatus(tenant);
+        datasets += s.datasets; jobs += s.jobs; applied += s.appliedEvents; running += s.running;
+      }
+      res.type('text/plain').send([
+        '# HELP synapseone_warehouse_up Warehouse service availability',
+        '# TYPE synapseone_warehouse_up gauge',
+        'synapseone_warehouse_up 1',
+        '# HELP synapseone_warehouse_datasets Tenant datasets',
+        '# TYPE synapseone_warehouse_datasets gauge',
+        `synapseone_warehouse_datasets ${datasets}`,
+        '# HELP synapseone_warehouse_jobs ETL jobs',
+        '# TYPE synapseone_warehouse_jobs gauge',
+        `synapseone_warehouse_jobs ${jobs}`,
+        '# HELP synapseone_warehouse_running_stream_jobs Running stream jobs',
+        '# TYPE synapseone_warehouse_running_stream_jobs gauge',
+        `synapseone_warehouse_running_stream_jobs ${running}`,
+        '# HELP synapseone_warehouse_applied_events Durable stream event markers',
+        '# TYPE synapseone_warehouse_applied_events gauge',
+        `synapseone_warehouse_applied_events ${applied}`,
+      ].join('\n') + '\n');
+    } catch {
+      res.type('text/plain').status(200).send('synapseone_warehouse_up 0\n');
+    }
   });
 
   // ---- datasets ----

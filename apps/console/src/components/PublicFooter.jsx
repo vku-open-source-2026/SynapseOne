@@ -45,7 +45,7 @@ export default function PublicFooter() {
         <div>
           <Link
             to="/"
-            className="text-xl font-semibold bg-gradient-to-b from-main-start to-main-end bg-clip-text text-transparent"
+            className="text-xl font-semibold bg-gradient-to-b from-[#0A72C4] to-[#4FACFE] bg-clip-text text-transparent"
           >
             synapseone
           </Link>

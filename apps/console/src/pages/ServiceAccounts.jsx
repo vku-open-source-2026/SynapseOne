@@ -11,13 +11,15 @@ import { Btn, Card, Code, Empty, Err, Field, Input, Modal, PageTitle, Spinner, T
 import { ScopeBar, useScope } from '../components/Scope.jsx';
 
 export default function ServiceAccounts() {
-  const { headers } = useAuth();
+  const { headers, auth } = useAuth();
+  const canAdmin = !!auth?.user?.is_org_admin;
   const scope = useScope();
   const [rows, setRows] = useState([]);
   const [err, setErr] = useState(null);
   const [loaded, setLoaded] = useState(false);
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [formErr, setFormErr] = useState(null);
   const [slug, setSlug] = useState('');
   const [token, setToken] = useState(null);
   const [minting, setMinting] = useState(null);
@@ -47,6 +49,7 @@ export default function ServiceAccounts() {
     e.preventDefault();
     if (busy) return;
     setBusy(true);
+    setFormErr(null);
     setErr(null);
     try {
       await api.createSA(scope.accountId, slug, headers);
@@ -54,7 +57,7 @@ export default function ServiceAccounts() {
       setSlug('');
       load();
     } catch (ex) {
-      setErr(ex);
+      setFormErr(ex);
     } finally {
       setBusy(false);
     }
@@ -74,7 +77,7 @@ export default function ServiceAccounts() {
 
   return (
     <>
-      <PageTitle title="Service Accounts" sub="Machine identity (kind=service-account JWTs)" right={<Btn onClick={() => setOpen(true)}>+ New</Btn>} />
+      <PageTitle title="Service Accounts" sub="Machine identity (kind=service-account JWTs)" right={canAdmin ? <Btn onClick={() => { setFormErr(null); setOpen(true); }}>+ New</Btn> : undefined} />
       <Err e={err} />
       <ScopeBar scope={scope} />
       <Card>
@@ -100,8 +103,8 @@ export default function ServiceAccounts() {
         )}
       </Card>
       {open && (
-        <Modal title="New service account" onClose={() => setOpen(false)}>
-          <form onSubmit={create}>
+        <Modal title="New service account" onClose={() => { setOpen(false); setFormErr(null); }}>
+          <form onSubmit={create}><Err e={formErr} />
             <Field label="Slug">
               <Input value={slug} onChange={(e) => setSlug(e.target.value)} placeholder="etl-worker" />
             </Field>

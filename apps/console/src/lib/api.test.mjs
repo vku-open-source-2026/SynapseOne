@@ -58,6 +58,17 @@ describe('console silent refresh', () => {
     assert.equal(stored.token, 'tok-2');
   });
 
+  it('createKey defaults to read-only scope, never wildcard', async () => {
+    let seenBody = null;
+    globalThis.fetch = async (url, init = {}) => {
+      seenBody = JSON.parse(init.body);
+      return { status: 201, ok: true, text: async () => JSON.stringify({ id: 'k1', apiKey: 'synapseone_test', prefix: 'synapseone_' }), headers: new Map() };
+    };
+    authStore.get = () => null;
+    await api.createKey('acct-1', 'qa', { token: 'tok' }, { scopes: [] });
+    assert.deepEqual(seenBody.scopes, ['*:read']);
+  });
+
   it('dead refresh clears the session and surfaces 401', async () => {
     const sessions = { refreshCalls: 0, validAccess: new Set(), validRefresh: new Map() };
     stubFetch(sessions);
@@ -74,6 +85,22 @@ describe('console silent refresh', () => {
     authStore.get = () => ({ apiKey: 'k', refreshToken: 'rt-x' });
     await assert.rejects(() => api.orgs({ apiKey: 'k' }), /401/);
     assert.equal(sessions.refreshCalls, 0);
+  });
+
+  it('does not replay password/MFA challenges or rotate sessions on credential errors', async () => {
+    const seen = [];
+    authStore.get = () => ({ token: 'newer-stored-token', refreshToken: 'refresh-still-live' });
+    globalThis.fetch = async (url, init = {}) => {
+      seen.push({ path: new URL(url).pathname, body: JSON.parse(init.body) });
+      return { status: 401, ok: false, text: async () => JSON.stringify({ error: 'invalid_credentials' }) };
+    };
+    await assert.rejects(() => api.switchContext('target-org', 'target-password', { token: 'current-token' }), /401/);
+    for (const path of ['/v1/platform/session', '/v1/platform/session?challenge=1', '/v1/auth/mfa/verify']) {
+      await assert.rejects(() => api.call('POST', path, { code: 'invalid-test-code' }, { token: 'current-token' }), /401/);
+    }
+    assert.equal(seen.length, 4, 'exactly one HTTP request per credential attempt');
+    assert.deepEqual(seen[0], { path: '/v1/auth/contexts/switch', body: { orgId: 'target-org', password: 'target-password' } });
+    assert.equal(seen.some((call) => call.path === '/v1/auth/refresh'), false);
   });
 
   it('generic call() rotates silently and preserves error status', async () => {
@@ -208,7 +235,7 @@ describe('console silent refresh', () => {
     assert.deepEqual(seen, [
       'GET /v1/base/collections',
       'POST /v1/base/collections',
-      'GET /v1/base/collections/c1/documents?limit=10',
+      'GET /v1/base/collections/c1/documents?withTotal=1&limit=10',
       'POST /v1/base/collections/c1/documents',
       'POST /v1/base/collections/c1/query',
       'POST /v1/base/collections/c1/documents/d1/increment',

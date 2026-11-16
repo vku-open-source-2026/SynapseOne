@@ -112,17 +112,21 @@ self-service unless `IAM_REGISTRATION_ALLOW_NEW_ORGS=false`.
 
 ### Delegated identity for Tier 2 (implemented)
 
-`POST /v1/auth/exchange` takes a service-account token or API key plus
+`POST /v1/auth/exchange` takes an **account-level** operator API key or a
+service-account token plus
 `{userId, accountId?, orgId?, scopes?, audience?, ttlSeconds?}` and returns a
-short-lived token for that user. It refuses cross-tenant targets and scope
-escalation and audits every exchange. Tier 2 must use this instead of forwarding a
-Tier-3 HMAC token plus one shared service key.
+short-lived token for that user. User-bound API keys cannot exchange; service
+accounts are rechecked for revocation, actual account binding and org status.
+It refuses inactive/suspended targets, cross-tenant targets and scope escalation
+and audits every exchange. Tier 2 must use this instead of forwarding a Tier-3
+HMAC token plus one shared service key.
 API keys: `scopes` are action patterns (`*`, `storage:*`, `workflow:Execute`). A key
 created with `userId` is **owner-bound** and inherits that user's permissions; without
-an owner it is an account-level key bounded by its scopes alone. Keys record
-`last_used_at` and can be rotated (`POST /v1/keys/:id/rotate {graceSeconds}` — the old
-secret stays valid for the grace window, 0 = revoked immediately). Users can list and
-revoke their own sessions (`GET/DELETE /v1/auth/sessions[/:id]`).
+an owner it is an account-level key bounded by its scopes alone. Owner-bound keys
+cannot be used for delegated exchange. Keys record `last_used_at` and can be rotated
+(`POST /v1/keys/:id/rotate {graceSeconds}` — the old secret stays valid for the grace
+window, 0 = revoked immediately). Users can list and revoke their own sessions
+(`GET/DELETE /v1/auth/sessions[/:id]`).
 
 ## Multi-factor authentication and sign-in lockout (implemented)
 
@@ -156,6 +160,43 @@ The first user of an organization becomes its administrator (`is_org_admin`, AWS
 "root"-like): full access inside its own org unless a policy explicitly denies. Later
 users start with **no permissions**. Admins manage admins with
 `PUT /v1/users/:userId/org-admin {isOrgAdmin}`; the last admin cannot be demoted.
+
+## Platform administrators
+
+`platform_admins` is a separate, cross-tenant control plane. It is **not**
+`is_org_admin` and does not grant tenant data access. A platform administrator:
+
+- must be a member of the reserved `PLATFORM_ORG_SLUG` organization;
+- must have TOTP MFA enabled and provide a fresh code at
+  `POST /v1/platform/session`;
+- receives a short-lived token (`kind=platform-admin`,
+  `aud=synapseone-platform-admin`, no tenant org claim);
+- only reaches `/v1/platform/*`; tenant APIs reject that token;
+- has `owner`, `operator` or `auditor` role, checked server-side.
+
+Destructive actions require a second TOTP step-up
+(`POST /v1/platform/step-up {code|recoveryCode, action}`, header
+`x-platform-step-up`). Each proof is one-time, bound to the issuing platform
+session and to one action; it is stored in `platform_step_ups` and cannot be
+replayed. The first owner is created through the internal one-time bootstrap
+endpoint, which returns a one-time `inviteToken` (see
+[`platform-superadmin.md`](platform-superadmin.md)).
+
+Invited accounts (first tenant admin, additional platform admins, tenant members)
+activate with `POST /v1/auth/invite/accept {token, password}` or the Console
+`/register` page. Email+org registration cannot join an existing organization
+without an invite code.
+
+## Privileged IAM mutations
+
+`IAM_SENSITIVE_MUTATION_MODE` controls whether account/user/role/policy/key/SA
+mutations require an organization administrator:
+
+- `audit` (default): evaluate, write a would-deny audit row, allow;
+- `enforce`: return `403 org_admin_required` for members.
+
+Production should use `enforce`. API-key owner binding is stricter: a member can
+only bind a key to themselves; binding another user requires an org admin.
 
 ## Managed policies
 

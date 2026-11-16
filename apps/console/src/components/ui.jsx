@@ -5,8 +5,10 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
 import React from 'react';
+import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { createPortal } from 'react-dom';
 import { Spinner, TableSkeleton as TableSkeletonBase, ListSkeleton, InlineLoader } from './loading.jsx';
+import { useI18n } from '../lib/i18n-context.js';
 
 export { Spinner, InlineLoader, ListSkeleton, TableSkeletonBase as TableSkeleton };
 export { PageSkeleton, LoadingOverlay, RouteProgress, ScrollToTop, Dots } from './loading.jsx';
@@ -15,29 +17,39 @@ export function Card({ className = '', children }) {
   return <div className={`bg-white rounded-3xl shadow-md p-6 ${className}`}>{children}</div>;
 }
 
-export function PageTitle({ title, sub, right }) {
+export function PageTitle({ title, sub, desc, subtitle: subtitleProp, right }) {
+  const subtitle = sub || desc || subtitleProp;
   return (
     <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-6">
       <div className="min-w-0">
         <h1 className="text-xl sm:text-2xl font-semibold text-main-text truncate">{title}</h1>
-        {sub && <p className="text-normal-text text-sm mt-1">{sub}</p>}
+        {subtitle && <p className="text-normal-text text-sm mt-1">{subtitle}</p>}
       </div>
       {right && <div className="flex flex-wrap items-center justify-end gap-2 shrink-0">{right}</div>}
     </div>
   );
 }
 
-export function Btn({ children, onClick, kind = 'primary', type = 'button', disabled, loading = false, className = '' }) {
+const BTN_VARIANTS = {
+  primary: 'primary', secondary: 'secondary', outline: 'secondary', ghost: 'secondary',
+  danger: 'danger', success: 'success',
+};
+
+export function Btn({ children, onClick, kind, variant, type = 'button', disabled, loading = false, className = '', title = '' }) {
+  const resolved = kind || BTN_VARIANTS[variant] || 'primary';
   const styles =
-    kind === 'primary'
+    resolved === 'primary'
       ? 'bg-gradient-to-b from-main-start to-main-end text-white'
-      : kind === 'danger'
+      : resolved === 'danger'
         ? 'bg-red-500 text-white'
-        : 'bg-slate-100 text-main-text';
+        : resolved === 'success'
+          ? 'bg-emerald-600 text-white'
+          : 'bg-slate-100 text-main-text';
   const isDisabled = disabled || loading;
   return (
     <button
       type={type}
+      title={title || undefined}
       disabled={isDisabled}
       aria-busy={loading || undefined}
       onClick={onClick}
@@ -49,10 +61,11 @@ export function Btn({ children, onClick, kind = 'primary', type = 'button', disa
   );
 }
 
-export function Field({ label, children }) {
+export function Field({ label, desc, children }) {
   return (
     <label className="block mb-3">
       <span className="block text-xs font-medium text-normal-text mb-1">{label}</span>
+      {desc && <span className="block text-[11px] text-normal-text/80 mb-1.5">{desc}</span>}
       {children}
     </label>
   );
@@ -73,8 +86,8 @@ export function Table({ head, children }) {
       <table className="w-full text-sm">
         <thead>
           <tr className="text-left text-normal-text">
-            {head.map((h) => (
-              <th key={h} className="py-2 pr-4 font-medium whitespace-nowrap">
+            {head.map((h, i) => (
+              <th key={`${h}-${i}`} className="py-2 pr-4 font-medium whitespace-nowrap">
                 {h}
               </th>
             ))}
@@ -86,7 +99,10 @@ export function Table({ head, children }) {
   );
 }
 
-export function Badge({ tone = 'gray', children }) {
+const BADGE_VARIANTS = { neutral: 'gray', success: 'green', info: 'blue', warning: 'amber', danger: 'red' };
+
+export function Badge({ tone, variant, children }) {
+  const resolved = tone || BADGE_VARIANTS[variant] || 'gray';
   const tones = {
     gray: 'bg-slate-100 text-main-text',
     green: 'bg-emerald-500/10 text-emerald-600',
@@ -95,16 +111,19 @@ export function Badge({ tone = 'gray', children }) {
     amber: 'bg-amber-400/15 text-amber-500',
   };
   return (
-    <span className={`inline-block px-2.5 py-0.5 rounded-full text-xs font-medium ${tones[tone] || tones.gray}`}>
+    <span className={`inline-block px-2.5 py-0.5 rounded-full text-xs font-medium ${tones[resolved] || tones.gray}`}>
       {children}
     </span>
   );
 }
 
-export function Empty({ text = 'No data yet', action }) {
+export function Empty({ text = 'No data yet', title, sub, icon, action }) {
+  const heading = title || text;
   return (
     <div className="py-6 text-center">
-      <p className="text-normal-text text-sm">{text}</p>
+      {icon && <div className="flex justify-center mb-2">{React.isValidElement(icon) ? icon : <FontAwesomeIcon icon={icon} className="text-2xl text-main-blue" />}</div>}
+      <p className="text-main-text text-sm font-medium">{heading}</p>
+      {sub && <p className="text-normal-text text-xs mt-1 max-w-xl mx-auto">{sub}</p>}
       {action && <div className="mt-3 flex justify-center">{action}</div>}
     </div>
   );
@@ -119,35 +138,260 @@ export function StatValue({ loading, value }) {
   return <p className="text-3xl font-semibold text-main-text tabular-nums">{value ?? '–'}</p>;
 }
 
+const ERROR_COPY = {
+  self_revoke_forbidden: {
+    title: 'Không thể tự thu hồi quyền owner',
+    message: 'Bạn không thể thu hồi quyền Platform Administrator của chính mình. Hãy nhờ một owner khác thực hiện.',
+  },
+  platform_org_create_required: {
+    title: 'Tạo tổ chức do Platform quản lý',
+    message: 'Tạo organization đã bị tắt trên deployment này. Liên hệ Platform Administrator để tạo tổ chức và cấp quyền admin ban đầu.',
+  },
+  org_admin_required: {
+    title: 'Cần quyền quản trị tổ chức',
+    message: 'Tài khoản của bạn vẫn dùng được các tính năng tenant, nhưng Audit yêu cầu quyền Organization Administrator. Hãy liên hệ admin của tổ chức hoặc đăng nhập bằng tài khoản admin.',
+  },
+  platform_admin_required: {
+    title: 'Cần quyền Platform Admin',
+    message: 'Tài khoản này không phải Platform Administrator đang hoạt động. Hãy dùng tài khoản đã được cấp quyền trong /admin/access.',
+  },
+  platform_admin_inactive: {
+    title: 'Platform Admin đã bị thu hồi hoặc vô hiệu hóa',
+    message: 'Quyền Platform Administrator của tài khoản này không còn hiệu lực. Liên hệ Platform Owner để được cấp lại.',
+  },
+  platform_admin_org_required: {
+    title: 'Sai tổ chức Platform',
+    message: 'Platform Administrator phải là thành viên của tổ chức synapseone-platform. Tài khoản hiện tại thuộc tổ chức tenant.',
+  },
+  platform_mfa_required: {
+    title: 'Cần bật MFA',
+    message: 'Platform Console yêu cầu TOTP MFA. Hãy bật MFA trong Security trước khi mở /admin.',
+  },
+  platform_role_required: {
+    title: 'Vai trò Platform không đủ quyền',
+    message: 'Hành động này yêu cầu vai trò owner hoặc operator. Tài khoản auditor chỉ được đọc.',
+  },
+  platform_step_up_required: {
+    title: 'Cần xác thực step-up',
+    message: 'Hành động này cần một mã TOTP mới. Mã step-up chỉ dùng một lần và gắn với đúng hành động hiện tại.',
+  },
+  scope_denied: {
+    title: 'API key không đủ scope',
+    message: 'API key hiện tại không có quyền cho thao tác này. Dùng user JWT hoặc API key có scope phù hợp.',
+  },
+  access_denied: {
+    title: 'Không có quyền thực hiện',
+    message: 'Policy hoặc vai trò hiện tại không cho phép thao tác này.',
+  },
+  last_admin: {
+    title: 'Không thể xóa admin cuối cùng',
+    message: 'Mỗi organization phải còn ít nhất một Organization Administrator đang hoạt động.',
+  },
+  last_owner: {
+    title: 'Không thể xóa owner cuối cùng',
+    message: 'Phải còn ít nhất một Platform Owner đang hoạt động để quản trị hệ thống.',
+  },
+  invite_required: {
+    title: 'Cần mã kích hoạt',
+    message: 'Tài khoản đã được mời nhưng chưa kích hoạt. Dùng mã activation code một lần tại /register.',
+  },
+  org_membership_required: {
+    title: 'Chưa được mời vào tổ chức',
+    message: 'Email này chưa có lời mời vào tổ chức. Liên hệ admin tổ chức để được mời trước.',
+  },
+  invalid_mfa_code: {
+    title: 'Mã xác thực không đúng',
+    message: 'Mã TOTP đã hết hạn, đã dùng, hoặc không khớp. Thử mã mới sau chu kỳ 30 giây.',
+  },
+  account_locked: {
+    title: 'Tài khoản tạm khóa',
+    message: 'Có quá nhiều lần xác thực sai. Thử lại sau hoặc nhờ admin mở khóa.',
+  },
+  invalid_token: {
+    title: 'Phiên đăng nhập không hợp lệ',
+    message: 'Token đã hết hạn hoặc không hợp lệ. Đăng nhập lại để tiếp tục.',
+  },
+  forbidden: {
+    title: 'Không có quyền truy cập',
+    message: 'Tài khoản hiện tại không được phép truy cập tài nguyên này.',
+  },
+  not_found: {
+    title: 'Không tìm thấy dữ liệu',
+    message: 'Tài nguyên không tồn tại hoặc bạn không có quyền xem (tenant isolation).',
+  },
+  invalid_invite_token: {
+    title: 'Mã kích hoạt không hợp lệ',
+    message: 'Mã đã hết hạn hoặc đã được dùng. Nhờ admin cấp mã mới.',
+  },
+  mfa_required: {
+    title: 'Cần xác thực MFA',
+    message: 'Nhập mã từ ứng dụng authenticator để hoàn tất đăng nhập.',
+  },
+  oidc_token_failed: {
+    title: 'IdP không trả về ID token',
+    message: 'Kiểm tra cấu hình client, redirect URI và scope openid/email/profile.',
+  },
+  oidc_bad_id_token: {
+    title: 'ID token không hợp lệ',
+    message: 'Chữ ký, issuer, audience hoặc thời hạn của ID token không hợp lệ.',
+  },
+  oidc_unknown_kid: {
+    title: 'Không tìm thấy khóa ký IdP',
+    message: 'kid trong ID token không có trong JWKS. Kiểm tra signing key của provider.',
+  },
+  oidc_bad_azp: {
+    title: 'ID token sai client',
+    message: 'Authorized party (azp) không khớp client ID. Kiểm tra cấu hình OIDC.',
+  },
+  oidc_no_email: {
+    title: 'IdP không trả về email',
+    message: 'Bật scope email và trả email claim trong provider.',
+  },
+  oidc_no_sub: {
+    title: 'IdP không trả về subject',
+    message: 'ID token thiếu claim sub. Kiểm tra cấu hình provider.',
+  },
+  oidc_callback_failed: {
+    title: 'Đăng nhập SSO thất bại',
+    message: 'Callback xử lý lỗi. Thử lại hoặc dùng mật khẩu.',
+  },
+  sso_unavailable: {
+    title: 'SSO chưa sẵn sàng',
+    message: 'Identity provider chưa được public HTTPS. Dùng đăng nhập bằng mật khẩu hoặc liên hệ quản trị viên.',
+  },
+  oidc_org_required: {
+    title: 'Chưa chọn tổ chức',
+    message: 'Nhập organization slug trước khi đăng nhập bằng SSO.',
+  },
+  oidc_discovery_failed: {
+    title: 'Không kết nối được IdP SSO',
+    message: 'Identity provider chưa sẵn sàng hoặc cấu hình issuer chưa đúng. Dùng mật khẩu hoặc thử lại sau.',
+  },
+  oidc_unreachable: {
+    title: 'Không kết nối được IdP SSO',
+    message: 'Server không reachable tới identity provider. Dùng mật khẩu hoặc thử lại sau.',
+  },
+  oidc_issuer_mismatch: {
+    title: 'Cấu hình SSO không nhất quán',
+    message: 'Issuer trong discovery document không khớp với OIDC_ISSUER. Liên hệ quản trị viên.',
+  },
+  oidc_endpoint_origin: {
+    title: 'Cấu hình SSO không an toàn',
+    message: 'Endpoint IdP không cùng origin với issuer. Liên hệ quản trị viên.',
+  },
+  oidc_insecure_endpoint: {
+    title: 'Cấu hình SSO không an toàn',
+    message: 'Endpoint IdP phải dùng HTTPS trong production.',
+  },
+  oidc_bad_state: {
+    title: 'Phiên SSO không hợp lệ',
+    message: 'State đã hết hạn hoặc không hợp lệ. Bắt đầu đăng nhập lại.',
+  },
+  oidc_state_expired: {
+    title: 'Phiên SSO đã hết hạn',
+    message: 'Quá thời gian 10 phút. Bắt đầu đăng nhập lại.',
+  },
+  oidc_bad_nonce: {
+    title: 'Phản hồi SSO không hợp lệ',
+    message: 'Nonce trong ID token không khớp. Bắt đầu đăng nhập lại.',
+  },
+  oidc_email_unverified: {
+    title: 'Email IdP chưa xác minh',
+    message: 'Identity provider trả về email chưa verified. Liên hệ quản trị viên IdP.',
+  },
+  oidc_not_configured: {
+    title: 'SSO chưa được cấu hình',
+    message: 'OIDC client secret hoặc issuer chưa được cấu hình trên server.',
+  },
+  oidc_code_required: {
+    title: 'Thiếu mã đăng nhập SSO',
+    message: 'Authorization code không được gửi về. Bắt đầu đăng nhập lại.',
+  },
+  org_not_allowed: {
+    title: 'Tổ chức không được phép SSO',
+    message: 'Organization này không nằm trong OIDC_ALLOWED_ORGS. Liên hệ quản trị viên.',
+  },
+  reserved_org_slug: {
+    title: 'Slug tổ chức bị giữ chỗ',
+    message: 'Slug này dành riêng cho platform administration. Chọn slug khác.',
+  },
+};
+
+function errorCodeOf(e) {
+  return e?.body?.error || e?.code || (() => {
+    const m = String(e?.message || '').match(/"error"\s*:\s*"([^"]+)"/);
+    return m ? m[1] : '';
+  })();
+}
+
+function defaultErrorCopy(e, code) {
+  const status = Number(e?.status || 0);
+  if (status === 401) return { title: 'Phiên đăng nhập đã hết hạn', message: 'Đăng nhập lại để tiếp tục.' };
+  if (status === 403) return { title: 'Không có quyền thực hiện', message: 'Tài khoản hiện tại không được phép thực hiện thao tác này.' };
+  if (status === 404) return { title: 'Không tìm thấy dữ liệu', message: 'Tài nguyên không tồn tại hoặc bạn không có quyền xem.' };
+  if (status === 409) return { title: 'Dữ liệu đã thay đổi', message: 'Có xung đột dữ liệu. Tải lại trang rồi thử lại.' };
+  if (status === 429) return { title: 'Quá nhiều yêu cầu', message: 'Vui lòng chờ một chút rồi thử lại.' };
+  if (status >= 500) return { title: 'Máy chủ đang gặp sự cố', message: 'Thử lại sau hoặc kiểm tra service health.' };
+  return { title: 'Không thực hiện được thao tác', message: code ? `Mã lỗi: ${code}` : 'Vui lòng thử lại.' };
+}
+
+const ERROR_COPY_EN = {
+  org_admin_required: { title: 'Organization administrator required', message: 'This view requires an active Organization Administrator for the current organization.' },
+  platform_admin_required: { title: 'Platform Administrator required', message: 'This account is not an active Platform Administrator. Ask a Platform Owner for access.' },
+  platform_admin_inactive: { title: 'Platform access revoked', message: 'Platform Administrator access for this account is no longer active.' },
+  platform_admin_org_required: { title: 'Wrong platform organization', message: 'Platform administrators must belong to the reserved platform organization.' },
+  platform_mfa_required: { title: 'MFA required', message: 'Enable TOTP MFA in Security before opening Platform Administration.' },
+  platform_role_required: { title: 'Platform role too low', message: 'This action requires the owner or operator role. Auditors are read-only.' },
+  platform_step_up_required: { title: 'Step-up verification required', message: 'Enter a fresh TOTP code. Step-up proofs are single-use and bound to one action.' },
+  scope_denied: { title: 'Credential scope denied', message: 'The API key or credential does not have the required scope for this action.' },
+  access_denied: { title: 'Access denied', message: 'The current role or policy does not allow this action.' },
+  last_admin: { title: 'Last organization administrator', message: 'Each organization must keep at least one active Organization Administrator.' },
+  last_owner: { title: 'Last platform owner', message: 'At least one active Platform Owner is required.' },
+  invite_required: { title: 'Activation required', message: 'This account was invited but has not been activated. Use the one-time code at /register.' },
+  invalid_mfa_code: { title: 'Invalid authenticator code', message: 'The code is incorrect, expired or already used. Wait for the next 30-second window.' },
+  account_locked: { title: 'Account temporarily locked', message: 'Too many failed verification attempts. Try again later or ask an administrator to unlock it.' },
+  invalid_token: { title: 'Session invalid', message: 'The session expired or was revoked. Sign in again.' },
+  forbidden: { title: 'Forbidden', message: 'This account is not allowed to access the resource.' },
+  not_found: { title: 'Not found', message: 'The resource does not exist or is outside your tenant scope.' },
+  invalid_invite_token: { title: 'Invalid activation code', message: 'The code expired or was already used. Ask an administrator for a new one.' },
+  mfa_required: { title: 'MFA required', message: 'Enter a code from your authenticator app to continue.' },
+  self_revoke_forbidden: { title: 'Cannot revoke your own owner access', message: 'Ask another Platform Owner to revoke your administrator rights.' },
+  platform_org_create_required: { title: 'Organization creation is managed by Platform', message: 'Organization creation is disabled here. Ask a Platform Administrator to create it and assign the first admin.' },
+};
+
 export function Err({ e }) {
   const [show, setShow] = React.useState(false);
   const [copied, setCopied] = React.useState(false);
+  const { lang } = useI18n();
   if (!e) return null;
-  // SynapseOneError packs `status path: bodyJSON` into one message (api.js) —
-  // a full JSON body would stretch the banner for pages. Show one short line,
-  // expand + copy on demand.
+  const code = errorCodeOf(e);
   const full = e.message || String(e);
   const LIMIT = 220;
+  const copy = lang === 'en'
+    ? (ERROR_COPY_EN[code] || { title: 'Request failed', message: full.length > LIMIT ? `${full.slice(0, LIMIT)}…` : full })
+    : (ERROR_COPY[code] || defaultErrorCopy(e, code));
   const long = full.length > LIMIT;
-  const shown = long && !show ? `${full.slice(0, LIMIT)}…` : full;
-  const copy = async () => {
+  const copyTextNow = async () => {
     await copyText(full);
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
   };
   return (
-    <div className="mb-4 px-4 py-2.5 rounded-2xl bg-red-500/10 text-red-600 text-sm min-w-0">
-      <p className="break-all">{shown}</p>
-      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+    <div className="mb-4 px-4 py-3 rounded-2xl bg-red-500/10 text-red-700 text-sm min-w-0" role="alert">
+      <p className="font-medium">{copy.title}</p>
+      <p className="text-xs mt-1 text-red-600/90">{copy.message}</p>
+      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+        {code && <span className="font-mono opacity-70">{code}</span>}
         {long && (
           <button onClick={() => setShow((v) => !v)} className="underline underline-offset-2 hover:opacity-80">
-            {show ? 'Show less' : 'Show details'}
+            {show ? 'Ẩn chi tiết' : 'Chi tiết kỹ thuật'}
           </button>
         )}
-        <button onClick={copy} className="underline underline-offset-2 hover:opacity-80">
-          {copied ? 'Copied!' : 'Copy'}
+        <button onClick={copyTextNow} className="underline underline-offset-2 hover:opacity-80">
+          {copied ? 'Đã copy' : 'Copy lỗi'}
         </button>
       </div>
+      {show && <p className="mt-2 break-all text-[11px] font-mono opacity-80">{full}</p>}
     </div>
   );
 }

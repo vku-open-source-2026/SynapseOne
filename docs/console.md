@@ -13,7 +13,7 @@ Org/Account switcher, IAM CRUD, authorize simulator, workflows, audit log.
 
 ```bash
 # together with the platform (console on :3000)
-docker compose up -d --build postgres redis s3 iam workflow gateway console
+docker compose up -d --build postgres valkey s3 iam workflow gateway console
 # open http://localhost:3000 → sign in demo@acme.local / org acme
 ```
 
@@ -83,3 +83,16 @@ JWTs only carry an `org` claim, so per-account filtering would hide every
 user-session request. A route-level
 `ErrorBoundary` turns render failures into a recovery card (reload/dashboard)
 instead of a white screen.
+
+## Platform Super Admin (`/admin`)
+
+A separate, cross-tenant control plane reuses the same React/Tailwind design
+system but has its own `AdminLayout`, `AdminSidebar`, `AdminTopbar` and
+`PlatformGuard`. It is not linked from the tenant console and requires a user
+JWT plus a fresh TOTP code to obtain a short-lived platform token
+(`kind=platform-admin`). The six modules are Overview, Organizations, Users &
+Access, Service Health, Usage, and Audit & Security, plus owner-only Platform
+Admins. Organization creation, account creation, user actions and admin grants
+require a fresh single-use step-up proof. Platform tokens are rejected on tenant
+APIs; API keys cannot open this console. Invited users activate from `/register`.
+See [`platform-superadmin.md`](platform-superadmin.md).

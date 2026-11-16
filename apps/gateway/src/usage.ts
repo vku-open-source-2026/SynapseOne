@@ -53,6 +53,7 @@ const FEATURE_ROUTES: Array<[prefix: string, feature: string]> = [
   ['/v1/faststore', 'faststore'],
   ['/v1/queue', 'queue'],
   ['/v1/storage', 'storage'],
+  ['/v1/warehouse', 'warehouse'],
   ['/v1/usage', 'usage'],
 ];
 

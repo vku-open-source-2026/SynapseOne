@@ -52,7 +52,10 @@ export interface ScanResult {
 // Backend selection
 // ---------------------------------------------------------------------------
 
-const REDIS_URL = process.env.FASTSTORE_REDIS_URL || process.env.REDIS_URL || '';
+// Valkey is the deployed datastore; it speaks the Redis protocol, so the
+// client and the legacy env names stay unchanged. *_VALKEY_URL wins.
+const REDIS_URL = process.env.FASTSTORE_VALKEY_URL || process.env.VALKEY_URL
+  || process.env.FASTSTORE_REDIS_URL || process.env.REDIS_URL || '';
 let redis: Redis | null = null;
 let connecting: Promise<boolean> | null = null;
 
@@ -72,15 +75,15 @@ export async function initStore(): Promise<boolean> {
       enableOfflineQueue: false,
       retryStrategy: () => null,
     });
-    client.on('error', (e: any) => console.error('[faststore][redis]', e?.message || e));
+    client.on('error', (e: any) => console.error('[faststore][valkey]', e?.message || e));
     try {
       await client.connect();
       await client.ping();
       redis = client;
-      console.log('[faststore] connected to Redis');
+      console.log('[faststore] connected to Valkey');
       return true;
     } catch (e: any) {
-      console.warn('[faststore] Redis unavailable, using in-memory fallback:', e?.message || e);
+      console.warn('[faststore] Valkey unavailable, using in-memory fallback:', e?.message || e);
       client.disconnect();
       redis = null;
       return false;
