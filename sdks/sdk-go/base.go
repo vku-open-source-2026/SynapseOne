@@ -227,6 +227,101 @@ type baseQueryEnvelope struct {
 	NextCursor *string          `json:"nextCursor"`
 }
 
+// ---------- databases ----------
+
+func (c *Client) baseCollectionsPath() string {
+	if c.BaseDatabase != "" {
+		return "/v1/base/databases/" + pathEscape(c.BaseDatabase) + "/collections"
+	}
+	return "/v1/base/collections"
+}
+
+// ListBaseDatabases lists visible database namespaces.
+func (c *Client) ListBaseDatabases(orgID, accountID string) ([]map[string]any, error) {
+	q := url.Values{}
+	if orgID != "" {
+		q.Set("orgId", orgID)
+	}
+	if accountID != "" {
+		q.Set("accountId", accountID)
+	}
+	p := "/v1/base/databases"
+	if qs := q.Encode(); qs != "" {
+		p += "?" + qs
+	}
+	b, err := c.do("GET", p, nil)
+	if err != nil {
+		return nil, err
+	}
+	var out []map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// CreateBaseDatabase creates a database namespace.
+func (c *Client) CreateBaseDatabase(body map[string]any) (map[string]any, error) {
+	b, err := c.do("POST", "/v1/base/databases", body)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetBaseDatabase fetches a database plus collection/document stats.
+func (c *Client) GetBaseDatabase(name string) (map[string]any, error) {
+	b, err := c.do("GET", "/v1/base/databases/"+pathEscape(name), nil)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// UpdateBaseDatabase patches name/description.
+func (c *Client) UpdateBaseDatabase(name string, patch map[string]any) (map[string]any, error) {
+	b, err := c.do("PATCH", "/v1/base/databases/"+pathEscape(name), patch)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// DeleteBaseDatabase removes a database; cascade deletes its collections.
+func (c *Client) DeleteBaseDatabase(name string, cascade bool) error {
+	p := "/v1/base/databases/" + pathEscape(name)
+	if cascade {
+		p += "?cascade=true"
+	}
+	_, err := c.do("DELETE", p, nil)
+	return err
+}
+
+// GetBaseDatabaseStats reads collection/document counts for a database.
+func (c *Client) GetBaseDatabaseStats(name string) (map[string]any, error) {
+	b, err := c.do("GET", "/v1/base/databases/"+pathEscape(name)+"/stats", nil)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ---------- collections ----------
 
 // ListBaseCollections lists visible collections, optionally filtered by
@@ -239,7 +334,7 @@ func (c *Client) ListBaseCollections(orgID, accountID string) ([]map[string]any,
 	if accountID != "" {
 		q.Set("accountId", accountID)
 	}
-	p := "/v1/base/collections"
+	p := c.baseCollectionsPath()
 	if qs := q.Encode(); qs != "" {
 		p += "?" + qs
 	}
@@ -258,7 +353,7 @@ func (c *Client) ListBaseCollections(orgID, accountID string) ([]map[string]any,
 // mapping ({fields:{logical:{path,type?,required?}},additional?}), orgId and
 // accountId. A map keeps the request forward-compatible.
 func (c *Client) CreateBaseCollection(body map[string]any) (map[string]any, error) {
-	b, err := c.do("POST", "/v1/base/collections", body)
+	b, err := c.do("POST", c.baseCollectionsPath(), body)
 	if err != nil {
 		return nil, err
 	}
@@ -271,7 +366,7 @@ func (c *Client) CreateBaseCollection(body map[string]any) (map[string]any, erro
 
 // GetBaseCollection fetches a collection plus its stats.
 func (c *Client) GetBaseCollection(name string) (map[string]any, error) {
-	b, err := c.do("GET", "/v1/base/collections/"+pathEscape(name), nil)
+	b, err := c.do("GET", c.baseCollectionsPath()+"/"+pathEscape(name), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -284,7 +379,7 @@ func (c *Client) GetBaseCollection(name string) (map[string]any, error) {
 
 // UpdateBaseCollection patches name/description/mapping.
 func (c *Client) UpdateBaseCollection(name string, patch map[string]any) (map[string]any, error) {
-	b, err := c.do("PATCH", "/v1/base/collections/"+pathEscape(name), patch)
+	b, err := c.do("PATCH", c.baseCollectionsPath()+"/"+pathEscape(name), patch)
 	if err != nil {
 		return nil, err
 	}
@@ -297,13 +392,13 @@ func (c *Client) UpdateBaseCollection(name string, patch map[string]any) (map[st
 
 // DeleteBaseCollection deletes a collection and all of its documents.
 func (c *Client) DeleteBaseCollection(name string) error {
-	_, err := c.do("DELETE", "/v1/base/collections/"+pathEscape(name), nil)
+	_, err := c.do("DELETE", c.baseCollectionsPath()+"/"+pathEscape(name), nil)
 	return err
 }
 
 // GetBaseCollectionStats reads document counts for a collection.
 func (c *Client) GetBaseCollectionStats(name string) (map[string]any, error) {
-	b, err := c.do("GET", "/v1/base/collections/"+pathEscape(name)+"/stats", nil)
+	b, err := c.do("GET", c.baseCollectionsPath()+"/"+pathEscape(name)+"/stats", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -323,7 +418,7 @@ func (c *Client) CreateBaseDocument(collection string, in BaseDocumentInput) (ma
 	if err != nil {
 		return nil, err
 	}
-	b, err := c.do("POST", "/v1/base/collections/"+pathEscape(collection)+"/documents", body)
+	b, err := c.do("POST", c.baseCollectionsPath()+"/"+pathEscape(collection)+"/documents", body)
 	if err != nil {
 		return nil, err
 	}
@@ -337,7 +432,7 @@ func (c *Client) CreateBaseDocument(collection string, in BaseDocumentInput) (ma
 // GetBaseDocument fetches one document. as is "data", "object", or "" (server
 // default: data).
 func (c *Client) GetBaseDocument(collection, id, as string) (map[string]any, error) {
-	p := "/v1/base/collections/" + pathEscape(collection) + "/documents/" + pathEscape(id)
+	p := c.baseCollectionsPath() + "/" + pathEscape(collection) + "/documents/" + pathEscape(id)
 	if as != "" {
 		p += "?as=" + url.QueryEscape(as)
 	}
@@ -358,7 +453,7 @@ func (c *Client) SetBaseDocument(collection, id string, in BaseDocumentInput) (m
 	if err != nil {
 		return nil, err
 	}
-	b, err := c.do("PUT", "/v1/base/collections/"+pathEscape(collection)+"/documents/"+pathEscape(id), body)
+	b, err := c.do("PUT", c.baseCollectionsPath()+"/"+pathEscape(collection)+"/documents/"+pathEscape(id), body)
 	if err != nil {
 		return nil, err
 	}
@@ -375,7 +470,7 @@ func (c *Client) UpdateBaseDocument(collection, id string, in BaseDocumentInput)
 	if err != nil {
 		return nil, err
 	}
-	b, err := c.do("PATCH", "/v1/base/collections/"+pathEscape(collection)+"/documents/"+pathEscape(id), body)
+	b, err := c.do("PATCH", c.baseCollectionsPath()+"/"+pathEscape(collection)+"/documents/"+pathEscape(id), body)
 	if err != nil {
 		return nil, err
 	}
@@ -388,7 +483,7 @@ func (c *Client) UpdateBaseDocument(collection, id string, in BaseDocumentInput)
 
 // DeleteBaseDocument deletes a document. ifVersion > 0 enforces optimistic locking.
 func (c *Client) DeleteBaseDocument(collection, id string, ifVersion int) error {
-	p := "/v1/base/collections/" + pathEscape(collection) + "/documents/" + pathEscape(id)
+	p := c.baseCollectionsPath() + "/" + pathEscape(collection) + "/documents/" + pathEscape(id)
 	if ifVersion > 0 {
 		p += "?ifVersion=" + strconv.Itoa(ifVersion)
 	}
@@ -405,7 +500,7 @@ func (c *Client) ListBaseDocuments(collection string, limit, offset int) ([]map[
 	if offset > 0 {
 		q.Set("offset", strconv.Itoa(offset))
 	}
-	p := "/v1/base/collections/" + pathEscape(collection) + "/documents"
+	p := c.baseCollectionsPath() + "/" + pathEscape(collection) + "/documents"
 	if qs := q.Encode(); qs != "" {
 		p += "?" + qs
 	}
@@ -425,7 +520,7 @@ func (c *Client) QueryBaseDocuments(collection string, q BaseQuery) (BaseQueryRe
 	if q.As == "" {
 		q.As = "data"
 	}
-	b, err := c.do("POST", "/v1/base/collections/"+pathEscape(collection)+"/query", q)
+	b, err := c.do("POST", c.baseCollectionsPath()+"/"+pathEscape(collection)+"/query", q)
 	if err != nil {
 		return BaseQueryResult[map[string]any]{}, err
 	}
@@ -450,7 +545,7 @@ func (c *Client) VectorSearchBaseDocuments(collection string, opts BaseVectorSea
 	if opts.As == "" {
 		opts.As = "data"
 	}
-	b, err := c.do("POST", "/v1/base/collections/"+pathEscape(collection)+"/vector-search", opts)
+	b, err := c.do("POST", c.baseCollectionsPath()+"/"+pathEscape(collection)+"/vector-search", opts)
 	if err != nil {
 		return BaseVectorSearchResult[map[string]any]{}, err
 	}
@@ -471,7 +566,7 @@ func (c *Client) IncrementBaseDocument(collection, id, field string, by, ifVersi
 	if ifVersion > 0 {
 		body["ifVersion"] = ifVersion
 	}
-	b, err := c.do("POST", "/v1/base/collections/"+pathEscape(collection)+"/documents/"+pathEscape(id)+"/increment", body)
+	b, err := c.do("POST", c.baseCollectionsPath()+"/"+pathEscape(collection)+"/documents/"+pathEscape(id)+"/increment", body)
 	if err != nil {
 		return nil, err
 	}
@@ -484,7 +579,7 @@ func (c *Client) IncrementBaseDocument(collection, id, field string, by, ifVersi
 
 // BatchBaseDocuments runs 1..100 create/set/update/delete/increment operations.
 func (c *Client) BatchBaseDocuments(collection string, operations []any) (map[string]any, error) {
-	b, err := c.do("POST", "/v1/base/collections/"+pathEscape(collection)+"/documents:batch",
+	b, err := c.do("POST", c.baseCollectionsPath()+"/"+pathEscape(collection)+"/documents:batch",
 		map[string]any{"operations": operations})
 	if err != nil {
 		return nil, err
@@ -507,7 +602,7 @@ func (c *Client) BaseChanges(collection, since string, limit int, as string) (ma
 	if as != "" {
 		q.Set("as", as)
 	}
-	b, err := c.do("GET", "/v1/base/collections/"+pathEscape(collection)+"/changes?"+q.Encode(), nil)
+	b, err := c.do("GET", c.baseCollectionsPath()+"/"+pathEscape(collection)+"/changes?"+q.Encode(), nil)
 	if err != nil {
 		return nil, err
 	}

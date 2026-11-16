@@ -137,6 +137,31 @@ def me(self) -> dict
 ```
 Returns the user record behind the current Bearer token.
 
+### Multi-factor authentication (`c.iam`)
+
+When an account has MFA, `login_with_password` raises `SynapseOneError` with
+`status == 401` and `body["error"] == "mfa_required"`; finish with its `mfaToken`.
+
+```python
+from synapseone_sdk import SynapseOneError
+
+try:
+    s = c.iam.login_with_password(email, password, "acme")
+except SynapseOneError as e:
+    if e.status == 401 and e.body.get("error") == "mfa_required":
+        s = c.iam.verify_mfa(e.body["mfaToken"], code="492039")  # or recovery_code=
+    else:
+        raise
+
+setup = c.iam.setup_totp()                  # {"secret", "otpauthUrl", ...}
+codes = c.iam.enable_totp("123456")["recoveryCodes"]
+c.iam.mfa_status()
+c.iam.regenerate_recovery_codes("123456")
+c.iam.disable_mfa(code="123456")            # or recovery_code=
+c.iam.reset_user_mfa(user_id)               # org admins: lost device
+c.iam.unlock_user(user_id)                  # org admins: clear a lockout
+```
+
 ### Organizations
 
 #### `list_orgs()`
@@ -476,14 +501,17 @@ def deactivate_workflow(self, wf_id: str) -> Any
 ```
 Deactivates a workflow.
 
-#### `execute_workflow(wf_id, payload=None)`
+#### `execute_workflow(wf_id, payload=None, *, wait=False, timeout_ms=30000)`
 ```python
-def execute_workflow(self, wf_id: str, payload: dict | None = None) -> Any
+def execute_workflow(self, wf_id: str, payload: dict | None = None, *, wait: bool = False, timeout_ms: int = 30000) -> Any
 ```
-Triggers a manual execution (proxied to the engine).
+Triggers a manual execution. Queue mode returns `202 {queued: true,
+executionId}`; `wait=True` blocks for the final result. `wait_for_execution`
+polls a queued/running execution.
 
 ```python
-c.execute_workflow(wf_id, {"url": "https://example.com/hook"})
+run = c.workflow.execute_workflow(wf_id, {"url": "https://example.com/hook"}, wait=True)
+same = c.workflow.wait_for_execution(run["executionId"])
 ```
 
 #### `update_workflow(wf_id, name=None, definition=None)`
@@ -613,6 +641,10 @@ Collections of JSON documents with a logical object↔data mapping, queries,
 optimistic concurrency, counters, batches and a change feed. Full guide:
 [synapsebase.md](synapsebase.md).
 
+Use `c.base.database("analytics")` to address a database namespace (or
+`c.base.collection("parks", database="analytics")` for typed use). Without it,
+calls use the legacy flat routes and the tenant `default` database.
+
 ```python
 from dataclasses import dataclass
 
@@ -664,6 +696,35 @@ feed = parks.changes("2026-10-01T00:00:00Z")
 `data`/`object` use the exported `UNSET` sentinel, so an explicit `None` is not
 mistaken for an omitted argument. Typed collections convert list/increment/
 changes results locally through `mapping`.
+
+Graph and GIS methods:
+
+```python
+c.base.graph_upsert_nodes("knowledge", [
+    {"id": "doc:1", "labels": ["Document"], "properties": {"title": "Bão số 12"}},
+])
+c.base.graph_upsert_edges("knowledge", [
+    {"from": "doc:1", "to": "province:hanoi", "type": "MENTIONS"},
+])
+sub = c.base.graph_node("knowledge", "doc:1", depth=2)
+stats = c.base.graph_stats("knowledge")
+
+c.base.geo_upsert("knowledge", [{
+    "id": "p1", "properties": {"name": "Hà Nội"},
+    "geometry": {"type": "Point", "coordinates": [105.85, 21.03]},
+}])
+nearby = c.base.geo_near("knowledge", 21.03, 105.85, 5000)
+extent = c.base.geo_stats("knowledge")
+```
+
+| Graph / GIS method | Purpose |
+|---|---|
+| `graph_upsert_nodes(collection, nodes)` / `graph_upsert_edges(collection, edges)` | upsert graph data |
+| `graph_node(collection, node_id, depth=1, limit=200)` / `graph_query(...)` | bounded traversal |
+| `graph_stats` / `graph_delete_node` | graph stats and cleanup |
+| `geo_upsert(collection, features)` / `geo_list(collection, bbox=, limit=)` | GeoJSON features |
+| `geo_near(collection, lat, lng, radius_meters)` | radius in metres |
+| `geo_within(collection, geometry)` / `geo_stats` / `geo_delete` | containment, extent, cleanup |
 
 ### Synapse Faststore (`c.faststore`)
 
@@ -809,7 +870,8 @@ if __name__ == "__main__":
 ## 0.7.x additions
 
 - `client.iam.register/login_with_password/change_password/request_password_reset/reset_password/verify_email/list_sessions/revoke_session` and `exchange_token` for Tier-2 delegated identity.
-- `client.storage` — `put_object/get_object/head_object/list_objects/delete_object/presign` + multipart.
+- `client.ocs` — buckets (`create_bucket/list_buckets/get_bucket/delete_bucket`) and objects (`put_object/get_object/head_object/list_objects/copy_object/presign`) + multipart.
+- `client.storage` — default-bucket compatibility (`put_object/get_object/head_object/list_objects/delete_object/presign`) + multipart.
 - `client.notifications` — `send/get/list/cancel/get_preference/set_preference/unsubscribe`.
 - `client.inference.chat_stream(...)` yields SSE `(event, data)`; `iter_text(...)` projects incremental text, `parse_chat_delta(data)` parses one frame.
 - `client.health.health()/ready()/status()`: `ready()` returns the degraded payload on 503 instead of raising (pass `throw_on_degraded=True` for strict probes).

@@ -126,12 +126,12 @@ export function assertProductionConfig(env: NodeJS.ProcessEnv = process.env): vo
     throw new Error('[stream] SYNAPSEONE_INTERNAL_SECRET must be set in production (internal-only service).');
   }
   const engine = (env.STREAM_ENGINE || '').trim().toLowerCase();
-  const redisUrl = env.STREAM_REDIS_URL || env.REDIS_URL || '';
+  const redisUrl = env.STREAM_VALKEY_URL || env.VALKEY_URL || env.STREAM_REDIS_URL || env.REDIS_URL || '';
   if (engine === 'memory') {
-    throw new Error('[stream] STREAM_ENGINE=memory is forbidden in production (events are lost on restart). Use redis or a durable engine.');
+    throw new Error('[stream] STREAM_ENGINE=memory is forbidden in production (events are lost on restart). Use valkey/redis or a durable engine.');
   }
   if (!engine && !redisUrl) {
-    throw new Error('[stream] In production one of STREAM_ENGINE or STREAM_REDIS_URL/REDIS_URL must be set (no memory fallback).');
+    throw new Error('[stream] In production one of STREAM_ENGINE or STREAM_VALKEY_URL/STREAM_REDIS_URL/VALKEY_URL/REDIS_URL must be set (no memory fallback).');
   }
   const origins = (env.CORS_ORIGIN || '').split(',').map((s) => s.trim()).filter(Boolean);
   if (!origins.length) {

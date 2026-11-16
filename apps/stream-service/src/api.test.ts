@@ -252,7 +252,7 @@ test('production fails closed on missing secret, memory engine and wildcard CORS
   );
   assert.throws(
     () => assertProductionConfig({ ...base, SYNAPSEONE_INTERNAL_SECRET: 's', CORS_ORIGIN: 'https://a.example' }),
-    /STREAM_ENGINE or STREAM_REDIS_URL/,
+    /STREAM_ENGINE or STREAM_VALKEY_URL/,
   );
   assert.throws(
     () => assertProductionConfig({ ...base, SYNAPSEONE_INTERNAL_SECRET: 's', CORS_ORIGIN: 'https://a.example', STREAM_ENGINE: 'memory' }),

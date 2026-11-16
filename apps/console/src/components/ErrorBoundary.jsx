@@ -30,7 +30,7 @@ export default class ErrorBoundary extends React.Component {
     if (!error) return this.props.children;
     return (
       <Card className="my-8">
-        <PageTitle title="This page failed to render" sub="The error was logged — reload or head back to the Dashboard" />
+        <PageTitle title="This page failed to render" sub="The error was logged, reload or head back to the Dashboard" />
         <pre className="bg-background rounded-2xl p-3 text-xs overflow-x-auto text-main-text mb-4">
           {error.message || String(error)}
         </pre>

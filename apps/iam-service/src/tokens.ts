@@ -7,9 +7,9 @@
  */
 import jwt from 'jsonwebtoken';
 import { randomBytes, randomUUID } from 'crypto';
-import { and, desc, eq, isNull, sql } from 'drizzle-orm';
-import { ensureTables, getDb, useDb, __mem, hashSecret, hashCandidates } from './db';
-import { apiKeys, refreshTokens } from './schema';
+import { and, desc, eq, gt, isNull, or, sql } from 'drizzle-orm';
+import { ensureTables, getDb, useDb, __mem, hashSecret, hashCandidates, bumpAuthVersion } from './db';
+import { apiKeys, executionDelegations, platformRunnerKeys, refreshTokens } from './schema';
 
 /** Fail fast on weak/default JWT secrets in production; warn loudly in dev. */
 function jwtSecret(): string {
@@ -57,18 +57,34 @@ export interface AccessClaims {
   account?: string; // account id
   scopes?: string[];
   kind?: string;
+  /** Platform administrator role (only kind=platform-admin). */
+  role?: 'owner' | 'operator' | 'auditor';
+  /** JWT id and one-time step-up binding. */
+  jti?: string;
+  sid?: string;
+  typ?: string;
+  action?: string;
   /** Delegated token: the service identity that acted for the user. */
-  act?: { sub: string; kind?: string };
+  act?: { sub: string; kind?: string; exec?: string; instance?: string };
   /** Delegation marker + audience (Tier-2 service). */
   delegated?: boolean;
   aud?: string;
+  amr?: string[];
+  auth_time?: number;
+  /** Credential epoch (users.auth_version) captured when the token was issued. */
+  ver?: number;
+  /** Per-execution delegated grant (kind=exec-delegated). */
+  exec?: string;
+  runner?: string;
+  instance?: string;
 }
 
 export function signAccess(
   claims: AccessClaims,
-  opts: { expiresIn?: number; audience?: string } = {},
+  opts: { expiresIn?: number; audience?: string; minExpiresIn?: number } = {},
 ): { token: string; expiresIn: number } {
-  const expiresIn = Math.min(Math.max(Math.floor(opts.expiresIn ?? ACCESS_TTL), 60), 86_400);
+  const floor = Math.min(Math.max(Math.floor(opts.minExpiresIn ?? 60), 1), 3600);
+  const expiresIn = Math.min(Math.max(Math.floor(opts.expiresIn ?? ACCESS_TTL), floor), 86_400);
   const kind = claims.kind || 'user';
   // Org-member user tokens carry full authority; narrow credentials (service
   // accounts, delegated tokens) pass scopes explicitly and are never widened.
@@ -93,6 +109,7 @@ export function signDelegated(input: {
   actorKind?: string;
   audience?: string;
   ttlSeconds?: number;
+  ver?: number;
 }): { token: string; expiresIn: number } {
   return signAccess(
     {
@@ -101,6 +118,7 @@ export function signDelegated(input: {
       account: input.account,
       scopes: input.scopes,
       kind: 'delegated',
+      ver: input.ver,
       delegated: true,
       act: { sub: input.actor, kind: input.actorKind || 'service-account' },
     },
@@ -111,6 +129,106 @@ export function signDelegated(input: {
 export function verifyAccess(token: string): AccessClaims {
   // Accept legacy issuer during the rebrand window so existing sessions survive.
   return jwt.verify(token, JWT_SECRET, { issuer: ['synapseone-iam', 'synapsedx-iam'], algorithms: ['HS256'] }) as AccessClaims;
+}
+
+export const PLATFORM_AUDIENCE = 'synapseone-platform-admin';
+export const PLATFORM_STEP_UP_AUDIENCE = 'synapseone-platform-step-up';
+
+/**
+ * Platform-session lifetime. Defaults to 15 minutes; operators can raise it
+ * for a long-lived admin console session (clamped to 30 days). The token still
+ * carries the user's auth_version so a revoked session can be rejected before
+ * its natural expiry.
+ */
+export function platformSessionTtl(): number {
+  const raw = Number(process.env.PLATFORM_SESSION_TTL_SECONDS ?? 900);
+  if (!Number.isFinite(raw)) return 900;
+  return Math.min(Math.max(Math.floor(raw), 60), 30 * 86_400);
+}
+
+/** Issue a token for the dedicated platform control plane. It has no
+ *  org/account claims and a distinct audience so it cannot be used as a normal
+ *  tenant token. */
+export function signPlatformAccess(input: {
+  userId: string;
+  role: 'owner' | 'operator' | 'auditor';
+  ttlSeconds?: number;
+  ver?: number;
+}): { token: string; expiresIn: number; jti: string } {
+  const expiresIn = Math.min(Math.max(Math.floor(input.ttlSeconds ?? platformSessionTtl()), 60), 30 * 86_400);
+  const scopes = input.role === 'owner'
+    ? ['platform:read', 'platform:write', 'platform:admin']
+    : input.role === 'operator'
+      ? ['platform:read', 'platform:write']
+      : ['platform:read'];
+  const jti = randomUUID();
+  const token = jwt.sign({
+    sub: input.userId,
+    kind: 'platform-admin',
+    role: input.role,
+    scopes,
+    ver: input.ver,
+    aud: PLATFORM_AUDIENCE,
+    iss: 'synapseone-iam',
+    auth_time: Math.floor(Date.now() / 1000),
+    jti,
+  }, JWT_SECRET, { expiresIn });
+  return { token, expiresIn, jti };
+}
+
+export function verifyPlatformAccess(token: string): AccessClaims {
+  const claims = verifyAccess(token);
+  if (claims.kind !== 'platform-admin' || claims.aud !== PLATFORM_AUDIENCE) {
+    throw new Error('not a platform administrator token');
+  }
+  return claims;
+}
+
+/** Short-lived proof of a fresh TOTP challenge for one action in one platform
+ *  session. The jti is consumed server-side exactly once. */
+export function signPlatformStepUp(input: {
+  userId: string;
+  role: 'owner' | 'operator' | 'auditor';
+  sessionJti: string;
+  action: string;
+}): { token: string; expiresIn: number; jti: string } {
+  const raw = Number(process.env.PLATFORM_STEP_UP_TTL_SECONDS || 300);
+  const expiresIn = Math.min(Math.max(Number.isFinite(raw) ? Math.floor(raw) : 300, 60), 900);
+  const jti = randomUUID();
+  const token = jwt.sign({
+    sub: input.userId,
+    kind: 'platform-step-up',
+    typ: 'platform_step_up',
+    role: input.role,
+    action: input.action,
+    sid: input.sessionJti,
+    jti,
+    aud: PLATFORM_STEP_UP_AUDIENCE,
+    iss: 'synapseone-iam',
+  }, JWT_SECRET, { expiresIn });
+  return { token, expiresIn, jti };
+}
+
+export function verifyPlatformStepUp(
+  token: string,
+  userId: string,
+  action: string,
+  sessionJti: string,
+): AccessClaims | null {
+  try {
+    const claims: any = jwt.verify(token, JWT_SECRET, {
+      issuer: ['synapseone-iam', 'synapsedx-iam'],
+      audience: PLATFORM_STEP_UP_AUDIENCE,
+      algorithms: ['HS256'],
+    });
+    if (claims?.typ !== 'platform_step_up' || claims?.kind !== 'platform-step-up') return null;
+    if (claims?.sub !== userId || claims?.sid !== sessionJti) return null;
+    if (String(claims?.action || '') !== String(action)) return null;
+    if (typeof claims?.jti !== 'string' || !claims.jti) return null;
+    return claims as AccessClaims;
+  } catch {
+    return null;
+  }
 }
 
 export function newRefreshToken(): { value: string; hash: string } {
@@ -238,6 +356,8 @@ export async function findRefreshOwner(value: string): Promise<{ user_id: string
 
 /** Thu hồi TẤT CẢ refresh token của user (mất thiết bị). Trả về số token bị thu hồi. */
 export async function revokeAllRefresh(userId: string): Promise<number> {
+  // Every access token issued before this revocation becomes unusable.
+  await bumpAuthVersion(userId);
   if (useDb()) {
     const db = getDb()!;
     await ensureTables();
@@ -356,18 +476,90 @@ export async function revokeApiKey(id: string): Promise<boolean> {
   return false;
 }
 
-/** Lookup by id for tenant-scoped revoke (safe fields only). */
-export async function findApiKeyById(id: string): Promise<{ account_id: string } | null> {
+/** Revoke every API key created on behalf of a deprovisioned user. */
+export async function revokeApiKeysForUser(userId: string): Promise<number> {
   if (useDb()) {
     const db = getDb()!;
     await ensureTables();
-    const rows = await db.select({ accountId: apiKeys.accountId }).from(apiKeys).where(eq(apiKeys.id, id)).limit(1);
-    return rows[0] ? { account_id: rows[0].accountId } : null;
+    const rows = await db.update(apiKeys)
+      .set({ revokedAt: sql`now()` })
+      .where(and(eq(apiKeys.userId, userId), isNull(apiKeys.revokedAt)))
+      .returning({ id: apiKeys.id });
+    return rows.length;
+  }
+  let count = 0;
+  for (const rec of __mem.apiKeys.values()) {
+    if (rec.user_id === userId && !rec.revoked_at) {
+      rec.revoked_at = new Date().toISOString();
+      count++;
+    }
+  }
+  return count;
+}
+
+/** Lookup by id for tenant-scoped revoke (safe fields only). */
+export interface ApiKeyRecord {
+  account_id: string;
+  user_id: string | null;
+  name: string;
+  scopes: string[];
+  expires_at: string | null;
+  revoked_at: string | null;
+}
+
+export async function findApiKeyById(id: string): Promise<ApiKeyRecord | null> {
+  if (useDb()) {
+    const db = getDb()!;
+    await ensureTables();
+    const rows = await db.select({
+      accountId: apiKeys.accountId,
+      userId: apiKeys.userId,
+      name: apiKeys.name,
+      scopes: apiKeys.scopes,
+      expiresAt: apiKeys.expiresAt,
+      revokedAt: apiKeys.revokedAt,
+    }).from(apiKeys).where(eq(apiKeys.id, id)).limit(1);
+    const r = rows[0];
+    return r
+      ? { account_id: r.accountId, user_id: r.userId, name: r.name, scopes: r.scopes || [], expires_at: iso(r.expiresAt), revoked_at: iso(r.revokedAt) }
+      : null;
   }
   for (const rec of __mem.apiKeys.values()) {
-    if (rec.id === id) return { account_id: rec.account_id };
+    if (rec.id === id) {
+      return { account_id: rec.account_id, user_id: rec.user_id || null, name: rec.name, scopes: rec.scopes || [], expires_at: rec.expires_at || null, revoked_at: rec.revoked_at || null };
+    }
   }
   return null;
+}
+
+/**
+ * Rotate an API key: mint a successor with the same owner/name/scopes/expiry
+ * and retire the old one. `graceSeconds` > 0 keeps the old key valid for a
+ * short overlap (zero-downtime redeploys, like AWS access-key rotation);
+ * 0 revokes it immediately. Returns null when the key is missing or retired.
+ */
+export async function rotateApiKey(id: string, graceSeconds: number): Promise<{ id: string; value: string; prefix: string; oldKeyExpiresAt: string } | null> {
+  const old = await findApiKeyById(id);
+  if (!old || old.revoked_at) return null;
+  if (old.expires_at && new Date(old.expires_at).getTime() < Date.now()) return null;
+  const next = await createApiKeyRecord(old.account_id, old.user_id, old.name, old.scopes, old.expires_at ? new Date(old.expires_at) : null);
+  const retireAt = new Date(Date.now() + Math.max(0, graceSeconds) * 1000);
+  if (useDb()) {
+    const db = getDb()!;
+    await ensureTables();
+    if (graceSeconds > 0) {
+      await db.update(apiKeys).set({ expiresAt: retireAt }).where(eq(apiKeys.id, id));
+    } else {
+      await db.update(apiKeys).set({ revokedAt: sql`now()` }).where(and(eq(apiKeys.id, id), isNull(apiKeys.revokedAt)));
+    }
+  } else {
+    for (const rec of __mem.apiKeys.values()) {
+      if (rec.id !== id) continue;
+      if (graceSeconds > 0) rec.expires_at = retireAt.toISOString();
+      else rec.revoked_at = new Date().toISOString();
+    }
+  }
+  return { ...next, oldKeyExpiresAt: retireAt.toISOString() };
 }
 
 /** Safe key listing (id/prefix/metadata only — hashes and secret values NEVER leave the server). */
@@ -376,8 +568,10 @@ export interface ApiKeyInfo {
   name: string;
   prefix: string;
   scopes: string[];
+  user_id: string | null;
   expires_at: string | null;
   revoked_at: string | null;
+  last_used_at: string | null;
   created_at: string | null;
 }
 
@@ -390,8 +584,10 @@ export async function listApiKeys(accountId: string): Promise<ApiKeyInfo[]> {
       name: apiKeys.name,
       prefix: apiKeys.keyPrefix,
       scopes: apiKeys.scopes,
+      userId: apiKeys.userId,
       expiresAt: apiKeys.expiresAt,
       revokedAt: apiKeys.revokedAt,
+      lastUsedAt: apiKeys.lastUsedAt,
       createdAt: apiKeys.createdAt,
     }).from(apiKeys)
       .where(eq(apiKeys.accountId, accountId))
@@ -402,8 +598,10 @@ export async function listApiKeys(accountId: string): Promise<ApiKeyInfo[]> {
       name: r.name,
       prefix: r.prefix,
       scopes: r.scopes || [],
+      user_id: r.userId ?? null,
       expires_at: iso(r.expiresAt),
       revoked_at: iso(r.revokedAt),
+      last_used_at: iso(r.lastUsedAt),
       created_at: iso(r.createdAt),
     }));
   }
@@ -415,13 +613,25 @@ export async function listApiKeys(accountId: string): Promise<ApiKeyInfo[]> {
       name: rec.name,
       prefix: rec.key_prefix,
       scopes: rec.scopes || [],
+      user_id: rec.user_id || null,
       expires_at: rec.expires_at || null,
       revoked_at: rec.revoked_at || null,
+      last_used_at: rec.last_used_at || null,
       created_at: rec.created_at || null,
     }));
 }
 
-export async function verifyApiKey(raw: string): Promise<{ account_id: string; scopes: string[] } | null> {
+export interface VerifiedApiKey {
+  id: string;
+  account_id: string;
+  user_id: string | null;
+  scopes: string[];
+}
+
+/** last_used_at is written at most once per minute per key (hot-path friendly). */
+const LAST_USED_THROTTLE_MS = 60_000;
+
+export async function verifyApiKey(raw: string): Promise<VerifiedApiKey | null> {
   if (!raw || typeof raw !== 'string' || raw.length > 512) return null;
   // Thử peppered hash trước, legacy sau (rotation-safe cho key cũ).
   for (const hash of hashCandidates(raw)) {
@@ -431,23 +641,361 @@ export async function verifyApiKey(raw: string): Promise<{ account_id: string; s
   return null;
 }
 
-async function verifyApiKeyByHash(hash: string): Promise<{ account_id: string; scopes: string[] } | null> {
+async function verifyApiKeyByHash(hash: string): Promise<VerifiedApiKey | null> {
   if (useDb()) {
     const db = getDb()!;
     await ensureTables();
     const rows = await db.select({
+      id: apiKeys.id,
       accountId: apiKeys.accountId,
+      userId: apiKeys.userId,
       scopes: apiKeys.scopes,
       expiresAt: apiKeys.expiresAt,
       revokedAt: apiKeys.revokedAt,
+      lastUsedAt: apiKeys.lastUsedAt,
     }).from(apiKeys).where(eq(apiKeys.keyHash, hash)).limit(1);
     const row = rows[0];
     if (!row || row.revokedAt) return null;
     if (row.expiresAt && new Date(row.expiresAt).getTime() < Date.now()) return null;
-    return { account_id: row.accountId, scopes: row.scopes || [] };
+    if (!row.lastUsedAt || Date.now() - new Date(row.lastUsedAt).getTime() > LAST_USED_THROTTLE_MS) {
+      // Best-effort usage stamp; verification never fails because of it.
+      db.update(apiKeys).set({ lastUsedAt: sql`now()` })
+        .where(and(eq(apiKeys.id, row.id), or(isNull(apiKeys.lastUsedAt), sql`${apiKeys.lastUsedAt} < now() - interval '60 seconds'`)))
+        .catch(() => undefined);
+    }
+    return { id: row.id, account_id: row.accountId, user_id: row.userId ?? null, scopes: row.scopes || [] };
   }
   const rec = __mem.apiKeys.get(hash);
   if (!rec || rec.revoked_at) return null;
   if (rec.expires_at && new Date(rec.expires_at).getTime() < Date.now()) return null;
-  return { account_id: rec.account_id, scopes: rec.scopes || [] };
+  rec.last_used_at = new Date().toISOString();
+  return { id: rec.id, account_id: rec.account_id, user_id: rec.user_id || null, scopes: rec.scopes || [] };
 }
+
+// ---------- platform (owner-scoped) runner keys ----------
+//
+// A platform runner is system compute, not a tenant credential. Its key has no
+// account/user binding and is restricted to runner/queue/inference scopes; the
+// gateway refuses it on every tenant data API. Workflow-service binds it to one
+// runner registration and only that runner may claim system-queue jobs.
+
+/** Scope families a platform runner key may hold. Never `*` or data-plane
+ *  services: a system key must not become a cross-tenant master key. */
+const PLATFORM_RUNNER_SCOPE_FAMILIES = new Set(['workflow', 'queue', 'inference']);
+const PLATFORM_RUNNER_SCOPE_RE = /^(workflow|queue|inference):(?:[A-Za-z][A-Za-z0-9*-]{0,63}|\*)$/;
+export const PLATFORM_RUNNER_DEFAULT_SCOPES = [
+  'workflow:*',
+  'queue:consume',
+  'queue:ack',
+  'queue:nack',
+  'queue:heartbeat',
+  'inference:*',
+];
+
+/** Normalize/validate owner-supplied runner scopes. Returns null when any
+ *  scope is outside the three runner families or malformed. */
+export function normalizePlatformRunnerScopes(input: unknown): string[] | null {
+  if (input === undefined || input === null) return PLATFORM_RUNNER_DEFAULT_SCOPES.slice();
+  if (!Array.isArray(input)) return null;
+  const out: string[] = [];
+  for (const raw of input) {
+    const scope = String(raw || '').trim();
+    if (!scope || scope.length > 80 || !PLATFORM_RUNNER_SCOPE_RE.test(scope)) return null;
+    if (!PLATFORM_RUNNER_SCOPE_FAMILIES.has(scope.split(':')[0])) return null;
+    if (!out.includes(scope)) out.push(scope);
+  }
+  return out.length ? out : null;
+}
+
+export interface PlatformRunnerKeyInfo {
+  id: string;
+  runner_id: string;
+  name: string;
+  prefix: string;
+  scopes: string[];
+  created_by: string | null;
+  expires_at: string | null;
+  revoked_at: string | null;
+  last_used_at: string | null;
+  created_at: string | null;
+}
+
+export interface VerifiedPlatformRunnerKey {
+  id: string;
+  runner_id: string;
+  name: string;
+  scopes: string[];
+}
+
+export async function createPlatformRunnerKey(input: {
+  runnerId: string;
+  name: string;
+  scopes: string[];
+  createdBy?: string | null;
+  expiresAt?: Date | null;
+}): Promise<{ id: string; value: string; prefix: string }> {
+  const raw = 'synapseone_pr_' + randomBytes(32).toString('base64url');
+  const prefix = raw.slice(0, 16);
+  const hash = hashSecret(raw);
+  if (useDb()) {
+    const db = getDb()!;
+    await ensureTables();
+    const rows = await db.insert(platformRunnerKeys).values({
+      runnerId: input.runnerId,
+      name: input.name,
+      keyPrefix: prefix,
+      keyHash: hash,
+      scopes: input.scopes,
+      createdBy: input.createdBy || null,
+      expiresAt: input.expiresAt || null,
+    }).returning({ id: platformRunnerKeys.id });
+    return { id: rows[0].id, value: raw, prefix };
+  }
+  const id = randomUUID();
+  __mem.platformRunnerKeys.set(hash, {
+    id,
+    runner_id: input.runnerId,
+    name: input.name,
+    key_prefix: prefix,
+    scopes: input.scopes,
+    created_by: input.createdBy || null,
+    expires_at: input.expiresAt?.toISOString() || null,
+    revoked_at: null,
+    last_used_at: null,
+    created_at: new Date().toISOString(),
+  });
+  return { id, value: raw, prefix };
+}
+
+export async function verifyPlatformRunnerKey(raw: string): Promise<VerifiedPlatformRunnerKey | null> {
+  if (!raw || typeof raw !== 'string' || raw.length > 512) return null;
+  for (const hash of hashCandidates(raw)) {
+    const hit = await verifyPlatformRunnerKeyByHash(hash);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+async function verifyPlatformRunnerKeyByHash(hash: string): Promise<VerifiedPlatformRunnerKey | null> {
+  if (useDb()) {
+    const db = getDb()!;
+    await ensureTables();
+    const rows = await db.select({
+      id: platformRunnerKeys.id,
+      runnerId: platformRunnerKeys.runnerId,
+      name: platformRunnerKeys.name,
+      scopes: platformRunnerKeys.scopes,
+      expiresAt: platformRunnerKeys.expiresAt,
+      revokedAt: platformRunnerKeys.revokedAt,
+      lastUsedAt: platformRunnerKeys.lastUsedAt,
+    }).from(platformRunnerKeys).where(eq(platformRunnerKeys.keyHash, hash)).limit(1);
+    const row = rows[0];
+    if (!row || row.revokedAt) return null;
+    if (row.expiresAt && new Date(row.expiresAt).getTime() < Date.now()) return null;
+    if (!row.lastUsedAt || Date.now() - new Date(row.lastUsedAt).getTime() > LAST_USED_THROTTLE_MS) {
+      db.update(platformRunnerKeys).set({ lastUsedAt: sql`now()` })
+        .where(and(
+          eq(platformRunnerKeys.id, row.id),
+          or(isNull(platformRunnerKeys.lastUsedAt), sql`${platformRunnerKeys.lastUsedAt} < now() - interval '60 seconds'`),
+        ))
+        .catch(() => undefined);
+    }
+    return { id: row.id, runner_id: row.runnerId, name: row.name, scopes: row.scopes || [] };
+  }
+  const rec = __mem.platformRunnerKeys.get(hash);
+  if (!rec || rec.revoked_at) return null;
+  if (rec.expires_at && new Date(rec.expires_at).getTime() < Date.now()) return null;
+  rec.last_used_at = new Date().toISOString();
+  return { id: rec.id, runner_id: rec.runner_id, name: rec.name, scopes: rec.scopes || [] };
+}
+
+export async function revokePlatformRunnerKey(id: string): Promise<boolean> {
+  if (useDb()) {
+    const db = getDb()!;
+    await ensureTables();
+    const rows = await db.update(platformRunnerKeys)
+      .set({ revokedAt: sql`now()` })
+      .where(and(eq(platformRunnerKeys.id, id), isNull(platformRunnerKeys.revokedAt)))
+      .returning({ id: platformRunnerKeys.id });
+    return rows.length > 0;
+  }
+  for (const rec of __mem.platformRunnerKeys.values()) {
+    if (rec.id === id && !rec.revoked_at) {
+      rec.revoked_at = new Date().toISOString();
+      return true;
+    }
+  }
+  return false;
+}
+
+export async function revokePlatformRunnerKeysForRunner(runnerId: string): Promise<number> {
+  if (useDb()) {
+    const db = getDb()!;
+    await ensureTables();
+    const rows = await db.update(platformRunnerKeys)
+      .set({ revokedAt: sql`now()` })
+      .where(and(eq(platformRunnerKeys.runnerId, runnerId), isNull(platformRunnerKeys.revokedAt)))
+      .returning({ id: platformRunnerKeys.id });
+    return rows.length;
+  }
+  let revoked = 0;
+  for (const rec of __mem.platformRunnerKeys.values()) {
+    if (rec.runner_id === runnerId && !rec.revoked_at) {
+      rec.revoked_at = new Date().toISOString();
+      revoked += 1;
+    }
+  }
+  return revoked;
+}
+
+// ---------- per-execution delegated grants ----------
+
+export interface ExecutionDelegationInfo {
+  jti: string;
+  execution_id: string;
+  runner_id: string;
+  instance_id: string | null;
+  user_id: string;
+  org_id: string | null;
+  account_id: string | null;
+  scopes: string[];
+  expires_at: string | null;
+  revoked_at: string | null;
+}
+
+export async function storeExecutionDelegation(input: {
+  jti: string;
+  executionId: string;
+  runnerId: string;
+  instanceId?: string | null;
+  userId: string;
+  orgId?: string | null;
+  accountId?: string | null;
+  scopes: string[];
+  expiresAt: Date;
+}): Promise<void> {
+  if (useDb()) {
+    const db = getDb()!;
+    await ensureTables();
+    await db.insert(executionDelegations).values({
+      jti: input.jti,
+      executionId: input.executionId,
+      runnerId: input.runnerId,
+      instanceId: input.instanceId || null,
+      userId: input.userId,
+      orgId: input.orgId || null,
+      accountId: input.accountId || null,
+      scopes: input.scopes,
+      expiresAt: input.expiresAt,
+    });
+    return;
+  }
+  __mem.executionDelegations.set(input.jti, {
+    jti: input.jti,
+    execution_id: input.executionId,
+    runner_id: input.runnerId,
+    instance_id: input.instanceId || null,
+    user_id: input.userId,
+    org_id: input.orgId || null,
+    account_id: input.accountId || null,
+    scopes: input.scopes,
+    expires_at: input.expiresAt.toISOString(),
+    revoked_at: null,
+  });
+}
+
+/** Active grant lookup used by /v1/auth/verify on every delegated request. */
+export async function verifyExecutionDelegation(jti: string): Promise<ExecutionDelegationInfo | null> {
+  if (!jti) return null;
+  if (useDb()) {
+    const db = getDb()!;
+    await ensureTables();
+    const rows = await db.select().from(executionDelegations).where(eq(executionDelegations.jti, jti)).limit(1);
+    const row = rows[0];
+    if (!row || row.revokedAt) return null;
+    if (new Date(row.expiresAt).getTime() <= Date.now()) return null;
+    return {
+      jti: row.jti,
+      execution_id: row.executionId,
+      runner_id: row.runnerId,
+      instance_id: row.instanceId ?? null,
+      user_id: row.userId,
+      org_id: row.orgId ?? null,
+      account_id: row.accountId ?? null,
+      scopes: row.scopes || [],
+      expires_at: iso(row.expiresAt),
+      revoked_at: null,
+    };
+  }
+  const rec = __mem.executionDelegations.get(jti);
+  if (!rec || rec.revoked_at) return null;
+  if (new Date(rec.expires_at).getTime() <= Date.now()) return null;
+  return rec;
+}
+
+export async function revokeExecutionDelegations(opts: { executionId?: string; runnerId?: string }): Promise<number> {
+  const executionId = String(opts.executionId || '').trim();
+  const runnerId = String(opts.runnerId || '').trim();
+  if (!executionId && !runnerId) return 0;
+  if (useDb()) {
+    const db = getDb()!;
+    await ensureTables();
+    const conds: any[] = [isNull(executionDelegations.revokedAt)];
+    if (executionId) conds.push(eq(executionDelegations.executionId, executionId));
+    if (runnerId) conds.push(eq(executionDelegations.runnerId, runnerId));
+    const rows = await db.update(executionDelegations)
+      .set({ revokedAt: sql`now()` })
+      .where(and(...conds))
+      .returning({ jti: executionDelegations.jti });
+    return rows.length;
+  }
+  let revoked = 0;
+  for (const rec of __mem.executionDelegations.values()) {
+    if (rec.revoked_at) continue;
+    if (executionId && rec.execution_id !== executionId) continue;
+    if (runnerId && rec.runner_id !== runnerId) continue;
+    rec.revoked_at = new Date().toISOString();
+    revoked += 1;
+  }
+  return revoked;
+}
+
+export async function listPlatformRunnerKeys(runnerId?: string): Promise<PlatformRunnerKeyInfo[]> {
+  if (useDb()) {
+    const db = getDb()!;
+    await ensureTables();
+    const rows = await db.select().from(platformRunnerKeys)
+      .where(runnerId ? eq(platformRunnerKeys.runnerId, runnerId) : undefined)
+      .orderBy(desc(platformRunnerKeys.createdAt))
+      .limit(500);
+    return rows.map((r) => ({
+      id: r.id,
+      runner_id: r.runnerId,
+      name: r.name,
+      prefix: r.keyPrefix,
+      scopes: r.scopes || [],
+      created_by: r.createdBy ?? null,
+      expires_at: iso(r.expiresAt),
+      revoked_at: iso(r.revokedAt),
+      last_used_at: iso(r.lastUsedAt),
+      created_at: iso(r.createdAt),
+    }));
+  }
+  return [...__mem.platformRunnerKeys.values()]
+    .filter((rec) => !runnerId || rec.runner_id === runnerId)
+    .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
+    .slice(0, 500)
+    .map((rec) => ({
+      id: rec.id,
+      runner_id: rec.runner_id,
+      name: rec.name,
+      prefix: rec.key_prefix,
+      scopes: rec.scopes || [],
+      created_by: rec.created_by || null,
+      expires_at: rec.expires_at || null,
+      revoked_at: rec.revoked_at || null,
+      last_used_at: rec.last_used_at || null,
+      created_at: rec.created_at || null,
+    }));
+}
+

@@ -1,0 +1,36 @@
+[package]
+name = "synapseone-queue"
+version = "0.7.1"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+description = "SynapseQueue tenant-scoped message queue with leases, retries, dead letters and replay"
+publish = false
+
+[[bin]]
+name = "synapseone-queue"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+url = "2"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+panic = "abort"

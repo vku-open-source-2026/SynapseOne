@@ -7,9 +7,11 @@ Architecture: `docs/agents/architecture.md`. Service map:
 ## 1. Prerequisites
 
 - Node 20 + npm (workspaces, `tsc`, `node --test`).
+- Rust 1.82+ or Docker (`rust:1-bookworm`) for `apps/ai-service`,
+  `apps/stream-service`, `apps/lds-service`, `apps/notifications-service`.
 - Python 3.11 + pip (Python SDK + inference service; CI uses Ruff and pytest).
 - Go 1.22 (Go SDK; CI runs `go vet` + `go test`).
-- Docker + Compose (Postgres/Redis/S3 + e2e).
+- Docker + Compose (Postgres/Valkey/S3 + e2e).
 - Optional: `jq` for e2e scripts, `make` (Windows users call the underlying
   commands directly).
 
@@ -22,7 +24,7 @@ make bootstrap            # cp .env.example .env + npm install --workspaces
 
 ```bash
 # Infra only (or full stack)
-docker compose up -d postgres redis s3 s3-init
+docker compose up -d postgres valkey s3 s3-init
 npm run dev --workspace=apps/iam-service        # :4001
 npm run dev --workspace=apps/workflow-service   # :4002
 npm run dev --workspace=apps/gateway            # :8080
@@ -58,7 +60,7 @@ make license-check
 - **Build before test.** Each service's `test` script is
   `node --test dist/*.test.js`; `make test` alone fails on a clean checkout.
 - Unit suites use in-memory backends. They do not exercise Postgres SQL,
-  migrations, Redis Lua, or header trust in production mode.
+  migrations, Valkey Lua, or header trust in production mode.
 - To exercise real backends and the full gateway path:
 
 ```bash
@@ -224,7 +226,7 @@ Version bumps touch every `package.json`, Compose image tags, SDK versions, and
 | Workflow webhook 401 | per-workflow auth mode/header/credential |
 | Workflow 500 on code node | sandbox timeout/permission error; check execution node run |
 | Queue duplicates | at-least-once; add dedupe key / idempotent handler |
-| Redis errors but service runs | memory fallback active (dev); production boot should fail |
+| Valkey errors but service runs | memory fallback active (dev); production boot should fail |
 | Console blank/config | `public/config.js` base URL / nginx entrypoint substitution |
 
 More human-facing fixes: `docs/troubleshooting.md`, `docs/production.md`,

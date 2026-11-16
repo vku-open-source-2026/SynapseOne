@@ -1,0 +1,31 @@
+[package]
+name = "synapseone-ai"
+version = "0.7.1"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+description = "SynapseOne API-docs assistant (LLM routing + call generation)"
+publish = false
+
+[[bin]]
+name = "synapseone-ai"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+regex = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+panic = "abort"

@@ -4,8 +4,53 @@ name: synapseone
 
 services:
   postgres:
-    image: pgvector/pgvector:pg16
+    build:
+      context: ./infra/postgres
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-postgres:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
+    # Tuned for the production host (15 GiB RAM, 4 vCPU, SSD). Values are
+    # deliberately small relative to host RAM because Postgres shares the box
+    # with the runner/inference workloads; override through .env if the host
+    # size changes. These flags are restart-only, so changing them recreates
+    # this container (the pgdata volume is preserved).
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-2GB}
+      - -c
+      - effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-6GB}
+      - -c
+      - work_mem=${POSTGRES_WORK_MEM:-16MB}
+      - -c
+      - maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-256MB}
+      - -c
+      - wal_buffers=${POSTGRES_WAL_BUFFERS:-16MB}
+      - -c
+      - max_wal_size=${POSTGRES_MAX_WAL_SIZE:-4GB}
+      - -c
+      - min_wal_size=${POSTGRES_MIN_WAL_SIZE:-1GB}
+      - -c
+      - checkpoint_completion_target=${POSTGRES_CHECKPOINT_COMPLETION_TARGET:-0.9}
+      - -c
+      - effective_io_concurrency=${POSTGRES_EFFECTIVE_IO_CONCURRENCY:-200}
+      - -c
+      - random_page_cost=${POSTGRES_RANDOM_PAGE_COST:-1.1}
+      - -c
+      - track_io_timing=on
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.max=5000
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - jit=off
+      - -c
+      - idle_in_transaction_session_timeout=60s
+      - -c
+      - idle_session_timeout=10min
+    shm_size: 512mb
+    stop_grace_period: 60s
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-synapseone}
       POSTGRES_USER: ${POSTGRES_USER:-synapseone}
@@ -18,43 +63,90 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 30s
     networks: [synapseone-net]
 
-  redis:
-    image: redis:7-alpine
+  # Transaction-mode connection pooler. Application services connect here with
+  # DATABASE_URL; migrations and advisory-lock/session code use
+  # DATABASE_DIRECT_URL so they keep a stable Postgres session.
+  pgbouncer:
+    build:
+      context: ./infra/pgbouncer
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-pgbouncer:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+    environment:
+      DB_USER: ${POSTGRES_USER:-synapseone}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-synapseone_password_change_me}
     volumes:
+      - ./infra/pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -w 1 127.0.0.1 6432 < /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks: [synapseone-net]
+
+  # Valkey 8 (BSD-3, Linux Foundation) is a drop-in Redis replacement: same
+  # wire protocol, RDB/AOF format, Lua, Streams and pub/sub. Redis 7.4+ moved
+  # to a non-OSI licence, so the platform ships Valkey instead.
+  valkey:
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    command: ["valkey-server", "--appendonly", "yes"]
+    volumes:
+      # Volume name kept as `redisdata` so an in-place Redis -> Valkey upgrade
+      # reuses the existing AOF/RDB without a data migration.
       - redisdata:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "valkey-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
     networks: [synapseone-net]
 
-  # Object storage S3-compatible (mac dinh S3Mock nhe, du cho MVP).
-  # Production: thay image bang MinIO (quay.io/minio/minio) hoac AWS S3 that,
-  # giu nguyen S3_ENDPOINT/S3_BUCKET/S3_REGION/S3 keys.
+  # Object storage: SeaweedFS (Apache-2.0) with its S3 API on :9090. Data
+  # persists in the `seaweeddata` volume; the host port is loopback-only and
+  # operators can point OCS at MinIO / AWS S3 / R2 by setting
+  # STORAGE_S3_ENDPOINT (+ credentials) without touching the code. The only
+  # S3 identity is STORAGE_S3_ACCESS_KEY / STORAGE_S3_SECRET_KEY (letters and
+  # digits), the same credentials SynapseOCS signs with.
   s3:
-    image: adobe/s3mock:latest
+    image: chrislusf/seaweedfs:4.48
     restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        printf '{"identities":[{"name":"synapseone","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":["Admin","Read","List","Tagging","Write"]}]}'
+        "$$S3_ADMIN_ACCESS_KEY" "$$S3_ADMIN_SECRET_KEY" > /tmp/s3.json &&
+        exec weed server -dir=/data -ip=s3 -ip.bind=0.0.0.0 -volume.max=0
+        -master.volumeSizeLimitMB=1024 -s3 -s3.port=9090 -s3.config=/tmp/s3.json
     environment:
-      COM_ADOBE_TESTING_S3MOCK_STORE_FILESYSTEM_ROOT: /data
+      S3_ADMIN_ACCESS_KEY: ${STORAGE_S3_ACCESS_KEY:-${S3_ACCESS_KEY:-test}}
+      S3_ADMIN_SECRET_KEY: ${STORAGE_S3_SECRET_KEY:-${S3_SECRET_KEY:-test}}
     volumes:
-      - s3data:/data
+      - seaweeddata:/data
     ports:
-      - "${S3_HOST_PORT:-9090}:9090"
+      # Loopback only: OCS reaches it over the Docker network.
+      - "${S3_HOST_PORT:-127.0.0.1:9090}:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9333/cluster/status >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
     networks: [synapseone-net]
 
   s3-init:
     image: amazon/aws-cli:latest
-    entrypoint: ["sh", "-c", "for i in $(seq 1 30); do aws --endpoint-url http://s3:9090 --region $${AWS_DEFAULT_REGION:-us-east-1} s3 mb s3://$${S3_BUCKET:-synapseone-core} && break || sleep 2; done; aws --endpoint-url http://s3:9090 --region $${AWS_DEFAULT_REGION:-us-east-1} s3 ls || true"]
+    entrypoint: ["sh", "-c", "for i in $(seq 1 30); do aws --endpoint-url http://s3:9090 s3api head-bucket --bucket $${S3_BUCKET} >/dev/null 2>&1 && break; aws --endpoint-url http://s3:9090 s3 mb s3://$${S3_BUCKET} && break; sleep 2; done; aws --endpoint-url http://s3:9090 s3 ls || true"]
     environment:
-      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-test}
-      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-test}
-      AWS_DEFAULT_REGION: ${S3_REGION:-us-east-1}
-      S3_BUCKET: ${S3_BUCKET:-synapseone-core}
+      AWS_ACCESS_KEY_ID: ${STORAGE_S3_ACCESS_KEY:-${S3_ACCESS_KEY:-test}}
+      AWS_SECRET_ACCESS_KEY: ${STORAGE_S3_SECRET_KEY:-${S3_SECRET_KEY:-test}}
+      AWS_DEFAULT_REGION: ${STORAGE_S3_REGION:-${S3_REGION:-us-east-1}}
+      S3_BUCKET: ${STORAGE_S3_BUCKET:-${S3_BUCKET:-synapseone-core}}
     depends_on:
       - s3
     networks: [synapseone-net]
@@ -80,13 +172,13 @@ services:
       AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_POSTGRESQL__NAME:-authentik}
       AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_POSTGRESQL__USER:-authentik}
       AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_POSTGRESQL__PASSWORD:-authentik_pw_change_me}
-      AUTHENTIK_REDIS__HOST: ${AUTHENTIK_REDIS__HOST:-redis}
+      AUTHENTIK_REDIS__HOST: ${AUTHENTIK_REDIS__HOST:-valkey}
       AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:-change_me_authentik_secret_key_60chars_min_xxxxxxxxxxxxxxxx}
       AUTHENTIK_ERROR_REPORTING__ENABLED: ${AUTHENTIK_ERROR_REPORTING__ENABLED:-false}
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
+      valkey:
         condition: service_healthy
       authentik-postgres-init:
         condition: service_completed_successfully
@@ -104,13 +196,13 @@ services:
       AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_POSTGRESQL__NAME:-authentik}
       AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_POSTGRESQL__USER:-authentik}
       AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_POSTGRESQL__PASSWORD:-authentik_pw_change_me}
-      AUTHENTIK_REDIS__HOST: ${AUTHENTIK_REDIS__HOST:-redis}
+      AUTHENTIK_REDIS__HOST: ${AUTHENTIK_REDIS__HOST:-valkey}
       AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:-change_me_authentik_secret_key_60chars_min_xxxxxxxxxxxxxxxx}
       AUTHENTIK_ERROR_REPORTING__ENABLED: ${AUTHENTIK_ERROR_REPORTING__ENABLED:-false}
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
+      valkey:
         condition: service_healthy
     networks: [synapseone-net]
 
@@ -121,25 +213,53 @@ services:
   iam:
     build:
       context: ./apps/iam-service
-    image: synapseone/iam:0.7.0
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-iam:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       PORT: 4001
-      DATABASE_URL: postgres://${POSTGRES_USER:-synapseone}:${POSTGRES_PASSWORD:-synapseone_password_change_me}@postgres:5432/${POSTGRES_DB:-synapseone}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      # Runtime traffic uses the transaction pooler; migrations and other
+      # session-scoped operations use the direct Postgres connection.
+      DATABASE_URL: postgres://${POSTGRES_USER:-synapseone}:${POSTGRES_PASSWORD:-synapseone_password_change_me}@pgbouncer:6432/${POSTGRES_DB:-synapseone}
+      DATABASE_DIRECT_URL: postgres://${POSTGRES_USER:-synapseone}:${POSTGRES_PASSWORD:-synapseone_password_change_me}@postgres:5432/${POSTGRES_DB:-synapseone}
+      # Valkey is the datastore; the legacy *_REDIS_URL names are still
+      # exported so pre-migration images keep talking to the same instance.
+      VALKEY_URL: ${VALKEY_URL:-${REDIS_URL:-redis://valkey:6379}}
+      REDIS_URL: ${REDIS_URL:-${VALKEY_URL:-redis://valkey:6379}}
       IAM_JWT_SECRET: ${IAM_JWT_SECRET:-change_me_super_secret_32chars_min}
       IAM_JWT_EXPIRES_IN: ${IAM_JWT_EXPIRES_IN:-3600}
       IAM_REFRESH_EXPIRES_IN: ${IAM_REFRESH_EXPIRES_IN:-2592000}
       IAM_API_KEY_PEPPER: ${IAM_API_KEY_PEPPER:-}
       IAM_ALLOW_DEV_LOGIN: ${IAM_ALLOW_DEV_LOGIN:-true}
       IAM_ALLOW_OIDC_DEMO_CALLBACK: ${IAM_ALLOW_OIDC_DEMO_CALLBACK:-true}
+      # Sensitive IAM mutations: audit logs would-deny; enforce requires org admin.
+      IAM_SENSITIVE_MUTATION_MODE: ${IAM_SENSITIVE_MUTATION_MODE:-audit}
+      IAM_ALLOW_DIRECT_ORG_CREATE: ${IAM_ALLOW_DIRECT_ORG_CREATE:-true}
+      # Platform Super Admin control plane (see docs/platform-superadmin.md).
+      PLATFORM_ADMIN_ENABLED: ${PLATFORM_ADMIN_ENABLED:-true}
+      PLATFORM_ADMIN_REQUIRE_MFA: ${PLATFORM_ADMIN_REQUIRE_MFA:-true}
+      PLATFORM_ADMIN_REQUIRE_STEP_UP: ${PLATFORM_ADMIN_REQUIRE_STEP_UP:-true}
+      PLATFORM_ORG_SLUG: ${PLATFORM_ORG_SLUG:-synapseone-platform}
+      PLATFORM_SESSION_TTL_SECONDS: ${PLATFORM_SESSION_TTL_SECONDS:-900}
+      PLATFORM_FRESH_MFA_SECONDS: ${PLATFORM_FRESH_MFA_SECONDS:-900}
+      PLATFORM_BOOTSTRAP_SECRET: ${PLATFORM_BOOTSTRAP_SECRET:-}
+      PLATFORM_RECOVERY_SECRET: ${PLATFORM_RECOVERY_SECRET:-}
+      # Dev convenience: echo reset/verification tokens (no mailer wired).
+      # Opt-in by design — the prod overlay pins it to "false".
+      IAM_EXPOSE_LIFECYCLE_TOKENS: ${IAM_EXPOSE_LIFECYCLE_TOKENS:-true}
       # Shared service-to-service credential (must match gateway + workflow).
       # Empty = dev mode (upstream warns). Production: set a random 32+ char value
       # and DO NOT publish IAM/WORKFLOW host ports.
       SYNAPSEONE_INTERNAL_SECRET: ${SYNAPSEONE_INTERNAL_SECRET:-${SYNAPSEDX_INTERNAL_SECRET:-}}
+      # Usage rollups → Synapse Warehouse (Tier-1 service-to-service).
+      WAREHOUSE_SERVICE_URL: ${WAREHOUSE_SERVICE_URL:-http://warehouse:4012}
+      USAGE_ROLLUP_BACKFILL_HOURS: ${USAGE_ROLLUP_BACKFILL_HOURS:-720}
+      USAGE_ROLLUP_INTERVAL_HOURS: ${USAGE_ROLLUP_INTERVAL_HOURS:-6}
+      USAGE_ROLLUP_INTERVAL_MS: ${USAGE_ROLLUP_INTERVAL_MS:-300000}
       HSTS_ENABLED: ${HSTS_ENABLED:-false}
       OIDC_PROVIDER: ${OIDC_PROVIDER:-authentik}
       OIDC_ISSUER: ${OIDC_ISSUER:-https://auth.synapseone.space/application/o/synapseone/}
+      # Explicit opt-in for early deployments whose IdP is still internal-only.
+      IAM_ALLOW_INTERNAL_OIDC_ISSUER: ${IAM_ALLOW_INTERNAL_OIDC_ISSUER:-false}
       OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-synapseone-platform}
       OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-change_me_oidc_secret}
       OIDC_STATE_SECRET: ${OIDC_STATE_SECRET:-}
@@ -154,29 +274,48 @@ services:
       retries: 5
       start_period: 20s
     depends_on:
-      postgres:
+      pgbouncer:
         condition: service_healthy
-      redis:
+      valkey:
         condition: service_healthy
     networks: [synapseone-net]
 
   workflow:
     build:
       context: ./apps/workflow-service
-    image: synapseone/workflow:0.7.0
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-workflow:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       PORT: 4002
-      DATABASE_URL: postgres://${POSTGRES_USER:-synapseone}:${POSTGRES_PASSWORD:-synapseone_password_change_me}@postgres:5432/${POSTGRES_DB:-synapseone}
+      # Runtime traffic uses the transaction pooler; migrations and other
+      # session-scoped operations use the direct Postgres connection.
+      DATABASE_URL: postgres://${POSTGRES_USER:-synapseone}:${POSTGRES_PASSWORD:-synapseone_password_change_me}@pgbouncer:6432/${POSTGRES_DB:-synapseone}
+      DATABASE_DIRECT_URL: postgres://${POSTGRES_USER:-synapseone}:${POSTGRES_PASSWORD:-synapseone_password_change_me}@postgres:5432/${POSTGRES_DB:-synapseone}
       IAM_SERVICE_URL: ${IAM_SERVICE_URL:-http://iam:4001}
       AUDIT_TRAIL: ${AUDIT_TRAIL:-true}
       AUDIT_INGEST_URL: ${AUDIT_INGEST_URL:-}
       SYNAPSEONE_INTERNAL_SECRET: ${SYNAPSEONE_INTERNAL_SECRET:-${SYNAPSEDX_INTERNAL_SECRET:-}}
       SYNAPSEONE_IAM_API_KEY: ${SYNAPSEONE_IAM_API_KEY:-${SYNAPSEDX_IAM_API_KEY:-}}
+      # 32-byte hex key for the encrypted secret/credential vault. Operators must
+      # set this in production; an empty value falls back to an ephemeral dev key.
+      SYNAPSEONE_CREDENTIAL_KEY: ${SYNAPSEONE_CREDENTIAL_KEY:-}
+      # Optional shared token for /v1/secrets/rotation-webhook.
+      SECRET_ROTATION_WEBHOOK_SECRET: ${SECRET_ROTATION_WEBHOOK_SECRET:-}
       HSTS_ENABLED: ${HSTS_ENABLED:-false}
       WORKFLOW_CRON_TICK_MS: ${WORKFLOW_CRON_TICK_MS:-15000}
       WORKFLOW_TIMEOUT_MS: ${WORKFLOW_TIMEOUT_MS:-60000}
       INFERENCE_TIMEOUT_MS: ${INFERENCE_TIMEOUT_MS:-120000}
+      # Queue-backed execution: triggers publish a job, workers run the DAG.
+      QUEUE_SERVICE_URL: ${QUEUE_SERVICE_URL:-http://queue:4007}
+      WORKFLOW_EXECUTION_MODE: ${WORKFLOW_EXECUTION_MODE:-queue}
+      WORKFLOW_WORKER_ENABLED: ${WORKFLOW_WORKER_ENABLED:-true}
+      WORKFLOW_WORKER_CONCURRENCY: ${WORKFLOW_WORKER_CONCURRENCY:-4}
+      WORKFLOW_WORKER_POLL_MS: ${WORKFLOW_WORKER_POLL_MS:-500}
+      WORKFLOW_QUEUE_VISIBILITY_SECONDS: ${WORKFLOW_QUEUE_VISIBILITY_SECONDS:-300}
+      WORKFLOW_QUEUE_MAX_ATTEMPTS: ${WORKFLOW_QUEUE_MAX_ATTEMPTS:-5}
+      WORKFLOW_QUEUE_INFERENCE: ${WORKFLOW_QUEUE_INFERENCE:-synapseone-inference}
+      SYNAPSEONE_PUBLIC_URL: ${SYNAPSEONE_PUBLIC_URL:-https://api.synapseone.space}
+      WORKFLOW_RUNNER_IMAGE: ${WORKFLOW_RUNNER_IMAGE:-ghcr.io/vku-open-source-2026/synapseone-workflow-runner:latest}
     ports:
       - "${WORKFLOW_HOST_PORT:-4002}:4002"
     healthcheck:
@@ -186,16 +325,18 @@ services:
       retries: 5
       start_period: 20s
     depends_on:
-      postgres:
+      pgbouncer:
         condition: service_healthy
       iam:
+        condition: service_healthy
+      queue:
         condition: service_healthy
     networks: [synapseone-net]
 
   ai:
     build:
       context: ./apps/ai-service
-    image: synapseone/ai:0.7.0
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-ai:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       PORT: 4003
@@ -213,7 +354,7 @@ services:
     ports:
       - "${AI_SERVICE_HOST_PORT:-127.0.0.1:4003}:4003"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:4003/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "/usr/local/bin/synapseone-ai", "--healthcheck"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -223,10 +364,13 @@ services:
   lds:
     build:
       context: ./apps/lds-service
-    image: synapseone/lds:0.7.0
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-lds:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       PORT: 4004
+      # LDS still runs its Node migration bootstrap (advisory lock) on the
+      # deployed 0.7.0 image; keep it on the direct connection until the Rust
+      # service is released with DATABASE_DIRECT_URL support.
       DATABASE_URL: postgres://${POSTGRES_USER:-synapseone}:${POSTGRES_PASSWORD:-synapseone_password_change_me}@postgres:5432/${POSTGRES_DB:-synapseone}
       SYNAPSEONE_INTERNAL_SECRET: ${SYNAPSEONE_INTERNAL_SECRET:-${SYNAPSEDX_INTERNAL_SECRET:-}}
       IAM_SERVICE_URL: ${IAM_SERVICE_URL:-http://iam:4001}
@@ -237,7 +381,7 @@ services:
     ports:
       - "${LDS_SERVICE_HOST_PORT:-127.0.0.1:4004}:4004"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:4004/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "/usr/local/bin/synapseone-lds", "--healthcheck"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -250,39 +394,55 @@ services:
   base:
     build:
       context: ./apps/base-service
-    image: synapseone/base:0.7.0
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-base:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       PORT: 4005
-      DATABASE_URL: postgres://${POSTGRES_USER:-synapseone}:${POSTGRES_PASSWORD:-synapseone_password_change_me}@postgres:5432/${POSTGRES_DB:-synapseone}
+      # Runtime traffic uses the transaction pooler; migrations and other
+      # session-scoped operations use the direct Postgres connection.
+      DATABASE_URL: postgres://${POSTGRES_USER:-synapseone}:${POSTGRES_PASSWORD:-synapseone_password_change_me}@pgbouncer:6432/${POSTGRES_DB:-synapseone}
+      DATABASE_DIRECT_URL: postgres://${POSTGRES_USER:-synapseone}:${POSTGRES_PASSWORD:-synapseone_password_change_me}@postgres:5432/${POSTGRES_DB:-synapseone}
       BASE_MAX_DOCUMENT_BYTES: ${BASE_MAX_DOCUMENT_BYTES:-262144}
       BASE_QUERY_SCAN_LIMIT: ${BASE_QUERY_SCAN_LIMIT:-200000}
+      STREAM_SERVICE_URL: ${STREAM_SERVICE_URL:-http://stream:4009}
+      # L2 read-through cache for document GETs. Empty URL disables the cache.
+      FASTSTORE_SERVICE_URL: ${FASTSTORE_SERVICE_URL:-http://faststore:4006}
+      BASE_CACHE_TTL_SECONDS: ${BASE_CACHE_TTL_SECONDS:-60}
+      BASE_CACHE_TIMEOUT_MS: ${BASE_CACHE_TIMEOUT_MS:-250}
+      BASE_OUTBOX_STREAM_TOPIC: ${BASE_OUTBOX_STREAM_TOPIC:-base-changes}
+      BASE_OUTBOX_RELAY_MS: ${BASE_OUTBOX_RELAY_MS:-1000}
+      # Capability collections are reachable only by account-level machine
+      # credentials. Tenant users and workflow runAs principals get 404.
+      SYNAPSEONE_BASE_MACHINE_COLLECTION_PREFIXES: ${SYNAPSEONE_BASE_MACHINE_COLLECTION_PREFIXES:-synapsedx_}
       AUDIT_TRAIL: ${AUDIT_TRAIL:-true}
       AUDIT_INGEST_URL: ${AUDIT_INGEST_URL:-}
+      INFERENCE_SERVICE_URL: ${INFERENCE_SERVICE_URL:-http://inference:4008}
+      SYNAPSEONE_API_KEY: ${SYNAPSEONE_API_KEY:-}
       SYNAPSEONE_INTERNAL_SECRET: ${SYNAPSEONE_INTERNAL_SECRET:-${SYNAPSEDX_INTERNAL_SECRET:-}}
       HSTS_ENABLED: ${HSTS_ENABLED:-false}
       CORS_ORIGIN: ${CORS_ORIGIN:-}
     ports:
       - "${BASE_SERVICE_HOST_PORT:-127.0.0.1:4005}:4005"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:4005/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "/usr/local/bin/synapseone-base", "--healthcheck"]
       interval: 15s
       timeout: 5s
       retries: 5
       start_period: 20s
     depends_on:
-      postgres:
+      pgbouncer:
         condition: service_healthy
     networks: [synapseone-net]
 
   faststore:
     build:
       context: ./apps/faststore-service
-    image: synapseone/faststore:0.7.0
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-faststore:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       PORT: 4006
-      FASTSTORE_REDIS_URL: ${FASTSTORE_REDIS_URL:-redis://redis:6379}
+      FASTSTORE_VALKEY_URL: ${FASTSTORE_VALKEY_URL:-${FASTSTORE_REDIS_URL:-redis://valkey:6379}}
+      FASTSTORE_REDIS_URL: ${FASTSTORE_REDIS_URL:-${FASTSTORE_VALKEY_URL:-redis://valkey:6379}}
       AUDIT_TRAIL: ${AUDIT_TRAIL:-true}
       AUDIT_INGEST_URL: ${AUDIT_INGEST_URL:-}
       SYNAPSEONE_INTERNAL_SECRET: ${SYNAPSEONE_INTERNAL_SECRET:-${SYNAPSEDX_INTERNAL_SECRET:-}}
@@ -291,24 +451,25 @@ services:
     ports:
       - "${FASTSTORE_SERVICE_HOST_PORT:-127.0.0.1:4006}:4006"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:4006/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "/usr/local/bin/synapseone-faststore", "--healthcheck"]
       interval: 15s
       timeout: 5s
       retries: 5
       start_period: 20s
     depends_on:
-      redis:
+      valkey:
         condition: service_healthy
     networks: [synapseone-net]
 
   queue:
     build:
       context: ./apps/queue-service
-    image: synapseone/queue:0.7.0
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-queue:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       PORT: 4007
-      QUEUE_REDIS_URL: ${QUEUE_REDIS_URL:-redis://redis:6379}
+      QUEUE_VALKEY_URL: ${QUEUE_VALKEY_URL:-${QUEUE_REDIS_URL:-redis://valkey:6379}}
+      QUEUE_REDIS_URL: ${QUEUE_REDIS_URL:-${QUEUE_VALKEY_URL:-redis://valkey:6379}}
       QUEUE_MAX_PAYLOAD_BYTES: ${QUEUE_MAX_PAYLOAD_BYTES:-262144}
       AUDIT_TRAIL: ${AUDIT_TRAIL:-true}
       AUDIT_INGEST_URL: ${AUDIT_INGEST_URL:-}
@@ -318,24 +479,25 @@ services:
     ports:
       - "${QUEUE_SERVICE_HOST_PORT:-127.0.0.1:4007}:4007"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:4007/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "/usr/local/bin/synapseone-queue", "--healthcheck"]
       interval: 15s
       timeout: 5s
       retries: 5
       start_period: 20s
     depends_on:
-      redis:
+      valkey:
         condition: service_healthy
     networks: [synapseone-net]
 
   stream:
     build:
       context: ./apps/stream-service
-    image: synapseone/stream:0.7.0
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-stream:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       PORT: 4009
-      STREAM_REDIS_URL: ${STREAM_REDIS_URL:-${REDIS_URL:-redis://redis:6379}}
+      STREAM_VALKEY_URL: ${STREAM_VALKEY_URL:-${STREAM_REDIS_URL:-${VALKEY_URL:-${REDIS_URL:-redis://valkey:6379}}}}
+      STREAM_REDIS_URL: ${STREAM_REDIS_URL:-${STREAM_VALKEY_URL:-${VALKEY_URL:-redis://valkey:6379}}}
       STREAM_MAX_PAYLOAD_BYTES: ${STREAM_MAX_PAYLOAD_BYTES:-262144}
       AUDIT_TRAIL: ${AUDIT_TRAIL:-true}
       AUDIT_INGEST_URL: ${AUDIT_INGEST_URL:-}
@@ -345,20 +507,54 @@ services:
     ports:
       - "${STREAM_SERVICE_HOST_PORT:-127.0.0.1:4009}:4009"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:4009/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "/usr/local/bin/synapseone-stream", "--healthcheck"]
       interval: 15s
       timeout: 5s
       retries: 5
       start_period: 20s
     depends_on:
-      redis:
+      valkey:
+        condition: service_healthy
+    networks: [synapseone-net]
+
+  warehouse:
+    build:
+      context: ./apps/warehouse-service
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-warehouse:${SYNAPSEONE_VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      PORT: 4012
+      NODE_ENV: production
+      WAREHOUSE_DATA_DIR: /data/warehouse
+      WAREHOUSE_THREADS: ${WAREHOUSE_THREADS:-2}
+      WAREHOUSE_QUERY_TIMEOUT_MS: ${WAREHOUSE_QUERY_TIMEOUT_MS:-15000}
+      STREAM_SERVICE_URL: ${STREAM_SERVICE_URL:-http://stream:4009}
+      SYNAPSEONE_INTERNAL_SECRET: ${SYNAPSEONE_INTERNAL_SECRET:-${SYNAPSEDX_INTERNAL_SECRET:-}}
+      CORS_ORIGIN: ${CORS_ORIGIN:-}
+    volumes:
+      - warehousedata:/data/warehouse
+    ports:
+      - "${WAREHOUSE_SERVICE_HOST_PORT:-127.0.0.1:4012}:4012"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/synapseone-warehouse", "--healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      stream:
         condition: service_healthy
     networks: [synapseone-net]
 
   inference:
     build:
       context: ./apps/inference-service
-    image: synapseone/inference:0.7.0
+      args:
+        INSTALL_MODELS: ${INFERENCE_INSTALL_MODELS:-1}
+        INSTALL_TORCH: ${INFERENCE_INSTALL_TORCH:-1}
+        PREFETCH_EMBEDDING: ${INFERENCE_PREFETCH_EMBEDDING:-1}
+        PREFETCH_DECISION: ${INFERENCE_PREFETCH_DECISION:-0}
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-inference:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       PORT: 4008
@@ -369,8 +565,22 @@ services:
       OPENROUTER_FALLBACK_MODEL: ${OPENROUTER_FALLBACK_MODEL:-${AI_LLM_FALLBACK_MODEL:-inception/mercury-2.5}}
       OPENROUTER_TIMEOUT_MS: ${OPENROUTER_TIMEOUT_MS:-30000}
       EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-sentence-transformers/all-MiniLM-L6-v2}
+      EMBEDDING_BACKEND: ${EMBEDDING_BACKEND:-auto}
+      EMBEDDING_ONNX_PATH: ${EMBEDDING_ONNX_PATH:-}
+      EMBEDDING_ONNX_FILE: ${EMBEDDING_ONNX_FILE:-}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-32}
+      EMBEDDING_MAX_LENGTH: ${EMBEDDING_MAX_LENGTH:-256}
+      DECISION_BACKEND: ${DECISION_BACKEND:-local}
       DECISION_MODEL_NAME: ${DECISION_MODEL_NAME:-vllm-sr/Decision-2.0-Eos-0.8B}
+      OPENROUTER_DECISIONS_URL: ${OPENROUTER_DECISIONS_URL:-}
+      DECISION_ENABLED: ${DECISION_ENABLED:-true}
+      DECISION_THREADS: ${DECISION_THREADS:-0}
+      DECISION_WARMUP: ${DECISION_WARMUP:-true}
       INFERENCE_DEVICE: ${INFERENCE_DEVICE:-auto}
+      INFERENCE_CPU_THREADS: ${INFERENCE_CPU_THREADS:-0}
+      INFERENCE_MODEL_DOWNLOAD: ${INFERENCE_MODEL_DOWNLOAD:-true}
+      INFERENCE_WARMUP: ${INFERENCE_WARMUP:-true}
+      MODEL_LOAD_RETRY_SECONDS: ${MODEL_LOAD_RETRY_SECONDS:-300}
       SYNAPSEONE_INTERNAL_SECRET: ${SYNAPSEONE_INTERNAL_SECRET:-${SYNAPSEDX_INTERNAL_SECRET:-}}
     ports:
       - "${INFERENCE_HOST_PORT:-127.0.0.1:4008}:4008"
@@ -382,15 +592,16 @@ services:
       start_period: 20s
     networks: [synapseone-net]
 
-  storage:
+  ocs:
     build:
-      context: ./apps/storage-service
-    image: synapseone/storage:0.7.0
+      context: ./apps/ocs-service
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-ocs:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
+      NODE_ENV: production
       PORT: 4010
       STORAGE_BACKEND: ${STORAGE_BACKEND:-s3}
-      STORAGE_S3_ENDPOINT: ${STORAGE_S3_ENDPOINT:-http://s3:9090}
+      STORAGE_S3_ENDPOINT: ${STORAGE_S3_ENDPOINT:-${S3_ENDPOINT:-}}
       STORAGE_S3_BUCKET: ${STORAGE_S3_BUCKET:-${S3_BUCKET:-synapseone-core}}
       STORAGE_S3_REGION: ${STORAGE_S3_REGION:-${S3_REGION:-us-east-1}}
       STORAGE_S3_ACCESS_KEY: ${STORAGE_S3_ACCESS_KEY:-${S3_ACCESS_KEY:-test}}
@@ -400,6 +611,7 @@ services:
       STORAGE_MAX_OBJECT_BYTES: ${STORAGE_MAX_OBJECT_BYTES:-26214400}
       STORAGE_TENANT_QUOTA_BYTES: ${STORAGE_TENANT_QUOTA_BYTES:-5368709120}
       STORAGE_ALLOWED_CONTENT_TYPES: ${STORAGE_ALLOWED_CONTENT_TYPES:-}
+      OCS_PUBLIC_BASE_URL: ${OCS_PUBLIC_BASE_URL:-http://localhost:8080}
       SYNAPSEONE_INTERNAL_SECRET: ${SYNAPSEONE_INTERNAL_SECRET:-${SYNAPSEDX_INTERNAL_SECRET:-}}
       CORS_ORIGIN: ${CORS_ORIGIN:-}
       HSTS_ENABLED: ${HSTS_ENABLED:-false}
@@ -408,7 +620,7 @@ services:
     ports:
       - "${STORAGE_HOST_PORT:-127.0.0.1:4010}:4010"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:4010/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "/usr/local/bin/synapseone-ocs", "--healthcheck"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -416,15 +628,78 @@ services:
     depends_on:
       s3-init:
         condition: service_completed_successfully
+    networks:
+      synapseone-net:
+        aliases: [storage]
+
+  # Nightly logical Postgres backups (pg_dump custom format of the platform and
+  # Authentik databases, sha256, BACKUP_RETENTION_DAYS) in the pgbackups volume.
+  # Restore: tools/backup/pg-restore.sh <file.dump>.
+  pg-backup:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/backup/pg-backup.sh"]
+    command: ["--loop"]
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER:-synapseone}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-synapseone_password_change_me}
+      BACKUP_DATABASES: ${BACKUP_DATABASES:-${POSTGRES_DB:-synapseone} authentik}
+      BACKUP_DIR: /backups
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-7}
+    volumes:
+      - ./tools/backup/pg-backup.sh:/backup/pg-backup.sh:ro
+      - pgbackups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [synapseone-net]
+
+  # Daily incremental snapshots of the object store (SynapseOCS files): content
+  # stored once per SHA-256, Content-Type kept, BACKUP_RETENTION_DAYS. Runs in
+  # the OCS image. Restore: docker compose run --rm --no-deps s3-backup restore latest
+  s3-backup:
+    build:
+      context: ./apps/ocs-service
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-ocs:${SYNAPSEONE_VERSION:-latest}
+    restart: unless-stopped
+    # The backup volume was created by the legacy root-run sidecar. The Rust
+    # image runs as a non-root app user, so this one-shot/loop service keeps
+    # root only to read and prune the existing backup files.
+    user: "0:0"
+    entrypoint: ["/usr/local/bin/s3-backup"]
+    command: ["loop"]
+    # The inherited OCS HTTP healthcheck does not apply to this loop sidecar.
+    healthcheck:
+      disable: true
+    environment:
+      STORAGE_S3_ENDPOINT: ${STORAGE_S3_ENDPOINT:-http://s3:9090}
+      STORAGE_S3_BUCKET: ${STORAGE_S3_BUCKET:-${S3_BUCKET:-synapseone-core}}
+      STORAGE_S3_REGION: ${STORAGE_S3_REGION:-${S3_REGION:-us-east-1}}
+      STORAGE_S3_ACCESS_KEY: ${STORAGE_S3_ACCESS_KEY:-${S3_ACCESS_KEY:-test}}
+      STORAGE_S3_SECRET_KEY: ${STORAGE_S3_SECRET_KEY:-${S3_SECRET_KEY:-test}}
+      STORAGE_S3_PATH_STYLE: ${STORAGE_S3_PATH_STYLE:-true}
+      BACKUP_DIR: /backups
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-7}
+    volumes:
+      - s3backups:/backups
+    depends_on:
+      s3:
+        condition: service_healthy
     networks: [synapseone-net]
 
   notifications:
     build:
       context: ./apps/notifications-service
-    image: synapseone/notifications:0.7.0
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-notifications:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       PORT: 4011
+      # The in-progress Rust notifications image sends its bootstrap DDL as a
+      # multi-statement prepared statement, which transaction pooling rejects.
+      # Keep it on the direct connection until that bootstrap is split.
       DATABASE_URL: postgres://${POSTGRES_USER:-synapseone}:${POSTGRES_PASSWORD:-synapseone_password_change_me}@postgres:5432/${POSTGRES_DB:-synapseone}
       # Delivery through SynapseQueue (at-least-once across replicas).
       NOTIFICATIONS_QUEUE_URL: ${NOTIFICATIONS_QUEUE_URL:-http://queue:4007}
@@ -440,7 +715,10 @@ services:
     ports:
       - "${NOTIFICATIONS_HOST_PORT:-127.0.0.1:4011}:4011"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:4011/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      # The deployed 0.7.x image is Node, while the in-progress Rust image
+      # ships a --healthcheck flag. Try either so a rolling migration does not
+      # mark the service unhealthy.
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:4011/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))\" 2>/dev/null || /usr/local/bin/synapseone-notifications --healthcheck"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -450,12 +728,14 @@ services:
         condition: service_healthy
       queue:
         condition: service_healthy
-    networks: [synapseone-net]
+    networks:
+      synapseone-net:
+        aliases: [storage]
 
   gateway:
     build:
       context: ./apps/gateway
-    image: synapseone/gateway:0.7.0
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-gateway:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       PORT: 8080
@@ -468,19 +748,25 @@ services:
       FASTSTORE_SERVICE_URL: ${FASTSTORE_SERVICE_URL:-http://faststore:4006}
       QUEUE_SERVICE_URL: ${QUEUE_SERVICE_URL:-http://queue:4007}
       STREAM_SERVICE_URL: ${STREAM_SERVICE_URL:-http://stream:4009}
-      STORAGE_SERVICE_URL: ${STORAGE_SERVICE_URL:-http://storage:4010}
+      WAREHOUSE_SERVICE_URL: ${WAREHOUSE_SERVICE_URL:-http://warehouse:4012}
+      STORAGE_SERVICE_URL: ${STORAGE_SERVICE_URL:-http://ocs:4010}
+      OCS_SERVICE_URL: ${OCS_SERVICE_URL:-http://ocs:4010}
       NOTIFICATIONS_SERVICE_URL: ${NOTIFICATIONS_SERVICE_URL:-http://notifications:4011}
       TRUST_PROXY: ${TRUST_PROXY:-}
       IAM_JWT_SECRET: ${IAM_JWT_SECRET:-change_me_super_secret_32chars_min}
       SYNAPSEONE_INTERNAL_SECRET: ${SYNAPSEONE_INTERNAL_SECRET:-${SYNAPSEDX_INTERNAL_SECRET:-}}
       HSTS_ENABLED: ${HSTS_ENABLED:-false}
       GATEWAY_VERIFY_APIKEY: ${GATEWAY_VERIFY_APIKEY:-true}
+      # Central policy enforcement (off|audit|enforce); see docs/iam-model.md.
+      AUTHZ_MODE: ${AUTHZ_MODE:-off}
+      AUTHZ_MODE_REQUIRED: ${AUTHZ_MODE_REQUIRED:-false}
+      AUTHZ_CACHE_TTL_MS: ${AUTHZ_CACHE_TTL_MS:-30000}
       PROXY_TIMEOUT_MS: ${PROXY_TIMEOUT_MS:-30000}
       CORS_ORIGIN: ${CORS_ORIGIN:-}
     ports:
       - "${GATEWAY_HOST_PORT:-8080}:8080"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "/usr/local/bin/synapseone-gateway", "--healthcheck"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -502,7 +788,9 @@ services:
         condition: service_healthy
       stream:
         condition: service_healthy
-      storage:
+      warehouse:
+        condition: service_healthy
+      ocs:
         condition: service_healthy
       notifications:
         condition: service_healthy
@@ -513,7 +801,7 @@ services:
   console:
     build:
       context: ./apps/console
-    image: synapseone/console:0.7.0
+    image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-console:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
       # URL gateway ma TRINH DUYET goi toi (khong phai ten service docker).
@@ -524,10 +812,12 @@ services:
       - "${CONSOLE_HOST_PORT:-3000}:80"
     depends_on:
       - gateway
-    networks: [synapseone-net]
+    networks:
+      synapseone-net:
+        aliases: [synapseone-console]
 
   # ---- Monitoring (Prometheus, optional but on by default) ----
-  # Tat khi khong can: docker compose stop prometheus postgres-exporter redis-exporter
+  # Tat khi khong can: docker compose stop prometheus postgres-exporter valkey-exporter
   # Query UI: Prometheus bieu thuc tai http://localhost:9091 (xem docs/monitoring.md).
   prometheus:
     image: prom/prometheus:v2.53.0
@@ -545,7 +835,7 @@ services:
     depends_on:
       - gateway
       - postgres-exporter
-      - redis-exporter
+      - valkey-exporter
     networks: [synapseone-net]
 
   postgres-exporter:
@@ -558,21 +848,26 @@ services:
         condition: service_healthy
     networks: [synapseone-net]
 
-  redis-exporter:
+  # oliver006/redis_exporter speaks the Redis protocol and scrapes Valkey
+  # unchanged (metric names stay `redis_*`).
+  valkey-exporter:
     image: oliver006/redis_exporter:v1.62.0
     restart: unless-stopped
     environment:
-      REDIS_ADDR: ${REDIS_URL:-redis://redis:6379}
+      REDIS_ADDR: ${VALKEY_URL:-${REDIS_URL:-redis://valkey:6379}}
     depends_on:
-      redis:
+      valkey:
         condition: service_healthy
     networks: [synapseone-net]
 
 volumes:
+  seaweeddata:
   pgdata:
   redisdata:
   storagedata:
-  s3data:
+  warehousedata:
+  pgbackups:
+  s3backups:
   prometheusdata:
 
 networks:

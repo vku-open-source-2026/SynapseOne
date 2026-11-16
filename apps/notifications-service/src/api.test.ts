@@ -64,6 +64,10 @@ async function call(method: string, path: string, body?: any, h: Record<string, 
   return { status: r.status, json, headers: r.headers };
 }
 
+// Offline test sink lives on 127.0.0.1; the SSRF guard is bypassed only
+// outside production for this suite.
+process.env.NOTIFICATIONS_WEBHOOK_ALLOW_PRIVATE = 'true';
+
 test('health and validation', async () => {
   const health = await call('GET', '/health', undefined, {});
   assert.equal(health.status, 200);

@@ -34,6 +34,76 @@ jobs:
           generate_release_notes: true
           files: release-assets/*
 
+  publish-images:
+    runs-on: ubuntu-latest
+    needs: release
+    permissions: { packages: write, id-token: write, contents: read }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: sigstore/cosign-installer@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build, attest and push every first-party image
+        env:
+          OWNER: ${{ github.repository_owner }}
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          OWNER="$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')"
+          SEMVER="${TAG#v}"
+          for pair in \
+            "gateway:apps/gateway" "iam:apps/iam-service" "workflow:apps/workflow-service" \
+            "ai:apps/ai-service" "lds:apps/lds-service" "base:apps/base-service" \
+            "faststore:apps/faststore-service" "queue:apps/queue-service" "stream:apps/stream-service" \
+            "warehouse:apps/warehouse-service" \
+            "inference:apps/inference-service" "ocs:apps/ocs-service" \
+            "notifications:apps/notifications-service" "console:apps/console" \
+            "postgres:infra/postgres" "edge:infra/prod"; do
+            name="${pair%%:*}"
+            context="${pair##*:}"
+            docker buildx build --push --provenance=true --sbom=true \
+              -t "ghcr.io/${OWNER}/synapseone-${name}:${TAG}" \
+              -t "ghcr.io/${OWNER}/synapseone-${name}:${SEMVER}" \
+              -t "ghcr.io/${OWNER}/synapseone-${name}:sha-${SHA}" \
+              -t "ghcr.io/${OWNER}/synapseone-${name}:latest" \
+              "${context}"
+          done
+          # Self-hosted workflow runner: shares the workflow engine source and
+          # bakes the inference model stack that the loop just pushed. Pull and
+          # tag it under the Dockerfile's local default before building.
+          for attempt in 1 2 3; do
+            if docker pull "ghcr.io/${OWNER}/synapseone-inference:${TAG}"; then break; fi
+            sleep 10
+          done
+          docker tag "ghcr.io/${OWNER}/synapseone-inference:${TAG}" synapseone/inference:0.9.1-20261114
+          docker buildx build --push --provenance=true --sbom=true \
+            -f apps/workflow-runner/Dockerfile \
+            -t "ghcr.io/${OWNER}/synapseone-workflow-runner:${TAG}" \
+            -t "ghcr.io/${OWNER}/synapseone-workflow-runner:${SEMVER}" \
+            -t "ghcr.io/${OWNER}/synapseone-workflow-runner:sha-${SHA}" \
+            -t "ghcr.io/${OWNER}/synapseone-workflow-runner:latest" \
+            .
+      - name: Sign images with cosign (keyless)
+        env:
+          OWNER: ${{ github.repository_owner }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          OWNER="$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')"
+          for name in gateway iam workflow workflow-runner ai lds base faststore queue stream inference ocs notifications console postgres edge; do
+            cosign sign --yes "ghcr.io/${OWNER}/synapseone-${name}:${TAG}"
+            cosign sign --yes "ghcr.io/${OWNER}/synapseone-${name}:latest"
+          done
+      - name: GHCR visibility reminder
+        run: |
+          echo "::notice::GHCR packages are private by default. GitHub has no REST API to change package visibility; an org owner must set each package to Public once in Organization → Packages → <package> → Package settings → Change visibility."
+
+
   publish-sdk-js:
     runs-on: ubuntu-latest
     needs: release
@@ -96,27 +166,3 @@ jobs:
           packages-dir: sdks/sdk-python/dist/
           verbose: true
           skip-existing: true # re-runs stay green when the version already exists
-
-  publish-images:
-    runs-on: ubuntu-latest
-    needs: release
-    permissions: { packages: write }
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - run: |
-          OWNER="${{ github.repository_owner }}"
-          TAG="${GITHUB_REF_NAME#v}"
-          docker build -t "ghcr.io/$OWNER/synapseone-gateway:$TAG" -t "ghcr.io/$OWNER/synapseone-gateway:latest" apps/gateway
-          docker build -t "ghcr.io/$OWNER/synapseone-iam:$TAG" -t "ghcr.io/$OWNER/synapseone-iam:latest" apps/iam-service
-          docker build -t "ghcr.io/$OWNER/synapseone-workflow:$TAG" -t "ghcr.io/$OWNER/synapseone-workflow:latest" apps/workflow-service
-          docker build -t "ghcr.io/$OWNER/synapseone-console:$TAG" -t "ghcr.io/$OWNER/synapseone-console:latest" apps/console
-          docker push "ghcr.io/$OWNER/synapseone-gateway:$TAG" && docker push "ghcr.io/$OWNER/synapseone-gateway:latest"
-          docker push "ghcr.io/$OWNER/synapseone-iam:$TAG" && docker push "ghcr.io/$OWNER/synapseone-iam:latest"
-          docker push "ghcr.io/$OWNER/synapseone-workflow:$TAG" && docker push "ghcr.io/$OWNER/synapseone-workflow:latest"
-          docker push "ghcr.io/$OWNER/synapseone-console:$TAG" && docker push "ghcr.io/$OWNER/synapseone-console:latest"
