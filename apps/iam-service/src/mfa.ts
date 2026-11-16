@@ -16,7 +16,7 @@
  */
 import { createCipheriv, createDecipheriv, createHash, createHmac, hkdfSync, randomBytes, randomInt, timingSafeEqual } from 'crypto';
 import jwt from 'jsonwebtoken';
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, isNull, lt, or, sql } from 'drizzle-orm';
 import { ensureTables, getDb } from './db';
 import { getJwtSecret } from './tokens';
 import * as schema from './schema';
@@ -220,6 +220,55 @@ async function saveMfa(userId: string, patch: Partial<Pick<MfaRecord, 'enabled' 
   if (r) Object.assign(r, patch);
 }
 
+/** Atomically claim a TOTP step. Concurrent requests reusing the same code
+ *  race on this conditional update; exactly one wins. */
+async function claimTotpStep(userId: string, step: number): Promise<boolean> {
+  const db = getDb();
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(schema.userMfa)
+      .set({ lastStep: step })
+      .where(and(
+        eq(schema.userMfa.userId, userId),
+        or(isNull(schema.userMfa.lastStep), lt(schema.userMfa.lastStep, step)),
+      ))
+      .returning({ userId: schema.userMfa.userId });
+    return rows.length > 0;
+  }
+  const r = mem.mfa.get(userId);
+  if (!r) return false;
+  if (r.last_step != null && r.last_step >= step) return false;
+  r.last_step = step;
+  return true;
+}
+
+/** Atomically consume one recovery-code hash. Returns remaining count, or
+ *  null when the code is missing/already used. */
+async function consumeRecoveryCode(userId: string, codeHash: string): Promise<number | null> {
+  const db = getDb();
+  if (db) {
+    await ensureTables();
+    return db.transaction(async (tx) => {
+      const rows = await tx.select({ hashes: schema.userMfa.recoveryHashes })
+        .from(schema.userMfa)
+        .where(eq(schema.userMfa.userId, userId))
+        .for('update');
+      const hashes = rows[0]?.hashes || [];
+      const idx = hashes.indexOf(codeHash);
+      if (idx < 0) return null;
+      const left = hashes.filter((_, i) => i !== idx);
+      await tx.update(schema.userMfa).set({ recoveryHashes: left }).where(eq(schema.userMfa.userId, userId));
+      return left.length;
+    });
+  }
+  const r = mem.mfa.get(userId);
+  if (!r) return null;
+  const idx = r.recovery_hashes.indexOf(codeHash);
+  if (idx < 0) return null;
+  r.recovery_hashes.splice(idx, 1);
+  return r.recovery_hashes.length;
+}
+
 /**
  * Check a TOTP code or a recovery code against the user's factor.
  * `requireEnabled=false` is only for confirming a pending enrolment.
@@ -240,16 +289,14 @@ export async function checkSecondFactor(
     }
     const step = verifyTotp(secret, input.code, rec.last_step);
     if (step == null) return { ok: false };
-    await saveMfa(userId, { last_step: step });
+    if (!(await claimTotpStep(userId, step))) return { ok: false };
     return { ok: true, method: 'totp', remainingRecovery: rec.recovery_hashes.length };
   }
   if (input.recoveryCode && rec.enabled) {
     const h = hashRecovery(input.recoveryCode);
-    const idx = rec.recovery_hashes.indexOf(h);
-    if (idx < 0) return { ok: false };
-    const left = rec.recovery_hashes.filter((_, i) => i !== idx);
-    await saveMfa(userId, { recovery_hashes: left });
-    return { ok: true, method: 'recovery', remainingRecovery: left.length };
+    const remaining = await consumeRecoveryCode(userId, h);
+    if (remaining == null) return { ok: false };
+    return { ok: true, method: 'recovery', remainingRecovery: remaining };
   }
   return { ok: false };
 }

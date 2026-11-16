@@ -77,8 +77,21 @@ export interface BaseDocument<T = Record<string, unknown>> {
   collection?: string;
 }
 
+export interface BaseDatabaseInfo {
+  id: string;
+  name: string;
+  description?: string;
+  orgId?: string;
+  accountId?: string;
+  createdAt: string;
+  updatedAt: string;
+  stats?: Record<string, unknown>;
+}
+
 export interface BaseCollectionInfo {
   id: string;
+  databaseId?: string;
+  database?: string;
   name: string;
   description?: string;
   mapping?: BaseMapping;
@@ -208,18 +221,78 @@ function queryString(params: Record<string, unknown>): string {
 // ---------------------------------------------------------------------------
 
 export class BaseService {
-  constructor(private readonly http: HttpClient) {}
+  constructor(
+    private readonly http: HttpClient,
+    private readonly databaseValue?: string,
+  ) {}
+
+  /**
+   * Bind this handle to a database namespace. Every collection/document call
+   * then uses `/v1/base/databases/{name}/...`; without it the legacy flat
+   * routes keep targeting the tenant's `default` database.
+   */
+  database(name: string): BaseService {
+    if (!name || !String(name).trim()) throw new Error('database name is required');
+    return new BaseService(this.http, String(name));
+  }
+
+  /** The database bound to this handle, if any. */
+  get databaseName(): string | undefined {
+    return this.databaseValue;
+  }
+
+  private get collectionRoot(): string {
+    return this.databaseValue
+      ? `/v1/base/databases/${encodeURIComponent(this.databaseValue)}/collections`
+      : '/v1/base/collections';
+  }
+
+  // ---- databases ----
+  listDatabases(query: { orgId?: string; accountId?: string } = {}): Promise<BaseDatabaseInfo[]> {
+    return this.http.req(`/v1/base/databases${queryString({ orgId: query.orgId, accountId: query.accountId })}`);
+  }
+
+  createDatabase(input: {
+    name: string;
+    description?: string;
+    orgId?: string;
+    accountId?: string;
+  }): Promise<BaseDatabaseInfo> {
+    return this.http.req('/v1/base/databases', { method: 'POST', body: JSON.stringify(input) });
+  }
+
+  getDatabase(name: string): Promise<BaseDatabaseInfo> {
+    return this.http.req(`/v1/base/databases/${encodeURIComponent(name)}`);
+  }
+
+  updateDatabase(name: string, patch: { name?: string; description?: string | null }): Promise<BaseDatabaseInfo> {
+    return this.http.req(`/v1/base/databases/${encodeURIComponent(name)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    });
+  }
+
+  deleteDatabase(name: string, opts: { cascade?: boolean } = {}) {
+    return this.http.req<{ ok: boolean; id: string; name: string; deletedCollections: number }>(
+      `/v1/base/databases/${encodeURIComponent(name)}${queryString({ cascade: opts.cascade ? 'true' : undefined })}`,
+      { method: 'DELETE' },
+    );
+  }
+
+  databaseStats(name: string) {
+    return this.http.req(`/v1/base/databases/${encodeURIComponent(name)}/stats`);
+  }
 
   // ---- graph (property graph per collection) ----
   graphUpsertNodes(collection: string, nodes: unknown[]): Promise<{ nodes: unknown[] }> {
-    return this.http.req(`/v1/base/collections/${encodeURIComponent(collection)}/graph/nodes`, {
+    return this.http.req(`${this.collectionRoot}/${encodeURIComponent(collection)}/graph/nodes`, {
       method: 'POST',
       body: JSON.stringify({ nodes }),
     });
   }
 
   graphUpsertEdges(collection: string, edges: unknown[]): Promise<{ edges: unknown[] }> {
-    return this.http.req(`/v1/base/collections/${encodeURIComponent(collection)}/graph/edges`, {
+    return this.http.req(`${this.collectionRoot}/${encodeURIComponent(collection)}/graph/edges`, {
       method: 'POST',
       body: JSON.stringify({ edges }),
     });
@@ -231,7 +304,7 @@ export class BaseService {
     opts: { depth?: number; limit?: number } = {},
   ): Promise<{ node: unknown; nodes: unknown[]; edges: unknown[]; next?: boolean }> {
     return this.http.req(
-      `/v1/base/collections/${encodeURIComponent(collection)}/graph/nodes/${encodeURIComponent(id)}${queryString({ depth: opts.depth, limit: opts.limit })}`,
+      `${this.collectionRoot}/${encodeURIComponent(collection)}/graph/nodes/${encodeURIComponent(id)}${queryString({ depth: opts.depth, limit: opts.limit })}`,
     );
   }
 
@@ -239,23 +312,23 @@ export class BaseService {
     collection: string,
     opts: { start: string[]; depth?: number; limit?: number; edgeTypes?: string[] },
   ): Promise<{ nodes: unknown[]; edges: unknown[]; next?: boolean }> {
-    return this.http.req(`/v1/base/collections/${encodeURIComponent(collection)}/graph/query`, {
+    return this.http.req(`${this.collectionRoot}/${encodeURIComponent(collection)}/graph/query`, {
       method: 'POST',
       body: JSON.stringify(opts),
     });
   }
 
   graphStats(collection: string): Promise<{ nodes: number; edges: number }> {
-    return this.http.req(`/v1/base/collections/${encodeURIComponent(collection)}/graph/stats`);
+    return this.http.req(`${this.collectionRoot}/${encodeURIComponent(collection)}/graph/stats`);
   }
 
   graphDeleteNode(collection: string, id: string): Promise<{ ok: boolean; id: string }> {
-    return this.http.req(`/v1/base/collections/${encodeURIComponent(collection)}/graph/nodes/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    return this.http.req(`${this.collectionRoot}/${encodeURIComponent(collection)}/graph/nodes/${encodeURIComponent(id)}`, { method: 'DELETE' });
   }
 
   // ---- GIS (PostGIS GeoJSON per collection) ----
   geoUpsert(collection: string, features: unknown[]): Promise<{ features: unknown[] }> {
-    return this.http.req(`/v1/base/collections/${encodeURIComponent(collection)}/geo/features`, {
+    return this.http.req(`${this.collectionRoot}/${encodeURIComponent(collection)}/geo/features`, {
       method: 'POST',
       body: JSON.stringify({ features }),
     });
@@ -263,7 +336,7 @@ export class BaseService {
 
   geoList(collection: string, opts: { bbox?: string; limit?: number } = {}): Promise<{ type: string; features: unknown[] }> {
     return this.http.req(
-      `/v1/base/collections/${encodeURIComponent(collection)}/geo/features${queryString({ bbox: opts.bbox, limit: opts.limit })}`,
+      `${this.collectionRoot}/${encodeURIComponent(collection)}/geo/features${queryString({ bbox: opts.bbox, limit: opts.limit })}`,
     );
   }
 
@@ -271,7 +344,7 @@ export class BaseService {
     collection: string,
     opts: { lat: number; lng: number; radiusMeters: number; limit?: number },
   ): Promise<{ type: string; features: unknown[] }> {
-    return this.http.req(`/v1/base/collections/${encodeURIComponent(collection)}/geo/near`, {
+    return this.http.req(`${this.collectionRoot}/${encodeURIComponent(collection)}/geo/near`, {
       method: 'POST',
       body: JSON.stringify(opts),
     });
@@ -281,54 +354,63 @@ export class BaseService {
     collection: string,
     opts: { geometry: Record<string, unknown>; limit?: number },
   ): Promise<{ type: string; features: unknown[] }> {
-    return this.http.req(`/v1/base/collections/${encodeURIComponent(collection)}/geo/within`, {
+    return this.http.req(`${this.collectionRoot}/${encodeURIComponent(collection)}/geo/within`, {
       method: 'POST',
       body: JSON.stringify(opts),
     });
   }
 
   geoStats(collection: string): Promise<{ features: number; extent?: unknown }> {
-    return this.http.req(`/v1/base/collections/${encodeURIComponent(collection)}/geo/stats`);
+    return this.http.req(`${this.collectionRoot}/${encodeURIComponent(collection)}/geo/stats`);
   }
 
   geoDelete(collection: string, id: string): Promise<{ ok: boolean; id: string }> {
-    return this.http.req(`/v1/base/collections/${encodeURIComponent(collection)}/geo/features/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    return this.http.req(`${this.collectionRoot}/${encodeURIComponent(collection)}/geo/features/${encodeURIComponent(id)}`, { method: 'DELETE' });
   }
 
   /** Bind a collection name (plus optional model/mapping) for typed use. */
   collection<T = Record<string, unknown>>(name: string, opts: BaseCollectionOptions<T> = {}): BaseCollection<T> {
-    return new BaseCollection<T>(this, name, opts);
+    const service = opts.database ? this.database(opts.database) : this;
+    return new BaseCollection<T>(service, name, opts);
   }
 
   // ---- collections ----
-  listCollections(query: { orgId?: string; accountId?: string } = {}): Promise<BaseCollectionInfo[]> {
-    return this.http.req(`/v1/base/collections${queryString({ orgId: query.orgId, accountId: query.accountId })}`);
+  listCollections(query: { orgId?: string; accountId?: string; database?: string } = {}): Promise<BaseCollectionInfo[]> {
+    if (query.database && !this.databaseValue) {
+      return this.database(query.database).listCollections({ orgId: query.orgId, accountId: query.accountId });
+    }
+    return this.http.req(`${this.collectionRoot}${queryString({ orgId: query.orgId, accountId: query.accountId })}`);
   }
 
   createCollection(input: {
     name: string;
     description?: string;
     mapping?: BaseMappingInput;
+    database?: string;
     orgId?: string;
     accountId?: string;
   }): Promise<BaseCollectionInfo> {
-    return this.http.req('/v1/base/collections', { method: 'POST', body: JSON.stringify(input) });
+    if (input.database && !this.databaseValue) {
+      const { database, ...rest } = input;
+      return this.database(database).createCollection(rest);
+    }
+    return this.http.req(this.collectionRoot, { method: 'POST', body: JSON.stringify(input) });
   }
 
   getCollection(name: string): Promise<BaseCollectionInfo> {
-    return this.http.req(`/v1/base/collections/${encodeURIComponent(name)}`);
+    return this.http.req(`${this.collectionRoot}/${encodeURIComponent(name)}`);
   }
 
   updateCollection(name: string, patch: { name?: string; description?: string | null; mapping?: BaseMappingInput }): Promise<BaseCollectionInfo> {
-    return this.http.req(`/v1/base/collections/${encodeURIComponent(name)}`, { method: 'PATCH', body: JSON.stringify(patch) });
+    return this.http.req(`${this.collectionRoot}/${encodeURIComponent(name)}`, { method: 'PATCH', body: JSON.stringify(patch) });
   }
 
   deleteCollection(name: string) {
-    return this.http.req<{ ok: boolean; id: string; name: string }>(`/v1/base/collections/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    return this.http.req<{ ok: boolean; id: string; name: string }>(`${this.collectionRoot}/${encodeURIComponent(name)}`, { method: 'DELETE' });
   }
 
   collectionStats(name: string) {
-    return this.http.req(`/v1/base/collections/${encodeURIComponent(name)}/stats`);
+    return this.http.req(`${this.collectionRoot}/${encodeURIComponent(name)}/stats`);
   }
 
   // ---- documents ----
@@ -336,7 +418,7 @@ export class BaseService {
     collection: string,
     body: { data?: Record<string, unknown>; object?: T; id?: string },
   ): Promise<BaseDocument<T>> {
-    return this.http.req(`/v1/base/collections/${encodeURIComponent(collection)}/documents`, {
+    return this.http.req(`${this.collectionRoot}/${encodeURIComponent(collection)}/documents`, {
       method: 'POST',
       body: JSON.stringify({ ...writeBody(body), ...(body.id !== undefined ? { id: body.id } : {}) }),
     });
@@ -347,7 +429,7 @@ export class BaseService {
     id: string,
     query: { as?: 'data' | 'object' } = {},
   ): Promise<BaseDocument<T>> {
-    return this.http.req(`/v1/base/collections/${encodeURIComponent(collection)}/documents/${encodeURIComponent(id)}${queryString({ as: query.as })}`);
+    return this.http.req(`${this.collectionRoot}/${encodeURIComponent(collection)}/documents/${encodeURIComponent(id)}${queryString({ as: query.as })}`);
   }
 
   setDocument<T = Record<string, unknown>>(
@@ -355,7 +437,7 @@ export class BaseService {
     id: string,
     body: { data?: Record<string, unknown>; object?: T; ifVersion?: number; merge?: boolean },
   ): Promise<BaseDocument<T>> {
-    return this.http.req(`/v1/base/collections/${encodeURIComponent(collection)}/documents/${encodeURIComponent(id)}`, {
+    return this.http.req(`${this.collectionRoot}/${encodeURIComponent(collection)}/documents/${encodeURIComponent(id)}`, {
       method: 'PUT',
       body: JSON.stringify({
         ...writeBody(body),
@@ -377,14 +459,14 @@ export class BaseService {
     if (body.data !== undefined || body.object !== undefined) Object.assign(payload, writeBody(body));
     if (body.unset?.length) payload.unset = body.unset;
     if (body.ifVersion !== undefined) payload.ifVersion = body.ifVersion;
-    return this.http.req(`/v1/base/collections/${encodeURIComponent(collection)}/documents/${encodeURIComponent(id)}`, {
+    return this.http.req(`${this.collectionRoot}/${encodeURIComponent(collection)}/documents/${encodeURIComponent(id)}`, {
       method: 'PATCH', body: JSON.stringify(payload),
     });
   }
 
   deleteDocument(collection: string, id: string, opts: { ifVersion?: number } = {}) {
     return this.http.req<{ ok: boolean; id: string }>(
-      `/v1/base/collections/${encodeURIComponent(collection)}/documents/${encodeURIComponent(id)}${queryString({ ifVersion: opts.ifVersion })}`,
+      `${this.collectionRoot}/${encodeURIComponent(collection)}/documents/${encodeURIComponent(id)}${queryString({ ifVersion: opts.ifVersion })}`,
       { method: 'DELETE' },
     );
   }
@@ -398,7 +480,7 @@ export class BaseService {
     if (query.offset !== undefined) body.offset = query.offset;
     if (query.cursor !== undefined) body.cursor = query.cursor;
     if (query.select !== undefined) body.select = query.select;
-    return this.http.req(`/v1/base/collections/${encodeURIComponent(collection)}/query`, {
+    return this.http.req(`${this.collectionRoot}/${encodeURIComponent(collection)}/query`, {
       method: 'POST', body: JSON.stringify(body),
     });
   }
@@ -418,7 +500,7 @@ export class BaseService {
     if (options.where !== undefined) body.where = options.where;
     if (options.filter !== undefined) body.filter = options.filter;
     if (options.select !== undefined) body.select = options.select;
-    return this.http.req(`/v1/base/collections/${encodeURIComponent(collection)}/vector-search`, {
+    return this.http.req(`${this.collectionRoot}/${encodeURIComponent(collection)}/vector-search`, {
       method: 'POST',
       body: JSON.stringify(body),
     });
@@ -428,7 +510,7 @@ export class BaseService {
     collection: string,
     opts: { limit?: number; offset?: number } = {},
   ): Promise<Array<BaseDocument<T>>> {
-    return this.http.req(`/v1/base/collections/${encodeURIComponent(collection)}/documents${queryString({ limit: opts.limit, offset: opts.offset })}`);
+    return this.http.req(`${this.collectionRoot}/${encodeURIComponent(collection)}/documents${queryString({ limit: opts.limit, offset: opts.offset })}`);
   }
 
   /** Paginated listing with an exact total and next cursor (#29 envelope). */
@@ -437,7 +519,7 @@ export class BaseService {
     opts: { limit?: number; offset?: number } = {},
   ): Promise<{ items: Array<BaseDocument<T>>; total: number; limit: number; offset: number; nextCursor: string | null }> {
     return this.http.req(
-      `/v1/base/collections/${encodeURIComponent(collection)}/documents${queryString({ limit: opts.limit, offset: opts.offset, withTotal: 1 })}`,
+      `${this.collectionRoot}/${encodeURIComponent(collection)}/documents${queryString({ limit: opts.limit, offset: opts.offset, withTotal: 1 })}`,
     );
   }
 
@@ -446,7 +528,7 @@ export class BaseService {
     id: string,
     body: { field: string; by?: number; ifVersion?: number },
   ): Promise<BaseDocument<T>> {
-    return this.http.req(`/v1/base/collections/${encodeURIComponent(collection)}/documents/${encodeURIComponent(id)}/increment`, {
+    return this.http.req(`${this.collectionRoot}/${encodeURIComponent(collection)}/documents/${encodeURIComponent(id)}/increment`, {
       method: 'POST',
       body: JSON.stringify({
         field: body.field,
@@ -458,7 +540,7 @@ export class BaseService {
 
   batch(collection: string, operations: Record<string, unknown>[]) {
     return this.http.req<{ results: any[]; ok: boolean }>(
-      `/v1/base/collections/${encodeURIComponent(collection)}/documents:batch`,
+      `${this.collectionRoot}/${encodeURIComponent(collection)}/documents:batch`,
       { method: 'POST', body: JSON.stringify({ operations }) },
     );
   }
@@ -467,7 +549,7 @@ export class BaseService {
     collection: string,
     query: { since: string; limit?: number; as?: 'data' | 'object' },
   ): Promise<{ changes: any[]; nextSince: string; hasMore: boolean }> {
-    return this.http.req(`/v1/base/collections/${encodeURIComponent(collection)}/changes${queryString({
+    return this.http.req(`${this.collectionRoot}/${encodeURIComponent(collection)}/changes${queryString({
       since: query.since, limit: query.limit, as: query.as,
     })}`);
   }
@@ -482,6 +564,8 @@ export interface BaseCollectionOptions<T> {
   model?: (obj: Record<string, unknown>) => T;
   /** Server-side mapping (logical -> dot path), used for data responses. */
   mapping?: BaseMappingInput;
+  /** Database namespace; defaults to the tenant's `default` database. */
+  database?: string;
 }
 
 /**

@@ -45,6 +45,7 @@ async def lifespan(_app: FastAPI):
     if (
         settings.DECISION_WARMUP
         and settings.DECISION_ENABLED
+        and settings.DECISION_BACKEND != "openrouter"
         and not settings.INFERENCE_MOCK_MODELS
     ):
         threading.Thread(
@@ -138,11 +139,14 @@ async def health():
     decision_status = decision_engine.status
     # Explicit mock mode is a dev/test choice; an unexpected failure to load a
     # real model is reported as degraded instead of a misleading "ok".
-    decision_failed = (
-        settings.DECISION_ENABLED
-        and not decision_status.get("loaded")
-        and bool(decision_status.get("error"))
-    )
+    if settings.DECISION_ENABLED and settings.DECISION_BACKEND == "openrouter":
+        decision_failed = not bool(settings.OPENROUTER_API_KEY)
+    else:
+        decision_failed = (
+            settings.DECISION_ENABLED
+            and not decision_status.get("loaded")
+            and bool(decision_status.get("error"))
+        )
     degraded = (
         bool(embedding_status.get("mock_mode")) and not settings.INFERENCE_MOCK_MODELS
     ) or decision_failed

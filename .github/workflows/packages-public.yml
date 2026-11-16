@@ -1,46 +1,47 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 VKU.VIC
-name: packages-public
+name: packages-visibility
 
-# GHCR packages are private by default. The release jobs try to flip them with
-# GITHUB_TOKEN, but GitHub only allows that through an organization admin token.
-# Add an org secret named GHCR_PAT (classic: admin:org + write:packages, or
-# fine-grained: Packages write + org admin), then run this workflow once.
+# GitHub has no REST/GraphQL API to change GitHub Packages visibility. The
+# only supported way is the package settings UI, once per package, by an
+# organization owner:
+#   Organization → Packages → <package> → Package settings
+#     → Danger Zone → Change visibility → Public
+#
+# This workflow audits the current visibility so you know what still needs a
+# click. It never fails the build for a private package.
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
-  packages: write
+  packages: read
 
 jobs:
-  make-public:
+  audit:
     runs-on: ubuntu-latest
     steps:
-      - name: Make every Synapse GHCR package public
+      - name: Report package visibility
         env:
-          GH_TOKEN: ${{ secrets.GHCR_PAT }}
+          GH_TOKEN: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::error::Add an organization secret GHCR_PAT with package admin rights, then re-run this workflow."
-            exit 1
-          fi
+          set -uo pipefail
           OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
           packages=(
-            synapseone-gateway synapseone-iam synapseone-workflow synapseone-ai
-            synapseone-lds synapseone-base synapseone-faststore synapseone-queue
-            synapseone-stream synapseone-inference synapseone-ocs synapseone-notifications
-            synapseone-console synapseone-postgres synapseone-edge
-            synapsedx/capabilities synapsedx/gateway synapsedx/console
-            synapsecity-city-service synapsecity-gateway synapsecity-console
-            synapsecitysos-sos-service synapsecitysos-gateway synapsecitysos-console
+            synapseone-gateway synapseone-iam synapseone-workflow synapseone-workflow-runner
+            synapseone-ai synapseone-lds synapseone-base synapseone-faststore
+            synapseone-queue synapseone-stream synapseone-inference synapseone-ocs
+            synapseone-notifications synapseone-console synapseone-postgres synapseone-edge
           )
+          private_count=0
           for pkg in "${packages[@]}"; do
-            encoded="${pkg//\//%2F}"
-            if gh api --method PATCH "/orgs/${OWNER}/packages/container/${encoded}" -f visibility=public >/dev/null 2>&1; then
-              echo "public: ${pkg}"
+            vis="$(gh api "/orgs/${OWNER}/packages/container/${pkg}" --jq '.visibility' 2>/dev/null || echo missing)"
+            if [ "$vis" = "public" ]; then
+              echo "public:  ${pkg}"
             else
-              echo "::warning::Could not set ${pkg} public (missing package or insufficient token scope)."
+              echo "::warning::${pkg} is ${vis}. Make it public once in Organization → Packages → ${pkg} → Package settings → Change visibility."
+              private_count=$((private_count + 1))
             fi
           done
+          echo "Private/missing packages: ${private_count}"
+          echo "GitHub exposes no API to flip visibility; this is an org-owner UI action."

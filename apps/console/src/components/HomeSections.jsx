@@ -36,7 +36,7 @@ const FLOW = [
   { icon: ShieldCheck, host: 'api.synapseone.space', chips: ['JWT', 'API key', 'rate limit', 'x-request-id'] },
   {
     icon: ServerCog,
-    chips: ['IAM', 'SynapseFlow', 'SynapseBase', 'Faststore', 'SynapseQueue', 'SynapseStream', 'SynapseOCS', 'Notifications', 'SynapseLDS', 'Inference', 'AI'],
+    chips: ['IAM', 'SynapseFlow', 'SynapseBase', 'Faststore', 'SynapseQueue', 'SynapseStream', 'Synapse Warehouse', 'SynapseOCS', 'Notifications', 'SynapseLDS', 'Inference', 'AI'],
   },
   { icon: Database, chips: ['PostgreSQL', 'Redis', 'SeaweedFS (S3)'] },
 ];
@@ -158,8 +158,8 @@ _, err = c.CreateBaseDocument("parks", synapseone.BaseDocumentInput{
     code: `export SYNAPSEONE_BASE_URL=https://api.synapseone.space
 
 synapseone login --email demo@acme.local --org acme
-synapseone call POST /v1/base/collections/parks/documents \\
-  --data '{"id":"park-1","object":{"name":"Central","capacity":120}}'`,
+synapseone base documents insert parks --id park-1 \\
+  --data '{"name":"Central","capacity":120}'`,
   },
   {
     id: 'curl',

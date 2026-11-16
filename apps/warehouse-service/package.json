@@ -12,7 +12,7 @@
     "lint": "echo lint-ok"
   },
   "dependencies": {
-    "@duckdb/node-api": "^1.5.6-r.2",
+    "@duckdb/node-api": "1.5.6-r.2",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",

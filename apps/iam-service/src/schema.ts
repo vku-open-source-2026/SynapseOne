@@ -25,9 +25,16 @@ export const organizations = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     slug: text('slug').notNull(),
     displayName: text('display_name').notNull(),
+    /** tenant = customer organization; platform = reserved staff organization. */
+    kind: text('kind').notNull().default('tenant'),
+    /** active | suspended. Platform org is always active. */
+    status: text('status').notNull().default('active'),
+    suspendedAt: timestamp('suspended_at', { withTimezone: true }),
+    suspendedBy: text('suspended_by'),
+    suspendReason: text('suspend_reason'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [uniqueIndex('organizations_slug_key').on(t.slug)],
+  (t) => [uniqueIndex('organizations_slug_key').on(t.slug), index('idx_organizations_kind').on(t.kind)],
 );
 
 export const accounts = pgTable(
@@ -57,6 +64,8 @@ export const users = pgTable(
     passwordHash: text('password_hash'),
     emailVerified: boolean('email_verified').notNull().default(false),
     active: boolean('active').notNull().default(true),
+    /** Incremented on every session/credential revocation; access JWTs carry it. */
+    authVersion: integer('auth_version').notNull().default(0),
     passwordUpdatedAt: timestamp('password_updated_at', { withTimezone: true }),
     /** Org administrator (AWS "root"-like): full access inside its own org. */
     isOrgAdmin: boolean('is_org_admin').notNull().default(false),
@@ -70,6 +79,8 @@ export const users = pgTable(
     uniqueIndex('idx_users_external_sub').on(t.externalSub).where(sql`${t.externalSub} is not null`),
     uniqueIndex('idx_users_org_email_lower').on(t.orgId, sql`lower(${t.email})`),
     index('idx_users_org').on(t.orgId),
+    index('idx_users_email_lower').on(sql`lower(${t.email})`),
+    index('idx_users_created_at').on(t.createdAt.desc()),
   ],
 );
 
@@ -163,6 +174,66 @@ export const apiKeys = pgTable(
   ],
 );
 
+/**
+ * Platform runner keys are system compute credentials. Unlike tenant API keys
+ * they have no account/user owner: they authenticate a SynapseOne-owned runner
+ * that any platform owner manages and that can claim work for every tenant.
+ * The plaintext value is returned once; only the hash is stored.
+ */
+export const platformRunnerKeys = pgTable(
+  'platform_runner_keys',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    /** Workflow runner registration id this key is bound to. */
+    runnerId: text('runner_id').notNull(),
+    name: text('name').notNull().default(''),
+    keyPrefix: text('key_prefix').notNull(),
+    keyHash: text('key_hash').notNull(),
+    scopes: text('scopes').array().notNull().default(sql`'{}'::text[]`),
+    createdBy: uuid('created_by'),
+    expiresAt: timestamp('expires_at', { withTimezone: true }),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('platform_runner_keys_key_hash_key').on(t.keyHash),
+    index('idx_platform_runner_keys_runner').on(t.runnerId),
+    index('idx_platform_runner_keys_expiry')
+      .on(t.expiresAt)
+      .where(sql`${t.revokedAt} is null`),
+  ],
+);
+
+/**
+ * Per-execution delegated grants minted for platform runners. The JWT carries
+ * the jti; IAM verifies this row on every gateway session check so completing,
+ * releasing or deleting a runner revokes outstanding data-plane authority.
+ */
+export const executionDelegations = pgTable(
+  'execution_delegations',
+  {
+    jti: uuid('jti').primaryKey(),
+    executionId: text('execution_id').notNull(),
+    runnerId: text('runner_id').notNull(),
+    instanceId: text('instance_id'),
+    userId: uuid('user_id').notNull(),
+    orgId: uuid('org_id'),
+    accountId: uuid('account_id'),
+    scopes: text('scopes').array().notNull().default(sql`'{}'::text[]`),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+  },
+  (t) => [
+    index('idx_execution_delegations_execution').on(t.executionId),
+    index('idx_execution_delegations_runner').on(t.runnerId),
+    index('idx_execution_delegations_expiry')
+      .on(t.expiresAt)
+      .where(sql`${t.revokedAt} is null`),
+  ],
+);
+
 export const serviceAccounts = pgTable(
   'service_accounts',
   {
@@ -170,6 +241,7 @@ export const serviceAccounts = pgTable(
     accountId: uuid('account_id').notNull().references(() => accounts.id, { onDelete: 'cascade' }),
     slug: text('slug').notNull(),
     description: text('description').default(''),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
@@ -266,12 +338,15 @@ export const auditLog = pgTable(
     action: text('action').notNull(),
     resource: text('resource').notNull().default(''),
     decision: boolean('decision').notNull(),
+    /** Tenant attribution column (indexed) for platform/tenant audit queries. */
+    orgId: uuid('org_id'),
     context: jsonb('context').$type<Record<string, any>>().notNull().default(sql`'{}'::jsonb`),
   },
   (t) => [
     index('idx_audit_actor').on(t.actorId, t.createdAt.desc()),
     index('idx_audit_time').on(t.createdAt.desc()),
     index('idx_audit_action').on(t.action, t.decision),
+    index('idx_audit_org_time').on(t.orgId, t.createdAt.desc()),
   ],
 );
 
@@ -323,3 +398,37 @@ export const userMfa = pgTable('user_mfa', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   enabledAt: timestamp('enabled_at', { withTimezone: true }),
 });
+
+/** Human-operated platform administrators (cross-tenant control plane).
+ *  This is deliberately separate from users.is_org_admin (tenant-scoped). */
+export const platformAdmins = pgTable(
+  'platform_admins',
+  {
+    userId: uuid('user_id').primaryKey().references(() => users.id, { onDelete: 'cascade' }),
+    role: text('role').notNull().default('auditor'),
+    grantedBy: uuid('granted_by').references(() => users.id, { onDelete: 'set null' }),
+    grantedAt: timestamp('granted_at', { withTimezone: true }).notNull().defaultNow(),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    reason: text('reason').notNull().default(''),
+  },
+  (t) => [index('idx_platform_admins_role').on(t.role), index('idx_platform_admins_revoked').on(t.revokedAt)],
+);
+
+/** One-time step-up proofs. A step-up JWT is bound to the issuing platform
+ *  session (sid), one action, and a jti consumed exactly once. */
+export const platformStepUps = pgTable(
+  'platform_step_ups',
+  {
+    jti: uuid('jti').primaryKey(),
+    userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+    sessionJti: uuid('session_jti').notNull(),
+    action: text('action').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    usedAt: timestamp('used_at', { withTimezone: true }),
+  },
+  (t) => [
+    index('idx_platform_step_ups_user').on(t.userId, t.expiresAt.desc()),
+    index('idx_platform_step_ups_expiry').on(t.expiresAt),
+  ],
+);

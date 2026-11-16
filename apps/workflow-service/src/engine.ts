@@ -322,8 +322,12 @@ export function isManualTriggerType(type: unknown): boolean {
   const t = normalizeNodeType(type);
   return t === 'manualTrigger' || t === 'n8n-nodes-base.manualTrigger' || t === 'synapseone.manualTrigger';
 }
+export function isMcpTriggerType(type: unknown): boolean {
+  const t = normalizeNodeType(type);
+  return t === 'mcpTrigger' || t === 'n8n-nodes-base.mcpTrigger' || t === 'synapseone.mcpTrigger';
+}
 export function isTriggerType(type: unknown): boolean {
-  return isWebhookType(type) || isCronType(type) || isManualTriggerType(type);
+  return isWebhookType(type) || isCronType(type) || isManualTriggerType(type) || isMcpTriggerType(type);
 }
 export function isCodeType(type: unknown): boolean {
   const t = normalizeNodeType(type);
@@ -410,6 +414,9 @@ const TRIGGER_TYPES = new Set([
   'synapseone.webhook',
   'synapseone.cron',
   'synapseone.manualTrigger',
+  'n8n-nodes-base.mcpTrigger',
+  'mcpTrigger',
+  'synapseone.mcpTrigger',
 ]);
 
 const MAX_CODE_BYTES = 50 * 1024;
@@ -925,6 +932,53 @@ function hasHeader(headers: Record<string, string>, name: string): boolean {
   return Object.keys(headers).some((k) => k.toLowerCase() === want);
 }
 
+/** Capability marker for the credential-destination protection contract. */
+export const HTTP_CREDENTIAL_DESTINATION_PROTECTION = 1 as const;
+
+/**
+ * Credential requests must declare a strict origin allowlist. Entries are
+ * exact canonical origins only (`https://host[:port]`); paths, wildcards,
+ * queries, userinfo and trailing slashes are rejected.
+ */
+function credentialAllowedOrigins(authCfg: any): Set<string> | null {
+  if (!authCfg || authCfg.allowedOrigins === undefined) return null;
+  const list = authCfg.allowedOrigins;
+  if (!Array.isArray(list) || list.length === 0) {
+    throw new Error('auth.allowedOrigins must be a non-empty array of exact origins');
+  }
+  if (list.length > 20) throw new Error('auth.allowedOrigins supports at most 20 origins');
+  const origins = new Set<string>();
+  for (const raw of list) {
+    if (typeof raw !== 'string' || !raw || raw.length > 2048 || /\s/.test(raw)) {
+      throw new Error('auth.allowedOrigins entries must be exact origin strings');
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(raw);
+    } catch {
+      throw new Error(`auth.allowedOrigins entry is malformed: ${raw.slice(0, 120)}`);
+    }
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      throw new Error('auth.allowedOrigins entries must use http(s)');
+    }
+    if (parsed.username || parsed.password || parsed.search || parsed.hash || parsed.pathname !== '/') {
+      throw new Error('auth.allowedOrigins entries must be exact origins without paths, queries, userinfo or fragments');
+    }
+    if (raw !== parsed.origin) {
+      throw new Error('auth.allowedOrigins entries must be canonical origins (no trailing slash or case variants)');
+    }
+    origins.add(parsed.origin);
+  }
+  return origins;
+}
+
+function assertCredentialOrigin(url: string, origins: Set<string>): void {
+  const origin = new URL(url).origin;
+  if (!origins.has(origin)) {
+    throw new Error(`credential destination origin ${origin} is not in auth.allowedOrigins`);
+  }
+}
+
 async function execHttp(node: EngineNode, input: any, ctx?: { principal?: RunPrincipal | null; credentialResolver?: CredentialResolver }): Promise<any> {
   const p = node.parameters || {};
   let url = String(p.url ?? p.uri ?? '');
@@ -935,6 +989,28 @@ async function execHttp(node: EngineNode, input: any, ctx?: { principal?: RunPri
     await assertUrlAllowed(url);
   } catch (e: any) {
     throw new Error(`httpRequest: ${e?.message || e}`);
+  }
+  // P0-4/P1-16: credential-backed auth — the node stores only a credentialId,
+  // the secret is resolved server-side and never lands in nodeRuns or params.
+  // Destination allowlisting is evaluated on the actual URL BEFORE resolving
+  // the credential, and re-evaluated on every redirect hop.
+  const authCfg = (p.auth && typeof p.auth === 'object' && !Array.isArray(p.auth) ? p.auth : null) as any;
+  const credentialId = authCfg?.credentialId || (typeof p.credentialId === 'string' ? p.credentialId : null);
+  let allowedOrigins: Set<string> | null;
+  try {
+    allowedOrigins = credentialAllowedOrigins(authCfg);
+  } catch (e: any) {
+    throw new Error(`httpRequest: ${e?.message || e}`);
+  }
+  if (credentialId && !allowedOrigins) {
+    throw new Error('httpRequest: credential-backed auth requires auth.allowedOrigins');
+  }
+  if (allowedOrigins) {
+    try {
+      assertCredentialOrigin(url, allowedOrigins);
+    } catch (e: any) {
+      throw new Error(`httpRequest: ${e?.message || e}`);
+    }
   }
   const method = String(p.method ?? 'GET').toUpperCase();
   if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'].includes(method)) throw new Error(`httpRequest: unsupported method ${method}`);
@@ -947,10 +1023,6 @@ async function execHttp(node: EngineNode, input: any, ctx?: { principal?: RunPri
       if (h?.name) headers[String(h.name)] = String(toValue(h.value, input));
     }
   }
-  // P0-4/P1-16: credential-backed auth — the node stores only a credentialId,
-  // the secret is resolved server-side and never lands in nodeRuns or params.
-  const authCfg = (p.auth && typeof p.auth === 'object' ? p.auth : null) as any;
-  const credentialId = authCfg?.credentialId || (typeof p.credentialId === 'string' ? p.credentialId : null);
   if (credentialId) {
     if (!ctx?.credentialResolver) throw new Error('httpRequest: auth.credentialId needs a credentialResolver (server wiring)');
     const cred = await ctx.credentialResolver(credentialId);
@@ -978,15 +1050,24 @@ async function execHttp(node: EngineNode, input: any, ctx?: { principal?: RunPri
       throw new Error(`httpRequest: unsupported credential kind '${kind}'`);
     }
   }
-  // P0-3: propagate the run principal downstream on first-party calls so the
-  // receiving service can authorize (never override explicit headers).
+  // Workflow JSON is untrusted. Never forward caller-chosen platform identity
+  // headers, even when written with the legacy prefix or mixed casing.
+  for (const key of Object.keys(headers)) {
+    const lower = key.toLowerCase();
+    if (lower.startsWith('x-synapseone-') || lower.startsWith('x-synapsedx-')) delete headers[key];
+  }
+  // First-party identity is derived exclusively from the actual run principal.
+  // Attach the internal secret only to an allowlisted origin and a bound run.
   try {
     const u = new URL(url);
     if (ctx?.principal?.sub && isAllowedSelfUrl(u)) {
-      if (!hasHeader(headers, 'x-synapseone-kind')) headers['X-SynapseOne-Kind'] = String(ctx.principal.kind || 'user');
-      if (!hasHeader(headers, 'x-synapseone-user')) headers['X-SynapseOne-User'] = String(ctx.principal.sub);
-      if (ctx.principal.org && !hasHeader(headers, 'x-synapseone-org')) headers['X-SynapseOne-Org'] = String(ctx.principal.org);
-      if (ctx.principal.account && !hasHeader(headers, 'x-synapseone-account')) headers['X-SynapseOne-Account'] = String(ctx.principal.account);
+      headers['X-SynapseOne-Kind'] = String(ctx.principal.kind || 'user');
+      headers['X-SynapseOne-User'] = String(ctx.principal.sub);
+      if (ctx.principal.org) headers['X-SynapseOne-Org'] = String(ctx.principal.org);
+      if (ctx.principal.account) headers['X-SynapseOne-Account'] = String(ctx.principal.account);
+      if (process.env.SYNAPSEONE_INTERNAL_SECRET) headers['X-SynapseOne-Internal'] = process.env.SYNAPSEONE_INTERNAL_SECRET;
+    } else if (isAllowedSelfUrl(u)) {
+      headers['X-SynapseOne-Anon'] = '1';
     }
   } catch { /* url already validated above */ }
   let body: string | undefined;
@@ -1023,6 +1104,13 @@ async function execHttp(node: EngineNode, input: any, ctx?: { principal?: RunPri
       } catch (e: any) {
         throw new Error(`httpRequest: ${e?.message || e}`);
       }
+      if (allowedOrigins) {
+        try {
+          assertCredentialOrigin(curUrl, allowedOrigins);
+        } catch (e: any) {
+          throw new Error(`httpRequest: redirect ${e?.message || e}`);
+        }
+      }
       const r = await fetch(curUrl, { method: curMethod, headers, body: curBody, signal: ctl.signal, redirect: 'manual' as any });
       if (r.status >= 300 && r.status < 400) {
         const loc = r.headers.get('location');
@@ -1038,6 +1126,14 @@ async function execHttp(node: EngineNode, input: any, ctx?: { principal?: RunPri
           await assertUrlAllowed(next);
         } catch (e: any) {
           throw new Error(`httpRequest: redirect ${e?.message || e}`);
+        }
+        if (new URL(next).origin !== new URL(curUrl).origin) {
+          // An allowlisted service may redirect to an external origin. Neither
+          // its platform secret nor custom credential headers may follow it.
+          const publicHeaders = new Set(['accept', 'accept-language', 'content-type', 'user-agent']);
+          for (const key of Object.keys(headers)) {
+            if (!publicHeaders.has(key.toLowerCase())) delete headers[key];
+          }
         }
         curUrl = next;
         // 301/302/303 downgrade to GET without body (fetch semantics).
@@ -1055,7 +1151,9 @@ async function execHttp(node: EngineNode, input: any, ctx?: { principal?: RunPri
         /* keep text */
       }
       if (!r.ok) throw new Error(`httpRequest: ${curMethod} ${curUrl} -> ${r.status}`);
-      const out = { statusCode: r.status, body: parsed };
+      const out = p.includeInput === true
+        ? { statusCode: r.status, body: parsed, input: clone(input) }
+        : { statusCode: r.status, body: parsed };
       if (safeJsonSize(out) > MAX_OUTPUT_BYTES) throw new Error('httpRequest: response exceeds 500KB');
       return out;
     }
@@ -2373,11 +2471,41 @@ export async function execCodeSandbox(node: EngineNode, input: any, opts?: { tim
 
 // ---------- DAG runner ----------
 
+/** Credential ids literally referenced by a workflow definition. A node may
+ *  only resolve a secret that its own graph declares; tenant-wide credential
+ *  ids are not enough. */
+export function referencedCredentialIds(value: unknown): Set<string> {
+  const ids = new Set<string>();
+  const walk = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item);
+      return;
+    }
+    if (!node || typeof node !== 'object') return;
+    for (const [key, item] of Object.entries(node as Record<string, unknown>)) {
+      if (key === 'credentialId' && typeof item === 'string' && item.trim()) ids.add(item.trim());
+      else walk(item);
+    }
+  };
+  walk(value);
+  return ids;
+}
+
 export async function runWorkflow(
   definition: { nodes?: EngineNode[]; connections?: Connections; name?: string; settings?: Record<string, any> },
   input: any,
   opts?: RunOpts,
 ): Promise<RunResult> {
+  // P2 hardening: scope credential resolution to the ids this graph declares.
+  // A compromised or mistaken node cannot read an arbitrary tenant credential.
+  if (opts?.credentialResolver) {
+    const allowed = referencedCredentialIds(definition);
+    const resolve = opts.credentialResolver;
+    opts = {
+      ...opts,
+      credentialResolver: (id: string) => allowed.has(id) ? resolve(id) : Promise.resolve(null),
+    };
+  }
   const nodes = Array.isArray(definition?.nodes) ? definition.nodes : [];
   // Accept workflows saved before the rebrand: normalise legacy node types
   // once at the boundary so every downstream switch sees `synapseone.*`.
@@ -2503,6 +2631,9 @@ export async function runWorkflow(
       case 'manualTrigger':
       case 'n8n-nodes-base.manualTrigger':
       case 'synapseone.manualTrigger':
+      case 'mcpTrigger':
+      case 'n8n-nodes-base.mcpTrigger':
+      case 'synapseone.mcpTrigger':
         output = await execTrigger(node, data);
         break;
       case 'noOp':

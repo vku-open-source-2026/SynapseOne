@@ -3,7 +3,7 @@
 Multi-model inference microservice for the SynapseOne ecosystem. Provides:
 1. **LLM Proxy**: OpenAI-compatible chat completions endpoint (streaming + non-streaming) backed by OpenRouter, with a configured fallback model.
 2. **Embedding**: Self-hosted `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions) running on **ONNX Runtime int8** by default, with PyTorch and deterministic mock fallbacks.
-3. **Decision Model**: Self-hosted `vllm-sr/Decision-2.0-Eos-0.8B` model (0.8B parameters) for single-forward-pass routing and structured evaluations (`system_one`).
+3. **Decision Model**: Self-hosted `vllm-sr/Decision-2.0-Eos-0.8B` model (0.8B parameters) for single-forward-pass routing and structured evaluations (`system_one`), or an OpenRouter decisions-only model via `/api/alpha/decisions` (`DECISION_BACKEND=openrouter`).
 
 ---
 
@@ -160,7 +160,9 @@ Example `noul` result:
 | `INFERENCE_MODEL_DOWNLOAD` | `true` | Allow first-use Hugging Face downloads |
 | `INFERENCE_WARMUP` | `true` | Load the embedding graph in a background thread at startup |
 | `MODEL_LOAD_RETRY_SECONDS` | `300` | Backoff after a failed model load |
-| `DECISION_MODEL_NAME` | `vllm-sr/Decision-2.0-Eos-0.8B` | Self-hosted 0.8B decision model |
+| `DECISION_BACKEND` | `local` | `local` self-hosted model or `openrouter` decisions endpoint |
+| `DECISION_MODEL_NAME` | `vllm-sr/Decision-2.0-Eos-0.8B` | Local 0.8B model or OpenRouter decisions model id |
+| `OPENROUTER_DECISIONS_URL` | `""` | Optional override; empty derives `<OPENROUTER_BASE_URL without /v1>/alpha/decisions` |
 | `DECISION_ENABLED` | `true` | Set `false` to skip the ~3 GB CPU model |
 | `DECISION_THREADS` | `0` | Decision runtime threads; 0 = auto |
 | `DECISION_WARMUP` | `true` | Load the decision model in a background thread at startup |

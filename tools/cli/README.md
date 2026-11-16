@@ -31,6 +31,13 @@ synapseone accounts create prod Production
 synapseone authz <user-id> workflow:Execute "*" --context team=etl
 synapseone workflows create --template webhook-to-log --name demo
 synapseone audit --limit 20
+
+# Data plane
+synapseone faststore set cache:demo --value '{"ok":true}' --ttl 300
+synapseone queue send emails --payload '{"to":"a@b.c"}'
+synapseone stream publish telemetry --payload '{"value":25.4}'
+synapseone ocs put city-assets map.png --file ./map.png
+synapseone notifications send a@b.c --channel email --subject Hi --body Hello
 ```
 
 For local container development: add `--base http://localhost:8080` (or `export SYNAPSEONE_BASE_URL=http://localhost:8080`).

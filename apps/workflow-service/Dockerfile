@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: 2026 VKU.VIC
 FROM node:20-alpine
 WORKDIR /app
-COPY package.json package-lock.json* ./
-RUN npm install --production=false || npm install
+COPY package.json package-lock.json ./
+RUN npm ci
 COPY tsconfig.json ./
 COPY src ./src
 COPY drizzle ./drizzle

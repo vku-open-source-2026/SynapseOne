@@ -51,6 +51,16 @@ function byNode(exec) {
   return Object.fromEntries((exec.nodeRuns || []).map((n) => [n.node, n]));
 }
 
+async function waitExecution(id, timeoutMs = 60000) {
+  const deadline = Date.now() + timeoutMs;
+  let exec = await api(`/v1/executions/${encodeURIComponent(id)}?includeData=true`);
+  while (exec && (exec.status === 'queued' || exec.status === 'running') && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    exec = await api(`/v1/executions/${encodeURIComponent(id)}?includeData=true`);
+  }
+  return exec;
+}
+
 async function runCase(name, payload, expectedRoute, expectedNodes, expectedTerminal, minNodes) {
   const res = await api(`/webhook/${currentWebhookPath}`, {
     method: 'POST',
@@ -58,7 +68,7 @@ async function runCase(name, payload, expectedRoute, expectedNodes, expectedTerm
   });
   assert.equal(res.ok, true, `${name}: webhook returned ok=false (${res.error || ''})`);
   assert.ok(res.executionId, `${name}: missing executionId`);
-  const exec = await api(`/v1/executions/${encodeURIComponent(res.executionId)}?includeData=true`);
+  const exec = await waitExecution(res.executionId);
   assert.equal(exec.status, 'success', `${name}: execution failed: ${exec.error || ''}`);
   const runs = byNode(exec);
   assert.ok(runs.Route, `${name}: Decision did not run`);

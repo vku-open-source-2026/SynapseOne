@@ -55,7 +55,10 @@ type Client struct {
 	Token   string // Bearer JWT (user or service-account token)
 	APIKey  string // X-API-Key
 	Tenant  string // x-synapseone-tenant (platform callers of faststore/queue)
-	HTTP    *http.Client
+	// BaseDatabase scopes SynapseBase calls to /v1/base/databases/{name}.
+	// Empty keeps the legacy flat API (tenant default database).
+	BaseDatabase string
+	HTTP         *http.Client
 	// MaxAttempts is the total number of tries for idempotent requests on
 	// 429/502/503/504 (default 3; 1 disables retries).
 	MaxAttempts int
@@ -105,6 +108,18 @@ func (c *Client) SetAPIKey(k string) { c.APIKey = k }
 // SetTenant sets the x-synapseone-tenant header used by platform callers of
 // Synapse Faststore and SynapseQueue. An empty string clears it.
 func (c *Client) SetTenant(t string) { c.Tenant = t }
+
+// WithBaseDatabase returns a shallow copy whose SynapseBase calls address the
+// named database instead of the legacy tenant default.
+func (c *Client) WithBaseDatabase(name string) *Client {
+	clone := *c
+	clone.BaseDatabase = name
+	return &clone
+}
+
+// SetBaseDatabase scopes subsequent SynapseBase calls to a database namespace.
+// An empty string restores the legacy flat API (tenant default database).
+func (c *Client) SetBaseDatabase(name string) { c.BaseDatabase = name }
 
 func (c *Client) do(method, path string, body any) ([]byte, error) {
 	return c.doWithTimeout(method, path, body, 0)
