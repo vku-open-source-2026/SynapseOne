@@ -41,6 +41,7 @@ export interface PrincipalInput {
 export type DecisionReason =
   | 'org-admin'
   | 'platform-admin'
+  | 'member-data-plane'
   | 'policy-allow'
   | 'scope-only'
   | 'explicit-deny'
@@ -140,6 +141,17 @@ async function decideForUser(userId: string, action: string, resource: string, c
     return { allowed: false, reason: 'implicit-deny', ...who };
   }
   if (user.is_org_admin) return { allowed: true, reason: 'org-admin', ...who };
+  // Tier-1 stamps ordinary member tokens with wildcard *data-plane* authority
+  // (tenant isolation is enforced by each service). A member with no explicit
+  // role/policy must still be able to use Base/LDS/Queue/Storage/... in its own
+  // tenant; otherwise AUTHZ_MODE=enforce would lock every non-admin out of the
+  // product. Control-plane families still require an explicit policy.
+  const family = String(action).split(':')[0]?.toLowerCase() || '';
+  const memberDataPlane = !docs.length && [
+    'base', 'faststore', 'queue', 'stream', 'storage', 'lds', 'warehouse',
+    'notifications', 'ai', 'inference', 'ocs',
+  ].includes(family);
+  if (memberDataPlane) return { allowed: true, reason: 'member-data-plane', ...who };
   return verdict.allowed
     ? { allowed: true, reason: 'policy-allow', ...who }
     : { allowed: false, reason: 'implicit-deny', ...who };

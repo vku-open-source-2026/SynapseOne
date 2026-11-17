@@ -131,13 +131,16 @@ describe('iam principal authorization', () => {
     assert.equal(r.json.reason, 'unknown-principal');
   });
 
-  it('org admin is allowed; member without roles is implicitly denied', async () => {
+  it('org admin is allowed; a role-less member gets tenant data-plane authority but no control plane', async () => {
     const a = await decide({ kind: 'user', sub: adminId }, 'iam:Write');
     assert.equal(a.json.allowed, true);
     assert.equal(a.json.reason, 'org-admin');
     const m = await decide({ kind: 'user', sub: memberId }, 'base:Read');
-    assert.equal(m.json.allowed, false);
-    assert.equal(m.json.reason, 'implicit-deny');
+    assert.equal(m.json.allowed, true);
+    assert.equal(m.json.reason, 'member-data-plane');
+    const iam = await decide({ kind: 'user', sub: memberId }, 'iam:Write');
+    assert.equal(iam.json.allowed, false);
+    assert.equal(iam.json.reason, 'implicit-deny');
   });
 
   it('managed ReadOnlyAccess grants reads only and denials are audited', async () => {
