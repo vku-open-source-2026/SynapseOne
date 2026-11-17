@@ -101,7 +101,12 @@ jobs:
         with: { node-version: 20 }
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
-      - run: cp .env.example .env
+      - run: |
+          cp .env.example .env
+          # The e2e stack seeds no IAM policies; run the local transport with
+          # central authz off. Production defaults to enforce via the prod overlay.
+          sed -i 's/^AUTHZ_MODE=.*/AUTHZ_MODE=off/' .env
+          sed -i 's/^AUTHZ_MODE_REQUIRED=.*/AUTHZ_MODE_REQUIRED=false/' .env
       - name: Compose up (single retry for transient registry/health failures)
         run: |
           set -e
