@@ -41,6 +41,15 @@ use store::{DatasourcePatch, NewDatasource, Store, StoreError, StoredDatasource}
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+fn build_version() -> String {
+    std::env::var("SYNAPSEONE_BUILD_VERSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .unwrap_or_else(|| VERSION.to_string())
+}
+
+
 #[derive(Clone)]
 struct Config {
     port: u16,
@@ -493,7 +502,7 @@ async fn health(State(state): State<AppState>) -> Response {
     let mut body = Map::new();
     body.insert("status".into(), Value::String("ok".into()));
     body.insert("service".into(), Value::String("lds".into()));
-    body.insert("version".into(), Value::String(VERSION.into()));
+    body.insert("version".into(), Value::String(build_version()));
     body.insert(
         "db".into(),
         Value::String(if state.store.uses_postgres() {

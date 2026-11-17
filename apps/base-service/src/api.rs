@@ -41,6 +41,15 @@ use crate::util::{
 };
 use crate::{AppState, Config, VERSION};
 
+fn build_version() -> String {
+    std::env::var("SYNAPSEONE_BUILD_VERSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .unwrap_or_else(|| VERSION.to_string())
+}
+
+
 type Params = HashMap<String, String>;
 
 const SERVICE: &str = "base";
@@ -627,7 +636,7 @@ async fn health(State(state): State<AppState>) -> Response {
             json!({
                 "status": "degraded",
                 "service": "base",
-                "version": VERSION,
+                "version": build_version(),
                 "db": if state.store.uses_postgres() { "postgres" } else { "memory" },
                 "error": "store_probe_failed",
                 "time": now_iso(),
@@ -639,7 +648,7 @@ async fn health(State(state): State<AppState>) -> Response {
         json!({
             "status": "ok",
             "service": "base",
-            "version": VERSION,
+            "version": build_version(),
             "db": if state.store.uses_postgres() { "postgres" } else { "memory" },
             "databases": databases.map(|items| items.len()).unwrap_or(0),
             "collections": collections.map(|items| items.len()).unwrap_or(0),

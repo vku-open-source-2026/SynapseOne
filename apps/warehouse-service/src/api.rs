@@ -29,6 +29,15 @@ use crate::util::{header, js_string, number_value, truthy};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+fn build_version() -> String {
+    std::env::var("SYNAPSEONE_BUILD_VERSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .unwrap_or_else(|| VERSION.to_string())
+}
+
+
 #[derive(Clone)]
 pub struct Config {
     pub port: u16,
@@ -359,7 +368,7 @@ async fn health() -> Response {
     Json(json!({
         "status": "ok",
         "service": "warehouse",
-        "version": VERSION,
+        "version": build_version(),
         "engine": "duckdb",
         "persistence": if std::env::var("WAREHOUSE_IN_MEMORY").as_deref() == Ok("1") { "memory" } else { "file" },
         "time": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),

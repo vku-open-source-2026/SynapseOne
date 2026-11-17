@@ -33,6 +33,15 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use store::{FaststoreError, FieldValue, MemoryStore, Stats, Store, WriteOptions, ZMember};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn build_version() -> String {
+    std::env::var("SYNAPSEONE_BUILD_VERSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .unwrap_or_else(|| VERSION.to_string())
+}
+
 const MAX_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
 const MAX_KEY_LENGTH: usize = 512;
 const MAX_FIELD_LENGTH: usize = 256;
@@ -597,7 +606,7 @@ async fn health(State(state): State<AppState>) -> Response {
     Json(json!({
         "status": "ok",
         "service": "faststore",
-        "version": VERSION,
+        "version": build_version(),
         "backend": state.store.name(),
         "time": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
     }))

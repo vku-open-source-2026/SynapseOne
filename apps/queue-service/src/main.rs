@@ -34,6 +34,15 @@ use store::{
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn build_version() -> String {
+    std::env::var("SYNAPSEONE_BUILD_VERSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .unwrap_or_else(|| VERSION.to_string())
+}
+
 const MAX_HEADERS_BYTES: usize = 8192;
 const MAX_DELAY_SECONDS: i64 = 7 * 24 * 60 * 60;
 const MAX_VISIBILITY_SECONDS: i64 = 3600;
@@ -1122,7 +1131,7 @@ async fn health(State(state): State<AppState>) -> Response {
     Json(json!({
         "status": "ok",
         "service": "queue",
-        "version": VERSION,
+        "version": build_version(),
         "backend": state.store.backend(),
         "time": iso(now_ms()),
     }))
