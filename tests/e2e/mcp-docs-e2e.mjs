@@ -33,14 +33,13 @@ async function rpc(method, params = {}) {
   return body;
 }
 
-async function rpcNoAuth(method, params = {}) {
+async function assertAnonymousMcpDenied() {
   const res = await fetch(`${BASE}/mcp`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 2, method, params }),
+    body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }),
   });
-  assert.equal(res.status, 200);
-  return res.json();
+  assert.equal(res.status, 401, 'anonymous MCP must be rejected');
 }
 
 async function main() {
@@ -60,13 +59,10 @@ async function main() {
   const activated = await api(`/v1/workflows/${encodeURIComponent(workflowId)}/activate`, { method: 'POST', body: '{}' });
   assert.equal(activated.active, true);
 
-  // The docs-reader tool is public read-only: no credential required.
-  const anonList = await rpcNoAuth('tools/list');
-  assert.ok((anonList.result?.tools || []).some((t) => t.name === 'read_synapseone_docs'), 'public MCP tool missing');
-  const anonCall = await rpcNoAuth('tools/call', { name: 'read_synapseone_docs', arguments: { path: 'docs/README.md' } });
-  assert.equal(anonCall.result.isError, undefined, JSON.stringify(anonCall.result));
-  assert.match(anonCall.result.content?.[0]?.text || '', /SynapseOne docs/);
-  console.log('MCP anonymous docs OK');
+  // Public/anonymous MCP is disabled by default: an unauthenticated client
+  // must never be able to invoke a tenant workflow.
+  await assertAnonymousMcpDenied();
+  console.log('MCP anonymous denied OK');
 
   const init = await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'e2e', version: '1' } });
   assert.equal(init.result.serverInfo.name, 'synapseone-synapseflow');
