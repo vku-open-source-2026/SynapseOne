@@ -241,7 +241,7 @@ export const api = {
   activateWorkflow: (id, a) => post(`/v1/workflows/${encodeURIComponent(id)}/activate`, {}, a),
   deactivateWorkflow: (id, a) => post(`/v1/workflows/${encodeURIComponent(id)}/deactivate`, {}, a),
   executeWorkflow: (id, input, a) => post(`/v1/workflows/${encodeURIComponent(id)}/execute`, input ?? {}, a),
-  executeWorkflowWait: (id, input, a, timeoutMs = 60000) => post(`/v1/workflows/${encodeURIComponent(id)}/execute?wait=1&timeoutMs=${encodeURIComponent(timeoutMs)}`, input ?? {}, a),
+  executeWorkflowWait: (id, input, a, timeoutMs = 300000) => post(`/v1/workflows/${encodeURIComponent(id)}/execute?wait=1&timeoutMs=${encodeURIComponent(timeoutMs)}`, input ?? {}, a),
   workflowRunners: (a) => get('/v1/workflow-runners', a),
   workflowRunnerOptions: (a) => get('/v1/workflow-runners/options', a),
   createWorkflowRunner: (body, a) => post('/v1/workflow-runners', body, a),
