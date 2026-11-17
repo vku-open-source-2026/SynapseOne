@@ -217,6 +217,7 @@ services:
     restart: unless-stopped
     environment:
       PORT: 4001
+      SYNAPSEONE_BUILD_VERSION: ${SYNAPSEONE_BUILD_VERSION:-0.9.0}
       # Runtime traffic uses the transaction pooler; migrations and other
       # session-scoped operations use the direct Postgres connection.
       DATABASE_URL: postgres://${POSTGRES_USER:-synapseone}:${POSTGRES_PASSWORD:-synapseone_password_change_me}@pgbouncer:6432/${POSTGRES_DB:-synapseone}
@@ -287,6 +288,7 @@ services:
     restart: unless-stopped
     environment:
       PORT: 4002
+      SYNAPSEONE_BUILD_VERSION: ${SYNAPSEONE_BUILD_VERSION:-0.9.0}
       # Runtime traffic uses the transaction pooler; migrations and other
       # session-scoped operations use the direct Postgres connection.
       DATABASE_URL: postgres://${POSTGRES_USER:-synapseone}:${POSTGRES_PASSWORD:-synapseone_password_change_me}@pgbouncer:6432/${POSTGRES_DB:-synapseone}
@@ -340,6 +342,7 @@ services:
     restart: unless-stopped
     environment:
       PORT: 4003
+      SYNAPSEONE_BUILD_VERSION: ${SYNAPSEONE_BUILD_VERSION:-0.9.0}
       AI_BASE_URL: ${AI_BASE_URL:-https://openrouter.ai/api/v1}
       AI_API_KEY: ${AI_API_KEY:-}
       AI_DECISION_MODEL: ${AI_DECISION_MODEL:-inception/mercury-2.5}
@@ -368,6 +371,7 @@ services:
     restart: unless-stopped
     environment:
       PORT: 4004
+      SYNAPSEONE_BUILD_VERSION: ${SYNAPSEONE_BUILD_VERSION:-0.9.0}
       # LDS still runs its Node migration bootstrap (advisory lock) on the
       # deployed 0.7.0 image; keep it on the direct connection until the Rust
       # service is released with DATABASE_DIRECT_URL support.
@@ -398,6 +402,7 @@ services:
     restart: unless-stopped
     environment:
       PORT: 4005
+      SYNAPSEONE_BUILD_VERSION: ${SYNAPSEONE_BUILD_VERSION:-0.9.0}
       # Runtime traffic uses the transaction pooler; migrations and other
       # session-scoped operations use the direct Postgres connection.
       DATABASE_URL: postgres://${POSTGRES_USER:-synapseone}:${POSTGRES_PASSWORD:-synapseone_password_change_me}@pgbouncer:6432/${POSTGRES_DB:-synapseone}
@@ -441,6 +446,7 @@ services:
     restart: unless-stopped
     environment:
       PORT: 4006
+      SYNAPSEONE_BUILD_VERSION: ${SYNAPSEONE_BUILD_VERSION:-0.9.0}
       FASTSTORE_VALKEY_URL: ${FASTSTORE_VALKEY_URL:-${FASTSTORE_REDIS_URL:-redis://valkey:6379}}
       FASTSTORE_REDIS_URL: ${FASTSTORE_REDIS_URL:-${FASTSTORE_VALKEY_URL:-redis://valkey:6379}}
       AUDIT_TRAIL: ${AUDIT_TRAIL:-true}
@@ -468,6 +474,7 @@ services:
     restart: unless-stopped
     environment:
       PORT: 4007
+      SYNAPSEONE_BUILD_VERSION: ${SYNAPSEONE_BUILD_VERSION:-0.9.0}
       QUEUE_VALKEY_URL: ${QUEUE_VALKEY_URL:-${QUEUE_REDIS_URL:-redis://valkey:6379}}
       QUEUE_REDIS_URL: ${QUEUE_REDIS_URL:-${QUEUE_VALKEY_URL:-redis://valkey:6379}}
       QUEUE_MAX_PAYLOAD_BYTES: ${QUEUE_MAX_PAYLOAD_BYTES:-262144}
@@ -496,6 +503,7 @@ services:
     restart: unless-stopped
     environment:
       PORT: 4009
+      SYNAPSEONE_BUILD_VERSION: ${SYNAPSEONE_BUILD_VERSION:-0.9.0}
       STREAM_VALKEY_URL: ${STREAM_VALKEY_URL:-${STREAM_REDIS_URL:-${VALKEY_URL:-${REDIS_URL:-redis://valkey:6379}}}}
       STREAM_REDIS_URL: ${STREAM_REDIS_URL:-${STREAM_VALKEY_URL:-${VALKEY_URL:-redis://valkey:6379}}}
       STREAM_MAX_PAYLOAD_BYTES: ${STREAM_MAX_PAYLOAD_BYTES:-262144}
@@ -524,6 +532,7 @@ services:
     restart: unless-stopped
     environment:
       PORT: 4012
+      SYNAPSEONE_BUILD_VERSION: ${SYNAPSEONE_BUILD_VERSION:-0.9.0}
       NODE_ENV: production
       WAREHOUSE_DATA_DIR: /data/warehouse
       WAREHOUSE_THREADS: ${WAREHOUSE_THREADS:-2}
@@ -558,6 +567,7 @@ services:
     restart: unless-stopped
     environment:
       PORT: 4008
+      SYNAPSEONE_BUILD_VERSION: ${SYNAPSEONE_BUILD_VERSION:-0.9.0}
       INFERENCE_HOST: 0.0.0.0
       OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-${AI_BASE_URL:-https://openrouter.ai/api/v1}}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-${AI_API_KEY:-}}
@@ -600,6 +610,7 @@ services:
     environment:
       NODE_ENV: production
       PORT: 4010
+      SYNAPSEONE_BUILD_VERSION: ${SYNAPSEONE_BUILD_VERSION:-0.9.0}
       STORAGE_BACKEND: ${STORAGE_BACKEND:-s3}
       STORAGE_S3_ENDPOINT: ${STORAGE_S3_ENDPOINT:-${S3_ENDPOINT:-}}
       STORAGE_S3_BUCKET: ${STORAGE_S3_BUCKET:-${S3_BUCKET:-synapseone-core}}
@@ -697,6 +708,7 @@ services:
     restart: unless-stopped
     environment:
       PORT: 4011
+      SYNAPSEONE_BUILD_VERSION: ${SYNAPSEONE_BUILD_VERSION:-0.9.0}
       # The in-progress Rust notifications image sends its bootstrap DDL as a
       # multi-statement prepared statement, which transaction pooling rejects.
       # Keep it on the direct connection until that bootstrap is split.
@@ -739,6 +751,7 @@ services:
     restart: unless-stopped
     environment:
       PORT: 8080
+      SYNAPSEONE_BUILD_VERSION: ${SYNAPSEONE_BUILD_VERSION:-0.9.0}
       IAM_SERVICE_URL: ${IAM_SERVICE_URL:-http://iam:4001}
       WORKFLOW_SERVICE_URL: ${WORKFLOW_SERVICE_URL:-http://workflow:4002}
       AI_SERVICE_URL: ${AI_SERVICE_URL:-http://ai:4003}

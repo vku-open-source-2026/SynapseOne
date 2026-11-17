@@ -29,6 +29,15 @@ use engine::{
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn build_version() -> String {
+    std::env::var("SYNAPSEONE_BUILD_VERSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .unwrap_or_else(|| VERSION.to_string())
+}
+
 const MAX_BATCH: usize = 100;
 
 #[derive(Clone)]
@@ -431,7 +440,7 @@ async fn health(State(state): State<AppState>) -> Response {
     Json(json!({
         "service": "stream",
         "status": "ok",
-        "version": VERSION,
+        "version": build_version(),
         "engine": state.engine.name(),
         "time": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
     }))

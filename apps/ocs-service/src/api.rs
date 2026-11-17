@@ -27,6 +27,15 @@ use crate::{AppState, Tenant};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+fn build_version() -> String {
+    std::env::var("SYNAPSEONE_BUILD_VERSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .unwrap_or_else(|| VERSION.to_string())
+}
+
+
 fn legacy_meta_headers(meta: &ObjectMeta) -> Vec<(String, String)> {
     let mut headers = vec![
         ("Content-Type".into(), meta.content_type.clone()),
@@ -74,7 +83,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "service": "storage",
         "product": "SynapseOCS",
         "status": "ok",
-        "version": VERSION,
+        "version": build_version(),
         "backend": state.backend.name(),
         "capabilities": {
             "buckets": true,

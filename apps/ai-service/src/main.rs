@@ -28,6 +28,15 @@ use llm::{LlmConfig, LlmError};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+fn build_version() -> String {
+    std::env::var("SYNAPSEONE_BUILD_VERSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .unwrap_or_else(|| VERSION.to_string())
+}
+
+
 #[derive(Clone)]
 struct Config {
     port: u16,
@@ -207,7 +216,7 @@ async fn health(State(state): State<AppState>) -> Response {
     Json(json!({
         "status": "ok",
         "service": "ai",
-        "version": VERSION,
+        "version": build_version(),
         "models": {
             "decision": state.config.decision_model,
             "llm": state.config.llm_model,

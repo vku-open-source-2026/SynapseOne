@@ -32,6 +32,15 @@ use db::{NewNotification, NotificationRecord, Store, CHANNELS};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+fn build_version() -> String {
+    std::env::var("SYNAPSEONE_BUILD_VERSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .unwrap_or_else(|| VERSION.to_string())
+}
+
+
 #[derive(Clone)]
 struct Config {
     port: u16,
@@ -571,7 +580,7 @@ async fn health(State(state): State<AppState>) -> Response {
     Json(json!({
         "service": "notifications",
         "status": "ok",
-        "version": VERSION,
+        "version": build_version(),
         "store": if state.store.uses_postgres() { "postgres" } else { "memory" },
         "delivery": if state.config.use_queue { "queue" } else { "local" },
         "channels": CHANNELS,
