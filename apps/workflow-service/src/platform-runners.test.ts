@@ -134,6 +134,7 @@ describe('owner-scoped platform runners', () => {
   let iamServer: Server | null = null;
   let queueServer: Server | null = null;
   let base = '';
+  let systemRunnerId = '';
   let iam: ReturnType<typeof mockIam>;
   let queue: ReturnType<typeof mockQueue>;
   const saved: Record<string, string | undefined> = {};
@@ -205,6 +206,7 @@ describe('owner-scoped platform runners', () => {
   it('lets a platform owner create a system runner and mints a system key once', async () => {
     const out = await call('POST', '/v1/platform/runners', { name: 'system-eu', kind: 'hybrid' }, OWNER);
     assert.equal(out.status, 201, JSON.stringify(out.json));
+    systemRunnerId = out.json.runner.id;
     assert.equal(out.json.runner.scope, 'platform');
     assert.equal(out.json.runner.mode, 'system');
     assert.equal(out.json.runner.queue, 'synapseone-wf-system');
@@ -289,6 +291,57 @@ describe('owner-scoped platform runners', () => {
       nodeRuns: [],
     }, runnerHeaders);
     assert.equal(complete.status, 200, JSON.stringify(complete.json));
+  });
+
+  it('only resolves credentials the claimed graph declares', async () => {
+    const mk = async (name: string) => {
+      const r = await call('POST', '/v1/credentials', {
+        accountId: 'acc-tenant-a', name, kind: 'bearer', secret: `secret-${name}`,
+      }, USER);
+      assert.equal(r.status, 201, JSON.stringify(r.json));
+      return r.json;
+    };
+    const declared = await mk(`declared-${Date.now()}`);
+    const unrelated = await mk(`unrelated-${Date.now()}`);
+    const created = await call('POST', '/v1/workflows', {
+      name: 'credential-scope-flow',
+      settings: { execution: { mode: 'system' } },
+      definition: {
+        nodes: [
+          { id: 'start', name: 'Start', type: 'n8n-nodes-base.manualTrigger', parameters: {} },
+          {
+            id: 'http', name: 'Fetch', type: 'n8n-nodes-base.httpRequest',
+            parameters: { url: 'https://example.com', method: 'GET', auth: { credentialId: declared.id, allowedOrigins: ['https://example.com'] } },
+          },
+        ],
+        connections: { Start: { main: [[{ node: 'Fetch' }]] } },
+      },
+    }, USER);
+    assert.equal(created.status, 201, JSON.stringify(created.json));
+    const queued = await call('POST', `/v1/workflows/${created.json.id}/execute`, {}, USER);
+    assert.equal(queued.status, 202, JSON.stringify(queued.json));
+    const runner = { id: systemRunnerId };
+    assert.ok(runner.id, 'system runner from the first test must exist');
+    const runnerHeaders = {
+      'Content-Type': 'application/json',
+      'x-synapseone-internal': INTERNAL,
+      'x-synapseone-kind': 'platform-runner',
+      'x-synapseone-runner': runner.id,
+      'x-synapseone-scopes': 'workflow:*,queue:consume,queue:ack,queue:nack,queue:heartbeat,inference:*',
+    };
+    const claim = await call('POST', `/v1/runner/jobs/${queued.json.executionId}/claim`, {
+      runnerId: runner.id, instanceId: 'credential-connector', leaseSeconds: 60,
+    }, runnerHeaders);
+    assert.equal(claim.status, 200, JSON.stringify(claim.json));
+    const good = await call('POST', `/v1/runner/jobs/${queued.json.executionId}/credentials`, { runnerId: runner.id, instanceId: 'credential-connector', attempt: claim.json.attempt, credentialId: declared.id }, runnerHeaders);
+    assert.equal(good.status, 200, JSON.stringify(good.json));
+    assert.equal(good.json.secret, declared.secret ?? `secret-${declared.name}`);
+    const bad = await call('POST', `/v1/runner/jobs/${queued.json.executionId}/credentials`, { runnerId: runner.id, instanceId: 'credential-connector', attempt: claim.json.attempt, credentialId: unrelated.id }, runnerHeaders);
+    assert.equal(bad.status, 404, JSON.stringify(bad.json));
+    await call('POST', `/v1/runner/jobs/${queued.json.executionId}/complete`, {
+      runnerId: runner.id, instanceId: 'credential-connector', attempt: claim.json.attempt,
+      status: 'success', output: {}, nodeRuns: [],
+    }, runnerHeaders);
   });
 
   it('caps a tenant’s queued system-runner work at the configured admission limit', async () => {
