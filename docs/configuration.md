@@ -22,6 +22,7 @@ reads which key (audited from source):
 | `AUTHZ_MODE` | `off` | central policy enforcement: `off` = tenant isolation only; `audit` = decide every authenticated request via IAM, log + header `x-synapseone-authz: would-deny`, never block; `enforce` = `403 access_denied`, IAM unreachable → `503 authz_unavailable` |
 | `AUTHZ_CACHE_TTL_MS` | 30000 | decision cache per principal/action/resource (0 disables, max 300000) — policy changes take effect after at most this long |
 | `AUTHZ_MODE_REQUIRED` | `false` | production fail-closed guard: when `true`, gateway refuses to boot with `AUTHZ_MODE=off` |
+| `AUTHZ_AUDIT_ACK` | unset | production-only, owner/expiry acknowledgement required to run `AUTHZ_MODE=audit` (e.g. `owner=security;expires=2026-12-01;reason=policy-backfill`). Without it the gateway refuses to boot in production |
 | `PLATFORM_ADMIN_ENABLED` | `true` dev / `false` prod unless set | enables `/v1/platform/*` and the `/admin` console |
 | `PLATFORM_ADMIN_REQUIRE_MFA` | `true` | platform session exchange requires an enrolled TOTP factor and a fresh code |
 | `PLATFORM_ADMIN_REQUIRE_STEP_UP` | `true` | destructive platform actions require `x-platform-step-up` |
@@ -90,6 +91,9 @@ reads which key (audited from source):
 | `WORKFLOW_QUEUE_CUSTOM` | `synapseone-wf-custom` | queue for `custom` workflows |
 | `WORKFLOW_QUEUE_SHARED` | `synapseone-wf-shared` | queue for `hybrid` workflows |
 | `WORKFLOW_QUEUE_INFERENCE` | `synapseone-inference` | queue for inference/hybrid runner jobs |
+| `WORKFLOW_SYSTEM_QUEUE_TENANT_MAX` | 100 | max queued+running system-runner executions per tenant (0 disables the admission cap) |
+| `MCP_ALLOW_ANONYMOUS` | `false` | opt-in anonymous MCP; only structurally read-only public tools are exposed. The gateway still requires authentication for `/mcp` |
+| `MCP_ANONYMOUS_RATE_LIMIT_PER_MIN` | 30 | per-source-IP anonymous MCP request limit when the opt-in above is enabled |
 | `SYNAPSEONE_PUBLIC_URL` | `https://api.synapseone.space` | gateway URL embedded in runner commands |
 | `WORKFLOW_RUNNER_IMAGE` | `ghcr.io/.../synapseone-workflow-runner:latest` | runner image embedded in commands |
 | `WORKFLOW_RUNNER_HEARTBEAT_SECONDS` | 15 | connector heartbeat interval (5–300) |

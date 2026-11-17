@@ -123,6 +123,9 @@ routes:
     target: ${WORKFLOW_SERVICE_URL:http://workflow:4002}
     auth: either
     service: workflow
+    # `?wait=1` allows a 300 s execution budget; do not cut it off at the 30 s
+    # global proxy default. Clients that need more must poll.
+    timeoutMs: 300000
     actions:
       - { method: POST, path: /v1/workflows/*/execute, action: workflow:Execute }
       - { method: POST, path: /v1/workflows/test-run, action: workflow:Execute }
@@ -153,10 +156,13 @@ routes:
     service: workflow
 
   # MCP (Model Context Protocol) server: active workflows with an mcpTrigger
-  # node are exposed as MCP tools. Clients use Bearer JWT or X-API-Key.
+  # node are exposed as MCP tools. Authentication is required by default;
+  # anonymous public tools are an explicit workflow-service opt-in
+  # (MCP_ALLOW_ANONYMOUS=true) and must be structurally read-only.
   - path: /mcp
     target: ${WORKFLOW_SERVICE_URL:http://workflow:4002}
-    auth: none
+    auth: either
+    service: workflow
     timeoutMs: 120000
 
   # Public inbound webhooks (P0-5): no gateway auth — the workflow-service

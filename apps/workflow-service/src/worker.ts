@@ -16,7 +16,7 @@ import { randomUUID } from 'crypto';
 import { runWorkflow } from './engine';
 import type { CredentialResolver, SynapseOneCall } from './engine';
 import {
-  claimExecutionRec, createHumanTaskRec, finishExecutionRec, getWorkflowRec,
+  claimExecutionRec, createHumanTaskRec, finishExecutionRec, getExecutionRec, getWorkflowRec,
   heartbeatExecutionRec, listRunnableExecutions, pauseExecutionRec, releaseExecutionRec,
   toPublicHumanTask,
 } from './store';
@@ -212,7 +212,21 @@ export function startPlatformWorker(deps: PlatformWorkerDeps): { stop: () => voi
               const claimed = await claimExecutionRec(executionId, { workerId: WORKER_ID, leaseSeconds });
               if (process.env.WORKFLOW_WORKER_DEBUG === '1') console.log(`[workflow][worker] claim ${executionId} -> ${claimed ? claimed.status : 'null'}`);
               if (!claimed) {
-                await ackWorkflowRun(target.queue, target.principal, msg.receipt);
+                // Do not ACK work that is still owned by a live lease: another
+                // worker/runner may have crashed after claiming it. Requeue
+                // with a delay so the message survives until the lease expires.
+                const current = await getExecutionRec(executionId).catch(() => null);
+                if (!current || current.status === 'success' || current.status === 'error' || current.status === 'cancelled') {
+                  await ackWorkflowRun(target.queue, target.principal, msg.receipt);
+                  return;
+                }
+                const delaySeconds = current.lease_expires_at
+                  ? Math.max(5, Math.min(300, Math.ceil((new Date(current.lease_expires_at).getTime() - Date.now()) / 1000) + 5))
+                  : 5;
+                await nackWorkflowRun(target.queue, target.principal, msg.receipt, {
+                  delaySeconds,
+                  error: 'not_claimable',
+                }).catch(() => undefined);
                 return;
               }
               hb = setInterval(() => {

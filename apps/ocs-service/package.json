@@ -1,6 +1,6 @@
 {
   "name": "@synapseone/ocs-service",
-  "version": "0.7.1",
+  "version": "0.9.0",
   "license": "Apache-2.0",
   "description": "SynapseOCS - bucket-aware object cloud storage with filesystem (dev) and S3/MinIO (prod) backends",
   "main": "dist/index.js",

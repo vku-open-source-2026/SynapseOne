@@ -185,7 +185,7 @@ describe('owner-scoped platform runners', () => {
     return { status: r.status, json };
   }
 
-  async function createWorkflow(mode: 'system' | 'custom', name: string): Promise<any> {
+  async function createWorkflow(mode: 'system' | 'custom', name: string, headers: Record<string, string> = USER): Promise<any> {
     const out = await call('POST', '/v1/workflows', {
       name,
       settings: { execution: { mode } },
@@ -193,10 +193,11 @@ describe('owner-scoped platform runners', () => {
         nodes: [
           { id: 'start', name: 'Start', type: 'n8n-nodes-base.manualTrigger', parameters: {} },
           { id: 'set', name: 'Echo', type: 'n8n-nodes-base.set', parameters: { values: { value: '={{ $json.value }}' } } },
+          { id: 'base', name: 'Base read', type: 'synapseone.base', parameters: { operation: 'list-collections' } },
         ],
-        connections: { Start: { main: [[{ node: 'Echo' }]] } },
+        connections: { Start: { main: [[{ node: 'Echo' }]] }, Echo: { main: [[{ node: 'Base read' }]] } },
       },
-    }, USER);
+    }, headers);
     assert.equal(out.status, 201, JSON.stringify(out.json));
     return out.json;
   }
@@ -257,7 +258,7 @@ describe('owner-scoped platform runners', () => {
     assert.equal(claim.status, 200, JSON.stringify(claim.json));
     assert.equal(claim.json.principal.org, 'org-tenant-a');
     assert.equal(claim.json.delegatedToken, `delegated-${queued.json.executionId}`);
-    assert.deepEqual(claim.json.delegatedScopes, ['*']);
+    assert.deepEqual(claim.json.delegatedScopes, ['base:read']);
     assert.ok(claim.json.delegatedTokenExpiresIn > 0 && claim.json.delegatedTokenExpiresIn <= 60, JSON.stringify(claim.json));
 
     const heartbeat = await call('POST', `/v1/runner/jobs/${queued.json.executionId}/heartbeat`, {
@@ -288,6 +289,23 @@ describe('owner-scoped platform runners', () => {
       nodeRuns: [],
     }, runnerHeaders);
     assert.equal(complete.status, 200, JSON.stringify(complete.json));
+  });
+
+  it('caps a tenant’s queued system-runner work at the configured admission limit', async () => {
+    const quotaUser = { ...USER, 'x-synapseone-org': `org-quota-${Date.now().toString(36)}` };
+    const prev = process.env.WORKFLOW_SYSTEM_QUEUE_TENANT_MAX;
+    process.env.WORKFLOW_SYSTEM_QUEUE_TENANT_MAX = '1';
+    try {
+      const wf = await createWorkflow('system', 'quota-flow', quotaUser);
+      const first = await call('POST', `/v1/workflows/${wf.id}/execute`, { value: 1 }, quotaUser);
+      assert.equal(first.status, 202, JSON.stringify(first.json));
+      const second = await call('POST', `/v1/workflows/${wf.id}/execute`, { value: 2 }, quotaUser);
+      assert.equal(second.status, 429, JSON.stringify(second.json));
+      assert.equal(second.json.error, 'tenant_queue_quota');
+    } finally {
+      if (prev === undefined) delete process.env.WORKFLOW_SYSTEM_QUEUE_TENANT_MAX;
+      else process.env.WORKFLOW_SYSTEM_QUEUE_TENANT_MAX = prev;
+    }
   });
 
   it('keeps the runner bootstrap available but management routes owner-only', async () => {

@@ -73,31 +73,48 @@ export async function withTransaction<T>(fn: () => Promise<T>): Promise<T> {
   return baseDb.transaction(async (tx) => txStore.run({ tx }, fn));
 }
 
-let ensured = false;
+let ensurePromise: Promise<void> | null = null;
+/** Run migrations once. A failed migration rejects (and is retried only by an
+ *  explicit later call) so callers can fail the process before listening —
+ *  never serve auth traffic against a missing or half-applied schema. */
 export async function ensureTables(): Promise<void> {
-  if (!db || ensured) return;
-  ensured = true;
-  try {
-    const client = await getDirectPool()!.connect();
-    try {
-      // Hold the advisory lock on the same dedicated session that runs the
-      // migration (pool connections are not guaranteed to be reused).
-      const migrationDb = drizzle(client, { schema });
-      await migrationDb.execute(sql`select pg_advisory_lock(hashtext('synapseone_iam_migrations'))`);
+  if (!db) return;
+  if (!ensurePromise) {
+    ensurePromise = (async () => {
+      const client = await getDirectPool()!.connect();
       try {
-        await migrate(migrationDb, {
-          migrationsFolder: path.join(__dirname, '..', 'drizzle'),
-          migrationsTable: '__drizzle_migrations_iam',
-        });
+        // Hold the advisory lock on the same dedicated session that runs the
+        // migration (pool connections are not guaranteed to be reused).
+        const migrationDb = drizzle(client, { schema });
+        await migrationDb.execute(sql`select pg_advisory_lock(hashtext('synapseone_iam_migrations'))`);
+        try {
+          await migrate(migrationDb, {
+            migrationsFolder: path.join(__dirname, '..', 'drizzle'),
+            migrationsTable: '__drizzle_migrations_iam',
+          });
+        } finally {
+          await migrationDb.execute(sql`select pg_advisory_unlock(hashtext('synapseone_iam_migrations'))`).catch(() => undefined);
+        }
       } finally {
-        await migrationDb.execute(sql`select pg_advisory_unlock(hashtext('synapseone_iam_migrations'))`).catch(() => undefined);
+        client.release();
       }
-    } finally {
-      client.release();
-    }
-  } catch (e: any) {
-    ensured = false;
-    console.error('[iam][db] migrations failed:', e?.message || e);
+    })().catch((e: any) => {
+      ensurePromise = null;
+      console.error('[iam][db] migrations failed:', e?.message || e);
+      throw e;
+    });
+  }
+  return ensurePromise;
+}
+
+/** Liveness/readiness probe for the Postgres dependency. */
+export async function pingDb(): Promise<boolean> {
+  if (!db) return true;
+  try {
+    await db.execute(sql`select 1`);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -1119,6 +1136,91 @@ export async function setOrgAdmin(userId: string, isAdmin: boolean): Promise<Use
   if (!u) return null;
   u.is_org_admin = isAdmin;
   return u;
+}
+
+/** Count active organization administrators. Callers must hold the per-org
+ *  guard below when using the result for a last-admin decision. */
+export async function countActiveOrgAdmins(orgId: string): Promise<number> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.select({ id: schema.users.id }).from(schema.users)
+      .where(and(
+        eq(schema.users.orgId, orgId),
+        eq(schema.users.isOrgAdmin, true),
+        eq(schema.users.active, true),
+      ));
+    return rows.length;
+  }
+  return [...mem.users.values()]
+    .filter((u) => u.org_id === orgId && u.is_org_admin && u.active !== false).length;
+}
+
+/** Serialize last-admin checks with the mutation that consumes the count.
+ *  Postgres uses a transaction-scoped advisory lock keyed by org; the memory
+ *  fallback uses a promise-chain mutex so concurrent test requests cannot both
+ *  observe two administrators. */
+const orgAdminLocks = new Map<string, Promise<void>>();
+async function withOrgAdminLock<T>(orgId: string, fn: () => Promise<T>): Promise<T> {
+  if (db) {
+    return withTransaction(async () => {
+      await db.execute(sql`select pg_advisory_xact_lock(hashtext(${`iam-org-admin:${orgId}`}))`);
+      return fn();
+    });
+  }
+  const previous = orgAdminLocks.get(orgId) || Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  orgAdminLocks.set(orgId, previous.then(() => gate));
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+export type GuardedAdminResult =
+  | { ok: true; user: User | null }
+  | { ok: false; reason: 'not_found' | 'last_admin' };
+
+/** Change org-admin membership without ever removing the last active admin. */
+export async function setOrgAdminGuarded(userId: string, isAdmin: boolean): Promise<GuardedAdminResult> {
+  const initial = await getUserById(userId);
+  if (!initial) return { ok: false, reason: 'not_found' };
+  return withOrgAdminLock(initial.org_id, async () => {
+    const current = await getUserById(userId);
+    if (!current) return { ok: false, reason: 'not_found' };
+    if (!isAdmin && current.is_org_admin && current.active !== false) {
+      if ((await countActiveOrgAdmins(current.org_id)) <= 1) {
+        return { ok: false, reason: 'last_admin' };
+      }
+    }
+    if (!!current.is_org_admin !== isAdmin) {
+      // The org-admin bit is carried in sessions; invalidate stale claims.
+      await bumpAuthVersion(userId);
+    }
+    const user = await setOrgAdmin(userId, isAdmin);
+    return { ok: true, user };
+  });
+}
+
+/** Activate/deactivate a user without ever deactivating the last active admin. */
+export async function setUserActiveGuarded(userId: string, active: boolean): Promise<GuardedAdminResult> {
+  const initial = await getUserById(userId);
+  if (!initial) return { ok: false, reason: 'not_found' };
+  return withOrgAdminLock(initial.org_id, async () => {
+    const current = await getUserById(userId);
+    if (!current) return { ok: false, reason: 'not_found' };
+    if (!active && current.is_org_admin && current.active !== false) {
+      if ((await countActiveOrgAdmins(current.org_id)) <= 1) {
+        return { ok: false, reason: 'last_admin' };
+      }
+    }
+    if (current.active === active) return { ok: true, user: current };
+    if (!active) await bumpAuthVersion(userId);
+    await setUserActive(userId, active);
+    return { ok: true, user: await getUserById(userId) };
+  });
 }
 
 /** Does the org already have at least one administrator? (bootstrap rule) */

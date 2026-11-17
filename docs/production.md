@@ -17,9 +17,10 @@ Use when taking SynapseOne off your laptop. Every item already has a mechanism â
 - [ ] `IAM_ALLOW_OIDC_DEMO_CALLBACK=false` (the demo callback accepts any caller-supplied email).
 - [ ] Random `IAM_API_KEY_PEPPER` (HMAC for at-rest key hashes).
 - [ ] `GATEWAY_VERIFY_APIKEY=true` when clients use API keys (centralized verification, fail-closed).
-- [ ] Set `AUTHZ_MODE=audit` first, inspect `GET /v1/audit?allowed=false`, then
-      `AUTHZ_MODE=enforce`; keep `AUTHZ_MODE_REQUIRED=true` so a missing config
-      cannot boot with policy enforcement disabled.
+- [ ] Production defaults to `AUTHZ_MODE=enforce`; keep `AUTHZ_MODE_REQUIRED=true`.
+      A temporary `audit` rollout is allowed only with an explicit owner/expiry:
+      `AUTHZ_AUDIT_ACK="owner=security;expires=2026-12-01;reason=policy-backfill"`.
+      Inspect `GET /v1/audit?allowed=false` before removing the acknowledgement.
 - [ ] Set `IAM_SENSITIVE_MUTATION_MODE=enforce` (after an `audit` observation
       window) so privileged IAM mutations require an organization administrator.
 - [ ] Set `IAM_ALLOW_DIRECT_ORG_CREATE=false`; create tenants through the

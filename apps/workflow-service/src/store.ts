@@ -35,6 +35,10 @@ export interface Principal {
   scopes?: string[];
   /** Bound runner registration (platform-runner machine credentials only). */
   runnerId?: string;
+  /** Organization administrator snapshot from the verified IAM session. */
+  isOrgAdmin?: boolean;
+  /** Role slugs from the verified IAM session (candidateRoles checks). */
+  roles?: string[];
 }
 
 /** CPU/RAM admission requirement for one execution or inference job. These
@@ -505,31 +509,46 @@ async function assertPostgresInstanceCapacity(tx: any, opts: {
   assertInstanceCapacity(sample, opts.required, reservations, opts.now.getTime(), instanceResourceMaxAgeMs(instance.metadata));
 }
 
-let ensured = false;
+let ensurePromise: Promise<void> | null = null;
+/** Run migrations once; a failure rejects so startup can exit before listen. */
 export async function ensureTables(): Promise<void> {
-  if (!db || ensured) return;
-  ensured = true;
-  try {
-    const client = await getDirectPool()!.connect();
-    try {
-      // Hold the advisory lock on the same dedicated session that runs the
-      // migration (pool connections are not guaranteed to be reused).
-      const migrationDb = drizzle(client, { schema: { credentials, executions, inferenceJobs, runnerUsageHourly, workflowRunnerInstances, workflowRunners, workflows } });
-      await migrationDb.execute(sql`select pg_advisory_lock(hashtext('synapseone_workflow_migrations'))`);
+  if (!db) return;
+  if (!ensurePromise) {
+    ensurePromise = (async () => {
+      const client = await getDirectPool()!.connect();
       try {
-        await migrate(migrationDb, {
-          migrationsFolder: path.join(__dirname, '..', 'drizzle'),
-          migrationsTable: '__drizzle_migrations_workflow',
-        });
+        // Hold the advisory lock on the same dedicated session that runs the
+        // migration (pool connections are not guaranteed to be reused).
+        const migrationDb = drizzle(client, { schema: { credentials, executions, inferenceJobs, runnerUsageHourly, workflowRunnerInstances, workflowRunners, workflows } });
+        await migrationDb.execute(sql`select pg_advisory_lock(hashtext('synapseone_workflow_migrations'))`);
+        try {
+          await migrate(migrationDb, {
+            migrationsFolder: path.join(__dirname, '..', 'drizzle'),
+            migrationsTable: '__drizzle_migrations_workflow',
+          });
+        } finally {
+          await migrationDb.execute(sql`select pg_advisory_unlock(hashtext('synapseone_workflow_migrations'))`).catch(() => undefined);
+        }
       } finally {
-        await migrationDb.execute(sql`select pg_advisory_unlock(hashtext('synapseone_workflow_migrations'))`).catch(() => undefined);
+        client.release();
       }
-    } finally {
-      client.release();
-    }
-  } catch (e: any) {
-    ensured = false;
-    console.error('[workflow][db] migrations failed:', e?.message || e);
+    })().catch((e: any) => {
+      ensurePromise = null;
+      console.error('[workflow][db] migrations failed:', e?.message || e);
+      throw e;
+    });
+  }
+  return ensurePromise;
+}
+
+/** Readiness probe for the workflow database. */
+export async function pingDb(): Promise<boolean> {
+  if (!db) return true;
+  try {
+    await db.execute(sql`select 1`);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -693,9 +712,13 @@ export async function updateWorkflowRec(
       accountId: patch.account_id !== undefined ? cleanTenant(patch.account_id) : cur.account_id,
       runAs: patch.run_as !== undefined ? cleanTenant(patch.run_as) : cur.run_as,
     };
+    // Only the executable graph is revisioned. Activation, rename, settings
+    // and tenant metadata edits must not invalidate already-queued executions.
+    const graphChanged = JSON.stringify(cur.nodes) !== JSON.stringify(next.nodes)
+      || JSON.stringify(cur.connections) !== JSON.stringify(next.connections);
     const rows = await db.update(workflows).set({
       ...next,
-      revision: sql`${workflows.revision} + 1`,
+      ...(graphChanged ? { revision: sql`${workflows.revision} + 1` } : {}),
       updatedAt: new Date(),
     }).where(eq(workflows.id, id)).returning();
     return rows[0] ? rowToWorkflow(rows[0]) : null;
@@ -712,7 +735,10 @@ export async function updateWorkflowRec(
     org_id: patch.org_id !== undefined ? cleanTenant(patch.org_id) : cur.org_id,
     account_id: patch.account_id !== undefined ? cleanTenant(patch.account_id) : cur.account_id,
     run_as: patch.run_as !== undefined ? cleanTenant(patch.run_as) : cur.run_as,
-    revision: (cur.revision || 1) + 1,
+    revision: (cur.revision || 1) + (
+      JSON.stringify(cur.nodes) !== JSON.stringify(patch.nodes ?? cur.nodes)
+      || JSON.stringify(cur.connections) !== JSON.stringify(patch.connections ?? cur.connections) ? 1 : 0
+    ),
     updated_at: nowIso(),
   };
   memWorkflows.set(id, next);
@@ -1362,7 +1388,7 @@ export function __clearMem(): void {
 
 // ---------- durable human tasks (#44) ----------
 
-export type HumanTaskStatus = 'pending' | 'claimed' | 'completed' | 'rejected' | 'expired' | 'cancelled';
+export type HumanTaskStatus = 'pending' | 'claimed' | 'resuming' | 'completed' | 'rejected' | 'expired' | 'cancelled';
 
 export interface StoredHumanTask {
   id: string;
@@ -1391,7 +1417,7 @@ export interface StoredHumanTask {
 }
 
 const memHumanTasks = new Map<string, StoredHumanTask>();
-const HUMAN_TASK_STATUSES: HumanTaskStatus[] = ['pending', 'claimed', 'completed', 'rejected', 'expired', 'cancelled'];
+const HUMAN_TASK_STATUSES: HumanTaskStatus[] = ['pending', 'claimed', 'resuming', 'completed', 'rejected', 'expired', 'cancelled'];
 
 function rowToHumanTask(r: typeof humanTasks.$inferSelect): StoredHumanTask {
   const status = HUMAN_TASK_STATUSES.includes(r.status as HumanTaskStatus) ? r.status as HumanTaskStatus : 'pending';
@@ -1682,6 +1708,178 @@ export function __clearHumanTasks(): void {
   memHumanTasks.clear();
   memSecrets.clear();
   memSecretVersions.clear();
+}
+
+/** Put a claimed/reserved resume back into `paused` after a failed dispatch, so
+ *  the human decision can be retried without consuming it. */
+export async function restoreExecutionPaused(id: string): Promise<StoredExecution | null> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(executions).set({
+      status: 'paused',
+      workerId: null,
+      runnerInstanceId: null,
+      leaseExpiresAt: null,
+    }).where(and(eq(executions.id, id), inArray(executions.status, ['running', 'queued']))).returning();
+    return rows[0] ? rowToExecution(rows[0]) : null;
+  }
+  const cur = memExecutions.get(id);
+  if (!cur || (cur.status !== 'running' && cur.status !== 'queued')) return null;
+  const next: StoredExecution = { ...cur, status: 'paused', worker_id: null, runner_instance_id: null, lease_expires_at: null };
+  memExecutions.set(id, next);
+  return next;
+}
+
+/** Persist a new human-task checkpoint while staying paused (multi-step
+ *  approvals resumed inline). */
+export async function savePausedExecutionRec(id: string, patch: {
+  output: any;
+  node_runs: StoredExecution['node_runs'];
+  error?: string | null;
+}): Promise<StoredExecution | null> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(executions).set({
+      status: 'paused',
+      output: patch.output,
+      nodeRuns: patch.node_runs,
+      error: patch.error ?? null,
+      workerId: null,
+      runnerInstanceId: null,
+      leaseExpiresAt: null,
+    }).where(and(eq(executions.id, id), eq(executions.status, 'running'))).returning();
+    return rows[0] ? rowToExecution(rows[0]) : null;
+  }
+  const cur = memExecutions.get(id);
+  if (!cur || cur.status !== 'running') return null;
+  const next: StoredExecution = {
+    ...cur,
+    status: 'paused',
+    output: patch.output,
+    node_runs: patch.node_runs,
+    error: patch.error ?? null,
+    worker_id: null,
+    runner_instance_id: null,
+    lease_expires_at: null,
+  };
+  memExecutions.set(id, next);
+  return next;
+}
+
+/** Expired running leases (dead runner / crashed worker). */
+export async function listExpiredRunningExecutions(limit = 100): Promise<StoredExecution[]> {
+  const n = Math.min(Math.max(Number(limit) || 100, 1), 500);
+  if (db) {
+    await ensureTables();
+    const rows = await db.select().from(executions)
+      .where(and(
+        eq(executions.status, 'running'),
+        or(isNull(executions.leaseExpiresAt), lt(executions.leaseExpiresAt, new Date())),
+      ))
+      .limit(n);
+    return rows.map(rowToExecution);
+  }
+  const now = Date.now();
+  return [...memExecutions.values()]
+    .filter((e) => e.status === 'running' && (!e.lease_expires_at || new Date(e.lease_expires_at).getTime() < now))
+    .slice(0, n);
+}
+
+/** Atomically move an expired running execution back to `queued` so the queue
+ *  sweeper can republish it. The claim path is still the exactly-one guard. */
+export async function reclaimExpiredExecution(id: string): Promise<StoredExecution | null> {
+  if (db) {
+    await ensureTables();
+    const now = new Date();
+    const rows = await db.update(executions).set({
+      status: 'queued',
+      workerId: null,
+      runnerInstanceId: null,
+      leaseExpiresAt: null,
+      error: null,
+    }).where(and(
+      eq(executions.id, id),
+      eq(executions.status, 'running'),
+      or(isNull(executions.leaseExpiresAt), lt(executions.leaseExpiresAt, now)),
+    )).returning();
+    return rows[0] ? rowToExecution(rows[0]) : null;
+  }
+  const cur = memExecutions.get(id);
+  if (!cur || cur.status !== 'running') return null;
+  if (cur.lease_expires_at && new Date(cur.lease_expires_at).getTime() >= Date.now()) return null;
+  const next: StoredExecution = {
+    ...cur, status: 'queued', worker_id: null, runner_instance_id: null, lease_expires_at: null, error: null,
+  };
+  memExecutions.set(id, next);
+  return next;
+}
+
+/** Overdue pending/claimed human tasks (deadline sweeper). */
+export async function listOverdueHumanTasks(limit = 100): Promise<StoredHumanTask[]> {
+  const n = Math.min(Math.max(Number(limit) || 100, 1), 500);
+  const now = new Date();
+  if (db) {
+    await ensureTables();
+    const rows = await db.select().from(humanTasks)
+      .where(and(
+        inArray(humanTasks.status, ['pending', 'claimed']),
+        isNotNull(humanTasks.deadline),
+        lt(humanTasks.deadline, now),
+      ))
+      .limit(n);
+    return rows.map(rowToHumanTask);
+  }
+  return [...memHumanTasks.values()]
+    .filter((t) => (t.status === 'pending' || t.status === 'claimed')
+      && !!t.deadline && new Date(t.deadline).getTime() < now.getTime())
+    .slice(0, n);
+}
+
+/** Active (queued+running) executions for a tenant key (org/account/user). */
+export async function countActiveExecutionsForTenant(tenant: string): Promise<number> {
+  if (!tenant) return 0;
+  const isOrg = tenant.startsWith('org:');
+  const isAccount = tenant.startsWith('account:');
+  const isUser = tenant.startsWith('user:');
+  if (!isOrg && !isAccount && !isUser) return 0;
+  const value = tenant.slice(tenant.indexOf(':') + 1);
+  if (db) {
+    await ensureTables();
+    const key = isOrg ? 'org' : isAccount ? 'account' : 'sub';
+    const rows = await db.select({ id: executions.id }).from(executions)
+      .where(and(
+        inArray(executions.status, ['queued', 'running']),
+        sql`${executions.principal}->>${key} = ${value}`,
+      ));
+    return rows.length;
+  }
+  return [...memExecutions.values()].filter((e) => {
+    if (e.status !== 'queued' && e.status !== 'running') return false;
+    const p = e.principal;
+    return !!p && (isOrg ? p.org === value : isAccount ? p.account === value : p.sub === value);
+  }).length;
+}
+
+/** Per-tenant active execution counts for the metrics endpoint. */
+export async function activeExecutionCountsByTenant(): Promise<Array<{ tenant: string; count: number }>> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.select({
+      tenant: sql<string>`coalesce(${executions.principal}->>'org', ${executions.principal}->>'account', ${executions.principal}->>'sub', 'unknown')`,
+      count: sql<number>`count(*)::int`,
+    }).from(executions)
+      .where(inArray(executions.status, ['queued', 'running']))
+      .groupBy(sql`1`);
+    return rows.map((r) => ({ tenant: String(r.tenant), count: Number(r.count) || 0 }));
+  }
+  const counts = new Map<string, number>();
+  for (const e of memExecutions.values()) {
+    if (e.status !== 'queued' && e.status !== 'running') continue;
+    const p = e.principal;
+    const tenant = p?.org || p?.account || p?.sub || 'unknown';
+    counts.set(tenant, (counts.get(tenant) || 0) + 1);
+  }
+  return [...counts.entries()].map(([tenant, count]) => ({ tenant, count }));
 }
 
 

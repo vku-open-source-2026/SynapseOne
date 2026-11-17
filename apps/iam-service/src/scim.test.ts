@@ -8,7 +8,7 @@ import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import { createApp } from './index';
-import { getOrgBySlug, createOrganization, listAccounts, rolesForUser, upsertUser } from './db';
+import { getOrgBySlug, createOrganization, listAccounts, rolesForUser, upsertUser, setOrgAdmin } from './db';
 import { createScimToken } from './scim';
 import { signAccess, newRefreshToken, storeRefresh, consumeRefresh } from './tokens';
 
@@ -43,6 +43,7 @@ before(async () => {
   scimToken = (await createScimToken({ orgId, description: 'test' })).token;
   const admin = await upsertUser(orgId, 'scim-admin@example.com', 'SCIM Admin');
   adminUserId = admin.id;
+  await setOrgAdmin(adminUserId, true);
   adminToken = signAccess({ sub: admin.id, email: admin.email, org: orgId }).token;
 });
 
@@ -124,6 +125,24 @@ describe('SCIM 2.0 (#48)', () => {
     const read = await scim('GET', `/scim/v2/Users/${createdUserId}`);
     assert.equal(read.status, 200);
     assert.equal(read.json.active, false);
+  });
+
+  it('refuses to deactivate or delete the last active org admin through SCIM', async () => {
+    await setOrgAdmin(adminUserId, false);
+    const created = await scim('POST', '/scim/v2/Users', { userName: 'last-admin@example.com', active: true });
+    assert.equal(created.status, 201, JSON.stringify(created.json));
+    await setOrgAdmin(created.json.id, true);
+    const patch = await scim('PATCH', `/scim/v2/Users/${created.json.id}`, {
+      Operations: [{ op: 'replace', path: 'active', value: false }],
+    });
+    assert.equal(patch.status, 409, JSON.stringify(patch.json));
+    const put = await scim('PUT', `/scim/v2/Users/${created.json.id}`, {
+      userName: 'last-admin@example.com', active: false,
+    });
+    assert.equal(put.status, 409, JSON.stringify(put.json));
+    const deleted = await scim('DELETE', `/scim/v2/Users/${created.json.id}`);
+    assert.equal(deleted.status, 409, JSON.stringify(deleted.json));
+    await setOrgAdmin(adminUserId, true);
   });
 
   it('enforces tenant isolation for users and groups', async () => {

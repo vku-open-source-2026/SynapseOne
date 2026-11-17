@@ -12,9 +12,11 @@ services:
       NODE_ENV: production
       HSTS_ENABLED: "true"
       GATEWAY_VERIFY_APIKEY: "true"
-      # Central policy enforcement must be explicit in production.
-      AUTHZ_MODE: ${AUTHZ_MODE:-audit}
+      # Central policy enforcement must be explicit in production. The default
+      # is enforce; audit is a time-bounded rollout override requiring an owner.
+      AUTHZ_MODE: ${AUTHZ_MODE:-enforce}
       AUTHZ_MODE_REQUIRED: ${AUTHZ_MODE_REQUIRED:-true}
+      AUTHZ_AUDIT_ACK: ${AUTHZ_AUDIT_ACK:-}
       # nginx is the only edge: one trusted proxy hop for the real client IP.
       TRUST_PROXY: ${TRUST_PROXY:-1}
     networks:
@@ -44,6 +46,10 @@ services:
     environment:
       NODE_ENV: production
       HSTS_ENABLED: "true"
+      # Credential encryption + first-party IAM integration must be configured
+      # before the service listens; missing values now fail boot.
+      SYNAPSEONE_CREDENTIAL_KEY: ${SYNAPSEONE_CREDENTIAL_KEY:?SYNAPSEONE_CREDENTIAL_KEY must be set in production}
+      SYNAPSEONE_IAM_API_KEY: ${SYNAPSEONE_IAM_API_KEY:?SYNAPSEONE_IAM_API_KEY must be set in production}
     ports: !reset []
 
   ai:

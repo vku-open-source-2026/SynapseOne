@@ -184,7 +184,9 @@ describe('platform super admin', () => {
     tenantOrgId = created.json.organization.id;
     tenantUserId = created.json.admin.id;
     assert.equal(created.json.admin.is_org_admin, true);
-    assert.equal(typeof created.json.inviteToken, 'string');
+    // Tenant invite tokens are not handed to platform administrators unless
+    // the deployment explicitly opts into lifecycle-token exposure.
+    assert.equal(created.json.inviteToken, undefined);
 
     const orgs = await call('GET', `/v1/platform/orgs?q=${encodeURIComponent(slug)}`, undefined, platformToken);
     assert.equal(orgs.status, 200);

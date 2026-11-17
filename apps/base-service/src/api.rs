@@ -618,18 +618,22 @@ fn store_error(error: StoreError) -> ApiError {
 // ---------- health / metrics ----------
 
 async fn health(State(state): State<AppState>) -> Response {
-    let collections = state
-        .store
-        .list_collections()
-        .await
-        .map(|items| items.len())
-        .unwrap_or(0);
-    let databases = state
-        .store
-        .list_databases()
-        .await
-        .map(|items| items.len())
-        .unwrap_or(0);
+    let collections = state.store.list_collections().await;
+    let databases = state.store.list_databases().await;
+    let ok = collections.is_ok() && databases.is_ok();
+    if !ok {
+        return json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({
+                "status": "degraded",
+                "service": "base",
+                "version": VERSION,
+                "db": if state.store.uses_postgres() { "postgres" } else { "memory" },
+                "error": "store_probe_failed",
+                "time": now_iso(),
+            }),
+        );
+    }
     json_response(
         StatusCode::OK,
         json!({
@@ -637,8 +641,8 @@ async fn health(State(state): State<AppState>) -> Response {
             "service": "base",
             "version": VERSION,
             "db": if state.store.uses_postgres() { "postgres" } else { "memory" },
-            "databases": databases,
-            "collections": collections,
+            "databases": databases.map(|items| items.len()).unwrap_or(0),
+            "collections": collections.map(|items| items.len()).unwrap_or(0),
             "time": now_iso(),
         }),
     )

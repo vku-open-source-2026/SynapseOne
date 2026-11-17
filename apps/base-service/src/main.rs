@@ -29,7 +29,7 @@ use tokio::net::TcpListener;
 
 use cache::Cache;
 
-pub const VERSION: &str = "0.7.1";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone)]
 pub struct Config {

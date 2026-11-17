@@ -28,6 +28,9 @@ pub const JWT_ISSUERS: [&str; 2] = ["synapseone-iam", "synapsedx-iam"];
 pub struct ReadyUpstream {
     pub name: String,
     pub url: String,
+    /// Critical upstreams gate readiness; optional ones are reported but do
+    /// not take the gateway out of rotation.
+    pub required: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -41,6 +44,7 @@ pub struct Config {
     pub internal_secret: String,
     pub verify_api_key: bool,
     pub authz_mode: AuthzMode,
+    pub authz_audit_ack: String,
     pub trust_proxy: TrustProxy,
     pub proxy_timeout_ms: u64,
     pub inference_rate_limit_per_min: u32,
@@ -72,16 +76,30 @@ impl Config {
         }
 
         let verify_api_key = verify_api_key_from_env();
-        let authz_mode = AuthzMode::from_env();
+        // Production defaults to enforcement. A deployment can still roll out
+        // in audit mode, but only with an explicit, owned override
+        // (AUTHZ_AUDIT_ACK="owner=<name>;expires=<date>;reason=...").
+        let authz_mode = if is_prod && std::env::var_os("AUTHZ_MODE").is_none() {
+            AuthzMode::Enforce
+        } else {
+            AuthzMode::from_env()
+        };
+        let audit_ack = std::env::var("AUTHZ_AUDIT_ACK").unwrap_or_default();
         validate_security_config(
             is_prod,
             verify_api_key,
             authz_mode,
             std::env::var("AUTHZ_MODE_REQUIRED").as_deref() == Ok("true"),
+            &audit_ack,
         )?;
         if is_prod && authz_mode == AuthzMode::Off {
             tracing::warn!(
-                "[gateway][security] AUTHZ_MODE=off — central policy enforcement is disabled. Set audit/enforce before exposing multi-tenant administration."
+                "[gateway][security] AUTHZ_MODE=off — central policy enforcement is disabled. Set AUTHZ_MODE=enforce before exposing multi-tenant administration."
+            );
+        }
+        if is_prod && authz_mode == AuthzMode::Audit {
+            tracing::warn!(
+                "[gateway][security] AUTHZ_MODE=audit — policy denies are NOT enforced. Override owner: {audit_ack}"
             );
         }
 
@@ -143,7 +161,11 @@ impl Config {
         ));
 
         Ok(Self {
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: std::env::var("SYNAPSEONE_BUILD_VERSION")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty() && value.len() <= 128)
+                .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
             port,
             is_prod,
             iam_service_url: env_or("IAM_SERVICE_URL", "http://iam:4001"),
@@ -152,6 +174,7 @@ impl Config {
             internal_secret,
             verify_api_key,
             authz_mode,
+            authz_audit_ack: audit_ack,
             trust_proxy,
             proxy_timeout_ms,
             inference_rate_limit_per_min,
@@ -235,6 +258,7 @@ pub fn validate_security_config(
     verify_api_key: bool,
     authz_mode: AuthzMode,
     authz_mode_required: bool,
+    audit_ack: &str,
 ) -> Result<(), String> {
     if is_prod && !verify_api_key {
         return Err(
@@ -244,7 +268,14 @@ pub fn validate_security_config(
     }
     if is_prod && authz_mode_required && authz_mode == AuthzMode::Off {
         return Err(
-            "[gateway] AUTHZ_MODE=off is forbidden when AUTHZ_MODE_REQUIRED=true. Set audit or enforce."
+            "[gateway] AUTHZ_MODE=off is forbidden when AUTHZ_MODE_REQUIRED=true. Set enforce (or a time-bounded audit override)."
+                .into(),
+        );
+    }
+    if is_prod && authz_mode == AuthzMode::Audit && audit_ack.trim().is_empty() {
+        return Err(
+            "[gateway] AUTHZ_MODE=audit is a rollout override. Set AUTHZ_MODE=enforce, or acknowledge it with AUTHZ_AUDIT_ACK='owner=<name>;expires=<date>;reason=<why>'. \
+             Audit mode never blocks a would-deny decision."
                 .into(),
         );
     }
@@ -253,19 +284,21 @@ pub fn validate_security_config(
 
 fn ready_upstreams_from_env() -> Vec<ReadyUpstream> {
     let mut upstreams = vec![
-        ready("iam", env_or("IAM_SERVICE_URL", "http://iam:4001")),
+        ready("iam", env_or("IAM_SERVICE_URL", "http://iam:4001"), true),
         ready(
             "workflow",
             env_or("WORKFLOW_SERVICE_URL", "http://workflow:4002"),
+            true,
         ),
-        ready("ai", env_or("AI_SERVICE_URL", "http://ai:4003")),
-        ready("lds", env_or("LDS_SERVICE_URL", "http://lds:4004")),
-        ready("base", env_or("BASE_SERVICE_URL", "http://base:4005")),
+        ready("ai", env_or("AI_SERVICE_URL", "http://ai:4003"), false),
+        ready("lds", env_or("LDS_SERVICE_URL", "http://lds:4004"), false),
+        ready("base", env_or("BASE_SERVICE_URL", "http://base:4005"), true),
         ready(
             "faststore",
             env_or("FASTSTORE_SERVICE_URL", "http://faststore:4006"),
+            false,
         ),
-        ready("queue", env_or("QUEUE_SERVICE_URL", "http://queue:4007")),
+        ready("queue", env_or("QUEUE_SERVICE_URL", "http://queue:4007"), false),
     ];
     for (name, key) in [
         ("stream", "STREAM_SERVICE_URL"),
@@ -273,7 +306,7 @@ fn ready_upstreams_from_env() -> Vec<ReadyUpstream> {
         ("inference", "INFERENCE_SERVICE_URL"),
     ] {
         if let Some(url) = optional_env(key) {
-            upstreams.push(ready(name, url));
+            upstreams.push(ready(name, url, false));
         }
     }
     let ocs = std::env::var("OCS_SERVICE_URL")
@@ -281,10 +314,10 @@ fn ready_upstreams_from_env() -> Vec<ReadyUpstream> {
         .filter(|value| !value.trim().is_empty())
         .or_else(|| optional_env("STORAGE_SERVICE_URL"));
     if let Some(url) = ocs {
-        upstreams.push(ready("ocs", url));
+        upstreams.push(ready("ocs", url, false));
     }
     if let Some(url) = optional_env("NOTIFICATIONS_SERVICE_URL") {
-        upstreams.push(ready("notifications", url));
+        upstreams.push(ready("notifications", url, false));
     }
     upstreams
 }
@@ -295,10 +328,11 @@ fn optional_env(name: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
-fn ready(name: &str, url: String) -> ReadyUpstream {
+fn ready(name: &str, url: String, required: bool) -> ReadyUpstream {
     ReadyUpstream {
         name: name.to_string(),
         url,
+        required,
     }
 }
 
