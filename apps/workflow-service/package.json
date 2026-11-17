@@ -1,6 +1,6 @@
 {
   "name": "@synapseone/workflow-service",
-  "version": "0.7.1",
+  "version": "0.9.0",
   "license": "Apache-2.0",
   "description": "synapseone Workflow - local built-in engine (no external dependency)",
   "main": "dist/index.js",

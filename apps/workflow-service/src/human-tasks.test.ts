@@ -18,6 +18,7 @@ const USER = {
   'x-synapseone-org': 'org-a',
   'x-synapseone-account': 'acct-a',
   'x-synapseone-kind': 'user',
+  'x-synapseone-roles': 'duty-manager',
 };
 const OTHER = { ...USER, 'x-synapseone-user': 'other@example.com', 'x-synapseone-org': 'org-b', 'x-synapseone-account': 'acct-b' };
 const ADMIN = { ...USER, 'x-synapseone-user': 'admin@example.com' };
@@ -148,6 +149,80 @@ describe('durable human tasks (#44)', () => {
     assert.equal(result.resumed.output.dispatched, false);
     const exec = await fetch(`${base}/v1/executions/${executionId}?includeData=true`, { headers: USER });
     assert.equal((await exec.json()).status, 'success');
+  });
+
+  it('enforces candidate roles on unassigned tasks', async () => {
+    const { taskId } = await createPaused();
+    const noRole = { ...USER, 'x-synapseone-user': 'member@example.com', 'x-synapseone-roles': 'viewer' };
+    const denied = await fetch(`${base}/v1/human-tasks/${taskId}/complete`, {
+      method: 'POST', headers: noRole, body: JSON.stringify({ decision: { approved: true } }),
+    });
+    assert.equal(denied.status, 403);
+    assert.equal((await denied.json()).error, 'not_assignee');
+
+    const allowed = await fetch(`${base}/v1/human-tasks/${taskId}/complete`, {
+      method: 'POST', headers: USER, body: JSON.stringify({ decision: { approved: true } }),
+    });
+    assert.equal(allowed.status, 200);
+  });
+
+  it('keeps a second human-task step durable after an inline resume', async () => {
+    const twoStep = {
+      nodes: [
+        { name: 'Start', type: 'manualTrigger', parameters: {} },
+        { name: 'First approval', type: 'humanTask', parameters: { title: 'First approval', candidateRoles: ['duty-manager'] } },
+        { name: 'Second approval', type: 'humanTask', parameters: { title: 'Second approval', candidateRoles: ['duty-manager'] } },
+        { name: 'Apply', type: 'set', parameters: { values: { done: true } } },
+      ],
+      connections: {
+        Start: { main: [[{ node: 'First approval' }]] },
+        'First approval': { main: [[{ node: 'Second approval' }]] },
+        'Second approval': { main: [[{ node: 'Apply' }]] },
+      },
+    };
+    const created = await fetch(`${base}/v1/workflows`, {
+      method: 'POST', headers: USER,
+      body: JSON.stringify({ name: `two-step-${Date.now().toString(36)}`, definition: twoStep }),
+    });
+    const createdText = await created.text();
+    assert.equal(created.status, 201, createdText);
+    const wf: any = JSON.parse(createdText);
+    const run: any = await (await fetch(`${base}/v1/workflows/${wf.id}/execute`, {
+      method: 'POST', headers: USER, body: JSON.stringify({ incident: 'INC-2' }),
+    })).json();
+    assert.equal(run.status, 'paused');
+    const first = await fetch(`${base}/v1/human-tasks/${run.taskId}/complete`, {
+      method: 'POST', headers: USER, body: JSON.stringify({ decision: { approved: true } }),
+    });
+    const firstText = await first.text();
+    assert.equal(first.status, 200, firstText);
+    const firstBody: any = JSON.parse(firstText);
+    assert.equal(firstBody.resumed.status, 'paused');
+    assert.ok(firstBody.resumed.taskId);
+
+    const second = await fetch(`${base}/v1/human-tasks/${firstBody.resumed.taskId}/complete`, {
+      method: 'POST', headers: USER, body: JSON.stringify({ decision: { approved: true } }),
+    });
+    const secondText = await second.text();
+    assert.equal(second.status, 200, secondText);
+    const secondBody: any = JSON.parse(secondText);
+    assert.equal(secondBody.resumed.status, 'success');
+    assert.equal(secondBody.resumed.output.done, true);
+    const exec: any = await (await fetch(`${base}/v1/executions/${run.executionId}?includeData=true`, { headers: USER })).json();
+    assert.equal(exec.status, 'success');
+    assert.equal(exec.nodeRuns.filter((n: any) => n.node === 'Apply').length, 1);
+  });
+
+  it('expires an overdue task and terminates its paused execution', async () => {
+    const { executionId, taskId } = await createPaused();
+    const expired = await fetch(`${base}/v1/human-tasks/${taskId}/expire`, {
+      method: 'POST', headers: USER, body: JSON.stringify({ force: true }),
+    });
+    assert.equal(expired.status, 200);
+    assert.equal((await expired.json()).task.status, 'expired');
+    const exec: any = await (await fetch(`${base}/v1/executions/${executionId}?includeData=true`, { headers: USER })).json();
+    assert.equal(exec.status, 'error');
+    assert.match(exec.error, /expired/);
   });
 
   it('denies cross-tenant reads and claims without leaking existence', async () => {

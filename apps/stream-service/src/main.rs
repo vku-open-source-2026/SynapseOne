@@ -28,7 +28,7 @@ use engine::{
     Engine, GroupReadOptions, MemoryEngine, PublishInput, ReadOptions, RedisEngine, StreamError,
 };
 
-const VERSION: &str = "0.7.1";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_BATCH: usize = 100;
 
 #[derive(Clone)]

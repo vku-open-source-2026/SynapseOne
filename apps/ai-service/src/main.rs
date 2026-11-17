@@ -26,7 +26,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use agent::{run_agent, AgentConfig, AgentError, AgentFailure};
 use llm::{LlmConfig, LlmError};
 
-const VERSION: &str = "0.7.1";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone)]
 struct Config {

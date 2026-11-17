@@ -68,7 +68,7 @@ describe('platform organization lifecycle', () => {
       new Promise<void>((resolve, reject) => {
         for (const k of ['NODE_ENV', 'DATABASE_URL', 'SYNAPSEONE_INTERNAL_SECRET', 'IAM_ALLOW_DEV_LOGIN',
           'PLATFORM_ADMIN_ENABLED', 'PLATFORM_ADMIN_REQUIRE_MFA', 'PLATFORM_ADMIN_REQUIRE_STEP_UP',
-          'PLATFORM_BOOTSTRAP_SECRET', 'PLATFORM_ORG_SLUG', 'IAM_SENSITIVE_MUTATION_MODE']) {
+          'PLATFORM_BOOTSTRAP_SECRET', 'PLATFORM_ORG_SLUG', 'IAM_SENSITIVE_MUTATION_MODE', 'IAM_EXPOSE_LIFECYCLE_TOKENS']) {
           saved[k] = process.env[k];
         }
         delete process.env.NODE_ENV;
@@ -81,6 +81,7 @@ describe('platform organization lifecycle', () => {
         process.env.PLATFORM_BOOTSTRAP_SECRET = BOOTSTRAP;
         process.env.PLATFORM_ORG_SLUG = 'synapseone-platform';
         process.env.IAM_SENSITIVE_MUTATION_MODE = 'audit';
+        process.env.IAM_EXPOSE_LIFECYCLE_TOKENS = 'true';
         const app = createApp();
         server = app.listen(0, '127.0.0.1', async () => {
           try {

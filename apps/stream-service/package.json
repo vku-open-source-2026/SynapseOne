@@ -1,6 +1,6 @@
 {
   "name": "@synapseone/stream-service",
-  "version": "0.7.1",
+  "version": "0.9.0",
   "license": "Apache-2.0",
   "description": "SynapseStream — tenant-scoped distributed event streaming log with pluggable engines (Redis Streams, Kafka-ready)",
   "main": "dist/index.js",

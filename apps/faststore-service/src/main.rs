@@ -32,7 +32,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use store::{FaststoreError, FieldValue, MemoryStore, Stats, Store, WriteOptions, ZMember};
 
-const VERSION: &str = "0.7.1";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
 const MAX_KEY_LENGTH: usize = 512;
 const MAX_FIELD_LENGTH: usize = 256;

@@ -27,7 +27,7 @@ use crate::types::{NewDataset, NewJob};
 use crate::usage::{self, UsageStatsFilter};
 use crate::util::{header, js_string, number_value, truthy};
 
-pub const VERSION: &str = "0.9.0";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone)]
 pub struct Config {

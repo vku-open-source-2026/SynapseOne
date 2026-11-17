@@ -18,7 +18,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::auth::{AuthFailure, AuthService, Principal};
-use crate::authz::{action_for, AuthzDecider, AuthzOutcome, AuthzService, IamDecider};
+use crate::authz::{action_for, AuthzDecider, AuthzMode, AuthzOutcome, AuthzService, IamDecider};
 use crate::config::{validate_security_config, Config};
 use crate::headers::{propagate_principal, request_id, HSTS_HEADER, SECURITY_HEADERS};
 use crate::metrics::{Metrics, CONTENT_TYPE};
@@ -162,11 +162,10 @@ pub(crate) fn exec_delegated_scopes_allowed(scopes: &[String]) -> bool {
     }
     scopes.iter().all(|scope| {
         let family = scope.split(':').next().unwrap_or("");
-        // Universal scopes are accepted for compatibility with the current
-        // mint, but the path allowlist below still confines them to
-        // data-plane routes; they can never reach the control plane.
+        // Never accept a universal grant: execution tokens must name their
+        // concrete data-plane family (workflow-service derives them from the graph).
         if family == "*" {
-            return true;
+            return false;
         }
         !family.is_empty() && EXEC_DELEGATED_SCOPE_FAMILIES.contains(&family)
     })
@@ -309,6 +308,7 @@ fn build_state_with_decider(
         config.verify_api_key,
         config.authz_mode,
         std::env::var("AUTHZ_MODE_REQUIRED").as_deref() == Ok("true"),
+        &config.authz_audit_ack,
     )?;
     validate_routes(&routes)?;
     let client = http_client();
@@ -648,24 +648,35 @@ async fn ready(State(state): State<AppState>, request: Request) -> Response {
         let internal_secret = state.config.internal_secret.clone();
         let name = upstream.name.clone();
         let url = upstream.url.clone();
-        async move { probe_upstream(&client, &name, &url, &internal_secret).await }
+        let required = upstream.required;
+        async move { probe_upstream(&client, &name, &url, &internal_secret, required).await }
     });
     let upstreams = futures_util::future::join_all(probes).await;
-    let all_ok = upstreams.iter().all(|upstream| upstream.ok);
+    let critical_ok = upstreams.iter().filter(|u| u.required).all(|u| u.ok);
+    let optional_degraded = upstreams.iter().any(|u| !u.required && !u.ok);
+    let authz_audit = state.config.is_prod && state.config.authz_mode == AuthzMode::Audit;
+    let mut body = json!({
+        "status": if critical_ok { "ready" } else { "degraded" },
+        "service": "gateway",
+        "version": state.config.version,
+        "schemaVersion": "1",
+        "criticalOk": critical_ok,
+        "optionalDegraded": optional_degraded,
+        "authzMode": state.config.authz_mode.as_str(),
+        "upstreams": upstreams,
+        "time": now_iso(),
+    });
+    if authz_audit {
+        body["authzWarning"] = json!("audit mode does not enforce policy denies");
+        body["authzAuditAck"] = json!(state.config.authz_audit_ack);
+    }
     json_response(
-        if all_ok {
+        if critical_ok {
             StatusCode::OK
         } else {
             StatusCode::SERVICE_UNAVAILABLE
         },
-        json!({
-            "status": if all_ok { "ready" } else { "degraded" },
-            "service": "gateway",
-            "version": state.config.version,
-            "schemaVersion": "1",
-            "upstreams": upstreams,
-            "time": now_iso(),
-        }),
+        body,
     )
 }
 
@@ -673,11 +684,15 @@ async fn ready(State(state): State<AppState>, request: Request) -> Response {
 struct ProbeResult {
     name: String,
     ok: bool,
+    required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<u16>,
     ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "dependencyStatus")]
+    dependency_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -687,10 +702,15 @@ async fn probe_upstream(
     name: &str,
     base_url: &str,
     internal_secret: &str,
+    required: bool,
 ) -> ProbeResult {
     let started = Instant::now();
+    // Node services expose a dependency-aware /ready; Rust services expose
+    // /health. Probing the stronger endpoint avoids green readiness on a
+    // service whose database is down.
+    let path = if matches!(name, "iam" | "workflow") { "/ready" } else { "/health" };
     let mut request = client
-        .get(format!("{}/health", base_url.trim_end_matches('/')))
+        .get(format!("{}{path}", base_url.trim_end_matches('/')))
         .timeout(Duration::from_secs(4))
         .header("x-request-id", "ready-probe");
     if !internal_secret.is_empty() {
@@ -699,26 +719,40 @@ async fn probe_upstream(
     match request.send().await {
         Ok(response) => {
             let status = response.status();
-            let version = response.json::<Value>().await.ok().and_then(|body| {
-                body.get("version")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            });
+            let body = response.json::<Value>().await.ok();
+            let version = body
+                .as_ref()
+                .and_then(|body| body.get("version"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let dependency_status = body
+                .as_ref()
+                .and_then(|body| body.get("status"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let reported_ok = dependency_status
+                .as_deref()
+                .map(|value| matches!(value, "ok" | "ready" | "healthy"))
+                .unwrap_or(true);
             ProbeResult {
                 name: name.to_string(),
-                ok: status.is_success(),
+                ok: status.is_success() && reported_ok,
+                required,
                 status: Some(status.as_u16()),
                 ms: elapsed_ms(started),
                 version,
+                dependency_status,
                 error: None,
             }
         }
         Err(_) => ProbeResult {
             name: name.to_string(),
             ok: false,
+            required,
             status: None,
             ms: elapsed_ms(started),
             version: None,
+            dependency_status: None,
             error: Some("unreachable".into()),
         },
     }

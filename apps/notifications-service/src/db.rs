@@ -32,6 +32,9 @@ pub struct NotificationRecord {
     pub updated_at: String,
     pub next_attempt_at: String,
     pub dead_reason: Option<String>,
+    /// Set once the notification was successfully handed to SynapseQueue.
+    /// Rows left NULL are drained by the local worker (publish failed/queue off).
+    pub published_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +126,8 @@ impl Store {
             "CREATE UNIQUE INDEX IF NOT EXISTS notifications_idem_key ON notifications (tenant, idempotency_key) WHERE idempotency_key IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS notifications_tenant_created ON notifications (tenant, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS notifications_due ON notifications (status, next_attempt_at)",
+            "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS published_at timestamptz",
+            "CREATE INDEX IF NOT EXISTS notifications_unpublished ON notifications (status, next_attempt_at) WHERE published_at IS NULL",
             r#"
             CREATE TABLE IF NOT EXISTS notification_preferences (
               tenant text NOT NULL,
@@ -160,6 +165,7 @@ impl Store {
             updated_at: now.clone(),
             next_attempt_at: now,
             dead_reason: None,
+            published_at: None,
         };
         match &self.backend {
             Backend::Postgres(pool) => {
@@ -338,6 +344,138 @@ impl Store {
                     n.updated_at = updated_at;
                 }
                 Ok(())
+            }
+        }
+    }
+
+    /// Mark a notification as successfully published to SynapseQueue. If this
+    /// write fails, the local worker may deliver a duplicate (at-least-once)
+    /// but the notification is never lost.
+    pub async fn mark_published(&self, id: &str) -> Result<(), String> {
+        match &self.backend {
+            Backend::Postgres(pool) => {
+                sqlx::query("UPDATE notifications SET published_at=now(), updated_at=now() WHERE id=$1::uuid")
+                    .bind(id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| format!("mark published: {e}"))?;
+                Ok(())
+            }
+            Backend::Memory(memory) => {
+                let mut mem = memory.lock().await;
+                if let Some(n) = mem.notifications.get_mut(id) {
+                    n.published_at = Some(iso(Utc::now()));
+                    n.updated_at = iso(Utc::now());
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Clear the queue-published marker so the local outbox can retry after a
+    /// failed delivery/ack. At-least-once may duplicate, never lose.
+    pub async fn clear_published(&self, id: &str) -> Result<(), String> {
+        match &self.backend {
+            Backend::Postgres(pool) => {
+                sqlx::query("UPDATE notifications SET published_at=NULL, updated_at=now() WHERE id=$1::uuid")
+                    .bind(id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| format!("clear published: {e}"))?;
+                Ok(())
+            }
+            Backend::Memory(memory) => {
+                let mut mem = memory.lock().await;
+                if let Some(n) = mem.notifications.get_mut(id) {
+                    n.published_at = None;
+                    n.updated_at = iso(Utc::now());
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Claim records that were persisted but never published (queue outage or
+    /// queue disabled). The local worker drains these independently of the
+    /// queue consumer, so an accepted notification cannot silently disappear.
+    pub async fn claim_pending(&self, limit: i64) -> Result<Vec<NotificationRecord>, String> {
+        match &self.backend {
+            Backend::Postgres(pool) => {
+                let rows = sqlx::query(
+                    r#"
+                    UPDATE notifications SET status='sending', updated_at=now()
+                    WHERE id IN (
+                      SELECT id FROM notifications
+                      WHERE status IN ('queued','failed') AND published_at IS NULL AND next_attempt_at <= now()
+                      ORDER BY next_attempt_at
+                      LIMIT $1 FOR UPDATE SKIP LOCKED
+                    ) RETURNING *
+                    "#,
+                )
+                .bind(limit)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| format!("claim pending: {e}"))?;
+                rows.iter().map(row_to_record).collect()
+            }
+            Backend::Memory(memory) => {
+                let mut mem = memory.lock().await;
+                let now = Utc::now();
+                let mut due: Vec<NotificationRecord> = mem
+                    .notifications
+                    .values()
+                    .filter(|n| {
+                        n.published_at.is_none()
+                            && matches!(n.status.as_str(), "queued" | "failed")
+                            && parse_ts(&n.next_attempt_at)
+                                .map(|t| t <= now)
+                                .unwrap_or(true)
+                    })
+                    .cloned()
+                    .collect();
+                due.sort_by(|a, b| a.next_attempt_at.cmp(&b.next_attempt_at));
+                due.truncate(limit.max(0) as usize);
+                for n in &due {
+                    if let Some(stored) = mem.notifications.get_mut(&n.id) {
+                        stored.status = "sending".into();
+                        stored.updated_at = iso(now);
+                    }
+                }
+                Ok(due)
+            }
+        }
+    }
+
+    /// Atomically claim one notification consumed from the queue. Returns None
+    /// when another consumer already delivered/cancelled it.
+    pub async fn claim_one(&self, tenant: &str, id: &str) -> Result<Option<NotificationRecord>, String> {
+        match &self.backend {
+            Backend::Postgres(pool) => {
+                let row = sqlx::query(
+                    r#"
+                    UPDATE notifications SET status='sending', updated_at=now()
+                    WHERE tenant=$1 AND id=$2::uuid AND status IN ('queued','failed')
+                    RETURNING *
+                    "#,
+                )
+                .bind(tenant)
+                .bind(id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| format!("claim notification: {e}"))?;
+                row.as_ref().map(row_to_record).transpose()
+            }
+            Backend::Memory(memory) => {
+                let mut mem = memory.lock().await;
+                let Some(n) = mem.notifications.get_mut(id) else {
+                    return Ok(None);
+                };
+                if n.tenant != tenant || !matches!(n.status.as_str(), "queued" | "failed") {
+                    return Ok(None);
+                }
+                n.status = "sending".into();
+                n.updated_at = iso(Utc::now());
+                Ok(Some(n.clone()))
             }
         }
     }
@@ -524,6 +662,10 @@ fn row_to_record(row: &sqlx::postgres::PgRow) -> Result<NotificationRecord, Stri
             .map_err(err)
             .map(iso)?,
         dead_reason: row.try_get("dead_reason").map_err(err)?,
+        published_at: row
+            .try_get::<Option<DateTime<Utc>>, _>("published_at")
+            .map_err(err)?
+            .map(iso),
     })
 }
 

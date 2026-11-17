@@ -107,6 +107,35 @@ describe('tenant secret vault (#47)', () => {
     assert.equal((await revoked.json()).error, 'version_revoked');
   });
 
+  it('allows only the creator or an org admin to list/read/mutate secrets', async () => {
+    await create();
+    const member = { ...USER, 'x-synapseone-user': 'member@example.com' };
+    const admin = { ...USER, 'x-synapseone-user': 'admin@example.com', 'x-synapseone-org-admin': 'true' };
+
+    const memberList = await fetch(`${base}/v1/secrets`, { headers: member });
+    assert.equal(memberList.status, 200);
+    assert.deepEqual((await memberList.json()).items, []);
+
+    for (const [method, path, body] of [
+      ['GET', '/v1/secrets/database-url', undefined],
+      ['POST', '/v1/secrets/database-url/read', '{}'],
+      ['POST', '/v1/secrets/database-url/rotate', JSON.stringify({ value: 'hijacked' })],
+      ['POST', '/v1/secrets/database-url/revoke', '{}'],
+      ['DELETE', '/v1/secrets/database-url', undefined],
+    ] as const) {
+      const r = await fetch(`${base}${path}`, { method, headers: member, body });
+      assert.equal(r.status, 403, `${method} ${path}`);
+      assert.equal((await r.json()).error, 'org_admin_required');
+    }
+
+    const adminList = await fetch(`${base}/v1/secrets`, { headers: admin });
+    assert.equal(adminList.status, 200);
+    assert.equal((await adminList.json()).items.length, 1);
+    const read = await fetch(`${base}/v1/secrets/database-url/read`, { method: 'POST', headers: admin, body: '{}' });
+    assert.equal(read.status, 200);
+    assert.equal((await read.json()).value, 'postgres://user:pass@db/app');
+  });
+
   it('denies cross-tenant access without leaking existence', async () => {
     await create();
     for (const [method, path, body] of [

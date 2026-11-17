@@ -203,9 +203,17 @@ export async function publishWorkflowRun(queue: string, executionId: string, p: 
   delaySeconds?: number;
   maxAttempts?: number;
   dedupeKey?: string;
+  /** Tenant dimension for fair-share/observability; the queue message itself
+   *  stays small and carries no workflow data. */
+  tenant?: string;
 } = {}): Promise<{ id: string; duplicate: boolean }> {
   const body: Record<string, any> = {
-    payload: { v: 1, kind: 'workflow.run', executionId },
+    payload: {
+      v: 1,
+      kind: 'workflow.run',
+      executionId,
+      ...(opts.tenant ? { tenant: opts.tenant.slice(0, 128) } : {}),
+    },
     ...(opts.dedupeKey ? { dedupeKey: opts.dedupeKey } : {}),
     ...(opts.delaySeconds ? { delaySeconds: Math.min(Math.max(Number(opts.delaySeconds), 0), 604800) } : {}),
     ...(opts.maxAttempts ? { maxAttempts: Math.min(Math.max(Number(opts.maxAttempts), 1), 100) } : {}),

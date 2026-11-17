@@ -23,6 +23,7 @@ const USER = {
   'x-synapseone-org': 'org-1',
   'x-synapseone-account': 'acc-1',
   'x-synapseone-kind': 'user',
+  'x-synapseone-roles': 'duty-manager',
 };
 const RUNNER_AUTH = {
   'Content-Type': 'application/json',
@@ -253,7 +254,7 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
     assert.ok(queued.executionId);
     // The message must not carry workflow input or the definition.
     const msg = mock.published.find((m) => m.payload?.executionId === queued.executionId);
-    assert.deepEqual(Object.keys(msg.payload).sort(), ['executionId', 'kind', 'v']);
+    assert.deepEqual(Object.keys(msg.payload).sort(), ['executionId', 'kind', 'tenant', 'v']);
 
     const exec: any = await waitFor(async () => {
       const r = await fetch(`${base}/v1/executions/${queued.executionId}?includeData=true`, { headers: USER });
@@ -276,7 +277,7 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
       });
       assert.equal(response.status, 400, revision);
     }
-    const updated = await updateWorkflowRec(wf.id, { name: 'edited since approval' });
+    const updated = await updateWorkflowRec(wf.id, { nodes: [...wf.nodes, { name: 'Added after approval', type: 'n8n-nodes-base.noOp', parameters: {} }] });
     const stale = await fetch(`${base}/v1/workflows/${wf.id}/execute?expectedRevision=${wf.revision}`, {
       method: 'POST', headers: USER, body: '{}',
     });
@@ -300,7 +301,7 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
     const queued = await (await fetch(`${base}/v1/workflows/${wf.id}/execute?expectedRevision=${wf.revision}`, {
       method: 'POST', headers: USER, body: '{}',
     })).json();
-    await updateWorkflowRec(wf.id, { name: 'unreviewed change' });
+    await updateWorkflowRec(wf.id, { nodes: [...wf.nodes, { name: 'Unreviewed node', type: 'n8n-nodes-base.noOp', parameters: {} }] });
     const claim = await fetch(`${base}/v1/runner/jobs/${queued.executionId}/claim`, {
       method: 'POST', headers: RUNNER_AUTH,
       body: JSON.stringify({ runnerId: runner.id, instanceId: 'connector-rev', leaseSeconds: 60 }),
@@ -323,7 +324,7 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
       principal: { sub: 'operator@example.com', org: 'org-1', account: 'acc-1', kind: 'user' },
       queue_name: 'synapseone-wf-platform', runner: 'platform',
     });
-    await updateWorkflowRec(wf.id, { name: 'unreviewed platform edit' });
+    await updateWorkflowRec(wf.id, { nodes: [...wf.nodes, { name: 'Unreviewed platform node', type: 'n8n-nodes-base.noOp', parameters: {} }] });
     const messages = mock.queues.get('synapseone-wf-platform') || new Map();
     messages.set(execution.id, {
       id: execution.id, payload: { kind: 'workflow.run', executionId: execution.id, v: 1 },

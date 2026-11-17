@@ -63,6 +63,12 @@ pub fn propagate_principal(
             if !principal.scopes.is_empty() {
                 insert(headers, "x-synapseone-scopes", &principal.scopes.join(","));
             }
+            if principal.org_admin {
+                insert(headers, "x-synapseone-org-admin", "true");
+            }
+            if !principal.roles.is_empty() {
+                insert(headers, "x-synapseone-roles", &principal.roles.join(","));
+            }
             insert(
                 headers,
                 "x-synapseone-kind",

@@ -22,8 +22,9 @@ import {
   getRoleById, getPolicyById, getAccountById, accountsForUser, getOrgById,
   policiesForRole, rolesForUser, ensureTables,
   setUserPassword, markEmailVerified, storeOneTimeToken, consumeOneTimeToken,
-  setUserActive, updateUserProfile, publicUser,
+  setUserActive, updateUserProfile, publicUser, bumpAuthVersion,
   setOrgAdmin, orgHasAdmin, assignRoleToServiceAccount, unassignRoleFromServiceAccount, rolesForServiceAccount,
+  countActiveOrgAdmins, setOrgAdminGuarded, setUserActiveGuarded, pingDb,
   getPlatformAdmin, listPlatformAdmins, grantPlatformAdmin, revokePlatformAdmin, countActivePlatformOwners,
   registerPlatformStepUp, consumePlatformStepUp,
   listPlatformOrganizations, getPlatformOrganization, getPlatformOrganizationResources, listPlatformUsers, getPlatformOverviewCounts, platformAuditStats,
@@ -65,6 +66,8 @@ import {
 dotenv.config();
 const PORT = Number(process.env.PORT || 4001);
 const VERSION = (() => {
+  const injected = String(process.env.SYNAPSEONE_BUILD_VERSION || '').trim();
+  if (injected) return injected.slice(0, 128);
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     return require('../package.json').version || '0.0.0';
@@ -681,14 +684,17 @@ export function exposesLifecycleTokens(): boolean {
 
 /** Issue an access+refresh pair for a user (login/register/refresh). */
 async function issueSession(
-  user: { id: string; email: string; org_id: string; auth_version?: number },
+  user: { id: string; email: string; org_id: string; auth_version?: number; is_org_admin?: boolean },
   options: { amr?: string[]; authTime?: number } = {},
 ): Promise<{ accessToken: string; expiresIn: number; refreshToken: string; user: unknown }> {
+  const roles = await rolesForUser(user.id).then((rows) => rows.map((r) => r.slug).slice(0, 50)).catch(() => []);
   const { token, expiresIn } = signAccess({
     sub: user.id,
     email: user.email,
     org: user.org_id,
     ver: Number(user.auth_version) || 0,
+    adm: user.is_org_admin === true,
+    ...(roles.length ? { roles } : {}),
     ...(options.amr && options.amr.length ? { amr: options.amr } : {}),
     ...(options.authTime ? { auth_time: options.authTime } : {}),
   });
@@ -1136,7 +1142,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
   // Hourly usage rollups → Synapse Warehouse (no-op without WAREHOUSE_SERVICE_URL).
   startUsageRollup();
   const PUBLIC_PREFIXES = ['/v1/auth/'];
-  const PUBLIC_EXACT = new Set(['/v1/auth']);
+  const PUBLIC_EXACT = new Set(['/v1/auth', '/ready']);
   app.use(((async (req: express.Request, res: express.Response, next: express.NextFunction) => {
     const p = req.path;
     if (p === '/health' || PUBLIC_EXACT.has(p) || PUBLIC_PREFIXES.some((x) => p.startsWith(x))) return next();
@@ -1236,6 +1242,20 @@ async function auditMutation(req: express.Request, action: string, resource: str
   }
 
   app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'iam', version: VERSION, ...(IS_PROD ? {} : { db: useDb() ? 'postgres' : 'memory' }), time: new Date().toISOString() }));
+  // Readiness must reflect the auth store, not just the process. A DB outage
+  // returns 503 so the gateway removes this instance from rotation.
+  app.get('/ready', async (_req, res) => {
+    const dbOk = await pingDb();
+    noStore(res);
+    res.status(dbOk ? 200 : 503).json({
+      status: dbOk ? 'ready' : 'degraded',
+      service: 'iam',
+      version: VERSION,
+      db: useDb() ? (dbOk ? 'ok' : 'down') : 'memory',
+      critical: { database: dbOk },
+      time: new Date().toISOString(),
+    });
+  });
 
   if (isDevLoginEnabled()) {
     console.warn('[iam][security] IAM_ALLOW_DEV_LOGIN=true — passwordless dev login ENABLED (any email gets a token). Set false in production.');
@@ -1531,7 +1551,13 @@ async function auditMutation(req: express.Request, action: string, resource: str
       });
       if (b.active !== undefined) {
         const active = b.active !== false;
-        await setUserActive(user.id, active);
+        const guarded = await setUserActiveGuarded(user.id, active);
+        if (!guarded.ok) {
+          if (guarded.reason === 'last_admin') {
+            return scimError(res, 409, 'cannot deactivate the last active organization administrator', 'mutability');
+          }
+          return scimError(res, 404, 'user not found');
+        }
         if (!active) {
           await revokeAllRefresh(user.id);
           await revokeApiKeysForUser(user.id);
@@ -1579,7 +1605,13 @@ async function auditMutation(req: express.Request, action: string, resource: str
       await updateUserProfile(user.id, { ...(displayName !== undefined ? { displayName } : {}), ...(externalSub !== undefined ? { externalSub } : {}) });
     }
     if (active !== undefined) {
-      await setUserActive(user.id, active);
+      const guarded = await setUserActiveGuarded(user.id, active);
+      if (!guarded.ok) {
+        if (guarded.reason === 'last_admin') {
+          return scimError(res, 409, 'cannot deactivate the last active organization administrator', 'mutability');
+        }
+        return scimError(res, 404, 'user not found');
+      }
       if (!active) {
         await revokeAllRefresh(user.id);
         await revokeApiKeysForUser(user.id);
@@ -1596,7 +1628,13 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!isUuid(req.params.id)) return scimError(res, 404, 'user not found');
     const user = await getUserById(req.params.id);
     if (!user || user.org_id !== token.orgId) return scimError(res, 404, 'user not found');
-    await setUserActive(user.id, false);
+    const guarded = await setUserActiveGuarded(user.id, false);
+    if (!guarded.ok) {
+      if (guarded.reason === 'last_admin') {
+        return scimError(res, 409, 'cannot deactivate the last active organization administrator', 'mutability');
+      }
+      return scimError(res, 404, 'user not found');
+    }
     const revokedSessions = await revokeAllRefresh(user.id);
     const revokedKeys = await revokeApiKeysForUser(user.id);
     await auditMutation(req, 'iam:scim:user:deactivate', `user:${user.id}`, { org: token.orgId, tokenId: token.id, revokedSessions, revokedKeys });
@@ -1621,7 +1659,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
       if (!user || user.org_id !== orgId) continue;
       for (const slug of group.roles) {
         const role = roles.find((r) => r.slug === slug);
-        if (role) await assignRole(userId, role.id);
+        if (role) {
+          await assignRole(userId, role.id);
+        }
       }
     }
   }
@@ -1634,7 +1674,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
       if (!user || user.org_id !== orgId) continue;
       for (const slug of group.roles) {
         const role = roles.find((r) => r.slug === slug);
-        if (role) await unassignRole(userId, role.id);
+        if (role) {
+          await unassignRole(userId, role.id);
+        }
       }
     }
   }
@@ -2111,12 +2153,13 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (policyErr) return res.status(400).json({ error: 'weak_password', message: policyErr });
     await setUserPassword(user.id, await hashPassword(parsed.data.newPassword));
     const revoked = await revokeAllRefresh(user.id);
+    const revokedKeys = await revokeApiKeysForUser(user.id);
     await logAudit({
       actor_type: 'user', actor_id: user.id, action: 'iam:password:change', resource: `user:${user.id}`,
-      decision: true, context: { org: user.org_id, revokedSessions: revoked },
+      decision: true, context: { org: user.org_id, revokedSessions: revoked, revokedApiKeys: revokedKeys },
     }).catch(() => undefined);
     noStore(res);
-    res.json({ ok: true, revokedSessions: revoked });
+    res.json({ ok: true, revokedSessions: revoked, revokedApiKeys: revokedKeys });
   });
 
   app.post('/v1/auth/password/forgot', async (req, res) => {
@@ -2162,12 +2205,13 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (policyErr) return res.status(400).json({ error: 'weak_password', message: policyErr });
     await setUserPassword(user.id, await hashPassword(parsed.data.newPassword));
     const revoked = await revokeAllRefresh(user.id);
+    const revokedKeys = await revokeApiKeysForUser(user.id);
     await logAudit({
       actor_type: 'user', actor_id: user.id, action: 'iam:password:reset', resource: `user:${user.id}`,
-      decision: true, context: { org: user.org_id, revokedSessions: revoked },
+      decision: true, context: { org: user.org_id, revokedSessions: revoked, revokedApiKeys: revokedKeys },
     }).catch(() => undefined);
     noStore(res);
-    res.json({ ok: true, revokedSessions: revoked });
+    res.json({ ok: true, revokedSessions: revoked, revokedApiKeys: revokedKeys });
   });
 
   app.post('/v1/auth/email/verify', async (req, res) => {
@@ -2339,7 +2383,12 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!user || user.active === false) return res.status(401).json({ error: 'account_deactivated' });
     const org = await getOrgById(user.org_id);
     if (org && org.status === 'suspended') return orgSuspendedResponse(res);
-    const { token, expiresIn } = signAccess({ sub: user.id, email: user.email, org: user.org_id, ver: Number(user.auth_version) || 0 });
+    const roles = await rolesForUser(user.id).then((rows) => rows.map((r) => r.slug).slice(0, 50)).catch(() => []);
+    const { token, expiresIn } = signAccess({
+      sub: user.id, email: user.email, org: user.org_id, ver: Number(user.auth_version) || 0,
+      adm: user.is_org_admin === true,
+      ...(roles.length ? { roles } : {}),
+    });
     noStore(res);
     res.json({ accessToken: token, expiresIn, refreshToken: rt.value });
   });
@@ -3387,13 +3436,15 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!(await callerIsOrgAdmin(req, TRUST_STAMPED, user.org_id))) {
       return res.status(403).json({ error: 'org_admin_required', message: 'only an organization administrator can change administrators' });
     }
-    if (!flag && user.is_org_admin) {
-      const admins = (await listUsers(user.org_id)).filter((u) => u.is_org_admin && u.active !== false);
-      if (admins.length <= 1) return res.status(409).json({ error: 'last_admin', message: 'an organization needs at least one active administrator' });
+    const guarded = await setOrgAdminGuarded(user.id, flag);
+    if (!guarded.ok) {
+      if (guarded.reason === 'last_admin') {
+        return res.status(409).json({ error: 'last_admin', message: 'an organization needs at least one active administrator' });
+      }
+      return res.status(404).json({ error: 'user_not_found' });
     }
     const reason = typeof (req.body || {}).reason === 'string' ? String((req.body || {}).reason).slice(0, 500) : '';
     const updated = await withTransaction(async () => {
-      const u = await setOrgAdmin(user.id, flag);
       await auditMutation(req, 'iam:user:org-admin', `user:${user.id}`, {
         org: user.org_id,
         targetUserId: user.id,
@@ -3401,7 +3452,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
         newValue: flag,
         ...(reason ? { reason } : {}),
       });
-      return u;
+      return guarded.user;
     });
     res.json(updated ? publicUser(updated) : { ok: true });
   });
@@ -3803,7 +3854,10 @@ async function auditMutation(req: express.Request, action: string, resource: str
   });
 
   app.post('/v1/platform/orgs', async (req, res) => {
-    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    // Creating a tenant mints its first administrator. Only a platform owner
+    // may do that; an operator must not be able to create (and then redeem)
+    // a tenant-admin invite they control.
+    const ctx = await currentPlatformAdmin(req, res, 'owner');
     if (!ctx) return;
     const parsed = z.object({
       slug: z.string().trim().regex(/^[a-z0-9-]{1,64}$/),
@@ -3836,7 +3890,11 @@ async function auditMutation(req: express.Request, action: string, resource: str
       return { created, admin, inviteToken };
     });
     noStore(res);
-    res.status(201).json({ organization: result.created, admin: publicUser(result.admin), inviteToken: result.inviteToken });
+    res.status(201).json({
+      organization: result.created,
+      admin: publicUser(result.admin),
+      ...(result.inviteToken && exposesLifecycleTokens() ? { inviteToken: result.inviteToken } : {}),
+    });
   });
 
   app.post('/v1/platform/orgs/:orgId/accounts', async (req, res) => {
@@ -4117,7 +4175,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       return token;
     });
     noStore(res);
-    res.json({ ok: true, inviteToken });
+    res.json({ ok: true, ...(inviteToken && exposesLifecycleTokens() ? { inviteToken } : {}) });
   });
 
   app.put('/v1/platform/users/:userId/org-admin', async (req, res) => {
@@ -4131,17 +4189,20 @@ async function auditMutation(req: express.Request, action: string, resource: str
     const targetOrg = await getOrgById(target.org_id);
     if (!targetOrg || (targetOrg.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'user_not_found' });
     if (!(await requirePlatformStepUp(req, res, ctx, 'user:org-admin'))) return;
-    if (!flag && target.is_org_admin) {
-      const admins = (await listUsers(target.org_id)).filter((u) => u.is_org_admin && u.active !== false);
-      if (admins.length <= 1) return res.status(409).json({ error: 'last_admin', message: 'an organization needs at least one active administrator' });
+    const guarded = await setOrgAdminGuarded(target.id, flag);
+    if (!guarded.ok) {
+      if (guarded.reason === 'last_admin') {
+        await auditPlatformDenied(req, ctx.user.id, target.org_id, 'user:org-admin', 'last_admin');
+        return res.status(409).json({ error: 'last_admin', message: 'an organization needs at least one active administrator' });
+      }
+      return res.status(404).json({ error: 'user_not_found' });
     }
     const reason = typeof (req.body || {}).reason === 'string' ? String((req.body || {}).reason).slice(0, 500) : '';
     const updated = await withTransaction(async () => {
-      const u = await setOrgAdmin(target.id, flag);
       await auditPlatformAction(req, ctx.user.id, 'platform:user:org-admin', target.org_id, {
         targetUserId: target.id, oldValue: !!target.is_org_admin, newValue: flag, ...(reason ? { reason } : {}),
       });
-      return u;
+      return guarded.user;
     });
     res.json(updated ? publicUser(updated) : { ok: true });
   });
@@ -4212,14 +4273,19 @@ async function auditMutation(req: express.Request, action: string, resource: str
     // Disabling the last active organization administrator is equivalent to
     // revoking the last admin: it would leave the tenant without an operator.
     if (target.active !== false && target.is_org_admin) {
-      const admins = (await listUsers(target.org_id)).filter((u) => u.is_org_admin && u.active !== false);
-      if (admins.length <= 1) {
-        await auditPlatformDenied(req, ctx.user.id, target.org_id, 'user:disable', 'last_admin');
-        return res.status(409).json({ error: 'last_admin', message: 'an organization needs at least one active administrator' });
+      const guarded = await setUserActiveGuarded(target.id, false);
+      if (!guarded.ok) {
+        if (guarded.reason === 'last_admin') {
+          await auditPlatformDenied(req, ctx.user.id, target.org_id, 'user:disable', 'last_admin');
+          return res.status(409).json({ error: 'last_admin', message: 'an organization needs at least one active administrator' });
+        }
+        return res.status(404).json({ error: 'user_not_found' });
       }
+    } else {
+      const guarded = await setUserActiveGuarded(target.id, false);
+      if (!guarded.ok) return res.status(404).json({ error: 'user_not_found' });
     }
     const result = await withTransaction(async () => {
-      await setUserActive(target.id, false);
       const revoked = await revokeAllRefresh(target.id);
       const revokedKeys = await revokeApiKeysForUser(target.id);
       await auditPlatformAction(req, ctx.user.id, 'platform:user:disable', target.org_id, { targetUserId: target.id, revoked, revokedKeys });
@@ -4361,7 +4427,12 @@ async function auditMutation(req: express.Request, action: string, resource: str
       });
       return { admin, inviteToken };
     });
-    res.status(201).json({ ...result.admin, email: target.email, display_name: target.display_name || '', inviteToken: result.inviteToken });
+    res.status(201).json({
+      ...result.admin,
+      email: target.email,
+      display_name: target.display_name || '',
+      ...(result.inviteToken && exposesLifecycleTokens() ? { inviteToken: result.inviteToken } : {}),
+    });
   });
 
   app.delete('/v1/platform/admins/:userId', async (req, res) => {
@@ -4410,6 +4481,11 @@ async function auditMutation(req: express.Request, action: string, resource: str
   // route). It has already authorized a platform owner before minting a key or
   // requesting a per-execution delegation.
   const RUNNER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+  // System compute credentials are cross-tenant. Never mint an immortal key:
+  // default to 30 days and refuse anything beyond the rotation window.
+  const PLATFORM_RUNNER_KEY_DEFAULT_TTL_DAYS = 30;
+  const PLATFORM_RUNNER_KEY_MAX_TTL_DAYS = 90;
+  const PLATFORM_RUNNER_KEY_MAX_TTL_MS = PLATFORM_RUNNER_KEY_MAX_TTL_DAYS * 86_400_000;
 
   app.post('/internal/platform-runners/keys', async (req, res) => {
     const parsed = z.object({
@@ -4426,12 +4502,16 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!scopes) {
       return res.status(400).json({ error: 'invalid_scopes', message: 'platform runner keys may only hold workflow/queue/inference scopes' });
     }
-    let expiry: Date | null = null;
-    if (expiresAt) {
-      expiry = new Date(expiresAt);
-      if (Number.isNaN(expiry.getTime()) || expiry.getTime() <= Date.now()) {
-        return res.status(400).json({ error: 'invalid_expiry', message: 'expiresAt must be a future timestamp' });
-      }
+    const now = Date.now();
+    const expiry = expiresAt ? new Date(expiresAt) : new Date(now + PLATFORM_RUNNER_KEY_DEFAULT_TTL_DAYS * 86_400_000);
+    if (Number.isNaN(expiry.getTime()) || expiry.getTime() <= now) {
+      return res.status(400).json({ error: 'invalid_expiry', message: 'expiresAt must be a future timestamp' });
+    }
+    if (expiry.getTime() - now > PLATFORM_RUNNER_KEY_MAX_TTL_MS + 1000) {
+      return res.status(400).json({
+        error: 'expiry_too_long',
+        message: `platform runner keys must expire within ${PLATFORM_RUNNER_KEY_MAX_TTL_DAYS} days`,
+      });
     }
     const key = await createPlatformRunnerKey({
       runnerId,
@@ -4446,7 +4526,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       action: 'platform:runner-key:create',
       resource: `runner:${runnerId}`,
       decision: true,
-      context: { keyId: key.id, prefix: key.prefix, scopes, expiresAt: expiry?.toISOString() || null },
+      context: { keyId: key.id, prefix: key.prefix, scopes, expiresAt: expiry.toISOString() },
     }).catch(() => undefined);
     noStore(res);
     res.status(201).json({
@@ -4455,7 +4535,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       prefix: key.prefix,
       runnerId,
       scopes,
-      expiresAt: expiry?.toISOString() || null,
+      expiresAt: expiry.toISOString(),
     });
   });
 
@@ -4515,12 +4595,27 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!RUNNER_ID_RE.test(runnerId) || !RUNNER_ID_RE.test(executionId) || !RUNNER_ID_RE.test(instanceId)) {
       return res.status(400).json({ error: 'invalid_id' });
     }
-    // Never let a system runner acquire platform-control authority.
-    const scopes = (requested === undefined || requested === null ? ['*'] : requested)
-      .map((s) => String(s))
-      .filter((s) => !/^platform:/i.test(s));
-    if (requested !== undefined && requested !== null && scopes.length !== requested.length) {
-      return res.status(403).json({ error: 'platform_scope_forbidden' });
+    // Never let a system runner acquire platform-control authority, a wildcard
+    // tenant grant, or a data-plane family/action its graph did not declare.
+    // Workflow-service derives these scopes from the executions graph; an
+    // omitted list is a bug, not an implicit master token.
+    const EXEC_SCOPE_FAMILIES = new Set(['base', 'search', 'lds', 'faststore', 'storage', 'ocs', 'warehouse', 'stream', 'notifications', 'inference', 'queue']);
+    const EXEC_SCOPE_RE = /^([a-z][a-z0-9-]*):(read|write|\*)$/;
+    if (!Array.isArray(requested) || requested.length === 0) {
+      return res.status(400).json({ error: 'scopes_required', message: 'execution delegations must declare their data-plane scopes' });
+    }
+    const scopes: string[] = [];
+    for (const raw of requested) {
+      const scope = String(raw || '').trim();
+      if (!scope) return res.status(400).json({ error: 'invalid_scopes' });
+      if (scope === '*' || scope.startsWith('*:') || /^platform:/i.test(scope)) {
+        return res.status(403).json({ error: 'platform_scope_forbidden' });
+      }
+      const m = EXEC_SCOPE_RE.exec(scope);
+      if (!m || !EXEC_SCOPE_FAMILIES.has(m[1])) {
+        return res.status(403).json({ error: 'exec_scope_forbidden', message: `'${scope}' is not an execution data-plane scope` });
+      }
+      if (!scopes.includes(scope)) scopes.push(scope);
     }
     const user = await getUserById(userId);
     if (!user) return res.status(404).json({ error: 'user_not_found' });
@@ -4719,15 +4814,21 @@ async function auditMutation(req: express.Request, action: string, resource: str
 }
 
 if (require.main === module) {
-  ensureTables().finally(() => {
-    const app = createApp();
-    const server = app.listen(PORT, () => console.log(`[iam] listening on :${PORT} db=${useDb() ? 'postgres' : 'memory'}`));
-    const shutdown = () => {
-      console.log('[iam] shutting down...');
-      server.close(() => process.exit(0));
-      setTimeout(() => process.exit(0), 8000).unref();
-    };
-    process.on('SIGTERM', shutdown);
-    process.on('SIGINT', shutdown);
-  });
+  ensureTables()
+    .then(() => {
+      const app = createApp();
+      const server = app.listen(PORT, () => console.log(`[iam] listening on :${PORT} db=${useDb() ? 'postgres' : 'memory'}`));
+      const shutdown = () => {
+        console.log('[iam] shutting down...');
+        server.close(() => process.exit(0));
+        setTimeout(() => process.exit(0), 8000).unref();
+      };
+      process.on('SIGTERM', shutdown);
+      process.on('SIGINT', shutdown);
+    })
+    .catch((e: any) => {
+      // Never listen against a missing/half-applied schema or invalid prod config.
+      console.error('[iam][fatal] startup failed:', e?.message || e);
+      process.exit(1);
+    });
 }

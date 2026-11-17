@@ -135,8 +135,15 @@ describe('platform RBAC matrix', () => {
     assert.equal(denied.json.error, 'platform_role_required');
   });
 
-  it('operator can operate but cannot manage platform administrators', async () => {
+  it('operator can operate but cannot manage platform administrators or create tenants', async () => {
     assert.equal((await call('GET', '/v1/platform/users?limit=1', undefined, operatorToken)).status, 200);
+    const createOrg = await call('POST', '/v1/platform/orgs', {
+      slug: `operator-org-${Date.now()}`,
+      displayName: 'Operator Tenant',
+      adminEmail: 'operator-controlled@test.local',
+    }, operatorToken);
+    assert.equal(createOrg.status, 403);
+    assert.equal(createOrg.json.error, 'platform_role_required');
     const denied = await call('POST', '/v1/platform/admins', {
       email: 'rbac-new-owner@test.local',
       role: 'owner',

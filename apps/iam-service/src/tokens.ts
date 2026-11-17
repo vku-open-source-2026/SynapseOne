@@ -73,6 +73,10 @@ export interface AccessClaims {
   auth_time?: number;
   /** Credential epoch (users.auth_version) captured when the token was issued. */
   ver?: number;
+  /** Org administrator snapshot; invalidated by bumping `ver` on change. */
+  adm?: boolean;
+  /** Role slugs granted at session issue; invalidated by `ver` on changes. */
+  roles?: string[];
   /** Per-execution delegated grant (kind=exec-delegated). */
   exec?: string;
   runner?: string;
@@ -692,6 +696,11 @@ export const PLATFORM_RUNNER_DEFAULT_SCOPES = [
   'inference:*',
 ];
 
+/** Hard maximum credential age, enforced at verification too (legacy keys
+ *  minted without `expires_at` must not remain valid forever). */
+export const PLATFORM_RUNNER_KEY_MAX_AGE_DAYS = 90;
+const PLATFORM_RUNNER_KEY_MAX_AGE_MS = PLATFORM_RUNNER_KEY_MAX_AGE_DAYS * 86_400_000;
+
 /** Normalize/validate owner-supplied runner scopes. Returns null when any
  *  scope is outside the three runner families or malformed. */
 export function normalizePlatformRunnerScopes(input: unknown): string[] | null {
@@ -788,10 +797,12 @@ async function verifyPlatformRunnerKeyByHash(hash: string): Promise<VerifiedPlat
       expiresAt: platformRunnerKeys.expiresAt,
       revokedAt: platformRunnerKeys.revokedAt,
       lastUsedAt: platformRunnerKeys.lastUsedAt,
+      createdAt: platformRunnerKeys.createdAt,
     }).from(platformRunnerKeys).where(eq(platformRunnerKeys.keyHash, hash)).limit(1);
     const row = rows[0];
     if (!row || row.revokedAt) return null;
     if (row.expiresAt && new Date(row.expiresAt).getTime() < Date.now()) return null;
+    if (row.createdAt && Date.now() - new Date(row.createdAt).getTime() > PLATFORM_RUNNER_KEY_MAX_AGE_MS) return null;
     if (!row.lastUsedAt || Date.now() - new Date(row.lastUsedAt).getTime() > LAST_USED_THROTTLE_MS) {
       db.update(platformRunnerKeys).set({ lastUsedAt: sql`now()` })
         .where(and(
@@ -805,6 +816,7 @@ async function verifyPlatformRunnerKeyByHash(hash: string): Promise<VerifiedPlat
   const rec = __mem.platformRunnerKeys.get(hash);
   if (!rec || rec.revoked_at) return null;
   if (rec.expires_at && new Date(rec.expires_at).getTime() < Date.now()) return null;
+  if (rec.created_at && Date.now() - new Date(rec.created_at).getTime() > PLATFORM_RUNNER_KEY_MAX_AGE_MS) return null;
   rec.last_used_at = new Date().toISOString();
   return { id: rec.id, runner_id: rec.runner_id, name: rec.name, scopes: rec.scopes || [] };
 }

@@ -81,6 +81,10 @@ describe('platform runner credentials', () => {
     assert.equal(out.status, 201, JSON.stringify(out.json));
     assert.match(out.json.apiKey, /^synapseone_pr_/);
     assert.equal(out.json.runnerId, 'runner-platform-1');
+    // Platform runner keys are never immortal: an omitted expiry defaults to
+    // a bounded rotation window.
+    assert.equal(typeof out.json.expiresAt, 'string');
+    assert.ok(new Date(out.json.expiresAt).getTime() > Date.now());
 
     const verified = await call('POST', '/v1/keys/verify', { apiKey: out.json.apiKey }, {
       'x-synapseone-internal': INTERNAL,
@@ -109,6 +113,15 @@ describe('platform runner credentials', () => {
     }
   });
 
+  it('rejects an expiry beyond the maximum runner-key rotation window', async () => {
+    const out = await call('POST', '/internal/platform-runners/keys', {
+      runnerId: 'runner-platform-expiry',
+      expiresAt: new Date(Date.now() + 365 * 86_400_000).toISOString(),
+    }, { 'x-synapseone-internal': INTERNAL });
+    assert.equal(out.status, 400, JSON.stringify(out.json));
+    assert.equal(out.json.error, 'expiry_too_long');
+  });
+
   it('delegates one execution to the platform runner with tenant context', async () => {
     const tenantOrg = await createOrganization('tenant-delegate', 'Tenant Delegate');
     const tenantUser = await upsertUser(tenantOrg.id, 'runner-target@test.local', 'Runner Target');
@@ -117,7 +130,7 @@ describe('platform runner credentials', () => {
       runnerId: 'runner-platform-1',
       instanceId: 'connector-1',
       executionId: 'exec-123',
-      scopes: ['*'],
+      scopes: ['base:read', 'queue:write'],
     }, { 'x-synapseone-internal': INTERNAL });
     assert.equal(out.status, 200, JSON.stringify(out.json));
     assert.ok(out.json.accessToken);
@@ -133,7 +146,7 @@ describe('platform runner credentials', () => {
     assert.equal(claims.act.sub, 'platform-runner:runner-platform-1');
     assert.equal(claims.act.exec, 'exec-123');
     assert.equal(claims.act.instance, 'connector-1');
-    assert.deepEqual(claims.scopes, ['*']);
+    assert.deepEqual(claims.scopes, ['base:read', 'queue:write']);
 
     const before = await call('GET', '/v1/auth/verify', undefined, {
       Authorization: `Bearer ${out.json.accessToken}`,
@@ -162,7 +175,7 @@ describe('platform runner credentials', () => {
       runnerId: 'runner-platform-1',
       instanceId: 'connector-1',
       executionId: 'exec-expire',
-      scopes: ['*'],
+      scopes: ['base:read'],
       ttlSeconds: 1,
     }, { 'x-synapseone-internal': INTERNAL });
     assert.equal(shortLived.status, 200, JSON.stringify(shortLived.json));
@@ -174,6 +187,29 @@ describe('platform runner credentials', () => {
     });
     assert.equal(expired.status, 401, JSON.stringify(expired.json));
     assert.equal(expired.json.error, 'token_expired');
+  });
+
+  it('refuses wildcard/non-data scopes on execution delegation', async () => {
+    const tenantOrg = await createOrganization('tenant-delegate-bad', 'Tenant Delegate Bad');
+    const tenantUser = await upsertUser(tenantOrg.id, 'runner-bad@test.local', 'Runner Bad');
+    for (const [i, scopes] of [['*'], ['*:write'], ['iam:*'], ['platform:admin']].entries()) {
+      const out = await call('POST', '/internal/platform-runners/delegate', {
+        userId: tenantUser.id,
+        runnerId: 'runner-platform-1',
+        instanceId: 'connector-1',
+        executionId: `exec-bad-${i}`,
+        scopes,
+      }, { 'x-synapseone-internal': INTERNAL });
+      assert.equal(out.status, 403, `${scopes}: ${JSON.stringify(out.json)}`);
+    }
+    const missing = await call('POST', '/internal/platform-runners/delegate', {
+      userId: tenantUser.id,
+      runnerId: 'runner-platform-1',
+      instanceId: 'connector-1',
+      executionId: 'exec-no-scopes',
+    }, { 'x-synapseone-internal': INTERNAL });
+    assert.equal(missing.status, 400);
+    assert.equal(missing.json.error, 'scopes_required');
   });
 
   it('revokes a runner key through the internal control plane', async () => {

@@ -2491,6 +2491,96 @@ export function referencedCredentialIds(value: unknown): Set<string> {
   return ids;
 }
 
+/** Data-plane read operations. Everything else is treated as mutating by the
+ *  public-MCP structural allowlist (fail closed on unknown node/operation). */
+const READ_ONLY_OPERATIONS: Record<string, Set<string>> = {
+  base: new Set(['list-collections', 'get-document', 'query-documents', 'vector-search']),
+  lds: new Set(['list-datasources', 'get-entity']),
+  faststore: new Set(['get', 'hash-get']),
+  queue: new Set(['list']),
+  stream: new Set(['list-topics']),
+  warehouse: new Set(['list-datasets', 'list-jobs']),
+};
+
+/** Resolve the first-party resource/operation pair a node executes. */
+function nodeResourceOperation(node: any): { resource: string; operation: string } | null {
+  const type = normalizeNodeType(node?.type);
+  if (type === 'synapseone.api') {
+    const p = node?.parameters && typeof node.parameters === 'object' ? node.parameters : {};
+    const resource = typeof p.resource === 'string' ? p.resource.trim() : '';
+    const operation = typeof p.operation === 'string' ? p.operation.trim() : '';
+    return resource && operation ? { resource, operation } : null;
+  }
+  if (typeof type !== 'string' || !INTEGRATION_NODE_TYPES[type]) return null;
+  return resolveIntegrationCall(type, node?.parameters || {});
+}
+
+/** Concrete data-plane scopes an execution graph actually needs. Control-plane
+ *  and inference calls are never granted by a runner delegation. */
+export function executionDataPlaneScopes(definition: { nodes?: any[]; connections?: any }): string[] {
+  const scopes = new Set<string>();
+  const nodes = Array.isArray(definition?.nodes) ? definition.nodes : [];
+  for (const node of nodes) {
+    const target = nodeResourceOperation(node);
+    if (!target) continue;
+    const familyByResource: Record<string, string> = {
+      base: 'base',
+      search: 'base',
+      lds: 'lds',
+      faststore: 'faststore',
+      ocs: 'storage',
+      storage: 'storage',
+      warehouse: 'warehouse',
+      stream: 'stream',
+      notifications: 'notifications',
+      inference: 'inference',
+      queue: 'queue',
+    };
+    const family = familyByResource[target.resource];
+    if (!family) continue;
+    const read = READ_ONLY_OPERATIONS[target.resource]?.has(target.operation) || false;
+    scopes.add(`${family}:${read ? 'read' : 'write'}`);
+  }
+  return [...scopes].sort();
+}
+
+/** Structural read-only proof for a public MCP tool graph. Labels are not
+ *  enough: only side-effect-free nodes and data-plane read operations pass.
+ *  HTTP tools must be GET/HEAD and credential-free, so an anonymous caller
+ *  cannot spend tenant credentials or trigger a mutation. */
+export function isStructurallyReadOnlyDefinition(definition: { nodes?: any[]; connections?: any }): boolean {
+  const nodes = Array.isArray(definition?.nodes) ? definition.nodes : [];
+  if (!nodes.length) return false;
+  let seenTrigger = false;
+  for (const node of nodes) {
+    const type = normalizeNodeType(node?.type);
+    if (typeof type !== 'string') return false;
+    if (type === 'mcpTrigger' || type === 'n8n-nodes-base.mcpTrigger' || type === 'synapseone.mcpTrigger') {
+      seenTrigger = true;
+      continue;
+    }
+    if (isNoOpType(type) || isSetType(type) || isIfType(type) || isDecisionType(type) || isCodeType(type)) {
+      continue;
+    }
+    if (isHttpRequestType(type)) {
+      const p = node?.parameters && typeof node.parameters === 'object' ? node.parameters : {};
+      const method = String(p.method || p.httpMethod || 'GET').toUpperCase();
+      if (method !== 'GET' && method !== 'HEAD') return false;
+      if (referencedCredentialIds(node).size > 0) return false;
+      const auth = p.auth && typeof p.auth === 'object' ? p.auth : null;
+      if (auth && String(auth.mode || 'none').toLowerCase() !== 'none') return false;
+      continue;
+    }
+    const target = nodeResourceOperation(node);
+    if (!target) return false;
+    const allowed = READ_ONLY_OPERATIONS[target.resource];
+    if (!allowed || !allowed.has(target.operation)) return false;
+    // Anonymous tools must not run on the workflow owner's stored credentials.
+    if (referencedCredentialIds(node).size > 0) return false;
+  }
+  return seenTrigger;
+}
+
 export async function runWorkflow(
   definition: { nodes?: EngineNode[]; connections?: Connections; name?: string; settings?: Record<string, any> },
   input: any,

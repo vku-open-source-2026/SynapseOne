@@ -97,7 +97,7 @@ async fn health_and_metrics_are_served() {
     assert_eq!(body["status"], "ok");
     assert_eq!(body["service"], "faststore");
     assert_eq!(body["backend"], "memory");
-    assert_eq!(body["version"], "0.7.1");
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
 
     let (status, _, bytes) = call(&app, "GET", "/metrics", None, &[]).await;
     assert_eq!(status, StatusCode::OK);

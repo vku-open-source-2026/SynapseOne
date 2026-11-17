@@ -1069,11 +1069,27 @@ describe('credentials, webhook hardening, tenant, revision, metrics (P0/P2)', ()
       body: JSON.stringify({ template: 'manual-starter', name: 'plant', orgId: 'acme' }),
     });
     assert.equal(plant.status, 403);
-    // Update bumps revision.
-    const upd: any = await (await fetch(`${base}/v1/workflows/${mine.id}`, {
+    // Metadata-only updates (rename/activation) must not invalidate queued work.
+    const renamed: any = await (await fetch(`${base}/v1/workflows/${mine.id}`, {
       method: 'PUT',
       headers: P({ 'x-synapseone-user': 'u1', 'x-synapseone-org': 'acme' }),
       body: JSON.stringify({ name: 'tenant-wf-2' }),
+    })).json();
+    assert.equal(renamed.revision, 1);
+    const activated: any = await (await fetch(`${base}/v1/workflows/${mine.id}/activate`, {
+      method: 'POST', headers: P({ 'x-synapseone-user': 'u1', 'x-synapseone-org': 'acme' }), body: '{}',
+    })).json();
+    assert.equal(activated.revision, 1);
+    // A graph change is revisioned.
+    const upd: any = await (await fetch(`${base}/v1/workflows/${mine.id}`, {
+      method: 'PUT',
+      headers: P({ 'x-synapseone-user': 'u1', 'x-synapseone-org': 'acme' }),
+      body: JSON.stringify({ definition: {
+        nodes: mine.nodes.map((n: any, i: number) => i === mine.nodes.length - 1
+          ? { ...n, parameters: { ...(n.parameters || {}), revisionProbe: 2 } }
+          : n),
+        connections: mine.connections,
+      } }),
     })).json();
     assert.equal(upd.revision, 2);
     // Execute records principal + actor.

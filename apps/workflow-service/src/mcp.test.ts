@@ -36,8 +36,12 @@ describe('MCP trigger', () => {
   let base = '';
   let toolName = '';
 
+  const saved: Record<string, string | undefined> = {};
   before(async () => {
+    for (const k of ['SYNAPSEONE_INTERNAL_SECRET', 'MCP_ALLOW_ANONYMOUS']) saved[k] = process.env[k];
     process.env.SYNAPSEONE_INTERNAL_SECRET = INTERNAL;
+    // Anonymous MCP is an explicit opt-in for structurally read-only tools.
+    process.env.MCP_ALLOW_ANONYMOUS = 'true';
     __clearMem();
     const app = createApp();
     await new Promise<void>((resolve) => {
@@ -50,7 +54,10 @@ describe('MCP trigger', () => {
   });
 
   after(() => new Promise<void>((resolve) => {
-    delete process.env.SYNAPSEONE_INTERNAL_SECRET;
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
     server.close(() => resolve());
   }));
 
@@ -153,6 +160,60 @@ describe('MCP trigger', () => {
     assert.equal(authList.body.result.tools.some((t: any) => t.name === privateName), true);
     const anonCall = await rpc(base, 'tools/call', { name: privateName, arguments: {} }, anonHeaders);
     assert.ok(anonCall.body.error);
+  });
+
+  it('requires auth unless anonymous public tools are explicitly enabled', async () => {
+    const anonHeaders = { 'Content-Type': 'application/json', 'x-synapseone-internal': INTERNAL };
+    process.env.MCP_ALLOW_ANONYMOUS = 'false';
+    try {
+      const listed = await rpc(base, 'tools/list', {}, anonHeaders);
+      assert.equal(listed.body.result.tools.some((t: any) => t.name === toolName), false);
+      const called = await rpc(base, 'tools/call', { name: toolName, arguments: { path: 'x' } }, anonHeaders);
+      assert.ok(called.body.error, JSON.stringify(called.body));
+    } finally {
+      process.env.MCP_ALLOW_ANONYMOUS = 'true';
+    }
+  });
+
+  it('rejects a public tool whose graph is not structurally read-only', async () => {
+    for (const [label, extra] of [
+      ['base write', { name: 'Write doc', type: 'synapseone.base', parameters: { operation: 'create-document', input: { collection: 'c', data: {} } } }],
+      ['http post', { name: 'Post hook', type: 'httpRequest', parameters: { url: 'https://example.com/hook', method: 'POST' } }],
+      ['inference', { name: 'LLM', type: 'synapseone.inference', parameters: { operation: 'chat', input: { messages: [{ role: 'user', content: 'hi' }] } } }],
+    ] as const) {
+      const created = await fetch(`${base}/v1/workflows`, {
+        method: 'POST', headers: H,
+        body: JSON.stringify({
+          name: `mcp-public-${label.replace(/\s+/g, '-')}`,
+          definition: {
+            nodes: [
+              { name: 'MCP Trigger', type: 'mcpTrigger', parameters: { toolName: `unsafe_${label.replace(/\W+/g, '_')}_${Date.now().toString(36)}`, public: true, readOnly: true } },
+              extra,
+            ],
+            connections: { 'MCP Trigger': { main: [[{ node: (extra as any).name }]] } },
+          },
+        }),
+      });
+      const createdText = await created.text();
+      assert.equal(created.status, 400, `${label}: ${createdText}`);
+      const body: any = JSON.parse(createdText);
+      assert.match(body.message, /structurally read-only/);
+    }
+  });
+
+  it('rate-limits anonymous MCP traffic per source IP', async () => {
+    const prev = process.env.MCP_ANONYMOUS_RATE_LIMIT_PER_MIN;
+    process.env.MCP_ANONYMOUS_RATE_LIMIT_PER_MIN = '2';
+    try {
+      const headers = { 'Content-Type': 'application/json', 'x-synapseone-internal': INTERNAL, 'x-forwarded-for': '198.51.100.77' };
+      assert.equal((await rpc(base, 'tools/list', {}, headers)).status, 200);
+      assert.equal((await rpc(base, 'tools/list', {}, headers)).status, 200);
+      const limited = await rpc(base, 'tools/list', {}, headers);
+      assert.equal(limited.status, 429);
+    } finally {
+      if (prev === undefined) delete process.env.MCP_ANONYMOUS_RATE_LIMIT_PER_MIN;
+      else process.env.MCP_ANONYMOUS_RATE_LIMIT_PER_MIN = prev;
+    }
   });
 
   it('blocks a duplicate active MCP tool name', async () => {

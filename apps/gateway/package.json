@@ -1,6 +1,6 @@
 {
   "name": "@synapseone/gateway",
-  "version": "0.7.1",
+  "version": "0.9.0",
   "license": "Apache-2.0",
   "description": "synapseone API Gateway - reverse proxy with JWT/API-key auth, rate limiting, routing",
   "main": "dist/index.js",

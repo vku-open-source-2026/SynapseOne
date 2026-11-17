@@ -32,6 +32,8 @@ jobs:
       - run: npm run build --workspaces --if-present
       - run: npm run workflows:validate
       - run: npm run test --workspaces --if-present
+      # Release identity: package/Cargo/image tags must match the workspace.
+      - run: node tools/version-check.cjs
       # API catalog drift gate (console try-it + AI agent + docs/api.md).
       - run: node tools/migration-check.mjs
       - run: node tools/catalog-check.mjs

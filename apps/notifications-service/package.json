@@ -1,6 +1,6 @@
 {
   "name": "@synapseone/notifications-service",
-  "version": "0.7.1",
+  "version": "0.9.0",
   "license": "Apache-2.0",
   "description": "SynapseNotifications - tenant-scoped notification delivery with templates, preferences, retries and DLQ",
   "main": "dist/index.js",

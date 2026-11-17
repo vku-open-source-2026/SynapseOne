@@ -36,6 +36,10 @@ pub struct Principal {
     pub instance: Option<String>,
     /// `act.sub` for delegated tokens (service/runner that acted for the user).
     pub act_sub: Option<String>,
+    /// Org-administrator snapshot from the IAM session (JWT `adm`).
+    pub org_admin: bool,
+    /// Role slugs snapshot from the IAM session (JWT `roles`).
+    pub roles: Vec<String>,
 }
 
 impl Principal {
@@ -585,6 +589,8 @@ pub fn principal_from_claims(claims: &Value) -> Principal {
             .and_then(|act| act.get("sub"))
             .and_then(Value::as_str)
             .map(str::to_string),
+        org_admin: claims.get("adm") == Some(&Value::Bool(true)),
+        roles: claim_string_list(claims, "roles"),
     }
 }
 
@@ -603,6 +609,8 @@ fn principal_from_api_key(info: ApiKeyInfo) -> Principal {
         exec: None,
         instance: None,
         act_sub: None,
+        org_admin: false,
+        roles: Vec::new(),
     }
 }
 

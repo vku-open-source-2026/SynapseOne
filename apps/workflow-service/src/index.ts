@@ -15,7 +15,7 @@ import cors from 'cors';
 import morgan from 'morgan';
 import dotenv from 'dotenv';
 import { timingSafeEqual, randomUUID } from 'crypto';
-import { auditMiddleware } from './audit';
+import { auditMiddleware, auditRequest } from './audit';
 import { AsyncLocalStorage } from 'async_hooks';
 import { workflowVisibleTo, validateWorkflowAccess } from './access';
 import {
@@ -27,7 +27,9 @@ import {
   createHumanTaskRec, getHumanTaskRec, listHumanTaskRecs, transitionHumanTaskRec, toPublicHumanTask,
   claimExecutionResume, finishExecutionRec,
   claimExecutionRec, heartbeatExecutionRec, releaseExecutionRec, pauseExecutionRec,
-  queueExecutionResume,
+  queueExecutionResume, restoreExecutionPaused, savePausedExecutionRec,
+  listExpiredRunningExecutions, reclaimExpiredExecution, listOverdueHumanTasks,
+  countActiveExecutionsForTenant, activeExecutionCountsByTenant, pingDb,
   createRunnerRec, getRunnerRec, listRunnerRecs, heartbeatRunnerRec, deleteRunnerRec,
   upsertRunnerInstance, listRunnerInstances, listRunnerInstancesForRunners, deleteRunnerInstance,
   markRunnerInstancesOffline, updateRunnerRec,
@@ -54,7 +56,7 @@ import type { DockerResources } from './resource-command';
 import { startPlatformWorker, platformWorkerId } from './worker';
 import { aggregateRunnerUsage, usageBucketStart } from './runner-usage';
 import type { RunnerUsageInterval } from './runner-usage';
-import { runWorkflow, HumanTaskPause, detectCycle, workflowCronIntervalMs, workflowCronNextRunAt, validateCronParams, validateSynapseOneParams, validateIntegrationParams, validateAgentToolIds, extractEmbeddingVector, isBlockedUrl as engineIsBlockedUrl, isAllowedSelfUrl, selfAllowlist, actorFor, isWebhookType, isCronType, isTriggerType, isCodeType, isHttpRequestType, isIfType, isSetType, isNoOpType, isAiAgentType, isDecisionType, isModelType, isIntegrationType, isMcpTriggerType, normalizeNodeType, edgeTargetPort, auxiliaryEdges, HTTP_CREDENTIAL_DESTINATION_PROTECTION } from './engine';
+import { runWorkflow, HumanTaskPause, detectCycle, workflowCronIntervalMs, workflowCronNextRunAt, validateCronParams, validateSynapseOneParams, validateIntegrationParams, validateAgentToolIds, extractEmbeddingVector, isBlockedUrl as engineIsBlockedUrl, isAllowedSelfUrl, selfAllowlist, actorFor, isWebhookType, isCronType, isTriggerType, isCodeType, isHttpRequestType, isIfType, isSetType, isNoOpType, isAiAgentType, isDecisionType, isModelType, isIntegrationType, isMcpTriggerType, normalizeNodeType, edgeTargetPort, auxiliaryEdges, HTTP_CREDENTIAL_DESTINATION_PROTECTION, referencedCredentialIds, executionDataPlaneScopes, isStructurallyReadOnlyDefinition } from './engine';
 import type { CredentialResolver, RunPrincipal, SynapseOneCall, EngineNode, Connections } from './engine';
 
 /** May this credential be resolved for this run principal? (P0-4/#5)
@@ -124,13 +126,22 @@ function humanTaskScope(p: Principal | null | undefined): { orgId?: string; acco
   return null;
 }
 
-/** May this principal act on the task? Assignee-bound tasks require the
- *  assignee; unassigned tasks are open to the owning tenant (candidate roles
- *  are policy hints surfaced to the caller). */
-function canActOnHumanTask(t: { assignee?: string | null; claimed_by?: string | null }, p: Principal | null | undefined): boolean {
-  if (!p) return true;
+/** May this principal act on the task? An explicit assignee/claim wins;
+ *  otherwise the caller must hold one of the task's candidateRoles (stamped
+ *  from the verified IAM session). Unassigned, role-less tasks are denied —
+ *  they are not "open to every tenant member". */
+function canActOnHumanTask(
+  t: { assignee?: string | null; claimed_by?: string | null; candidate_roles?: string[] },
+  p: Principal | null | undefined,
+): boolean {
+  if (!p) return false;
   if (t.assignee) return t.assignee === p.sub || t.claimed_by === p.sub;
-  return true;
+  if (t.claimed_by && t.claimed_by !== p.sub) return false;
+  if (t.claimed_by === p.sub) return true;
+  const candidates = Array.isArray(t.candidate_roles) ? t.candidate_roles.filter(Boolean) : [];
+  if (!candidates.length) return false;
+  const held = new Set((p.roles || []).map((r) => String(r).toLowerCase()));
+  return candidates.some((role) => held.has(String(role).toLowerCase()));
 }
 
 /** May this execution record be read by this principal? Same tenant rules as
@@ -829,6 +840,8 @@ export const synapseoneCall: SynapseOneCall = async (resource, operation, args, 
 dotenv.config();
 const PORT = Number(process.env.PORT || 4002);
 const VERSION = (() => {
+  const injected = String(process.env.SYNAPSEONE_BUILD_VERSION || '').trim();
+  if (injected) return injected.slice(0, 128);
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     return require('../package.json').version || '0.0.0';
@@ -1080,6 +1093,16 @@ function validateDefinition(definition: any, opts: { requireTrigger?: boolean } 
           return `definition.nodes['${nm}']: minConfidence must be 0..1`;
         }
       }
+      // A human task with neither an assignee nor candidate roles can never be
+      // decided under the default-deny rule.
+      if (['humanTask', 'synapseone.humanTask'].includes(String(normalizeNodeType((n as any).type)))) {
+        const hp = params && typeof params === 'object' ? params as any : {};
+        const assignee = typeof hp.assignee === 'string' ? hp.assignee.trim() : '';
+        const roles = Array.isArray(hp.candidateRoles) ? hp.candidateRoles.filter(Boolean) : [];
+        if (!assignee && !roles.length) {
+          return `definition.nodes['${nm}']: humanTask needs assignee or candidateRoles`;
+        }
+      }
       // M8: reject schedules that would silently never fire.
       if (isCronType((n as any).type)) {
         const ce = validateCronParams(params || {});
@@ -1168,6 +1191,12 @@ function validateDefinition(definition: any, opts: { requireTrigger?: boolean } 
       }
     }
   } catch { /* ignore */ }
+  // A public MCP tool is callable without a tenant principal. `readOnly` is a
+  // label; prove it structurally before exposing it.
+  const publicTool = findMcpTrigger(definition);
+  if (publicTool?.public && !isStructurallyReadOnlyDefinition(definition)) {
+    return `MCP tool '${publicTool.toolName}' is public but its graph is not structurally read-only (only read operations, GET/HEAD HTTP and no stored credentials are allowed)`;
+  }
   // A definition without any recognized trigger can never run — reject save
   // instead of producing an "active but dead" workflow that fires nothing.
   // (test-run sandboxes run trigger-less fragments, so it opts out.)
@@ -1303,6 +1332,10 @@ export function principalFromHeaders(req: express.Request): import('./store').Pr
     const list = raw.split(',').map((s) => s.trim()).filter((s) => s && s.length <= 200);
     return list.length ? list.slice(0, 100) : undefined;
   };
+  const roles = (raw: string): string[] | undefined => {
+    const list = raw.split(',').map((s) => s.trim()).filter((s) => s && s.length <= 64);
+    return list.length ? list.slice(0, 50) : undefined;
+  };
   const kindHeader = clean(h('x-synapseone-kind'));
   const runnerHeader = clean(h('x-synapseone-runner'));
   // A platform runner key has no user/tenant. It is a system compute identity
@@ -1326,6 +1359,8 @@ export function principalFromHeaders(req: express.Request): import('./store').Pr
       account: clean(h('x-synapseone-account')),
       kind: kindHeader,
       scopes: scopes(h('x-synapseone-scopes')),
+      isOrgAdmin: h('x-synapseone-org-admin') === 'true',
+      roles: roles(h('x-synapseone-roles')),
     };
   }
   // Account-level API keys have kind=apikey + account without a user. The
@@ -1389,6 +1424,18 @@ async function enqueueExecution(args: {
   }
   const queue = queueNameForSettings(args.wf.settings, mode);
   if (!isQueueName(queue)) throw httpError(500, 'invalid_queue', `workflow runner queue '${queue}' is invalid`);
+  const tenantKey = args.principal
+    ? (args.principal.org ? `org:${args.principal.org}` : args.principal.account ? `account:${args.principal.account}` : `user:${args.principal.sub}`)
+    : '';
+  if (mode === 'system' && tenantKey) {
+    // Shared system runner capacity is a finite emergency/City resource. Cap
+    // each tenant's queued+running system work instead of letting one tenant
+    // monopolise the FIFO lane. 0 disables the cap (explicit operator choice).
+    const cap = Math.max(0, Number(process.env.WORKFLOW_SYSTEM_QUEUE_TENANT_MAX ?? 100) || 0);
+    if (cap > 0 && (await countActiveExecutionsForTenant(tenantKey)) >= cap) {
+      throw httpError(429, 'tenant_queue_quota', `tenant ${tenantKey} already has ${cap} active system-runner executions; wait for them to finish or raise WORKFLOW_SYSTEM_QUEUE_TENANT_MAX`);
+    }
+  }
 
   const settings = args.wf.settings && typeof args.wf.settings === 'object' ? args.wf.settings : {};
   const executionSettings = settings.execution && typeof settings.execution === 'object' ? settings.execution : {};
@@ -1419,7 +1466,7 @@ async function enqueueExecution(args: {
       maxAttempts: Number(executionSettings.maxAttempts) || queueMaxAttempts(),
       visibilityTimeoutSeconds: Number(executionSettings.visibilityTimeoutSeconds) || queueVisibilitySeconds(),
     });
-    await publishWorkflowRun(queue, execution.id, queuePrincipal, { delaySeconds: args.delaySeconds });
+    await publishWorkflowRun(queue, execution.id, queuePrincipal, { delaySeconds: args.delaySeconds, tenant: tenantKey });
   } catch (e: any) {
     await finishExecutionRec(execution.id, {
       status: 'error',
@@ -1434,7 +1481,7 @@ async function enqueueExecution(args: {
   return { execution, queue, mode };
 }
 
-async function publishExistingExecution(execution: StoredExecution, delaySeconds?: number): Promise<void> {
+async function publishExistingExecution(execution: StoredExecution, delaySeconds?: number, dedupeKey?: string): Promise<void> {
   if (!execution.queue_name) throw httpError(409, 'not_queued', 'execution has no runner queue');
   if (!queueTransportEnabled()) {
     throw httpError(503, 'queue_unavailable', 'workflow execution requires SynapseQueue');
@@ -1447,6 +1494,10 @@ async function publishExistingExecution(execution: StoredExecution, delaySeconds
   });
   await publishWorkflowRun(execution.queue_name, execution.id, queuePrincipal, {
     delaySeconds,
+    ...(dedupeKey ? { dedupeKey } : {}),
+    tenant: execution.principal
+      ? (execution.principal.org ? `org:${execution.principal.org}` : execution.principal.account ? `account:${execution.principal.account}` : `user:${execution.principal.sub}`)
+      : undefined,
   });
 }
 
@@ -2055,6 +2106,25 @@ function delegationTtlForLease(leaseExpiresAt: string | null | undefined): numbe
   return Math.min(300, Math.max(1, remaining));
 }
 
+/** Restrict graph-derived scopes to the caller's own credential authority.
+ *  `*` is never minted; an empty result means the execution grant cannot call
+ *  any data plane (fail closed). */
+function delegationScopesForPrincipal(principal: Principal, graphScopes: string[]): string[] {
+  const held = Array.isArray(principal.scopes) ? principal.scopes : [];
+  if (!held.length || held.includes('*')) return graphScopes;
+  const allows = (scope: string): boolean => {
+    const [family, action] = scope.split(':');
+    if (!family || !action) return false;
+    return held.some((raw) => {
+      if (raw === '*' || raw === `${family}:*` || raw === `*:${action}`) return true;
+      if (action === 'read' && raw === '*:read') return true;
+      if (action === 'write' && raw === '*:write') return true;
+      return raw === scope;
+    });
+  };
+  return graphScopes.filter(allows);
+}
+
 /** Mint the per-execution delegated user token returned to a platform runner.
  *  The runner itself never stores a user token: it gets one short-lived token
  *  for exactly the execution it claimed. */
@@ -2063,16 +2133,14 @@ async function mintExecutionDelegation(args: {
   instanceId: string;
   executionId: string;
   principal: Principal;
+  scopes: string[];
   ttlSeconds?: number;
 }): Promise<{ token: string; expiresIn: number; scopes: string[]; jti: string | null } | null> {
   if (!args.principal?.sub) return null;
+  if (!Array.isArray(args.scopes) || args.scopes.length === 0) return null;
   const secret = serviceInternalSecret();
   if (!secret) throw httpError(503, 'internal_secret_required', 'SYNAPSEONE_INTERNAL_SECRET is required for platform runner delegation');
-  const scopes = Array.isArray(args.principal.scopes) && args.principal.scopes.length
-    ? args.principal.scopes
-    : args.principal.kind === 'user' || args.principal.kind === 'delegated'
-      ? ['*']
-      : [];
+  const scopes = args.scopes;
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 5000);
   try {
@@ -2298,6 +2366,12 @@ export function createApp(): express.Express {
     }
     if (!process.env.DATABASE_URL) {
       throw new Error('[workflow] DATABASE_URL must be set in production (in-memory fallback would split-brain)');
+    }
+    if (!/^[0-9a-fA-F]{64}$/.test(String(process.env.SYNAPSEONE_CREDENTIAL_KEY || '').trim())) {
+      throw new Error('[workflow] SYNAPSEONE_CREDENTIAL_KEY must be a 32-byte hex string in production (credential nodes cannot work without it)');
+    }
+    if (!String(process.env.SYNAPSEONE_IAM_API_KEY || '').trim()) {
+      throw new Error('[workflow] SYNAPSEONE_IAM_API_KEY must be set in production (first-party IAM integration nodes need a service credential)');
     }
     const mode = String(process.env.WORKFLOW_EXECUTION_MODE || 'auto').toLowerCase();
     if (mode !== 'inline' && mode !== 'local' && mode !== 'sync' && !queueBackendConfigured()) {
@@ -2547,6 +2621,25 @@ export function createApp(): express.Express {
   // Exposes active workflows with an `mcpTrigger` node as MCP tools. Clients
   // authenticate through the gateway with a Bearer JWT or X-API-Key.
   const MCP_PROTOCOL_VERSION = '2025-06-18';
+  /** Public/anonymous MCP is opt-in and only for structurally read-only
+   *  graphs. The gateway itself requires authentication by default; this flag
+   *  exists for private deployments that intentionally expose public docs
+   *  tools. */
+  const mcpAnonymousEnabled = (): boolean => process.env.MCP_ALLOW_ANONYMOUS === 'true';
+  const mcpAnonLimit = (): number => Math.max(1, Math.min(Number(process.env.MCP_ANONYMOUS_RATE_LIMIT_PER_MIN) || 30, 10000));
+  const mcpAnonHits = new Map<string, { n: number; reset: number }>();
+  function mcpAnonymousRateLimited(req: express.Request): boolean {
+    if (!mcpAnonymousEnabled()) return false;
+    const ip = String(req.headers['x-forwarded-for'] || req.ip || 'anon').split(',')[0].trim().slice(0, 64);
+    const now = Date.now();
+    const cur = mcpAnonHits.get(ip);
+    if (!cur || cur.reset <= now) {
+      mcpAnonHits.set(ip, { n: 1, reset: now + 60_000 });
+      return false;
+    }
+    cur.n += 1;
+    return cur.n > mcpAnonLimit();
+  }
   const mcpGate = (req: express.Request, res: express.Response, next: express.NextFunction) => {
     if (!INTERNAL_SECRET) return next();
     const raw = (req.headers['x-synapseone-internal'] ?? req.headers['x-synapsedx-internal']) as string | string[] | undefined;
@@ -2566,12 +2659,16 @@ export function createApp(): express.Express {
       if (!w.active) continue;
       const tool = findMcpTrigger({ nodes: w.nodes });
       if (!tool) continue;
+      // Legacy public tools saved before structural validation must not stay
+      // callable by anonymous or cross-tenant clients.
+      if (tool.public && !isStructurallyReadOnlyDefinition({ nodes: w.nodes, connections: w.connections })) continue;
       if (w.settings?.access !== undefined && !canAccessWorkflow(w, principal)) continue;
       // Anonymous callers only see explicitly public, read-only tools. A
       // logged-in caller sees its tenant tools plus other tenants' public
       // read-only docs tools.
       if (!principal) {
-        if (!tool.public) continue;
+        if (!mcpAnonymousEnabled() || !tool.public) continue;
+        if (!isStructurallyReadOnlyDefinition({ nodes: w.nodes, connections: w.connections })) continue;
       } else if (!canAccessWorkflow(w, principal) && !tool.public) {
         continue;
       }
@@ -2598,8 +2695,10 @@ export function createApp(): express.Express {
     if (!hit) throw Object.assign(new Error(`Unknown MCP tool '${name}'`), { rpcCode: -32602 });
     const wf = hit.workflow;
     if (!wf) throw Object.assign(new Error(`Workflow for tool '${name}' not found`), { rpcCode: -32602 });
-    if (!principal && !hit.tool.public) {
-      throw Object.assign(new Error(`Tool '${name}' requires authentication`), { rpcCode: -32001 });
+    if (!principal) {
+      if (!mcpAnonymousEnabled() || !hit.tool.public || !isStructurallyReadOnlyDefinition({ nodes: wf.nodes, connections: wf.connections })) {
+        throw Object.assign(new Error(`Tool '${name}' requires authentication`), { rpcCode: -32001 });
+      }
     }
     const input = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
     const runPrincipal = principal || workflowRunPrincipal(wf);
@@ -2656,6 +2755,10 @@ export function createApp(): express.Express {
 
   app.post('/mcp', mcpGate, async (req, res) => {
     const principal = principalFromHeaders(req);
+    if (!principal && mcpAnonymousRateLimited(req)) {
+      res.setHeader('Retry-After', '60');
+      return res.status(429).json({ jsonrpc: '2.0', id: null, error: { code: -32002, message: 'anonymous MCP rate limit exceeded' } });
+    }
     const body = req.body;
     const handle = async (msg: any): Promise<any | null> => {
       const id = msg && Object.prototype.hasOwnProperty.call(msg, 'id') ? msg.id : undefined;
@@ -2755,10 +2858,9 @@ export function createApp(): express.Express {
   app.get('/health', async (_req, res) => {
     let counts: any = {};
     try {
-      const [wfs, execs] = await Promise.all([listWorkflowRecs(), listExecutionRecs({ limit: 1 })]);
+      const [wfs] = await Promise.all([listWorkflowRecs()]);
       counts = { workflows: wfs.length };
-      void execs;
-    } catch { /* health never fails on db */ }
+    } catch { /* liveness never fails on db; /ready is the dependency probe */ }
     const queueOk = await pingWorkflowQueue();
     res.json({
       status: queueOk === false ? 'degraded' : 'ok',
@@ -2768,6 +2870,26 @@ export function createApp(): express.Express {
       queue: queueOk === null ? 'inline' : queueOk ? 'ok' : 'down',
       worker: queueTransportEnabled() && String(process.env.WORKFLOW_WORKER_ENABLED || 'true').toLowerCase() !== 'false' ? 'platform' : 'off',
       selfAllowlist: selfAllowlist().length, ...counts, time: new Date().toISOString(),
+    });
+  });
+
+  app.get('/ready', async (_req, res) => {
+    const dbOk = await pingDb();
+    const credentialsOk = !IS_PROD_WF || /^[0-9a-fA-F]{64}$/.test(String(process.env.SYNAPSEONE_CREDENTIAL_KEY || '').trim());
+    const queueOk = await pingWorkflowQueue().catch(() => false);
+    const queueRequired = queueTransportEnabled() && queueBackendConfigured();
+    const ready = dbOk && credentialsOk && (!queueRequired || queueOk !== false);
+    res.status(ready ? 200 : 503).json({
+      status: ready ? 'ready' : 'degraded',
+      service: 'workflow',
+      version: VERSION,
+      critical: {
+        database: dbOk,
+        credentialKey: credentialsOk,
+        ...(queueRequired ? { queue: queueOk !== false } : {}),
+      },
+      transport: queueTransportEnabled() ? 'queue' : 'inline',
+      time: new Date().toISOString(),
     });
   });
 
@@ -4076,7 +4198,11 @@ function tenantBinding(
           maxAttempts: queueMaxAttempts(),
           visibilityTimeoutSeconds: Math.max(60, queueVisibilitySeconds()),
         });
-        await publishWorkflowRun(DEFAULT_SYSTEM_QUEUE, execution.id, null);
+        await publishWorkflowRun(DEFAULT_SYSTEM_QUEUE, execution.id, null, {
+          tenant: execution.principal
+            ? (execution.principal.org ? `org:${execution.principal.org}` : execution.principal.account ? `account:${execution.principal.account}` : `user:${execution.principal.sub}`)
+            : undefined,
+        });
       } catch (e: any) {
         await finishExecutionRec(execution.id, {
           status: 'error',
@@ -4791,11 +4917,16 @@ function tenantBinding(
         });
       }
       try {
+        const graphScopes = delegationScopesForPrincipal(
+          claimed.principal,
+          executionDataPlaneScopes({ nodes: wf.nodes, connections: wf.connections }),
+        );
         delegation = await mintExecutionDelegation({
           runnerId: ctx.runner.id,
           instanceId: ctx.instanceId || 'unknown',
           executionId: claimed.id,
           principal: claimed.principal,
+          scopes: graphScopes,
           ttlSeconds: delegationTtlForLease(claimed.lease_expires_at),
         });
       } catch (e: any) {
@@ -4849,11 +4980,24 @@ function tenantBinding(
     }
     try {
       await revokeExecutionDelegationsViaIam({ executionId: ctx.execution.id });
+      const wf = await getWorkflowRec(ctx.execution.workflow_id);
+      if (!wf) return res.status(404).json({ error: 'workflow_not_found' });
+      if (ctx.execution.workflow_revision != null && ctx.execution.workflow_revision !== wf.revision) {
+        return res.status(409).json({ error: 'workflow_revision_conflict', message: 'the execution graph changed since it was queued' });
+      }
+      const graphScopes = delegationScopesForPrincipal(
+        ctx.execution.principal,
+        executionDataPlaneScopes({ nodes: wf.nodes, connections: wf.connections }),
+      );
+      if (!graphScopes.length) {
+        return res.status(409).json({ error: 'no_data_scopes', message: 'this execution graph does not declare any data-plane operations' });
+      }
       const delegation = await mintExecutionDelegation({
         runnerId: ctx.runner.id,
         instanceId: ctx.instanceId,
         executionId: ctx.execution.id,
         principal: ctx.execution.principal,
+        scopes: graphScopes,
         ttlSeconds: delegationTtlForLease(ctx.execution.lease_expires_at),
       });
       if (!delegation) return res.status(409).json({ error: 'principal_required' });
@@ -4890,13 +5034,20 @@ function tenantBinding(
     let refreshedDelegation: { token: string; expiresIn: number; scopes: string[]; jti: string | null } | null = null;
     if (ctx.runner.scope === 'platform' && ctx.execution.principal?.sub) {
       try {
-        refreshedDelegation = await mintExecutionDelegation({
-          runnerId: ctx.runner.id,
-          instanceId: ctx.instanceId,
-          executionId: ctx.execution.id,
-          principal: ctx.execution.principal,
-          ttlSeconds: delegationTtlForLease(updated.lease_expires_at),
-        });
+        const wf = await getWorkflowRec(ctx.execution.workflow_id);
+        const graphScopes = wf
+          ? delegationScopesForPrincipal(ctx.execution.principal, executionDataPlaneScopes({ nodes: wf.nodes, connections: wf.connections }))
+          : [];
+        if (graphScopes.length) {
+          refreshedDelegation = await mintExecutionDelegation({
+            runnerId: ctx.runner.id,
+            instanceId: ctx.instanceId,
+            executionId: ctx.execution.id,
+            principal: ctx.execution.principal,
+            scopes: graphScopes,
+            ttlSeconds: delegationTtlForLease(updated.lease_expires_at),
+          });
+        }
       } catch (e: any) {
         // Keep the previous grant alive; the next heartbeat retries.
         console.warn(`[workflow] delegation refresh failed for ${ctx.execution.id}: ${String(e?.message || e).slice(0, 200)}`);
@@ -4940,7 +5091,16 @@ function tenantBinding(
       return res.status(400).json({ error: 'invalid_credential', message: 'credentialId is required' });
     }
     const rec = await getCredentialRec(credentialId);
-    if (!rec || !credentialVisibleTo(rec, ctx.execution.principal || principalFromHeaders(req))) {
+    if (!rec) return res.status(404).json({ error: 'not_found' });
+    const wf = await getWorkflowRec(ctx.execution.workflow_id);
+    if (!wf) return res.status(404).json({ error: 'workflow_not_found' });
+    // A queued execution must not resolve credentials from a newer graph.
+    if (ctx.execution.workflow_revision != null && ctx.execution.workflow_revision !== wf.revision) {
+      return res.status(409).json({ error: 'workflow_revision_conflict', message: 'the execution graph changed since it was queued' });
+    }
+    const declared = referencedCredentialIds({ nodes: wf.nodes, connections: wf.connections });
+    if (!declared.has(credentialId)) return res.status(404).json({ error: 'not_found' });
+    if (!credentialVisibleTo(rec, ctx.execution.principal || principalFromHeaders(req))) {
       return res.status(404).json({ error: 'not_found' });
     }
     let secret: string;
@@ -5188,6 +5348,8 @@ function tenantBinding(
     const b = (req.body || {}) as any;
     const title = String(b.title || '').trim();
     if (!title || title.length > 300) return res.status(400).json({ error: 'invalid_title', message: 'title is required (≤300 chars)' });
+    const assignee = b.assignee ? String(b.assignee).slice(0, 128) : null;
+    const candidateRoles = Array.isArray(b.candidateRoles) ? b.candidateRoles.map(String).slice(0, 20) : [];
     const deadline = b.deadline ? new Date(String(b.deadline)) : null;
     if (deadline && Number.isNaN(deadline.getTime())) return res.status(400).json({ error: 'invalid_deadline' });
     // A fabricated task must not become a back door for resuming another
@@ -5203,14 +5365,20 @@ function tenantBinding(
       const workflow = await getWorkflowRec(linkedWorkflowId);
       if (!workflow || !canAccessWorkflow(workflow, principal)) return res.status(404).json({ error: 'not_found' });
     }
+    if (!assignee && !candidateRoles.length) {
+      return res.status(400).json({
+        error: 'approver_required',
+        message: 'a human task needs an explicit assignee or at least one candidateRoles entry',
+      });
+    }
     const task = await createHumanTaskRec({
       execution_id: b.executionId ? String(b.executionId) : null,
       workflow_id: linkedWorkflowId,
       node_name: b.node ? String(b.node) : 'manual',
       title,
       description: String(b.description || '').slice(0, 4000),
-      assignee: b.assignee ? String(b.assignee).slice(0, 128) : null,
-      candidate_roles: Array.isArray(b.candidateRoles) ? b.candidateRoles.map(String).slice(0, 20) : [],
+      assignee,
+      candidate_roles: candidateRoles,
       decision_schema: b.decisionSchema && typeof b.decisionSchema === 'object' ? b.decisionSchema : {},
       payload: b.payload && typeof b.payload === 'object' ? b.payload : {},
       deadline: deadline ? deadline.toISOString() : null,
@@ -5281,47 +5449,64 @@ function tenantBinding(
     }
     const payload = b.decision && typeof b.decision === 'object' ? b.decision : {};
     const nextStatus = decision === 'approve' ? 'completed' : 'rejected';
+    const previousStatus = task.status === 'claimed' ? 'claimed' : 'pending';
+    // Reserve the decision before dispatching the resume. `resuming` is not a
+    // terminal state: a dispatch failure restores the task so the caller can
+    // retry, and the decision is only completed after the resume is durable.
     const updated = await transitionHumanTaskRec(task.id, ['pending', 'claimed'], {
-      status: nextStatus,
+      status: 'resuming',
       completed_by: principal.sub,
       completed_at: new Date().toISOString(),
       decision: { ...payload, approved: decision === 'approve' },
       note,
     });
     if (!updated) return res.status(409).json({ error: 'decision_conflict' });
-    let resumed = null;
+    const restoreTask = async () => {
+      await transitionHumanTaskRec(task.id, ['resuming'], {
+        status: previousStatus,
+        claimed_by: task.claimed_by,
+        claimed_at: task.claimed_at,
+        completed_by: null,
+        completed_at: null,
+        decision: null,
+        note: null,
+      }).catch(() => null);
+    };
+    const completeTask = () => transitionHumanTaskRec(task.id, ['resuming'], { status: nextStatus });
+    let resumed: any = null;
     if (updated.execution_id) {
       const exec = await getExecutionRec(updated.execution_id);
       const wf = updated.workflow_id ? await getWorkflowRec(updated.workflow_id) : null;
       if (exec && exec.status === 'paused' && wf && canAccessWorkflow(wf, exec.principal || principal)) {
-        const output = { humanTask: { id: updated.id, status: updated.status, decision: updated.decision, note: updated.note }, ...(updated.decision || {}) };
-        // Queue-mode executions resume on a worker: persist the checkpoint,
-        // put the row back to `queued`, and publish a fresh job. The queue
-        // message from the original run was already acked when it paused.
+        const output = { humanTask: { id: updated.id, status: nextStatus, decision: updated.decision, note: updated.note }, ...(updated.decision || {}) };
         if (exec.queue_name && exec.runner !== 'inline') {
           const queued = await queueExecutionResume(exec.id, { node: updated.node_name, output });
-          if (queued) {
-            try {
-              await publishExistingExecution(queued);
-              resumed = { executionId: exec.id, status: 'queued', queued: true, queue: queued.queue_name, workflowId: wf.id };
-            } catch (e: any) {
-              // Dispatch failed: put the paused checkpoint back so the user can
-              // retry the decision instead of losing the execution.
-              await finishExecutionRec(exec.id, {
-                status: 'error', output: exec.output, node_runs: exec.node_runs,
-                error: `resume dispatch failed: ${String(e?.message || e).slice(0, 500)}`,
-                finishedAt: new Date().toISOString(), allowedStatuses: ['queued'],
-              }).catch(() => null);
-              throw e;
-            }
-          } else {
-            resumed = { executionId: exec.id, status: 'already_resumed' };
+          if (!queued) {
+            await restoreTask();
+            return res.status(409).json({ error: 'already_resumed', status: 'running' });
           }
-          res.json({ task: toPublicHumanTask(updated), resumed });
-          return;
+          try {
+            await publishExistingExecution(queued);
+          } catch (e: any) {
+            // Put the execution back to paused and release the decision: a
+            // transient queue outage must not consume the approval.
+            await restoreExecutionPaused(exec.id).catch(() => null);
+            await restoreTask();
+            return res.status(503).json({
+              error: 'resume_dispatch_failed',
+              message: `the execution could not be re-queued; the decision was not consumed (${String(e?.message || e).slice(0, 300)})`,
+            });
+          }
+          const done = await completeTask();
+          resumed = { executionId: exec.id, status: 'queued', queued: true, queue: queued.queue_name, workflowId: wf.id };
+          return res.json({ task: toPublicHumanTask(done || updated), resumed });
         }
         const won = await claimExecutionResume(exec.id);
-        if (won) {
+        if (!won) {
+          await restoreTask();
+          return res.status(409).json({ error: 'already_resumed', status: 'running' });
+        }
+        try {
           const r = await runWorkflow(
             { nodes: wf.nodes as any, connections: wf.connections as any, name: wf.name, settings: wf.settings as any },
             exec.input,
@@ -5329,54 +5514,125 @@ function tenantBinding(
               triggeredBy: 'human-task', principal: exec.principal || principal,
               credentialResolver: makeCredentialResolver(exec.principal || principal), synapseoneCall,
               resumeFrom: { node: updated.node_name, output },
+              humanTask: {
+                create: async (nodeTask: any) => {
+                  const rec = await createHumanTaskRec({
+                    id: randomUUID(), execution_id: exec.id, workflow_id: wf.id, node_name: nodeTask.node,
+                    title: nodeTask.title, description: nodeTask.description, assignee: nodeTask.assignee,
+                    candidate_roles: nodeTask.candidateRoles, decision_schema: nodeTask.decisionSchema,
+                    payload: nodeTask.payload, deadline: nodeTask.deadline,
+                    org_id: exec.principal?.org || wf.org_id || null,
+                    account_id: exec.principal?.account || wf.account_id || null,
+                  });
+                  return toPublicHumanTask(rec);
+                },
+              },
             },
           );
           const finishedAt = new Date().toISOString();
           const mergedRuns = [...(exec.node_runs || []), ...(r.nodeRuns || [])];
-          const finished = await finishExecutionRec(exec.id, {
-            status: r.status === 'error' ? 'error' : 'success',
-            output: r.output, node_runs: mergedRuns as any,
-            error: (r as any).error ?? null, finishedAt,
+          if (r.status === 'paused') {
+            // A second human-task node pauses the same execution: persist the
+            // new checkpoint instead of marking the run successful.
+            await savePausedExecutionRec(exec.id, { output: r.output, node_runs: mergedRuns as any });
+            await completeTask();
+            recordRun('human-task', 'paused', r.nodeRuns);
+            resumed = {
+              executionId: exec.id, status: 'paused', paused: true, output: r.output,
+              taskId: r.pause?.task?.id, task: r.pause?.task,
+            };
+          } else if (r.status === 'error') {
+            await restoreExecutionPaused(exec.id).catch(() => null);
+            await restoreTask();
+            return res.status(503).json({
+              error: 'resume_failed',
+              message: `the execution failed to resume; the decision was not consumed (${String((r as any).error || '').slice(0, 300)})`,
+            });
+          } else {
+            const finished = await finishExecutionRec(exec.id, {
+              status: 'success', output: r.output, node_runs: mergedRuns as any,
+              error: null, finishedAt, allowedStatuses: ['running'],
+            });
+            await completeTask();
+            recordRun('human-task', r.status, r.nodeRuns);
+            resumed = { executionId: exec.id, status: r.status, output: r.output, execution: finished ? toApiExecution(finished, true) : null };
+          }
+        } catch (e: any) {
+          await restoreExecutionPaused(exec.id).catch(() => null);
+          await restoreTask();
+          return res.status(503).json({
+            error: 'resume_dispatch_failed',
+            message: `the execution could not be resumed; the decision was not consumed (${String(e?.message || e).slice(0, 300)})`,
           });
-          recordRun('human-task', r.status, r.nodeRuns);
-          resumed = { executionId: exec.id, status: r.status, output: r.output, execution: finished ? toApiExecution(finished, true) : null };
-        } else {
-          resumed = { executionId: exec.id, status: 'already_resumed' };
         }
+      } else {
+        await completeTask();
       }
+    } else {
+      await completeTask();
     }
-    res.json({ task: toPublicHumanTask(updated), resumed });
+    const fresh = await getHumanTaskRec(task.id);
+    res.json({ task: toPublicHumanTask(fresh || updated), resumed });
   }
 
   app.post('/v1/human-tasks/:id/complete', (req, res) => decideHumanTask(req, res, 'approve'));
   app.post('/v1/human-tasks/:id/reject', (req, res) => decideHumanTask(req, res, 'reject'));
 
-  app.post('/v1/human-tasks/:id/expire', async (req, res) => {
-    const principal = principalFromHeaders(req);
-    const task = await getHumanTaskRec(String(req.params.id || ''));
-    if (!task || !await canAccessHumanTask(task, principal)) return res.status(404).json({ error: 'not_found' });
+  async function expireHumanTask(task: any, force = false): Promise<{ ok: boolean; task?: any; error?: string; status?: number }> {
+    if (!task) return { ok: false, error: 'not_found', status: 404 };
     if (task.status === 'completed' || task.status === 'rejected' || task.status === 'expired' || task.status === 'cancelled') {
-      return res.status(409).json({ error: 'task_closed', status: task.status });
+      return { ok: false, error: 'task_closed', status: 409 };
     }
-    const force = (req.body || {}).force === true;
     if (!force && (!task.deadline || new Date(task.deadline).getTime() > Date.now())) {
-      return res.status(409).json({ error: 'deadline_not_reached' });
+      return { ok: false, error: 'deadline_not_reached', status: 409 };
     }
     const updated = await transitionHumanTaskRec(task.id, ['pending', 'claimed'], {
       status: 'expired', escalated_at: new Date().toISOString(),
     });
-    if (!updated) return res.status(409).json({ error: 'expire_conflict' });
-    res.json({ task: toPublicHumanTask(updated) });
+    if (!updated) return { ok: false, error: 'expire_conflict', status: 409 };
+    // A paused execution must reach a terminal state on expiry; otherwise it
+    // stays paused forever with no one able to approve it.
+    if (updated.execution_id) {
+      const exec = await getExecutionRec(updated.execution_id);
+      if (exec && exec.status === 'paused') {
+        await finishExecutionRec(exec.id, {
+          status: 'error',
+          output: exec.output,
+          node_runs: exec.node_runs,
+          error: `human task '${updated.title}' expired before a decision`,
+          finishedAt: new Date().toISOString(),
+          allowedStatuses: ['paused'],
+        }).catch(() => null);
+      }
+    }
+    return { ok: true, task: updated };
+  }
+
+  app.post('/v1/human-tasks/:id/expire', async (req, res) => {
+    const principal = principalFromHeaders(req);
+    const task = await getHumanTaskRec(String(req.params.id || ''));
+    if (!task || !await canAccessHumanTask(task, principal)) return res.status(404).json({ error: 'not_found' });
+    const result = await expireHumanTask(task, (req.body || {}).force === true);
+    if (!result.ok) return res.status(result.status || 409).json({ error: result.error });
+    res.json({ task: toPublicHumanTask(result.task) });
   });
 
   // ---------- tenant secret vault (#47) ----------
   const SECRET_NAME_RE = /^[A-Za-z][A-Za-z0-9_.-]{1,127}$/;
 
-  function secretOrg(req: any, res: any): { org: string; account: string | null; sub: string } | null {
+  function secretOrg(req: any, res: any): { org: string; account: string | null; sub: string; isOrgAdmin: boolean } | null {
     const principal = principalFromHeaders(req);
     if (!principal) { res.status(401).json({ error: 'unauthenticated' }); return null; }
     if (!principal.org) { res.status(400).json({ error: 'org_required', message: 'the caller credential has no organization claim' }); return null; }
-    return { org: principal.org, account: principal.account || null, sub: principal.sub };
+    return { org: principal.org, account: principal.account || null, sub: principal.sub, isOrgAdmin: principal.isOrgAdmin === true };
+  }
+
+  /** Secrets are tenant-sensitive: only an org administrator or the identity
+   *  that created the secret may read or mutate it. A per-secret account ACL
+   *  (account-bound secrets created by this account's owner) is represented by
+   *  `created_by`; ordinary org members get neither names nor values. */
+  function canManageSecret(scope: { sub: string; isOrgAdmin: boolean }, secret: { created_by?: string | null }): boolean {
+    return scope.isOrgAdmin || (!!secret.created_by && secret.created_by === scope.sub);
   }
 
   async function scopedSecret(req: any, res: any, scope: { org: string; account: string | null }) {
@@ -5418,8 +5674,10 @@ function tenantBinding(
     const scope = secretOrg(req, res);
     if (!scope) return;
     const rows = await listSecretRecs(scope.org, scope.account || undefined);
+    // Non-admins can enumerate only their own secrets (no cross-member names).
+    const visible = scope.isOrgAdmin ? rows : rows.filter((s) => s.created_by === scope.sub);
     res.setHeader('cache-control', 'no-store');
-    res.json({ items: rows.map(toPublicSecret), total: rows.length });
+    res.json({ items: visible.map(toPublicSecret), total: visible.length });
   });
 
   app.get('/v1/secrets/:name', async (req, res) => {
@@ -5427,6 +5685,7 @@ function tenantBinding(
     if (!scope) return;
     const secret = await scopedSecret(req, res, scope);
     if (!secret) return;
+    if (!canManageSecret(scope, secret)) return res.status(403).json({ error: 'org_admin_required', message: 'only the secret owner or an organization administrator may read this secret' });
     const versions = await listSecretVersionRecs(secret);
     res.setHeader('cache-control', 'no-store');
     res.json({ secret: toPublicSecret(secret), versions: versions.map(toPublicSecretVersion) });
@@ -5437,12 +5696,16 @@ function tenantBinding(
     if (!scope) return;
     const secret = await scopedSecret(req, res, scope);
     if (!secret) return;
+    if (!canManageSecret(scope, secret)) return res.status(403).json({ error: 'org_admin_required', message: 'only the secret owner or an organization administrator may read this secret' });
     const version = (req.body || {}).version === undefined ? undefined : Number((req.body || {}).version);
     if (version !== undefined && (!Number.isInteger(version) || version < 1)) return res.status(400).json({ error: 'invalid_version' });
     const result = await readSecretValue(secret, version);
     if ('error' in result) {
       return res.status(result.error === 'not_found' ? 404 : 410).json({ error: result.error === 'expired' ? 'version_expired' : result.error === 'revoked' ? 'version_revoked' : 'not_found' });
     }
+    // Reads are sensitive even though the route is POST; audit explicitly
+    // (the generic middleware skips `*/read` tails).
+    try { auditRequest(req, 'workflow', 'allowed'); } catch { /* audit never breaks a read */ }
     res.setHeader('cache-control', 'no-store');
     res.json({ name: secret.name, version: result.version, value: result.value });
   });
@@ -5452,6 +5715,7 @@ function tenantBinding(
     if (!scope) return;
     const secret = await scopedSecret(req, res, scope);
     if (!secret) return;
+    if (!canManageSecret(scope, secret)) return res.status(403).json({ error: 'org_admin_required', message: 'only the secret owner or an organization administrator may rotate this secret' });
     const b = (req.body || {}) as any;
     if (typeof b.value !== 'string' || b.value.length < 1 || Buffer.byteLength(b.value, 'utf8') > 65536) {
       return res.status(400).json({ error: 'invalid_value' });
@@ -5466,9 +5730,11 @@ function tenantBinding(
     if (!scope) return;
     const secret = await scopedSecret(req, res, scope);
     if (!secret) return;
+    if (!canManageSecret(scope, secret)) return res.status(403).json({ error: 'org_admin_required', message: 'only the secret owner or an organization administrator may revoke this secret' });
     const version = (req.body || {}).version === undefined ? undefined : Number((req.body || {}).version);
     if (version !== undefined && (!Number.isInteger(version) || version < 1)) return res.status(400).json({ error: 'invalid_version' });
     const revoked = await revokeSecretRec(secret, version);
+    try { auditRequest(req, 'workflow', 'allowed'); } catch { /* never break the mutation */ }
     res.json({ ok: true, revoked, version: version || 'all' });
   });
 
@@ -5477,7 +5743,9 @@ function tenantBinding(
     if (!scope) return;
     const secret = await scopedSecret(req, res, scope);
     if (!secret) return;
+    if (!canManageSecret(scope, secret)) return res.status(403).json({ error: 'org_admin_required', message: 'only the secret owner or an organization administrator may delete this secret' });
     await deleteSecretRec(secret);
+    try { auditRequest(req, 'workflow', 'allowed'); } catch { /* never break the mutation */ }
     res.json({ ok: true, name: secret.name });
   });
 
@@ -5504,6 +5772,7 @@ function tenantBinding(
 
   // ---------- /metrics (P2): Prometheus exposition ----------
   app.get('/metrics', async (_req, res) => {
+    const tenantRows = await activeExecutionCountsByTenant().catch(() => []);
     const lines = [
       '# HELP synapseone_workflow_runs_total Workflow executions by trigger and status.',
       '# TYPE synapseone_workflow_runs_total counter',
@@ -5514,6 +5783,12 @@ function tenantBinding(
       '# HELP synapseone_workflow_webhook_rejected_total Rejected inbound webhook calls by reason.',
       '# TYPE synapseone_workflow_webhook_rejected_total counter',
       ...[...metricWebhookRejected.entries()].map(([reason, v]) => `synapseone_workflow_webhook_rejected_total{reason="${reason}"} ${v}`),
+      '# HELP synapseone_workflow_active_executions Queued or running executions per tenant.',
+      '# TYPE synapseone_workflow_active_executions gauge',
+      ...tenantRows.map((row) => `synapseone_workflow_active_executions{tenant="${String(row.tenant).replace(/[\\"\n]/g, '_').slice(0, 128)}"} ${row.count}`),
+      '# HELP synapseone_workflow_system_queue_tenant_max Admission cap for shared system-runner executions (0 = unlimited).',
+      '# TYPE synapseone_workflow_system_queue_tenant_max gauge',
+      `synapseone_workflow_system_queue_tenant_max ${Math.max(0, Number(process.env.WORKFLOW_SYSTEM_QUEUE_TENANT_MAX ?? 100) || 0)}`,
     ];
     res.type('text/plain').send(`${lines.join('\n')}\n`);
   });
@@ -5591,6 +5866,12 @@ function tenantBinding(
     }
     if (err?.status === 413 || err?.type === 'entity.too.large') {
       return res.status(413).json({ error: 'payload_too_large', message: 'Request body exceeds the size limit' });
+    }
+    if (typeof err?.status === 'number' && err.status >= 400 && err.status < 500) {
+      return res.status(err.status).json({
+        error: String(err.code || 'request_rejected'),
+        message: String(err.message || 'request rejected').slice(0, 500),
+      });
     }
     res.status(500).json({ error: 'internal' });
   });
@@ -6398,6 +6679,81 @@ export function buildTemplate(name: string, workflowName?: string): any | null {
   return null;
 }
 const lastCronRun = new Map<string, number>();
+
+/** Recover executions whose runner/worker died mid-job (expired lease) and
+ *  expire human tasks whose deadline passed. The queue is at-least-once, so a
+ *  duplicate republish is harmless: claimExecutionRec is the exactly-one guard. */
+export async function reclaimWorkflowStateOnce(): Promise<{ reclaimed: number; republished: number; expiredTasks: number }> {
+  let reclaimed = 0;
+  let republished = 0;
+  let expiredTasks = 0;
+  const expired = await listExpiredRunningExecutions(200);
+  for (const exec of expired) {
+    const reclaimedExec = await reclaimExpiredExecution(exec.id).catch(() => null);
+    if (!reclaimedExec) continue;
+    reclaimed += 1;
+    if (!reclaimedExec.queue_name || reclaimedExec.runner === 'inline') {
+      await finishExecutionRec(reclaimedExec.id, {
+        status: 'error', output: reclaimedExec.output, node_runs: reclaimedExec.node_runs,
+        error: 'execution lease expired; the inline runner did not report a result',
+        finishedAt: new Date().toISOString(), allowedStatuses: ['queued'],
+      }).catch(() => null);
+      continue;
+    }
+    try {
+      await publishExistingExecution(reclaimedExec, 0, `reclaim:${reclaimedExec.id}`);
+      republished += 1;
+    } catch (e: any) {
+      console.error(`[workflow][reclaim] republish ${reclaimedExec.id} failed:`, e?.message || e);
+    }
+  }
+  // Queued rows with no consumer activity (lost publish, queue wipe) are also
+  // recoverable work. Republish after two visibility windows.
+  if (queueTransportEnabled()) {
+    const staleAfterMs = Math.max(60, queueVisibilitySeconds() * 2) * 1000;
+    const queued = await listExecutionRecs({ status: 'queued', limit: 500 }).catch(() => ({ items: [] as StoredExecution[] }));
+    for (const exec of queued.items) {
+      if (!exec.queue_name || exec.runner === 'inline') continue;
+      if (Date.now() - new Date(exec.startedAt).getTime() < staleAfterMs) continue;
+      try {
+        await publishExistingExecution(exec, 0, `stale:${exec.id}`);
+        republished += 1;
+      } catch (e: any) {
+        console.error(`[workflow][reclaim] stale queued ${exec.id} republish failed:`, e?.message || e);
+      }
+    }
+  }
+  const overdue = await listOverdueHumanTasks(200).catch(() => []);
+  for (const task of overdue) {
+    const updated = await transitionHumanTaskRec(task.id, ['pending', 'claimed'], {
+      status: 'expired', escalated_at: new Date().toISOString(),
+    }).catch(() => null);
+    if (!updated) continue;
+    expiredTasks += 1;
+    if (updated.execution_id) {
+      const exec = await getExecutionRec(updated.execution_id).catch(() => null);
+      if (exec && exec.status === 'paused') {
+        await finishExecutionRec(exec.id, {
+          status: 'error', output: exec.output, node_runs: exec.node_runs,
+          error: `human task '${updated.title}' expired before a decision`,
+          finishedAt: new Date().toISOString(), allowedStatuses: ['paused'],
+        }).catch(() => null);
+      }
+    }
+  }
+  return { reclaimed, republished, expiredTasks };
+}
+
+export function startWorkflowReclaimer(): void {
+  const everyMs = Math.max(5000, Number(process.env.WORKFLOW_RECLAIM_TICK_MS || 30000));
+  const tick = () => {
+    reclaimWorkflowStateOnce().catch((e: any) => console.error('[workflow][reclaim] tick failed:', e?.message || e));
+  };
+  setInterval(tick, everyMs).unref?.();
+  setTimeout(tick, 5000).unref?.();
+}
+
+
 function startCronLoop(): void {
   const everyMs = Math.max(10000, Number(process.env.WORKFLOW_CRON_TICK_MS || 15000));
   const tick = async () => {
@@ -6459,21 +6815,28 @@ function startCronLoop(): void {
 }
 
 if (require.main === module) {
-  ensureTables().catch(() => undefined).finally(() => {
-    const app = createApp();
-    startCronLoop();
-    const workerEnabled = queueTransportEnabled() && String(process.env.WORKFLOW_WORKER_ENABLED || 'true').toLowerCase() !== 'false';
-    const worker = workerEnabled ? startPlatformWorker({ synapseoneCall, makeCredentialResolver, recordRun }) : null;
-    const server = app.listen(PORT, () => console.log(`[workflow] listening on :${PORT} engine=local db=${useDb() ? 'postgres' : 'memory'} transport=${queueTransportEnabled() ? 'queue' : 'inline'} worker=${workerEnabled ? platformWorkerId() : 'off'}`));
-    const shutdown = () => {
-      console.log('[workflow] shutting down...');
-      worker?.stop();
-      server.close(() => process.exit(0));
-      setTimeout(() => process.exit(0), 8000).unref();
-    };
-    process.on('SIGTERM', shutdown);
-    process.on('SIGINT', shutdown);
-  });
+  ensureTables()
+    .then(() => {
+      const app = createApp();
+      startCronLoop();
+      startWorkflowReclaimer();
+      const workerEnabled = queueTransportEnabled() && String(process.env.WORKFLOW_WORKER_ENABLED || 'true').toLowerCase() !== 'false';
+      const worker = workerEnabled ? startPlatformWorker({ synapseoneCall, makeCredentialResolver, recordRun }) : null;
+      const server = app.listen(PORT, () => console.log(`[workflow] listening on :${PORT} engine=local db=${useDb() ? 'postgres' : 'memory'} transport=${queueTransportEnabled() ? 'queue' : 'inline'} worker=${workerEnabled ? platformWorkerId() : 'off'}`));
+      const shutdown = () => {
+        console.log('[workflow] shutting down...');
+        worker?.stop();
+        server.close(() => process.exit(0));
+        setTimeout(() => process.exit(0), 8000).unref();
+      };
+      process.on('SIGTERM', shutdown);
+      process.on('SIGINT', shutdown);
+    })
+    .catch((e: any) => {
+      // A failed/partial migration must never accept workflow traffic.
+      console.error('[workflow][fatal] startup failed:', e?.message || e);
+      process.exit(1);
+    });
 }
 
 // Exported for tests (start loop only under main).

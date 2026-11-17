@@ -3764,6 +3764,28 @@ async fn postgres_live_lifecycle_when_configured() {
 }
 
 #[test]
+fn migration_snapshot_foreign_key_matches_applied_0008_sql() {
+    let sql = include_str!("../drizzle/0008_base_databases.sql");
+    let snapshot: serde_json::Value =
+        serde_json::from_str(include_str!("../drizzle/meta/0008_snapshot.json"))
+            .expect("0008 snapshot is valid JSON");
+    let expected = "synapseone_base_collections_database_id_fkey";
+    assert!(
+        sql.contains(expected),
+        "0008 SQL must create the documented FK name"
+    );
+    let fks = snapshot["tables"]["public.synapseone_base_collections"]["foreignKeys"]
+        .as_object()
+        .expect("collections snapshot has foreignKeys");
+    assert!(
+        fks.contains_key(expected),
+        "snapshot records {fks:?}, SQL creates {expected}"
+    );
+    assert_eq!(fks[expected]["name"], expected);
+    assert_eq!(fks[expected]["tableTo"], "synapseone_base_databases");
+}
+
+#[test]
 fn runtime_multidb_repair_follows_the_applied_0008_timestamp() {
     let migrations = crate::store::MIGRATIONS;
     let repair = migrations

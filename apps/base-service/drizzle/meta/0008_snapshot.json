@@ -204,8 +204,8 @@
         }
       },
       "foreignKeys": {
-        "synapseone_base_collections_database_id_synapseone_base_databases_id_fk": {
-          "name": "synapseone_base_collections_database_id_synapseone_base_databases_id_fk",
+        "synapseone_base_collections_database_id_fkey": {
+          "name": "synapseone_base_collections_database_id_fkey",
           "tableFrom": "synapseone_base_collections",
           "tableTo": "synapseone_base_databases",
           "columnsFrom": [

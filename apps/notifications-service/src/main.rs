@@ -30,7 +30,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use db::{NewNotification, NotificationRecord, Store, CHANNELS};
 
-const VERSION: &str = "0.7.1";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone)]
 struct Config {
@@ -274,7 +274,11 @@ fn infer_channel(recipient: &Value) -> &'static str {
 
 async fn queue_call(state: &AppState, path: &str, body: Value) -> Result<Value, String> {
     let url = format!("{}{}", state.config.queue_url, path);
-    let mut request = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut request = client
         .post(url)
         .header("Content-Type", "application/json")
         .header("x-synapseone-tenant", "notifications-outbox")
@@ -289,15 +293,15 @@ async fn queue_call(state: &AppState, path: &str, body: Value) -> Result<Value, 
     response.json::<Value>().await.map_err(|e| e.to_string())
 }
 
-async fn publish_to_queue(state: &AppState, record: &NotificationRecord) -> bool {
+async fn publish_to_queue(state: &AppState, record: &NotificationRecord) -> Result<(), String> {
     if !state.config.use_queue {
-        return false;
+        return Err("queue disabled".into());
     }
     let path = format!(
         "/v1/queue/queues/{}/messages",
         urlencoding(&state.config.queue_name)
     );
-    let result = queue_call(
+    queue_call(
         state,
         &path,
         json!({
@@ -305,14 +309,8 @@ async fn publish_to_queue(state: &AppState, record: &NotificationRecord) -> bool
             "headers": { "notificationId": record.id },
         }),
     )
-    .await;
-    match result {
-        Ok(_) => true,
-        Err(error) => {
-            tracing::error!("[notifications] queue publish failed, falling back to local worker: {error}");
-            false
-        }
-    }
+    .await
+    .map(|_| ())
 }
 
 fn urlencoding(value: &str) -> String {
@@ -321,8 +319,8 @@ fn urlencoding(value: &str) -> String {
 
 // ---- delivery worker ----
 
-async fn process_due_once(state: &AppState, limit: i64) -> Result<(usize, usize, usize), String> {
-    let due = state.store.claim_due(limit).await?;
+async fn process_pending_once(state: &AppState, limit: i64) -> Result<(usize, usize, usize), String> {
+    let due = state.store.claim_pending(limit).await?;
     let mut delivered = 0usize;
     let mut failed = 0usize;
     for notification in &due {
@@ -429,7 +427,7 @@ async fn consume_from_queue(state: &AppState, consumer: &str) {
             .get("notificationId")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let notification = match state.store.get(tenant, id).await {
+        let notification = match state.store.claim_one(tenant, id).await {
             Ok(Some(notification)) => notification,
             _ => {
                 let _ = ack_or_nack(state, "ack", json!({ "receipt": receipt })).await;
@@ -493,6 +491,9 @@ async fn consume_from_queue(state: &AppState, consumer: &str) {
                     None,
                 )
                 .await;
+            // If the queue nack/redelivery also fails, the local outbox must
+            // still be able to retry the delivery.
+            let _ = state.store.clear_published(&notification.id).await;
             let _ = ack_or_nack(
                 state,
                 "nack",
@@ -523,8 +524,12 @@ async fn worker_loop(state: AppState) {
         interval.tick().await;
         if state.config.use_queue {
             consume_from_queue(&state, &consumer).await;
-        } else if let Err(error) = process_due_once(&state, 20).await {
-            tracing::error!("[notifications] worker error: {error}");
+        }
+        // Drain records that were persisted but not published (queue outage,
+        // queue disabled, or a publish that raced). This is the durable outbox
+        // fallback: accepted notifications are never silently dropped.
+        if let Err(error) = process_pending_once(&state, 20).await {
+            tracing::error!("[notifications] local outbox drain error: {error}");
         }
     }
 }
@@ -699,7 +704,25 @@ async fn create_notification(
         {
             Ok(record) => {
                 if state.config.use_queue {
-                    publish_to_queue(&state, &record).await;
+                    match publish_to_queue(&state, &record).await {
+                        Ok(()) => {
+                            if let Err(error) = state.store.mark_published(&record.id).await {
+                                tracing::error!(
+                                    "[notifications] published {} but could not persist publish state: {error}",
+                                    record.id
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            // Keep the row unpublished; the local worker retries
+                            // it with the normal delivery backoff. Never return
+                            // 202 without a durable retry path.
+                            tracing::error!(
+                                "[notifications] queue publish failed for {}; local outbox will retry: {error}",
+                                record.id
+                            );
+                        }
+                    }
                 }
                 created.push(record);
             }
@@ -1089,6 +1112,53 @@ mod tests {
             .unwrap();
         assert_eq!(cancelled.status, "cancelled");
         assert!(store.cancel("org:org-a", &first.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn queue_publish_failure_keeps_a_durable_local_outbox() {
+        let store = Store::connect(None).await.expect("memory store");
+        let state = AppState {
+            store: store.clone(),
+            config: Config {
+                port: 0,
+                is_prod: false,
+                internal_secret: String::new(),
+                cors_origins: vec![],
+                max_attempts: 5,
+                rate_limit: 120,
+                // Nothing listens here: publish must fail fast and leave the
+                // record unpublished for the local worker.
+                queue_url: "http://127.0.0.1:1".into(),
+                queue_name: "notifications".into(),
+                use_queue: true,
+                tick_ms: 500,
+            },
+            limiter: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let app = build_app(state.clone());
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/notifications")
+                    .header("content-type", "application/json")
+                    .header("x-synapseone-org", "org-outbox")
+                    .body(Body::from(
+                        r#"{"recipient":{"userId":"u1"},"channel":"log","body":"durable"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let listed = store.list("org:org-outbox", None, 10).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, "queued");
+        assert!(listed[0].published_at.is_none());
+        let (claimed, delivered, failed) = process_pending_once(&state, 10).await.unwrap();
+        assert_eq!((claimed, delivered, failed), (1, 1, 0));
+        let after = store.list("org:org-outbox", None, 10).await.unwrap();
+        assert_eq!(after[0].status, "delivered");
     }
 
     #[tokio::test]

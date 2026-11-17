@@ -16,6 +16,8 @@ import { setUserActive, revokeServiceAccount, setOrganizationStatus } from './db
 
 // Lifecycle tokens are opt-in; these tests assert the dev/mailer-less flow.
 process.env.IAM_EXPOSE_LIFECYCLE_TOKENS = 'true';
+// This file intentionally registers many users against one in-process server.
+process.env.IAM_AUTH_RATE_LIMIT_PER_MIN = '1000';
 
 let base = '';
 let server: Server;
@@ -73,6 +75,50 @@ describe('first-party credential lifecycle', () => {
     assert.equal(verify.data.emailVerified, true);
     const reused = await call('POST', '/v1/auth/email/verify', { token: reg.emailVerificationToken });
     assert.equal(reused.status, 400);
+  });
+
+  it('revokes user-bound API keys on password change and reset', async () => {
+    const reg = await register('cred-key-revoke', 'keyrevoke@cred.local');
+    const orgs = await call('GET', '/v1/orgs', undefined, reg.accessToken);
+    const orgId = orgs.data[0].id;
+    const acc = await call('POST', `/v1/orgs/${orgId}/accounts`, { slug: 'prod', displayName: 'Prod' }, reg.accessToken);
+    assert.equal(acc.status, 201, JSON.stringify(acc.data));
+    const mint = () => call('POST', `/v1/accounts/${acc.data.id}/keys`, {
+      name: `key-${Date.now()}`, userId: reg.user.id, scopes: ['*:read'],
+    }, reg.accessToken);
+    const first = await mint();
+    assert.equal(first.status, 201, JSON.stringify(first.data));
+    const key = first.data.apiKey || `${first.data.keyPrefix}.${first.data.secret}`;
+    assert.ok(key, JSON.stringify(first.data));
+    const valid = await call('GET', '/v1/auth/verify', undefined, undefined, { 'x-api-key': key });
+    assert.equal(valid.status, 200, JSON.stringify(valid.data));
+
+    const changed = await call('POST', '/v1/auth/password/change', {
+      currentPassword: PASSWORD, newPassword: 'another strong passphrase',
+    }, reg.accessToken);
+    assert.equal(changed.status, 200, JSON.stringify(changed.data));
+    assert.ok(changed.data.revokedApiKeys >= 1);
+    const revoked = await call('GET', '/v1/auth/verify', undefined, undefined, { 'x-api-key': key });
+    assert.equal(revoked.status, 401, JSON.stringify(revoked.data));
+
+    const login = await call('POST', '/v1/auth/login', {
+      email: 'keyrevoke@cred.local', password: 'another strong passphrase', orgSlug: 'cred-key-revoke',
+    });
+    assert.equal(login.status, 200);
+    const second = await call('POST', `/v1/accounts/${acc.data.id}/keys`, {
+      name: 'reset-key', userId: reg.user.id, scopes: ['*:read'],
+    }, login.data.accessToken);
+    assert.equal(second.status, 201, JSON.stringify(second.data));
+    const resetKey = second.data.apiKey || `${second.data.keyPrefix}.${second.data.secret}`;
+    const forgot = await call('POST', '/v1/auth/password/forgot', { email: 'keyrevoke@cred.local', orgSlug: 'cred-key-revoke' });
+    assert.ok(forgot.data.resetToken);
+    const reset = await call('POST', '/v1/auth/password/reset', {
+      token: forgot.data.resetToken, newPassword: 'third strong passphrase',
+    });
+    assert.equal(reset.status, 200, JSON.stringify(reset.data));
+    assert.ok(reset.data.revokedApiKeys >= 1);
+    const afterReset = await call('GET', '/v1/auth/verify', undefined, undefined, { 'x-api-key': resetKey });
+    assert.equal(afterReset.status, 401, JSON.stringify(afterReset.data));
   });
 
   it('rejects existing access tokens after the account is disabled', async () => {

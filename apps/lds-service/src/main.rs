@@ -39,7 +39,7 @@ use projector::{
 };
 use store::{DatasourcePatch, NewDatasource, Store, StoreError, StoredDatasource};
 
-const VERSION: &str = "0.7.1";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone)]
 struct Config {

@@ -467,8 +467,23 @@ async function main(): Promise<void> {
         return;
       }
       if (e instanceof RunnerHttpError && (e.status === 404 || e.status === 409 || e.status === 403)) {
-        await api.request('POST', `/v1/queue/queues/${encodeURIComponent(workflowQueue)}/ack`, { receipt }).catch(() => null);
-        log(`skip workflow execution=${executionId}: ${e.status}`);
+        const code = String(e.body?.error || '');
+        // Terminal outcomes: the execution is gone, finished, or the runner is
+        // structurally not allowed to touch it. ACK so the message does not
+        // loop forever.
+        const terminal = e.status === 404 || e.status === 403
+          || ['workflow_revision_conflict', 'already_finished', 'workflow_not_found', 'execution_not_found'].includes(code);
+        if (terminal) {
+          await api.request('POST', `/v1/queue/queues/${encodeURIComponent(workflowQueue)}/ack`, { receipt }).catch(() => null);
+          log(`skip workflow execution=${executionId}: ${e.status} ${code}`);
+          return;
+        }
+        // `not_claimable` while a live lease exists is recoverable: keep the
+        // message and retry after the current owner's lease should expire.
+        await api.request('POST', `/v1/queue/queues/${encodeURIComponent(workflowQueue)}/nack`, {
+          receipt, requeue: true, delaySeconds: 30, error: code || `http_${e.status}`,
+        }).catch(() => null);
+        log(`defer workflow execution=${executionId}: ${e.status} ${code}`);
         return;
       }
       errorLog(`workflow execution ${executionId} failed:`, e?.message || e);

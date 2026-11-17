@@ -1,6 +1,6 @@
 {
   "name": "@synapseone/faststore-service",
-  "version": "0.7.1",
+  "version": "0.9.0",
   "license": "Apache-2.0",
   "description": "Synapse Faststore - tenant-scoped Redis-backed cache, counters, data structures and distributed locks",
   "main": "dist/index.js",

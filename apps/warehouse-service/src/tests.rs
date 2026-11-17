@@ -157,7 +157,7 @@ async fn health_and_ready_are_public() {
     assert_eq!(body["status"], "ok");
     assert_eq!(body["service"], "warehouse");
     assert_eq!(body["engine"], "duckdb");
-    assert_eq!(body["version"], "0.9.0");
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert!(body["time"].as_str().unwrap().ends_with('Z'));
 
     let (status, body) = call(&app, "GET", "/ready", None).await;

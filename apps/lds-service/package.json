@@ -1,6 +1,6 @@
 {
   "name": "@synapseone/lds-service",
-  "version": "0.7.1",
+  "version": "0.9.0",
   "license": "Apache-2.0",
   "description": "synapseone SynapseLDS - Linked Data Service (NGSI-LD open data gateway)",
   "main": "dist/index.js",

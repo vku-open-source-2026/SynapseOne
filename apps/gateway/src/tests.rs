@@ -253,6 +253,7 @@ impl MockIam {
                 post(|| async { Json(json!({ "created": true })) }),
             )
             .route("/health", get(mock_health))
+            .route("/ready", get(mock_health))
             .fallback(|| async { (StatusCode::NOT_FOUND, Json(json!({ "error": "not_found" }))) })
             .with_state(state.clone());
         let server = spawn(router).await;
@@ -538,7 +539,7 @@ impl UpstreamState {
 
 fn test_config(iam_base: &str) -> Config {
     Config {
-        version: "0.7.1".into(),
+        version: "0.9.0".into(),
         port: 0,
         is_prod: false,
         iam_service_url: iam_base.to_string(),
@@ -547,6 +548,7 @@ fn test_config(iam_base: &str) -> Config {
         internal_secret: TEST_INTERNAL.into(),
         verify_api_key: true,
         authz_mode: AuthzMode::Off,
+        authz_audit_ack: String::new(),
         trust_proxy: TrustProxy::Disabled,
         proxy_timeout_ms: 30_000,
         inference_rate_limit_per_min: 60,
@@ -687,6 +689,16 @@ fn routes_yaml_loads_and_validates() {
     assert_eq!(
         find_route(&routes, "/webhook").unwrap().timeout_ms,
         Some(300_000)
+    );
+    // `?wait=1` workflow calls may run for the full 300 s budget.
+    assert_eq!(
+        find_route(&routes, "/v1/workflows/x/execute").unwrap().timeout_ms,
+        Some(300_000)
+    );
+    // Anonymous MCP is disabled at the edge; the gateway requires a credential.
+    assert_eq!(
+        find_route(&routes, "/mcp").unwrap().auth,
+        AuthMode::Either
     );
     for route in &routes {
         if route.auth != AuthMode::None {
@@ -940,10 +952,6 @@ fn exec_delegated_scopes_must_be_data_plane_only() {
     for scopes in [
         vec!["*".to_string()],
         vec!["*:read".to_string()],
-    ] {
-        assert!(exec_delegated_scopes_allowed(&scopes), "{scopes:?}");
-    }
-    for scopes in [
         vec![],
         vec!["iam:*".to_string()],
         vec!["workflow:*".to_string()],
@@ -1482,10 +1490,12 @@ fn trust_proxy_and_config_guards() {
         effective_jwt_secret(TEST_SECRET, true).unwrap(),
         TEST_SECRET
     );
-    assert!(validate_security_config(true, false, AuthzMode::Off, false).is_err());
-    assert!(validate_security_config(true, true, AuthzMode::Off, true).is_err());
-    assert!(validate_security_config(true, true, AuthzMode::Audit, true).is_ok());
-    assert!(validate_security_config(false, false, AuthzMode::Off, true).is_ok());
+    assert!(validate_security_config(true, false, AuthzMode::Off, false, "").is_err());
+    assert!(validate_security_config(true, true, AuthzMode::Off, true, "").is_err());
+    assert!(validate_security_config(true, true, AuthzMode::Audit, true, "").is_err());
+    assert!(validate_security_config(true, true, AuthzMode::Audit, true, "owner=security;expires=2026-12-01").is_ok());
+    assert!(validate_security_config(true, true, AuthzMode::Enforce, true, "").is_ok());
+    assert!(validate_security_config(false, false, AuthzMode::Off, true, "").is_ok());
     let mut prod = test_config("http://127.0.0.1:1");
     prod.is_prod = true;
     prod.verify_api_key = false;
@@ -3080,6 +3090,7 @@ async fn ready_probes_versions_and_reports_degraded() {
     config.ready_upstreams = vec![crate::config::ReadyUpstream {
         name: "iam".into(),
         url: iam.base.clone(),
+        required: true,
     }];
     let routes = vec![route("/v1/auth", &iam.base, AuthMode::None)];
     let gateway = spawn_gateway(config, routes).await;
@@ -3100,10 +3111,12 @@ async fn ready_probes_versions_and_reports_degraded() {
         crate::config::ReadyUpstream {
             name: "iam".into(),
             url: iam.base.clone(),
+            required: true,
         },
         crate::config::ReadyUpstream {
             name: "dead".into(),
             url: "http://127.0.0.1:1".into(),
+            required: true,
         },
     ];
     let degraded = spawn_gateway(
@@ -3120,6 +3133,35 @@ async fn ready_probes_versions_and_reports_degraded() {
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["status"], "degraded");
     assert_eq!(body["upstreams"][1]["error"], "unreachable");
+
+    // Optional upstreams are reported but do not take the gateway out of rotation.
+    let mut optional_config = test_config(&iam.base);
+    optional_config.ready_upstreams = vec![
+        crate::config::ReadyUpstream {
+            name: "iam".into(),
+            url: iam.base.clone(),
+            required: true,
+        },
+        crate::config::ReadyUpstream {
+            name: "optional".into(),
+            url: "http://127.0.0.1:1".into(),
+            required: false,
+        },
+    ];
+    let optional = spawn_gateway(
+        optional_config,
+        vec![route("/v1/auth", &iam.base, AuthMode::None)],
+    )
+    .await;
+    let response = http()
+        .get(format!("{}/ready", optional.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["optionalDegraded"], true);
 }
 
 #[tokio::test]
@@ -3437,8 +3479,8 @@ async fn exec_delegated_grants_are_data_plane_only_and_checked_every_request() {
         let body: Value = denied.json().await.unwrap();
         assert_eq!(body["error"], "execution_scope_forbidden");
     }
-    // A universal scope is accepted on data-plane only; it cannot reach the
-    // control plane (the mint should still narrow scopes).
+    // A universal scope is never accepted for an execution grant, even on a
+    // data-plane path; workflow-service must derive concrete scopes.
     let universal = sign(json!({
         "sub": "user-1", "org": "org-1", "kind": "exec-delegated",
         "scopes": ["*"], "jti": "11111111-1111-4111-8111-111111111111",
@@ -3451,14 +3493,9 @@ async fn exec_delegated_grants_are_data_plane_only_and_checked_every_request() {
         .send()
         .await
         .unwrap();
-    assert_eq!(data.status(), StatusCode::OK);
-    let control = client
-        .get(format!("{}/v1/keys", gateway.base))
-        .bearer_auth(&universal)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(control.status(), StatusCode::FORBIDDEN);
+    assert_eq!(data.status(), StatusCode::FORBIDDEN);
+    let data_body: Value = data.json().await.unwrap();
+    assert_eq!(data_body["error"], "execution_scope_forbidden");
 
     // Legacy 1-hour platform-runner delegations (kind=delegated with only
     // act.sub=platform-runner:<id>) are retired even if IAM still considers
