@@ -40,13 +40,31 @@ class EmbeddingResponse(BaseModel):
     usage: EmbeddingUsage
 
 
+class EmbeddingModelError(Exception):
+    """A real embedding model was expected but is unavailable.
+
+    Raised instead of silently serving deterministic mock vectors under
+    the real model name. The ``/v1/embeddings`` route maps this to
+    HTTP 503 so downstream consumers fail loudly.
+    """
+
+    def __init__(self, message: str, code: str = "model_degraded"):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+
 class EmbeddingEngine:
     """Self-hosted lightweight embedding service (default: sentence-transformers/all-MiniLM-L6-v2).
 
     Backend order for ``EMBEDDING_BACKEND=auto`` on CPU: ONNX Runtime int8 ->
-    PyTorch/sentence-transformers -> deterministic hash mock. ONNX avoids the
-    torch dependency, uses a ~23 MB int8 graph and is faster on CPU (measured
-    ~1.2-1.5x on AVX2, more with AVX-512 VNNI).
+    PyTorch/sentence-transformers. When no backend can be loaded, requests
+    fail closed (HTTP 503 model_degraded) instead of answering with
+    deterministic mock vectors; mock vectors are only served in the
+    explicit dev mode (``INFERENCE_MOCK_MODELS`` or
+    ``EMBEDDING_BACKEND=mock``). ONNX avoids the torch dependency, uses a
+    ~23 MB int8 graph and is faster on CPU (measured ~1.2-1.5x on AVX2,
+    more with AVX-512 VNNI).
     """
 
     def __init__(self, cfg: Optional[Settings] = None):
@@ -202,25 +220,37 @@ class EmbeddingEngine:
         model_to_report = model_override or self.model_name
         target_dim = self.dimension
 
-        vectors: List[List[float]] = []
-        prompt_tokens = 0
+        # Explicit dev mode only: deterministic mock vectors. Without this
+        # opt-in the engine fails closed rather than serving hashes under
+        # the real model name.
+        mock_mode = bool(self.cfg.INFERENCE_MOCK_MODELS) or (
+            self.cfg.EMBEDDING_BACKEND == "mock"
+        )
 
-        # Try real model if available
-        if not self._is_loaded and not self.cfg.INFERENCE_MOCK_MODELS:
+        if not self._is_loaded and not mock_mode:
             self.load_model()
 
-        if self._is_loaded and self._model is not None:
+        vectors: List[List[float]] = []
+        if mock_mode:
+            vectors = [self._generate_mock_embedding(t, target_dim) for t in texts]
+        elif self._is_loaded and self._model is not None:
             try:
                 vectors = self._encode(texts)
-            except Exception as exc:  # noqa: BLE001 - degrade, never 500
-                # Fallback to mock if runtime failure occurs
+            except Exception as exc:  # noqa: BLE001 - fail closed, never mock
                 self._load_error = str(exc)
-                logger.exception("embedding inference failed, using mock vectors")
-                vectors = [self._generate_mock_embedding(t, target_dim) for t in texts]
+                logger.exception("embedding inference failed")
+                raise EmbeddingModelError(
+                    f"embedding inference failed: {exc}"
+                ) from exc
         else:
-            vectors = [self._generate_mock_embedding(t, target_dim) for t in texts]
+            # A real model was expected but never loaded: fail closed.
+            raise EmbeddingModelError(
+                "embedding model is not available: "
+                f"{self._load_error or 'model not loaded'}"
+            )
 
         # Calculate approximate token count (~4 chars per token)
+        prompt_tokens = 0
         for t in texts:
             prompt_tokens += max(1, len(t) // 4)
 

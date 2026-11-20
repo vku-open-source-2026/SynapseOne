@@ -12,7 +12,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .config import settings
 from .decision import DecisionRequest, RouteRequest, decision_engine
-from .embedding import EmbeddingRequest, embedding_engine
+from .embedding import (
+    EmbeddingModelError,
+    EmbeddingRequest,
+    embedding_engine,
+)
 from .llm import (
     ChatCompletionRequest,
     LlmError,
@@ -224,6 +228,13 @@ async def create_embeddings(req: EmbeddingRequest):
     try:
         resp = embedding_engine.embed(inputs=req.input, model_override=req.model)
         return resp.model_dump()
+    except EmbeddingModelError as e:
+        # Fail closed: a broken real model never answers with deterministic
+        # mock vectors under the real model name (#98).
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"error": e.code, "message": e.message},
+        )
     except Exception as e:
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

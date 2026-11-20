@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from src.config import settings
 from src.decision import decision_engine
+from src.embedding import embedding_engine
 from src.main import app
 
 client = TestClient(app)
@@ -70,16 +71,24 @@ def test_internal_secret_auth():
         )
         assert res_bad_auth.status_code == 401
 
-        # /v1/* with valid header -> 200
-        res_ok = client.post(
-            "/v1/embeddings",
-            json={"input": "hello"},
-            headers={"x-synapseone-internal": "super_secret_test_123"},
-        )
-        assert res_ok.status_code == 200
+        # /v1/* with valid header passes auth. With no real model available
+        # and mock mode off, the embeddings route now fails closed (#98):
+        # 503 model_degraded, never silent mock vectors.
+        with patch.object(embedding_engine, "load_model", return_value=False), \
+                patch.object(embedding_engine, "_is_loaded", False), \
+                patch.object(embedding_engine, "_load_error", "no backend in test env"):
+            res_ok = client.post(
+                "/v1/embeddings",
+                json={"input": "hello"},
+                headers={"x-synapseone-internal": "super_secret_test_123"},
+            )
+        assert res_ok.status_code == 503
+        assert res_ok.json()["error"] == "model_degraded"
 
 
-def test_embeddings_single_and_batch():
+def test_embeddings_single_and_batch(monkeypatch):
+    # Explicit mock mode is the documented dev path for vector shape checks.
+    monkeypatch.setattr(settings, "INFERENCE_MOCK_MODELS", True)
     # 1. Single text
     res = client.post(
         "/v1/embeddings", json={"input": "Test embedding"}, headers=auth_headers()
@@ -106,6 +115,65 @@ def test_embeddings_single_and_batch():
     for idx, item in enumerate(batch_body["data"]):
         assert item["index"] == idx
         assert len(item["embedding"]) == 384
+
+
+def _force_real_model_unavailable(monkeypatch):
+    """Simulate the production failure mode: real model expected, none loadable."""
+    monkeypatch.setattr(settings, "INFERENCE_MOCK_MODELS", False)
+    monkeypatch.setattr(settings, "EMBEDDING_BACKEND", "auto")
+    monkeypatch.setattr(embedding_engine, "_is_loaded", False)
+    monkeypatch.setattr(embedding_engine, "_model", None)
+    monkeypatch.setattr(embedding_engine, "_load_error", "simulated load failure")
+    monkeypatch.setattr(embedding_engine, "load_model", lambda: False)
+
+
+def test_embeddings_fail_closed_when_model_never_loaded(monkeypatch):
+    _force_real_model_unavailable(monkeypatch)
+    res = client.post(
+        "/v1/embeddings", json={"input": "hello"}, headers=auth_headers()
+    )
+    assert res.status_code == 503
+    body = res.json()
+    assert body["error"] == "model_degraded"
+    assert "simulated load failure" in body["message"]
+    # /health reports the same degradation instead of hiding it.
+    health = client.get("/health").json()
+    assert health["components"]["embedding"]["mock_mode"] is True
+    assert health["status"] == "degraded"
+
+
+def test_embeddings_fail_closed_on_runtime_encode_failure(monkeypatch):
+    _force_real_model_unavailable(monkeypatch)
+
+    class _BrokenModel:
+        def encode(self, *args, **kwargs):
+            raise RuntimeError("onnx session exploded")
+
+    monkeypatch.setattr(embedding_engine, "_is_loaded", True)
+    monkeypatch.setattr(embedding_engine, "_backend", "torch")
+    monkeypatch.setattr(embedding_engine, "_model", _BrokenModel())
+    res = client.post(
+        "/v1/embeddings", json={"input": ["a", "b"]}, headers=auth_headers()
+    )
+    assert res.status_code == 503
+    body = res.json()
+    assert body["error"] == "model_degraded"
+    assert "embedding inference failed" in body["message"]
+
+
+def test_embeddings_explicit_mock_mode_still_serves(monkeypatch):
+    # INFERENCE_MOCK_MODELS is the documented dev opt-in: mock vectors are
+    # served, and only then.
+    monkeypatch.setattr(settings, "INFERENCE_MOCK_MODELS", True)
+    monkeypatch.setattr(embedding_engine, "_is_loaded", False)
+    res = client.post(
+        "/v1/embeddings", json={"input": "hello"}, headers=auth_headers()
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["object"] == "list"
+    assert len(body["data"]) == 1
+    assert len(body["data"][0]["embedding"]) == 384
 
 
 def test_decision_system_one():
