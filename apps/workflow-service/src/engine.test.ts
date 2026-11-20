@@ -8,7 +8,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { runWorkflow, detectCycle, cronIntervalMs, execCodeSandbox, validateCronParams, cronNextRunAt, validateSynapseOneParams, validateIntegrationParams, resolveIntegrationCall, validateAgentToolIds, isBlockedUrl, assertUrlAllowed } from './engine';
+import { runWorkflow, detectCycle, cronIntervalMs, execCodeSandbox, execAiAgentNode, validateCronParams, cronNextRunAt, validateSynapseOneParams, validateIntegrationParams, resolveIntegrationCall, validateAgentToolIds, isBlockedUrl, assertUrlAllowed } from './engine';
 
 const N = (name: string, type: string, parameters: any = {}) => ({ name, type, parameters });
 
@@ -1135,6 +1135,77 @@ describe('engine: decision fallback and agent sockets', () => {
     assert.equal(res.status, 'success');
     assert.match(res.output.agent.actions_taken[0].result.error, /not enabled/);
     assert.equal(res.output.agent.tools_used[0], 'logic_calculator');
+  });
+
+  it('fails loud on every data-plane tool when synapseoneCall is unwired (#99)', async () => {
+    // Every tool that used to fabricate a success when the caller was not
+    // wired — including the fabricated authz allow — must now fail with the
+    // same message as workflow_run instead.
+    const unwiredTools = [
+      { name: 'decision_eval', arguments: JSON.stringify({ input: 'pick one', choices: ['a', 'b'] }) },
+      { name: 'synapsebase_query', arguments: JSON.stringify({ collection: 'c' }) },
+      { name: 'synapsebase_vector_search', arguments: JSON.stringify({ query: 'q' }) },
+      { name: 'faststore_cache', arguments: JSON.stringify({ key: 'k' }) },
+      { name: 'queue_publish', arguments: JSON.stringify({ queue: 'q' }) },
+      { name: 'iam_check_permission', arguments: JSON.stringify({ userId: 'u1', action: 'read', resource: 'r' }) },
+      { name: 'workflow_list', arguments: JSON.stringify({}) },
+      { name: 'lds_publish', arguments: JSON.stringify({}) },
+      { name: 'workflow_run', arguments: JSON.stringify({ id: 'wf-1' }) },
+    ];
+    let llmTurn = 0;
+    const orig = globalThis.fetch;
+    (globalThis as any).fetch = async () => {
+      llmTurn += 1;
+      if (llmTurn === 1) {
+        return {
+          status: 200,
+          ok: true,
+          json: async () => ({
+            choices: [{
+              message: {
+                role: 'assistant',
+                tool_calls: unwiredTools.map((tool, index) => ({
+                  id: `call_${index + 1}`,
+                  type: 'function',
+                  function: tool,
+                })),
+              },
+            }],
+          }),
+        } as any;
+      }
+      return {
+        status: 200,
+        ok: true,
+        json: async () => ({
+          choices: [{ message: { role: 'assistant', content: 'done after tool errors' } }],
+        }),
+      } as any;
+    };
+    try {
+      const out: any = await execAiAgentNode(
+        N('Agent', 'synapseflow.aiAgent', {
+          core: 'synapse-inference',
+          baseUrl: 'https://llm-mock.example.com',
+          userPrompt: 'drive every unwired tool',
+          tools: unwiredTools.map((tool) => tool.name),
+          maxSteps: 4,
+        }),
+        {},
+        // Deliberately unwired: no synapseoneCall on the ctx.
+        undefined,
+      );
+      assert.equal(out.agent.tools_used.length, unwiredTools.length);
+      for (const action of out.agent.actions_taken) {
+        assert.deepEqual(
+          action.result,
+          { error: 'workflow execution is not wired' },
+          `tool ${action.tool} fabricated a result instead of failing loud`,
+        );
+      }
+    } finally {
+      (globalThis as any).fetch = orig;
+    }
   });
 });
 

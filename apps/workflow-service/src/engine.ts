@@ -1873,19 +1873,17 @@ export async function execAiAgentNode(
           for (const [k, v] of Object.entries(toolArgs.choices)) choicesMap[k] = String(v);
         }
         if (!Object.keys(choicesMap).length) return { error: 'choices are required' };
-        if (ctx?.synapseoneCall) {
-          return await ctx.synapseoneCall(
-            'inference',
-            'route',
-            { input: String(toolArgs.input ?? ''), choices: choicesMap, instruction: toolArgs.instruction },
-            ctx.principal,
-          );
-        }
-        return { best_choice: Object.keys(choicesMap)[0], confidence: 0.9, probabilities: {} };
+        if (!ctx?.synapseoneCall) throw new Error('workflow execution is not wired');
+        return await ctx.synapseoneCall(
+          'inference',
+          'route',
+          { input: String(toolArgs.input ?? ''), choices: choicesMap, instruction: toolArgs.instruction },
+          ctx.principal,
+        );
       }
       case 'synapsebase_query': {
         const action = String(toolArgs.action || 'query');
-        if (!ctx?.synapseoneCall) return action === 'query' ? { items: [], total: 0 } : { ok: true };
+        if (!ctx?.synapseoneCall) throw new Error('workflow execution is not wired');
         if (action === 'get') {
           return await ctx.synapseoneCall('base', 'get-document', { collection: toolArgs.collection, id: toolArgs.id }, ctx.principal);
         }
@@ -1942,7 +1940,7 @@ export async function execAiAgentNode(
         );
       }
       case 'synapsebase_vector_search': {
-        if (!ctx?.synapseoneCall) return { items: [], total: 0 };
+        if (!ctx?.synapseoneCall) throw new Error('workflow execution is not wired');
         let vec = toolArgs.vector ?? toolArgs.embedding;
         const q = toolArgs.query ?? toolArgs.text ?? toolArgs.input ?? toolArgs.prompt;
         if ((!Array.isArray(vec) || !vec.length) && q && ctx?.synapseoneCall) {
@@ -1973,7 +1971,7 @@ export async function execAiAgentNode(
       }
       case 'faststore_cache': {
         const action = String(toolArgs.action || (toolArgs.value !== undefined ? 'set' : 'get'));
-        if (!ctx?.synapseoneCall) return action === 'get' ? { key: toolArgs.key, value: null } : { ok: true };
+        if (!ctx?.synapseoneCall) throw new Error('workflow execution is not wired');
         if (action === 'set') {
           return await ctx.synapseoneCall(
             'faststore',
@@ -1998,7 +1996,7 @@ export async function execAiAgentNode(
       }
       case 'queue_publish': {
         const action = String(toolArgs.action || 'publish');
-        if (!ctx?.synapseoneCall) return { ok: true, id: 'mock-msg' };
+        if (!ctx?.synapseoneCall) throw new Error('workflow execution is not wired');
         if (action === 'list') return await ctx.synapseoneCall('queue', 'list', {}, ctx.principal);
         if (action === 'consume') {
           return await ctx.synapseoneCall(
@@ -2019,15 +2017,13 @@ export async function execAiAgentNode(
         );
       }
       case 'iam_check_permission': {
-        if (ctx?.synapseoneCall) {
-          return await ctx.synapseoneCall(
-            'authorize',
-            'check',
-            { userId: toolArgs.userId, action: toolArgs.action, resource: toolArgs.resource, scope: toolArgs.scope },
-            ctx.principal,
-          );
-        }
-        return { allowed: true };
+        if (!ctx?.synapseoneCall) throw new Error('workflow execution is not wired');
+        return await ctx.synapseoneCall(
+          'authorize',
+          'check',
+          { userId: toolArgs.userId, action: toolArgs.action, resource: toolArgs.resource, scope: toolArgs.scope },
+          ctx.principal,
+        );
       }
       case 'workflow_run': {
         if (!ctx?.synapseoneCall) throw new Error('workflow execution is not wired');
@@ -2048,12 +2044,12 @@ export async function execAiAgentNode(
         );
       }
       case 'workflow_list': {
-        if (!ctx?.synapseoneCall) return [];
+        if (!ctx?.synapseoneCall) throw new Error('workflow execution is not wired');
         return await ctx.synapseoneCall('workflows', 'list', {}, ctx.principal);
       }
       case 'lds_publish': {
         const action = String(toolArgs.action || (toolArgs.record ? 'publish-record' : 'list-datasources'));
-        if (!ctx?.synapseoneCall) return action === 'list-datasources' ? [] : { ok: true };
+        if (!ctx?.synapseoneCall) throw new Error('workflow execution is not wired');
         if (action === 'publish-record') {
           return await ctx.synapseoneCall(
             'lds',
