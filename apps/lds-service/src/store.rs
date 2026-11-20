@@ -658,8 +658,6 @@ impl Store {
         &self,
         datasource_id: &str,
     ) -> Result<(i64, Option<String>), StoreError> {
-        let attributes = self.get_attributes(datasource_id).await?;
-        let _ = attributes;
         match &self.backend {
             Backend::Postgres(pool) => {
                 let row = sqlx::query(

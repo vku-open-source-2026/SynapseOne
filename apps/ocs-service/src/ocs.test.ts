@@ -8,7 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import type { Server } from 'node:http';
 import { createApp } from './index';
-import { createBackend } from './backend';
+import { createBackend, checksumHex, tenantSegment } from './backend';
 
 let server: Server;
 let base = '';
@@ -208,6 +208,28 @@ test('multipart complete enforces the bucket quota and aborts the upload', async
   });
   assert.equal(completed.status, 201, JSON.stringify(completed.json));
   assert.equal(completed.json.object.size, 512);
+});
+
+test('corrupt object metadata is a backend error, not a 404 masquerade', async () => {
+  await request('POST', '/v1/ocs/buckets', { name: 'media' });
+  // Plant a corrupt metadata file for @ocs/media/broken.txt exactly where
+  // the fs backend stores it.
+  const internal = '@ocs/media/broken.txt';
+  const metaPath = path.join(
+    root, 'meta', tenantSegment('org:org-a'), `${checksumHex(Buffer.from(internal))}.json`,
+  );
+  fs.mkdirSync(path.dirname(metaPath), { recursive: true });
+  fs.writeFileSync(metaPath, '{not valid json');
+
+  const head = await request('HEAD', '/v1/ocs/buckets/media/objects/broken.txt');
+  assert.equal(head.status, 502);
+  const get = await request('GET', '/v1/ocs/buckets/media/objects/broken.txt');
+  assert.equal(get.status, 502, JSON.stringify(get.json));
+  assert.equal(get.json.error, 'backend_error');
+  assert.match(String(get.json.message), /corrupt metadata/);
+  // A genuinely absent object still reads as a clean 404.
+  const missing = await request('GET', '/v1/ocs/buckets/media/objects/never-written.txt');
+  assert.equal(missing.status, 404);
 });
 
 test('legacy storage remains the default bucket and reserved keys are rejected', async () => {

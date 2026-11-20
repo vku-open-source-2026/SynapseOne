@@ -881,8 +881,8 @@ async fn patch_datasource(
             Some("anonymous callers may only read public exports".into()),
         );
     }
-    let current = match state.store.get_datasource(&id).await {
-        Ok(Some(datasource)) if can_access(&datasource, &caller) => datasource,
+    match state.store.get_datasource(&id).await {
+        Ok(Some(datasource)) if can_access(&datasource, &caller) => {}
         Ok(_) => {
             return json_error(
                 StatusCode::NOT_FOUND,
@@ -891,7 +891,7 @@ async fn patch_datasource(
             )
         }
         Err(error) => return internal_error(error),
-    };
+    }
     let Ok(body) = serde_json::from_slice::<Value>(&body) else {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -1021,7 +1021,6 @@ async fn patch_datasource(
             Some("no updatable fields provided".into()),
         );
     }
-    let _ = current;
     match state.store.update_datasource(&id, patch).await {
         Ok(Some(updated)) => Json(to_api_datasource(&updated)).into_response(),
         Ok(None) => json_error(

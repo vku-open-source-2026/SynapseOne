@@ -24,8 +24,7 @@ Authentik/Keycloak are optional external OIDC IdPs.
 | Full API reference | `docs/api.md` |
 
 Skip: `node_modules/`, `apps/*/dist/`, `.pytest_cache/`, `.ruff_cache/`,
-`apps/tunnel-service/dist/` (stale build output, no source), and `.notes/`
-(local credentials — never print, copy, or commit).
+and `.notes/` (local credentials — never print, copy, or commit).
 
 ## Stack
 

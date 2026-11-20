@@ -87,18 +87,27 @@ class FileBackend implements Backend {
     await fsp.mkdir(path.dirname(p), { recursive: true });
     await fsp.writeFile(p, JSON.stringify(meta));
   }
+  /** Read object metadata. Only a missing meta file (ENOENT) means "no such
+   *  object"; other read errors (EACCES, …) and corrupt JSON propagate as
+   *  backend errors instead of masquerading as a 404 (#100). */
   private async readMeta(tenant: string, key: string): Promise<ObjectMeta | null> {
+    let raw: string;
     try {
-      return JSON.parse(await fsp.readFile(this.metaPath(tenant, key), 'utf8')) as ObjectMeta;
-    } catch {
-      return null;
+      raw = await fsp.readFile(this.metaPath(tenant, key), 'utf8');
+    } catch (error: any) {
+      if (error?.code === 'ENOENT') return null;
+      throw new Error(`read metadata for object '${key}': ${error?.message || error}`);
+    }
+    try {
+      return JSON.parse(raw) as ObjectMeta;
+    } catch (error: any) {
+      throw new Error(`corrupt metadata for object '${key}': ${error?.message || error}`);
     }
   }
 
   async put(tenant: string, key: string, body: Buffer, contentType: string, checksumSha256?: string): Promise<ObjectMeta> {
     const p = this.objPath(tenant, key);
     await fsp.mkdir(path.dirname(p), { recursive: true });
-    await fsp.writeFile(p, body);
     const now = new Date().toISOString();
     const prev = await this.readMeta(tenant, key);
     const meta: ObjectMeta = {
@@ -110,7 +119,11 @@ class FileBackend implements Backend {
       createdAt: prev?.createdAt || now,
       updatedAt: now,
     };
+    // Metadata first: a crash mid-put can leave a stale or orphaned meta
+    // entry (self-healing on the next put of the same key), never a body
+    // that no metadata points at (#100).
     await this.writeMeta(meta, tenant);
+    await fsp.writeFile(p, body);
     return meta;
   }
 

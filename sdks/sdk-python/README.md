@@ -123,8 +123,12 @@ warnings. `c.call(method, path, body)` remains the generic escape hatch.
 ## Tests
 
 ```bash
-python -m pytest synapseone_sdk -q
+python -m pytest tests -q
 ```
+
+The offline test harness lives in `tests/` (stdlib echo servers, no
+platform needed) and is not shipped in the wheel — only the `synapseone_sdk`
+and `synapsedx_sdk` packages are packaged.
 
 ## Full documentation
 

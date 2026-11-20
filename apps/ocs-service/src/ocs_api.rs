@@ -1747,4 +1747,66 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
     }
+
+    #[tokio::test]
+    async fn corrupt_object_metadata_is_a_backend_error_not_a_missing_object() {
+        // A filesystem or corruption problem must surface as 502
+        // backend_error, not masquerade as a clean 404 (#100).
+        let (app, backend, _dir) = quota_app(1024 * 1024);
+        let Backend::Fs(fs) = &backend else {
+            unreachable!("quota_app builds the fs backend");
+        };
+        let meta_path = fs
+            .root()
+            .join("meta")
+            .join(crate::backend::tenant_segment("org:org-qa"))
+            .join(format!("{}.json", checksum_hex(b"corrupt.bin")));
+        tokio::fs::create_dir_all(meta_path.parent().unwrap())
+            .await
+            .expect("meta dir");
+        tokio::fs::write(&meta_path, b"{not valid json")
+            .await
+            .expect("corrupt meta");
+
+        let (status, _) = call(
+            &app,
+            "HEAD",
+            "/v1/ocs/buckets/default/objects/corrupt.bin",
+            Vec::new(),
+            "application/octet-stream",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let (status, body) = call(
+            &app,
+            "GET",
+            "/v1/ocs/buckets/default/objects/corrupt.bin",
+            Vec::new(),
+            "application/octet-stream",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"], "backend_error");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("corrupt metadata")),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_object_metadata_still_reads_as_not_found() {
+        // Only a genuinely absent object answers 404.
+        let (app, _backend, _dir) = quota_app(1024 * 1024);
+        let (status, body) = call(
+            &app,
+            "GET",
+            "/v1/ocs/buckets/default/objects/never-written.bin",
+            Vec::new(),
+            "application/octet-stream",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
 }

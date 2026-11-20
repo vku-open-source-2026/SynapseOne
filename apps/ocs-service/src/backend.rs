@@ -165,9 +165,22 @@ impl FileBackend {
             .map_err(|error| error.to_string())
     }
 
-    async fn read_meta(&self, tenant: &str, key: &str) -> Option<ObjectMeta> {
-        let body = tokio::fs::read(self.meta_path(tenant, key)).await.ok()?;
-        serde_json::from_slice(&body).ok()
+    /// Read object metadata. Only a missing meta file (ENOENT) means "no
+    /// such object"; any other read error (EACCES, …) or corrupt JSON
+    /// propagates as a backend error instead of masquerading as a 404
+    /// (#100).
+    async fn read_meta(&self, tenant: &str, key: &str) -> Result<Option<ObjectMeta>, String> {
+        let path = self.meta_path(tenant, key);
+        let body = match tokio::fs::read(&path).await {
+            Ok(body) => body,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!("read metadata for object '{key}': {error}"));
+            }
+        };
+        serde_json::from_slice(&body)
+            .map(Some)
+            .map_err(|error| format!("corrupt metadata for object '{key}': {error}"))
     }
 
     pub async fn put(
@@ -186,11 +199,8 @@ impl FileBackend {
                 .await
                 .map_err(|error| error.to_string())?;
         }
-        tokio::fs::write(&path, body)
-            .await
-            .map_err(|error| error.to_string())?;
         let now = now_iso();
-        let previous = self.read_meta(tenant, key).await;
+        let previous = self.read_meta(tenant, key).await?;
         let meta = ObjectMeta {
             key: key.to_string(),
             size: body.len() as u64,
@@ -203,33 +213,47 @@ impl FileBackend {
                 .unwrap_or_else(|| now.clone()),
             updated_at: now,
         };
+        // Metadata first: a crash mid-put can leave a stale or orphaned
+        // meta entry (self-healing on the next put of the same key), never
+        // a body that no metadata points at (#100).
         self.write_meta(tenant, &meta).await?;
+        tokio::fs::write(&path, body)
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(meta)
     }
 
-    pub async fn get(&self, tenant: &str, key: &str) -> Option<ObjectBody> {
-        let meta = self.read_meta(tenant, key).await?;
-        let path = self.object_path(tenant, key)?;
-        let body = tokio::fs::read(path).await.ok()?;
-        Some(ObjectBody {
+    pub async fn get(&self, tenant: &str, key: &str) -> Result<Option<ObjectBody>, String> {
+        let Some(meta) = self.read_meta(tenant, key).await? else {
+            return Ok(None);
+        };
+        let path = self
+            .object_path(tenant, key)
+            .ok_or_else(|| "invalid object key".to_string())?;
+        let body = match tokio::fs::read(path).await {
+            Ok(body) => body,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("read object '{key}': {error}")),
+        };
+        Ok(Some(ObjectBody {
             meta,
             body: Bytes::from(body),
-        })
+        }))
     }
 
-    pub async fn head(&self, tenant: &str, key: &str) -> Option<ObjectMeta> {
+    pub async fn head(&self, tenant: &str, key: &str) -> Result<Option<ObjectMeta>, String> {
         self.read_meta(tenant, key).await
     }
 
-    pub async fn delete(&self, tenant: &str, key: &str) -> bool {
-        if self.read_meta(tenant, key).await.is_none() {
-            return false;
+    pub async fn delete(&self, tenant: &str, key: &str) -> Result<bool, String> {
+        if self.read_meta(tenant, key).await?.is_none() {
+            return Ok(false);
         }
         if let Some(path) = self.object_path(tenant, key) {
             let _ = tokio::fs::remove_file(path).await;
         }
         let _ = tokio::fs::remove_file(self.meta_path(tenant, key)).await;
-        true
+        Ok(true)
     }
 
     pub async fn list(
@@ -701,21 +725,21 @@ impl Backend {
 
     pub async fn get(&self, tenant: &str, key: &str) -> Result<Option<ObjectBody>, String> {
         match self {
-            Self::Fs(backend) => Ok(backend.get(tenant, key).await),
+            Self::Fs(backend) => backend.get(tenant, key).await,
             Self::S3(backend) => backend.get(tenant, key).await,
         }
     }
 
     pub async fn head(&self, tenant: &str, key: &str) -> Result<Option<ObjectMeta>, String> {
         match self {
-            Self::Fs(backend) => Ok(backend.head(tenant, key).await),
+            Self::Fs(backend) => backend.head(tenant, key).await,
             Self::S3(backend) => backend.head(tenant, key).await,
         }
     }
 
     pub async fn delete(&self, tenant: &str, key: &str) -> Result<bool, String> {
         match self {
-            Self::Fs(backend) => Ok(backend.delete(tenant, key).await),
+            Self::Fs(backend) => backend.delete(tenant, key).await,
             Self::S3(backend) => backend.delete(tenant, key).await,
         }
     }
