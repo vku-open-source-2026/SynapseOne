@@ -386,6 +386,44 @@ impl FileBackend {
         }
         Ok(())
     }
+
+    /// Sizes of the uploaded parts of a multipart upload (the part files on
+    /// disk), so the final object size can be checked against the
+    /// tenant/bucket quotas before assembling.
+    pub async fn part_sizes(
+        &self,
+        tenant: &str,
+        upload_id: &str,
+    ) -> Result<Vec<(u64, u64)>, String> {
+        let dir = self
+            .upload_dir(tenant, upload_id)
+            .ok_or_else(|| "invalid upload id".to_string())?;
+        let mut entries = tokio::fs::read_dir(&dir)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut parts = Vec::new();
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(number) = name
+                .strip_suffix(".part")
+                .and_then(|raw| raw.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let size = entry
+                .metadata()
+                .await
+                .map_err(|error| error.to_string())?
+                .len();
+            parts.push((number, size));
+        }
+        parts.sort_by_key(|(number, _)| *number);
+        Ok(parts)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -574,6 +612,35 @@ impl S3Backend {
             .abort_multipart(&Self::full(tenant, key), upload_id)
             .await
     }
+
+    /// Sizes of the uploaded parts of a multipart upload via ListParts, so
+    /// the final object size can be checked against the tenant/bucket
+    /// quotas before assembling.
+    pub async fn part_sizes(
+        &self,
+        tenant: &str,
+        upload_id: &str,
+        key: &str,
+    ) -> Result<Vec<(u64, u64)>, String> {
+        let mut all = Vec::new();
+        let mut marker: Option<u64> = None;
+        // 1000 parts per page with at most 10k parts per upload → 12 pages
+        // is a hard safety ceiling; a server that never stops paginating
+        // fails closed instead of returning a partial (undercounted) list.
+        for _ in 0..12 {
+            let page = self
+                .client
+                .list_parts(&Self::full(tenant, key), upload_id, marker)
+                .await?;
+            let next = page.next;
+            all.extend(page.parts);
+            marker = match next {
+                Some(next_marker) => Some(next_marker),
+                None => return Ok(all),
+            };
+        }
+        Err("s3 list parts: pagination did not terminate".into())
+    }
 }
 
 fn s3_object_meta(key: &str, object: &S3Object) -> ObjectMeta {
@@ -750,6 +817,21 @@ impl Backend {
         match self {
             Self::Fs(backend) => backend.abort_multipart(tenant, upload_id).await,
             Self::S3(backend) => backend.abort_multipart(tenant, upload_id, key).await,
+        }
+    }
+
+    /// Sizes of the uploaded parts for a multipart upload, keyed by part
+    /// number. Used to compute the final object size before assembling so
+    /// the tenant/bucket quotas apply to multipart completes as well.
+    pub async fn part_sizes(
+        &self,
+        tenant: &str,
+        upload_id: &str,
+        key: &str,
+    ) -> Result<Vec<(u64, u64)>, String> {
+        match self {
+            Self::Fs(backend) => backend.part_sizes(tenant, upload_id).await,
+            Self::S3(backend) => backend.part_sizes(tenant, upload_id, key).await,
         }
     }
 }

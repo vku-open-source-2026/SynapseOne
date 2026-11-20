@@ -1405,9 +1405,10 @@ async fn complete_multipart(
         Ok(body) => body,
         Err(response) => return response,
     };
-    if let Err(response) = require_bucket(&state, &tenant, &bucket).await {
-        return response;
-    }
+    let bucket_meta = match require_bucket(&state, &tenant, &bucket).await {
+        Ok(meta) => Some(meta),
+        Err(response) => return response,
+    };
     let key = js_string(body.get("key"));
     if let Some(error) = validate_ocs_key(&key) {
         return error_response(StatusCode::BAD_REQUEST, "invalid_key", Some(error), None);
@@ -1435,9 +1436,99 @@ async fn complete_multipart(
         }
         clean.push((number as u64, etag));
     }
+    // Quota gate (#97): parts are capped individually at max_object_bytes,
+    // but up to 10,000 of them are accepted — their SUM was never checked.
+    // Compute the final object size from the stored part metadata and run
+    // the same tenant/bucket checks as the PUT path, before assembling.
+    let target = internal_key(&bucket, &key);
+    let part_sizes = match state.backend.part_sizes(&tenant, &upload_id, &target).await {
+        Ok(sizes) => sizes,
+        Err(error) => return backend_error(error),
+    };
+    let mut final_size: u64 = 0;
+    for (number, _) in &clean {
+        let Some((_, size)) = part_sizes.iter().find(|(stored, _)| stored == number) else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_parts",
+                Some(format!("part {number} was not uploaded")),
+                None,
+            );
+        };
+        final_size = final_size.saturating_add(*size);
+    }
+    let existing = match state.backend.head(&tenant, &target).await {
+        Ok(existing) => existing,
+        Err(error) => return backend_error(error),
+    };
+    let existing_size = existing.as_ref().map(|meta| meta.size).unwrap_or(0);
+    let (_, tenant_bytes) = match state.backend.usage(&tenant).await {
+        Ok(usage) => usage,
+        Err(error) => return backend_error(error),
+    };
+    let (_, bucket_bytes) = match bucket_stats(&state, &tenant, &bucket).await {
+        Ok(stats) => stats,
+        Err(error) => return error.into_response(),
+    };
+    let tenant_next = tenant_bytes
+        .saturating_sub(existing_size)
+        .saturating_add(final_size);
+    if tenant_next > state.config.tenant_quota_bytes {
+        // Abort the rejected upload so its parts do not keep occupying
+        // storage; the error still reports the quota envelope.
+        if let Err(error) = state
+            .backend
+            .abort_multipart(&tenant, &upload_id, &target)
+            .await
+        {
+            tracing::warn!(
+                "[storage] abort of tenant-quota-exceeding upload {upload_id} failed: {error}"
+            );
+        }
+        return error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "quota_exceeded",
+            Some(format!(
+                "tenant quota is {} bytes",
+                state.config.tenant_quota_bytes
+            )),
+            Some(json!({
+                "usedBytes": tenant_bytes,
+                "quotaBytes": state.config.tenant_quota_bytes,
+            })),
+        );
+    }
+    if let Some(quota_bytes) = bucket_meta
+        .and_then(|meta| meta.quota_bytes)
+        .filter(|quota| *quota > 0)
+    {
+        let bucket_next = bucket_bytes
+            .saturating_sub(existing_size)
+            .saturating_add(final_size);
+        if bucket_next > quota_bytes {
+            if let Err(error) = state
+                .backend
+                .abort_multipart(&tenant, &upload_id, &target)
+                .await
+            {
+                tracing::warn!(
+                    "[storage] abort of bucket-quota-exceeding upload {upload_id} failed: {error}"
+                );
+            }
+            return error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "bucket_quota_exceeded",
+                Some(format!("bucket quota is {quota_bytes} bytes")),
+                Some(json!({
+                    "usedBytes": bucket_bytes,
+                    "quotaBytes": quota_bytes,
+                })),
+            );
+        }
+    }
     match state
         .backend
-        .complete_multipart(&tenant, &upload_id, &internal_key(&bucket, &key), &clean)
+        .complete_multipart(&tenant, &upload_id, &target, &clean)
         .await
     {
         Ok(meta) => (
@@ -1473,5 +1564,187 @@ async fn abort_multipart(
     {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
         Err(error) => backend_error(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{Backend, FileBackend};
+    use crate::config::Config;
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use tower::ServiceExt;
+
+    fn quota_app(
+        tenant_quota_bytes: u64,
+    ) -> (axum::Router, Backend, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let backend = Backend::Fs(FileBackend::new(dir.path()).expect("fs backend"));
+        let mut config = Config::for_test();
+        config.tenant_quota_bytes = tenant_quota_bytes;
+        (crate::api::build_app(backend.clone(), config), backend, dir)
+    }
+
+    async fn call(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: Vec<u8>,
+        content_type: &str,
+    ) -> (StatusCode, Value) {
+        let request = HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .header("x-synapseone-org", "org-qa")
+            .header("content-type", content_type)
+            .body(Body::from(body))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.expect("oneshot");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        let json: Value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        (status, json)
+    }
+
+    async fn json_call(app: &axum::Router, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
+        call(app, method, uri, serde_json::to_vec(&body).unwrap(), "application/json").await
+    }
+
+    /// Create an upload, push the given parts, and return
+    /// (upload_id, validated parts for the complete call).
+    async fn upload_parts(
+        app: &axum::Router,
+        bucket: &str,
+        key: &str,
+        parts: &[&[u8]],
+    ) -> (String, Vec<(u64, String)>) {
+        let (status, body) = json_call(
+            app,
+            "POST",
+            &format!("/v1/ocs/buckets/{bucket}/uploads"),
+            json!({ "key": key, "contentType": "application/octet-stream" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "create upload failed: {body}");
+        let upload_id = body["uploadId"].as_str().unwrap().to_string();
+        let mut clean = Vec::new();
+        for (index, part) in parts.iter().enumerate() {
+            let part_number = index as u64 + 1;
+            let (status, body) = call(
+                app,
+                "PUT",
+                &format!(
+                    "/v1/ocs/buckets/{bucket}/uploads/{upload_id}/parts/{part_number}?key={key}"
+                ),
+                part.to_vec(),
+                "application/octet-stream",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "upload part failed: {body}");
+            clean.push((part_number, body["etag"].as_str().unwrap().to_string()));
+        }
+        (upload_id, clean)
+    }
+
+    async fn complete_upload(
+        app: &axum::Router,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        clean: Vec<(u64, String)>,
+    ) -> (StatusCode, Value) {
+        let parts: Vec<Value> = clean
+            .into_iter()
+            .map(|(number, etag)| json!({ "partNumber": number, "etag": etag }))
+            .collect();
+        json_call(
+            app,
+            "POST",
+            &format!("/v1/ocs/buckets/{bucket}/uploads/{upload_id}/complete"),
+            json!({ "key": key, "parts": parts }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn multipart_complete_rejects_tenant_quota_overflow() {
+        let (app, backend, _dir) = quota_app(100);
+        // 60 + 60 bytes across two parts: each part passes the per-part
+        // limit, but the assembled object exceeds the 100-byte tenant quota.
+        let (upload_id, clean) =
+            upload_parts(&app, "default", "big.bin", &[&[7u8; 60], &[7u8; 60]]).await;
+        let (status, body) = complete_upload(&app, "default", "big.bin", &upload_id, clean).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        assert_eq!(body["error"], "quota_exceeded");
+        assert_eq!(body["details"]["quotaBytes"], json!(100));
+        // The rejected upload is aborted: parts are gone and no object exists.
+        assert!(backend.part_sizes("org:org-qa", &upload_id, "default/big.bin").await.is_err());
+        let (status, _) = call(
+            &app,
+            "GET",
+            "/v1/ocs/buckets/default/objects/big.bin",
+            Vec::new(),
+            "application/octet-stream",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn multipart_complete_rejects_bucket_quota_overflow() {
+        // Tenant quota is generous; the bucket's own quota is the binding one.
+        let (app, backend, _dir) = quota_app(1024 * 1024);
+        let (status, body) = json_call(
+            &app,
+            "POST",
+            "/v1/ocs/buckets",
+            json!({ "name": "tiny", "quotaBytes": 1024 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "create bucket failed: {body}");
+        let (upload_id, clean) =
+            upload_parts(&app, "tiny", "video.bin", &[&[7u8; 600], &[7u8; 600]]).await;
+        let (status, body) = complete_upload(&app, "tiny", "video.bin", &upload_id, clean).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        assert_eq!(body["error"], "bucket_quota_exceeded");
+        assert_eq!(body["details"]["quotaBytes"], json!(1024));
+        assert!(backend.part_sizes("org:org-qa", &upload_id, "tiny/video.bin").await.is_err());
+        let (status, _) = call(
+            &app,
+            "GET",
+            "/v1/ocs/buckets/tiny/objects/video.bin",
+            Vec::new(),
+            "application/octet-stream",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn multipart_complete_under_quota_still_succeeds() {
+        let (app, backend, _dir) = quota_app(1024);
+        let (upload_id, clean) =
+            upload_parts(&app, "default", "small.bin", &[&[1u8; 10], &[2u8; 20]]).await;
+        let (status, body) = complete_upload(&app, "default", "small.bin", &upload_id, clean).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["object"]["size"], json!(30));
+        // Parts are consumed by a successful complete.
+        assert!(backend.part_sizes("org:org-qa", &upload_id, "default/small.bin").await.is_err());
+        let (status, _) = call(
+            &app,
+            "GET",
+            "/v1/ocs/buckets/default/objects/small.bin",
+            Vec::new(),
+            "application/octet-stream",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 }

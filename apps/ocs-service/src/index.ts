@@ -321,6 +321,31 @@ export function createApp(backend: Backend = createBackend()): express.Express {
       return res.status(400).json({ error: 'invalid_parts' });
     }
     try {
+      // Quota gate: the legacy router enforces the tenant quota on PUT; the
+      // same check applies to the assembled multipart object, computed from
+      // the stored part sizes before assembling (#97).
+      if (!backend.partSizes) return res.status(501).json({ error: 'multipart_unsupported' });
+      const sizes = await backend.partSizes(tenant, uploadId, String(key));
+      const byNumber = new Map(sizes.map((p) => [p.partNumber, p.size]));
+      let finalSize = 0;
+      for (const p of clean) {
+        const size = byNumber.get(p.partNumber);
+        if (size === undefined) {
+          return res.status(400).json({ error: 'invalid_parts', message: `part ${p.partNumber} was not uploaded` });
+        }
+        finalSize += size;
+      }
+      const usage = await backend.usage(tenant);
+      const existing = await backend.head(tenant, String(key));
+      if (usage.bytes - (existing?.size || 0) + finalSize > TENANT_QUOTA_BYTES) {
+        await backend.abortMultipart?.(tenant, uploadId, String(key)).catch(() => undefined);
+        return res.status(413).json({
+          error: 'quota_exceeded',
+          message: `tenant quota is ${TENANT_QUOTA_BYTES} bytes`,
+          usedBytes: usage.bytes,
+          quotaBytes: TENANT_QUOTA_BYTES,
+        });
+      }
       const meta = await backend.completeMultipart(tenant, uploadId, String(key), clean);
       res.status(201).json({ object: meta });
     } catch (e: any) {

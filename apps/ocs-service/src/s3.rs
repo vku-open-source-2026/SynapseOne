@@ -58,6 +58,14 @@ pub struct ListResult {
     pub next: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct PartsPage {
+    /// (part number, size in bytes) for one ListParts page.
+    pub parts: Vec<(u64, u64)>,
+    /// Part number to continue from when the page is truncated.
+    pub next: Option<u64>,
+}
+
 fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
@@ -599,6 +607,54 @@ impl S3Client {
         let query = vec![("uploadId".to_string(), upload_id.to_string())];
         let _ = self.call("DELETE", key, &query, &[], None).await;
         Ok(())
+    }
+
+    /// ListParts: the uploaded parts with their sizes. Used to compute the
+    /// final multipart object size before assembling, so the tenant/bucket
+    /// quotas apply to multipart completes too.
+    pub async fn list_parts(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number_marker: Option<u64>,
+    ) -> Result<PartsPage, String> {
+        let mut query = vec![
+            ("uploadId".into(), upload_id.to_string()),
+            ("max-parts".into(), 1000.to_string()),
+        ];
+        if let Some(marker) = part_number_marker {
+            query.push(("part-number-marker".into(), marker.to_string()));
+        }
+        let response = self.call("GET", key, &query, &[], None).await?;
+        if !response.status().is_success() {
+            return Err(Self::failure("s3 list parts", response).await);
+        }
+        let xml = response.text().await.map_err(|error| error.to_string())?;
+        let mut parts = Vec::new();
+        let mut rest = xml.as_str();
+        while let Some(start) = rest.find("<Part>") {
+            let after = &rest[start + "<Part>".len()..];
+            let Some(end) = after.find("</Part>") else {
+                break;
+            };
+            let block = &after[..end];
+            let number = extract_tag(block, "PartNumber")
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            let size = extract_tag(block, "Size")
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            parts.push((number, size));
+            rest = &after[end + "</Part>".len()..];
+        }
+        let truncated = xml.contains("<IsTruncated>true</IsTruncated>");
+        let next = if truncated {
+            extract_tag(&xml, "NextPartNumberMarker")
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        } else {
+            None
+        };
+        Ok(PartsPage { parts, next })
     }
 }
 

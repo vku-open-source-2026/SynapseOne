@@ -241,4 +241,24 @@ export class S3Client {
   async abortMultipart(key: string, uploadId: string): Promise<void> {
     await this.call('DELETE', key, { uploadId }).catch(() => undefined);
   }
+
+  /** ListParts: uploaded parts with their sizes, for the multipart quota check. */
+  async listParts(key: string, uploadId: string, partNumberMarker?: number): Promise<{ parts: Array<{ partNumber: number; size: number }>; next?: number }> {
+    const q: Record<string, string> = { uploadId, 'max-parts': '1000' };
+    if (partNumberMarker !== undefined) q['part-number-marker'] = String(partNumberMarker);
+    const res = await this.call('GET', key, q);
+    if (!res.ok) throw new Error(`s3 list parts ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    const xml = await res.text();
+    const parts: Array<{ partNumber: number; size: number }> = [];
+    for (const m of xml.matchAll(/<Part>([\s\S]*?)<\/Part>/g)) {
+      const block = m[1];
+      parts.push({
+        partNumber: Number(/<PartNumber>([\s\S]*?)<\/PartNumber>/.exec(block)?.[1] || 0),
+        size: Number(/<Size>([\s\S]*?)<\/Size>/.exec(block)?.[1] || 0),
+      });
+    }
+    const truncated = /<IsTruncated>true<\/IsTruncated>/.test(xml);
+    const next = truncated ? Number(/<NextPartNumberMarker>([\s\S]*?)<\/NextPartNumberMarker>/.exec(xml)?.[1] || 0) : undefined;
+    return { parts, next };
+  }
 }

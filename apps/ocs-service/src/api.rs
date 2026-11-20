@@ -529,6 +529,58 @@ async fn complete_multipart(
         }
         clean.push((number as u64, etag));
     }
+    // Quota gate (#97): the legacy router enforces the tenant quota on PUT;
+    // the same check applies to the assembled multipart object, computed
+    // from the stored part sizes before assembling.
+    let part_sizes = match state.backend.part_sizes(&tenant, &upload_id, &key).await {
+        Ok(sizes) => sizes,
+        Err(error) => return backend_error(error),
+    };
+    let mut final_size: u64 = 0;
+    for (number, _) in &clean {
+        let Some((_, size)) = part_sizes.iter().find(|(stored, _)| stored == number) else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_parts",
+                Some(format!("part {number} was not uploaded")),
+                None,
+            );
+        };
+        final_size = final_size.saturating_add(*size);
+    }
+    let existing = match state.backend.head(&tenant, &key).await {
+        Ok(existing) => existing,
+        Err(error) => return backend_error(error),
+    };
+    let existing_size = existing.as_ref().map(|meta| meta.size).unwrap_or(0);
+    let (_, used_bytes) = match state.backend.usage(&tenant).await {
+        Ok(usage) => usage,
+        Err(error) => return backend_error(error),
+    };
+    let next_bytes = used_bytes
+        .saturating_sub(existing_size)
+        .saturating_add(final_size);
+    if next_bytes > state.config.tenant_quota_bytes {
+        // Abort the rejected upload so its parts do not keep occupying
+        // storage; the error still reports the quota envelope.
+        if let Err(error) = state.backend.abort_multipart(&tenant, &upload_id, &key).await {
+            tracing::warn!(
+                "[storage] abort of quota-exceeding upload {upload_id} failed: {error}"
+            );
+        }
+        let mut body = Map::new();
+        body.insert("error".into(), Value::String("quota_exceeded".into()));
+        body.insert(
+            "message".into(),
+            Value::String(format!(
+                "tenant quota is {} bytes",
+                state.config.tenant_quota_bytes
+            )),
+        );
+        body.insert("usedBytes".into(), json!(used_bytes));
+        body.insert("quotaBytes".into(), json!(state.config.tenant_quota_bytes));
+        return (StatusCode::PAYLOAD_TOO_LARGE, Json(Value::Object(body))).into_response();
+    }
     match state
         .backend
         .complete_multipart(&tenant, &upload_id, &key, &clean)

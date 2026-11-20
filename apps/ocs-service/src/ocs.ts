@@ -756,7 +756,7 @@ export function registerOcsRoutes(app: Express, backend: Backend, options: OcsOp
       const tenant = tenantOf(req);
       const bucket = String(req.params.bucket || '');
       if (!(await requireBucket(backend, tenant, bucket, res))) return;
-      if (!backend.completeMultipart) return res.status(501).json({ error: 'multipart_unsupported' });
+      if (!backend.completeMultipart || !backend.partSizes) return res.status(501).json({ error: 'multipart_unsupported' });
       const body = (req.body || {}) as Record<string, unknown>;
       const key = String(body.key || '');
       const keyError = validateOcsKey(key);
@@ -769,7 +769,46 @@ export function registerOcsRoutes(app: Express, backend: Backend, options: OcsOp
       if (clean.some((part) => !Number.isInteger(part.partNumber) || part.partNumber < 1 || !part.etag)) {
         return res.status(400).json({ error: 'invalid_parts' });
       }
-      const meta = await backend.completeMultipart(tenant, String(req.params.id), internalKey(bucket, key), clean);
+      // Quota gate: parts are capped individually at maxObjectBytes, but
+      // their SUM was never checked. Compute the final object size from the
+      // stored part metadata and run the same tenant/bucket checks as the
+      // PUT path, before assembling (#97).
+      const target = internalKey(bucket, key);
+      const sizes = await backend.partSizes(tenant, String(req.params.id), target);
+      const byNumber = new Map(sizes.map((part) => [part.partNumber, part.size]));
+      let finalSize = 0;
+      for (const part of clean) {
+        const size = byNumber.get(part.partNumber);
+        if (size === undefined) {
+          return res.status(400).json({ error: 'invalid_parts', message: `part ${part.partNumber} was not uploaded` });
+        }
+        finalSize += size;
+      }
+      const existing = await backend.head(tenant, target);
+      const [tenantUsage, bucketUsage, bucketMeta] = await Promise.all([
+        backend.usage(tenant),
+        bucketStats(backend, tenant, bucket),
+        readBucket(backend, tenant, bucket),
+      ]);
+      const tenantNext = tenantUsage.bytes - (existing?.size || 0) + finalSize;
+      if (tenantNext > options.tenantQuotaBytes) {
+        await backend.abortMultipart?.(tenant, String(req.params.id), target).catch(() => undefined);
+        return res.status(413).json({
+          error: 'quota_exceeded',
+          message: `tenant quota is ${options.tenantQuotaBytes} bytes`,
+          details: { usedBytes: tenantUsage.bytes, quotaBytes: options.tenantQuotaBytes },
+        });
+      }
+      const quotaBytes = bucketMeta?.quotaBytes;
+      if (quotaBytes && bucketUsage.bytes - (existing?.size || 0) + finalSize > quotaBytes) {
+        await backend.abortMultipart?.(tenant, String(req.params.id), target).catch(() => undefined);
+        return res.status(413).json({
+          error: 'bucket_quota_exceeded',
+          message: `bucket quota is ${quotaBytes} bytes`,
+          details: { usedBytes: bucketUsage.bytes, quotaBytes },
+        });
+      }
+      const meta = await backend.completeMultipart(tenant, String(req.params.id), target, clean);
       res.status(201).json({ bucket, object: publicMeta(bucket, meta) });
     } catch (error) {
       sendError(res, error);

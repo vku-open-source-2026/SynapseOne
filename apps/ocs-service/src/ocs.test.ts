@@ -180,6 +180,36 @@ test('multipart upload and presign are bucket-aware', async () => {
   assert.equal(wrongMethod.json.error, 'presign_method_mismatch');
 });
 
+test('multipart complete enforces the bucket quota and aborts the upload', async () => {
+  const created = await request('POST', '/v1/ocs/buckets', { name: 'tiny-quota', quotaBytes: 1024 });
+  assert.equal(created.status, 201, JSON.stringify(created.json));
+  const upload = await request('POST', '/v1/ocs/buckets/tiny-quota/uploads', { key: 'big.bin', contentType: 'application/octet-stream' });
+  const id = upload.json.uploadId;
+  // Each part is small; only their sum crosses the bucket quota.
+  const part1 = await request('PUT', `/v1/ocs/buckets/tiny-quota/uploads/${id}/parts/1?key=big.bin`, Buffer.alloc(600, 1), { ...headers(), 'Content-Type': 'application/octet-stream' });
+  const part2 = await request('PUT', `/v1/ocs/buckets/tiny-quota/uploads/${id}/parts/2?key=big.bin`, Buffer.alloc(600, 2), { ...headers(), 'Content-Type': 'application/octet-stream' });
+  const rejected = await request('POST', `/v1/ocs/buckets/tiny-quota/uploads/${id}/complete`, {
+    key: 'big.bin', parts: [{ partNumber: 1, etag: part1.json.etag }, { partNumber: 2, etag: part2.json.etag }],
+  });
+  assert.equal(rejected.status, 413, JSON.stringify(rejected.json));
+  assert.equal(rejected.json.error, 'bucket_quota_exceeded');
+  assert.equal(rejected.json.details.quotaBytes, 1024);
+  // The rejected upload is aborted: no object exists and the parts are gone.
+  assert.equal((await request('GET', '/v1/ocs/buckets/tiny-quota/objects/big.bin')).status, 404);
+  const retry = await request('POST', `/v1/ocs/buckets/tiny-quota/uploads/${id}/complete`, {
+    key: 'big.bin', parts: [{ partNumber: 1, etag: part1.json.etag }],
+  });
+  assert.equal(retry.status, 502, JSON.stringify(retry.json));
+  // A completing upload that fits the quota still succeeds.
+  const small = await request('POST', '/v1/ocs/buckets/tiny-quota/uploads', { key: 'fits.bin', contentType: 'application/octet-stream' });
+  const smallPart = await request('PUT', `/v1/ocs/buckets/tiny-quota/uploads/${small.json.uploadId}/parts/1?key=fits.bin`, Buffer.alloc(512, 3), { ...headers(), 'Content-Type': 'application/octet-stream' });
+  const completed = await request('POST', `/v1/ocs/buckets/tiny-quota/uploads/${small.json.uploadId}/complete`, {
+    key: 'fits.bin', parts: [{ partNumber: 1, etag: smallPart.json.etag }],
+  });
+  assert.equal(completed.status, 201, JSON.stringify(completed.json));
+  assert.equal(completed.json.object.size, 512);
+});
+
 test('legacy storage remains the default bucket and reserved keys are rejected', async () => {
   await request('PUT', '/v1/storage/objects/legacy.txt', Buffer.from('legacy'), { ...headers(), 'Content-Type': 'text/plain' });
   const list = await request('GET', '/v1/ocs/buckets/default/objects');

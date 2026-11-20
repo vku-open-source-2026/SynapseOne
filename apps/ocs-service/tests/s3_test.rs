@@ -379,6 +379,68 @@ async fn s3_backend_multipart_flow() {
     }));
 }
 
+/// ListParts drives the multipart quota check: the backend must page
+/// through the part list and return (part number, size) pairs, including
+/// the truncated second page.
+#[tokio::test]
+async fn s3_backend_part_sizes_pages_through_list_parts() {
+    let server = MockServer::start().await;
+    let segment = tenant_segment("org:org-a");
+    let object_path = format!("/b/tenants/{segment}/video.bin");
+
+    Mock::given(method("GET"))
+        .and(path(&object_path))
+        .and(query_param("uploadId", "up-1"))
+        .and(query_param("part-number-marker", "3"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<ListPartsResult>\
+             <IsTruncated>false</IsTruncated>\
+             <Part><PartNumber>4</PartNumber><Size>70</Size></Part>\
+             <Part><PartNumber>5</PartNumber><Size>80</Size></Part>\
+             </ListPartsResult>",
+        ))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(&object_path))
+        .and(query_param("uploadId", "up-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<ListPartsResult>\
+             <IsTruncated>true</IsTruncated>\
+             <NextPartNumberMarker>3</NextPartNumberMarker>\
+             <Part><PartNumber>1</PartNumber><Size>10</Size></Part>\
+             <Part><PartNumber>2</PartNumber><Size>20</Size></Part>\
+             <Part><PartNumber>3</PartNumber><Size>30</Size></Part>\
+             </ListPartsResult>",
+        ))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let backend = Backend::S3(S3Backend::new(
+        S3Client::new(config(&server.uri())).unwrap(),
+    ));
+    let sizes = backend
+        .part_sizes("org:org-a", "up-1", "video.bin")
+        .await
+        .unwrap();
+    assert_eq!(
+        sizes,
+        vec![(1, 10), (2, 20), (3, 30), (4, 70), (5, 80)]
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == wiremock::http::Method::GET)
+            .count(),
+        2,
+        "the truncated first page must be followed by a marker page"
+    );
+}
+
 #[test]
 fn xml_decode_matrix() {
     assert_eq!(

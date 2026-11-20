@@ -44,6 +44,8 @@ export interface Backend {
   uploadPart?(tenant: string, uploadId: string, key: string, partNumber: number, body: Buffer): Promise<{ etag: string }>;
   completeMultipart?(tenant: string, uploadId: string, key: string, parts: Array<{ partNumber: number; etag: string }>): Promise<ObjectMeta>;
   abortMultipart?(tenant: string, uploadId: string, key: string): Promise<void>;
+  /** Uploaded parts with their sizes, so the final object size can be checked against quotas before assembling. */
+  partSizes?(tenant: string, uploadId: string, key: string): Promise<Array<{ partNumber: number; size: number }>>;
 }
 
 export function checksumHex(body: Buffer): string {
@@ -195,6 +197,19 @@ class FileBackend implements Backend {
   async abortMultipart(tenant: string, uploadId: string): Promise<void> {
     await fsp.rm(this.uploadDir(tenant, uploadId), { recursive: true, force: true });
   }
+
+  async partSizes(tenant: string, uploadId: string): Promise<Array<{ partNumber: number; size: number }>> {
+    const dir = this.uploadDir(tenant, uploadId);
+    const names = await fsp.readdir(dir);
+    const parts: Array<{ partNumber: number; size: number }> = [];
+    for (const name of names) {
+      const partNumber = Number(/^(\d+)\.part$/.exec(name)?.[1] || 0);
+      if (!partNumber) continue;
+      parts.push({ partNumber, size: (await fsp.stat(path.join(dir, name))).size });
+    }
+    parts.sort((a, b) => a.partNumber - b.partNumber);
+    return parts;
+  }
 }
 
 class S3Backend implements Backend {
@@ -286,6 +301,22 @@ class S3Backend implements Backend {
   }
   abortMultipart(tenant: string, uploadId: string, key: string): Promise<void> {
     return this.client.abortMultipart(this.full(tenant, key), uploadId);
+  }
+
+  async partSizes(tenant: string, uploadId: string, key: string): Promise<Array<{ partNumber: number; size: number }>> {
+    const full = this.full(tenant, key);
+    const all: Array<{ partNumber: number; size: number }> = [];
+    let marker: number | undefined;
+    // 1000 parts per page with at most 10k parts per upload → 12 pages is a
+    // hard safety ceiling; a server that never stops paginating fails
+    // closed instead of returning a partial (undercounted) list.
+    for (let page = 0; page < 12; page += 1) {
+      const result = await this.client.listParts(full, uploadId, marker);
+      all.push(...result.parts);
+      if (result.next === undefined) return all;
+      marker = result.next;
+    }
+    throw new Error('s3 list parts: pagination did not terminate');
   }
 }
 
