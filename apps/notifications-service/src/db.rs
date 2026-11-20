@@ -62,6 +62,26 @@ pub struct NewNotification {
 struct MemoryStore {
     notifications: HashMap<String, NotificationRecord>,
     preferences: HashMap<String, PreferenceRecord>,
+    /// Test-only: when set, the next call to the matching method returns a
+    /// simulated store error once, so handler fail-closed paths can be
+    /// exercised without a real database.
+    #[cfg(test)]
+    fail_next: Option<&'static str>,
+}
+
+/// Consume a test-injected failure for `method`, if armed for it.
+#[cfg(test)]
+fn take_injected_failure(mem: &mut MemoryStore, method: &str) -> Option<String> {
+    if mem.fail_next.as_deref() == Some(method) {
+        mem.fail_next = None;
+        return Some(format!("simulated {method} failure"));
+    }
+    None
+}
+
+#[cfg(not(test))]
+fn take_injected_failure(_mem: &mut MemoryStore, _method: &str) -> Option<String> {
+    None
 }
 
 #[derive(Clone)]
@@ -328,6 +348,9 @@ impl Store {
             }
             Backend::Memory(memory) => {
                 let mut mem = memory.lock().await;
+                if let Some(error) = take_injected_failure(&mut mem, "update") {
+                    return Err(error);
+                }
                 if let Some(n) = mem.notifications.get_mut(id) {
                     if let Some(status) = status {
                         n.status = status.to_string();
@@ -467,6 +490,9 @@ impl Store {
             }
             Backend::Memory(memory) => {
                 let mut mem = memory.lock().await;
+                if let Some(error) = take_injected_failure(&mut mem, "claim_one") {
+                    return Err(error);
+                }
                 let Some(n) = mem.notifications.get_mut(id) else {
                     return Ok(None);
                 };
@@ -476,6 +502,109 @@ impl Store {
                 n.status = "sending".into();
                 n.updated_at = iso(Utc::now());
                 Ok(Some(n.clone()))
+            }
+        }
+    }
+
+    /// Re-claim one notification stuck in 'sending' after its worker died
+    /// between claim and terminal update (queue redelivery path). Only rows
+    /// whose updated_at is older than the visibility timeout are
+    /// re-claimable; anything fresher still belongs to an in-flight
+    /// consumer and must be treated as a dedupe, not re-delivered.
+    pub async fn reclaim_stale_sending(
+        &self,
+        tenant: &str,
+        id: &str,
+        visibility_seconds: i64,
+    ) -> Result<Option<NotificationRecord>, String> {
+        let cutoff = Utc::now() - chrono::Duration::seconds(visibility_seconds.max(0));
+        match &self.backend {
+            Backend::Postgres(pool) => {
+                let row = sqlx::query(
+                    r#"
+                    UPDATE notifications SET status='sending', updated_at=now()
+                    WHERE tenant=$1 AND id=$2::uuid AND status='sending' AND updated_at <= $3
+                    RETURNING *
+                    "#,
+                )
+                .bind(tenant)
+                .bind(id)
+                .bind(cutoff)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| format!("reclaim sending: {e}"))?;
+                row.as_ref().map(row_to_record).transpose()
+            }
+            Backend::Memory(memory) => {
+                let mut mem = memory.lock().await;
+                let Some(n) = mem.notifications.get_mut(id) else {
+                    return Ok(None);
+                };
+                if n.tenant != tenant || n.status != "sending" {
+                    return Ok(None);
+                }
+                let stale =
+                    parse_ts(&n.updated_at).map(|t| t <= cutoff).unwrap_or(true);
+                if !stale {
+                    return Ok(None);
+                }
+                n.updated_at = iso(Utc::now());
+                Ok(Some(n.clone()))
+            }
+        }
+    }
+
+    /// Sweep 'sending' rows stranded by a crashed worker and re-claim the
+    /// ones older than the visibility timeout for delivery. At-least-once
+    /// allows a duplicate delivery, never a lost notification.
+    pub async fn claim_stale_sending(
+        &self,
+        limit: i64,
+        visibility_seconds: i64,
+    ) -> Result<Vec<NotificationRecord>, String> {
+        let cutoff = Utc::now() - chrono::Duration::seconds(visibility_seconds.max(0));
+        match &self.backend {
+            Backend::Postgres(pool) => {
+                let rows = sqlx::query(
+                    r#"
+                    UPDATE notifications SET status='sending', updated_at=now()
+                    WHERE id IN (
+                      SELECT id FROM notifications
+                      WHERE status='sending' AND updated_at <= $1
+                      ORDER BY updated_at
+                      LIMIT $2 FOR UPDATE SKIP LOCKED
+                    ) RETURNING *
+                    "#,
+                )
+                .bind(cutoff)
+                .bind(limit)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| format!("claim stale sending: {e}"))?;
+                rows.iter().map(row_to_record).collect()
+            }
+            Backend::Memory(memory) => {
+                let mut mem = memory.lock().await;
+                let now = Utc::now();
+                let mut stale: Vec<NotificationRecord> = mem
+                    .notifications
+                    .values()
+                    .filter(|n| {
+                        n.status == "sending"
+                            && parse_ts(&n.updated_at)
+                                .map(|t| t <= cutoff)
+                                .unwrap_or(true)
+                    })
+                    .cloned()
+                    .collect();
+                stale.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+                stale.truncate(limit.max(0) as usize);
+                for n in &stale {
+                    if let Some(stored) = mem.notifications.get_mut(&n.id) {
+                        stored.updated_at = iso(now);
+                    }
+                }
+                Ok(stale)
             }
         }
     }
@@ -508,8 +637,17 @@ impl Store {
         }
     }
 
-    /// Claim due notifications for delivery (single replica-safe on Postgres).
-    pub async fn claim_due(&self, limit: i64) -> Result<Vec<NotificationRecord>, String> {
+    /// Claim due notifications for delivery (single replica-safe on
+    /// Postgres). Also re-claims 'sending' rows older than the visibility
+    /// timeout so a crashed worker cannot strand an accepted notification.
+    #[allow(dead_code)]
+    pub async fn claim_due(
+        &self,
+        limit: i64,
+        sending_visibility_seconds: i64,
+    ) -> Result<Vec<NotificationRecord>, String> {
+        let sending_cutoff =
+            Utc::now() - chrono::Duration::seconds(sending_visibility_seconds.max(0));
         match &self.backend {
             Backend::Postgres(pool) => {
                 let rows = sqlx::query(
@@ -517,12 +655,14 @@ impl Store {
                     UPDATE notifications SET status='sending', updated_at=now()
                     WHERE id IN (
                       SELECT id FROM notifications
-                      WHERE status IN ('queued','failed') AND next_attempt_at <= now()
+                      WHERE (status IN ('queued','failed') AND next_attempt_at <= now())
+                         OR (status='sending' AND updated_at <= $1)
                       ORDER BY next_attempt_at
-                      LIMIT $1 FOR UPDATE SKIP LOCKED
+                      LIMIT $2 FOR UPDATE SKIP LOCKED
                     ) RETURNING *
                     "#,
                 )
+                .bind(sending_cutoff)
                 .bind(limit)
                 .fetch_all(pool)
                 .await
@@ -536,10 +676,14 @@ impl Store {
                     .notifications
                     .values()
                     .filter(|n| {
-                        matches!(n.status.as_str(), "queued" | "failed")
+                        (matches!(n.status.as_str(), "queued" | "failed")
                             && parse_ts(&n.next_attempt_at)
                                 .map(|t| t <= now)
-                                .unwrap_or(true)
+                                .unwrap_or(true))
+                            || (n.status == "sending"
+                                && parse_ts(&n.updated_at)
+                                    .map(|t| t <= sending_cutoff)
+                                    .unwrap_or(true))
                     })
                     .cloned()
                     .collect();
@@ -574,7 +718,10 @@ impl Store {
                 row.as_ref().map(row_to_preference).transpose()
             }
             Backend::Memory(memory) => {
-                let mem = memory.lock().await;
+                let mut mem = memory.lock().await;
+                if let Some(error) = take_injected_failure(&mut mem, "get_preference") {
+                    return Err(error);
+                }
                 Ok(mem
                     .preferences
                     .get(&format!("{tenant}\u{0}{recipient}"))
@@ -633,6 +780,16 @@ impl Store {
             let mut mem = memory.lock().await;
             mem.notifications.clear();
             mem.preferences.clear();
+        }
+    }
+
+    /// Test-only: make the next call to `method` (e.g. "claim_one",
+    /// "get_preference", "update") fail once, to exercise fail-closed
+    /// handler paths against a simulated store outage.
+    #[cfg(test)]
+    pub async fn simulate_failure(&self, method: &'static str) {
+        if let Backend::Memory(memory) = &self.backend {
+            memory.lock().await.fail_next = Some(method);
         }
     }
 }

@@ -53,6 +53,9 @@ struct Config {
     queue_name: String,
     use_queue: bool,
     tick_ms: u64,
+    /// How long a 'sending' row may sit without a terminal update before a
+    /// crash recovery re-claims it (queue redelivery and the local sweep).
+    sending_visibility_seconds: i64,
 }
 
 #[derive(Clone)]
@@ -107,6 +110,8 @@ fn config_from_env() -> Config {
             .unwrap_or_else(|| "notifications".into()),
         use_queue,
         tick_ms: env_u64("NOTIFICATIONS_TICK_MS", 2000).max(500),
+        sending_visibility_seconds: env_i64("NOTIFICATIONS_SENDING_VISIBILITY_SECONDS", 120)
+            .clamp(0, 3600),
     }
 }
 
@@ -329,7 +334,18 @@ fn urlencoding(value: &str) -> String {
 // ---- delivery worker ----
 
 async fn process_pending_once(state: &AppState, limit: i64) -> Result<(usize, usize, usize), String> {
-    let due = state.store.claim_pending(limit).await?;
+    let mut due = state.store.claim_pending(limit).await?;
+    // Crash recovery: rows a worker left in 'sending' (claimed, then the
+    // process died before any terminal update) are re-claimed once older
+    // than the visibility timeout and run through the same pipeline, in
+    // both queue and local modes. At-least-once accepts the duplicate
+    // delivery; it must never accept a lost notification.
+    due.extend(
+        state
+            .store
+            .claim_stale_sending(limit, state.config.sending_visibility_seconds)
+            .await?,
+    );
     let mut delivered = 0usize;
     let mut failed = 0usize;
     for notification in &due {
@@ -399,6 +415,104 @@ async fn process_pending_once(state: &AppState, limit: i64) -> Result<(usize, us
     Ok((due.len(), delivered, failed))
 }
 
+/// Outcome of trying to secure a consumed message for delivery.
+enum Claimed {
+    /// The message owns the notification; deliver it.
+    Deliver(NotificationRecord),
+    /// Another consumer owns it or it is already terminal → ack (dedupe).
+    Dedupe,
+    /// Transient store error → nack with requeue so the message returns.
+    Requeue(String),
+}
+
+/// Claim a consumed notification, or recover the crash case where a worker
+/// died after claiming: a row stuck in 'sending' older than the visibility
+/// timeout is re-claimed and re-delivered (idempotent attempt) instead of
+/// letting the redelivery be acked into a black hole.
+async fn claim_for_delivery(state: &AppState, tenant: &str, id: &str) -> Claimed {
+    let claim = match state.store.claim_one(tenant, id).await {
+        Ok(claim) => claim,
+        // Store error at claim: never ack — the message must come back.
+        Err(error) => {
+            tracing::warn!("[notifications] claim of {id} failed: {error}");
+            return Claimed::Requeue(format!("claim failed: {error}"));
+        }
+    };
+    let Some(notification) = claim else {
+        // Not claimable: terminal already, owned by an in-flight consumer,
+        // or crash-stranded in 'sending'. Look it up before acking so the
+        // stranded case is recovered.
+        return match state.store.get(tenant, id).await {
+            Ok(Some(existing)) if existing.status == "sending" => {
+                match state
+                    .store
+                    .reclaim_stale_sending(
+                        tenant,
+                        id,
+                        state.config.sending_visibility_seconds,
+                    )
+                    .await
+                {
+                    Ok(Some(notification)) => {
+                        tracing::warn!(
+                            "[notifications] recovered {id} stuck in 'sending' after a worker crash"
+                        );
+                        Claimed::Deliver(notification)
+                    }
+                    Ok(None) => {
+                        // Fresher than the visibility timeout: a live
+                        // consumer still owns the delivery → dedupe.
+                        tracing::debug!(
+                            "[notifications] redelivery of in-flight {id} acked as dedupe"
+                        );
+                        Claimed::Dedupe
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "[notifications] reclaim of stranded {id} failed: {error}"
+                        );
+                        Claimed::Requeue(format!("reclaim failed: {error}"))
+                    }
+                }
+            }
+            Ok(Some(existing)) => {
+                tracing::debug!(
+                    "[notifications] redelivery of {id} in state '{}' acked as dedupe",
+                    existing.status
+                );
+                Claimed::Dedupe
+            }
+            Ok(None) => {
+                // Unknown to the store: nothing to recover → dedupe.
+                tracing::debug!("[notifications] redelivery of unknown {id} acked as dedupe");
+                Claimed::Dedupe
+            }
+            Err(error) => {
+                tracing::warn!("[notifications] lookup of {id} failed: {error}");
+                Claimed::Requeue(format!("lookup failed: {error}"))
+            }
+        };
+    };
+    Claimed::Deliver(notification)
+}
+
+/// Nack with requeue so the queue redelivers; log if even that fails.
+async fn nack_requeue(state: &AppState, receipt: &Value, reason: &str) {
+    if let Err(error) = ack_or_nack(
+        state,
+        "nack",
+        json!({
+            "receipt": receipt,
+            "error": reason,
+            "requeue": true,
+        }),
+    )
+    .await
+    {
+        tracing::warn!("[notifications] nack/requeue failed ({reason}): {error}");
+    }
+}
+
 async fn consume_from_queue(state: &AppState, consumer: &str) {
     let path = format!(
         "/v1/queue/queues/{}/consume",
@@ -436,21 +550,44 @@ async fn consume_from_queue(state: &AppState, consumer: &str) {
             .get("notificationId")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let notification = match state.store.claim_one(tenant, id).await {
-            Ok(Some(notification)) => notification,
-            _ => {
-                let _ = ack_or_nack(state, "ack", json!({ "receipt": receipt })).await;
+        let notification = match claim_for_delivery(state, tenant, id).await {
+            Claimed::Deliver(notification) => notification,
+            Claimed::Dedupe => {
+                if let Err(error) = ack_or_nack(state, "ack", json!({ "receipt": receipt })).await {
+                    tracing::warn!("[notifications] ack of deduped {id} failed: {error}");
+                }
+                continue;
+            }
+            Claimed::Requeue(reason) => {
+                nack_requeue(state, &receipt, &reason).await;
                 continue;
             }
         };
-        let pref = state
+        let pref = match state
             .store
             .get_preference(&notification.tenant, &recipient_key(&notification.recipient))
             .await
-            .ok()
-            .flatten();
+        {
+            Ok(pref) => pref,
+            Err(error) => {
+                // Fail closed on consent: a preference-store error must
+                // never be read as "no unsubscribe record". Skip the
+                // delivery entirely and let the message come back.
+                tracing::warn!(
+                    "[notifications] preference read for {} failed: {error}",
+                    notification.id
+                );
+                nack_requeue(
+                    state,
+                    &receipt,
+                    &format!("preference read failed: {error}"),
+                )
+                .await;
+                continue;
+            }
+        };
         if pref.as_ref().is_some_and(|p| p.unsubscribed) {
-            let _ = state
+            if let Err(error) = state
                 .store
                 .update(
                     &notification.id,
@@ -459,8 +596,26 @@ async fn consume_from_queue(state: &AppState, consumer: &str) {
                     None,
                     Some("recipient_unsubscribed"),
                 )
+                .await
+            {
+                tracing::warn!(
+                    "[notifications] cancel of unsubscribed {} failed: {error}",
+                    notification.id
+                );
+                nack_requeue(
+                    state,
+                    &receipt,
+                    &format!("persist cancel failed: {error}"),
+                )
                 .await;
-            let _ = ack_or_nack(state, "ack", json!({ "receipt": receipt })).await;
+                continue;
+            }
+            if let Err(error) = ack_or_nack(state, "ack", json!({ "receipt": receipt })).await {
+                tracing::warn!(
+                    "[notifications] ack of cancelled {} failed: {error}",
+                    notification.id
+                );
+            }
             continue;
         }
         let result = delivery::deliver(&notification).await;
@@ -478,7 +633,7 @@ async fn consume_from_queue(state: &AppState, consumer: &str) {
         }
         attempts.push(attempt);
         if result.ok {
-            let _ = state
+            if let Err(error) = state
                 .store
                 .update(
                     &notification.id,
@@ -487,10 +642,32 @@ async fn consume_from_queue(state: &AppState, consumer: &str) {
                     None,
                     None,
                 )
+                .await
+            {
+                // The delivery happened but the terminal state is not
+                // persisted. Requeue instead of acking: the row stays
+                // claimable and the at-least-once duplicate is the price
+                // of never stranding it in 'sending'.
+                tracing::warn!(
+                    "[notifications] delivered update for {} failed: {error}",
+                    notification.id
+                );
+                nack_requeue(
+                    state,
+                    &receipt,
+                    &format!("persist delivered failed: {error}"),
+                )
                 .await;
-            let _ = ack_or_nack(state, "ack", json!({ "receipt": receipt })).await;
+                continue;
+            }
+            if let Err(error) = ack_or_nack(state, "ack", json!({ "receipt": receipt })).await {
+                tracing::warn!(
+                    "[notifications] ack of delivered {} failed: {error}",
+                    notification.id
+                );
+            }
         } else {
-            let _ = state
+            if let Err(error) = state
                 .store
                 .update(
                     &notification.id,
@@ -499,18 +676,27 @@ async fn consume_from_queue(state: &AppState, consumer: &str) {
                     None,
                     None,
                 )
-                .await;
-            // If the queue nack/redelivery also fails, the local outbox must
-            // still be able to retry the delivery.
-            let _ = state.store.clear_published(&notification.id).await;
-            let _ = ack_or_nack(
+                .await
+            {
+                // Requeue regardless: a row neither 'failed' nor
+                // 'delivered' would be stranded in 'sending'.
+                tracing::warn!(
+                    "[notifications] failed update for {} failed: {error}",
+                    notification.id
+                );
+            }
+            // Best-effort: hand the row back to the local outbox too, so
+            // the notification survives even if the queue nack is lost.
+            if let Err(error) = state.store.clear_published(&notification.id).await {
+                tracing::warn!(
+                    "[notifications] clear published for {} failed: {error}",
+                    notification.id
+                );
+            }
+            nack_requeue(
                 state,
-                "nack",
-                json!({
-                    "receipt": receipt,
-                    "error": result.error.clone().unwrap_or_else(|| "delivery failed".into()),
-                    "requeue": true,
-                }),
+                &receipt,
+                result.error.as_deref().unwrap_or("delivery failed"),
             )
             .await;
         }
@@ -1045,6 +1231,7 @@ mod tests {
                 queue_name: "notifications".into(),
                 use_queue: false,
                 tick_ms: 500,
+                sending_visibility_seconds: 120,
             },
             limiter: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -1141,6 +1328,7 @@ mod tests {
                 queue_name: "notifications".into(),
                 use_queue: true,
                 tick_ms: 500,
+                sending_visibility_seconds: 120,
             },
             limiter: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -1198,5 +1386,249 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ---- at-least-once consume contract (#96) ----
+
+    /// In-memory SynapseQueue stand-in: canned consume responses plus
+    /// recorded ack/nack receipts, so the consumer's fail-closed decisions
+    /// can be asserted without a real queue.
+    #[derive(Clone)]
+    struct FakeQueue {
+        messages: Arc<Vec<Value>>,
+        acks: Arc<Mutex<Vec<Value>>>,
+        nacks: Arc<Mutex<Vec<Value>>>,
+    }
+
+    async fn fake_consume(State(queue): State<FakeQueue>) -> Json<Value> {
+        Json(json!({ "messages": queue.messages.as_ref().clone() }))
+    }
+
+    async fn fake_ack(State(queue): State<FakeQueue>, Json(body): Json<Value>) -> Json<Value> {
+        queue
+            .acks
+            .lock()
+            .await
+            .push(body.get("receipt").cloned().unwrap_or(Value::Null));
+        Json(json!({ "ok": true }))
+    }
+
+    async fn fake_nack(State(queue): State<FakeQueue>, Json(body): Json<Value>) -> Json<Value> {
+        queue.nacks.lock().await.push(body);
+        Json(json!({ "ok": true }))
+    }
+
+    async fn spawn_fake_queue(messages: Vec<Value>) -> (FakeQueue, String) {
+        let queue = FakeQueue {
+            messages: Arc::new(messages),
+            acks: Arc::new(Mutex::new(Vec::new())),
+            nacks: Arc::new(Mutex::new(Vec::new())),
+        };
+        let app = Router::new()
+            .route("/v1/queue/queues/{name}/consume", post(fake_consume))
+            .route("/v1/queue/queues/{name}/ack", post(fake_ack))
+            .route("/v1/queue/queues/{name}/nack", post(fake_nack))
+            .with_state(queue.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (queue, format!("http://{addr}"))
+    }
+
+    fn queue_message(id: &str, tenant: &str, receipt: &str) -> Value {
+        json!({
+            "receipt": receipt,
+            "payload": { "notificationId": id, "tenant": tenant },
+        })
+    }
+
+    async fn queue_state(store: Store, queue_url: String, visibility: i64) -> AppState {
+        AppState {
+            store,
+            config: Config {
+                port: 0,
+                is_prod: false,
+                internal_secret: String::new(),
+                cors_origins: vec![],
+                max_attempts: 5,
+                rate_limit: 120,
+                queue_url,
+                queue_name: "notifications".into(),
+                use_queue: true,
+                tick_ms: 500,
+                sending_visibility_seconds: visibility,
+            },
+            limiter: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    async fn seed(store: &Store, tenant: &str, body: &str) -> NotificationRecord {
+        store
+            .create(NewNotification {
+                tenant: tenant.into(),
+                channel: "log".into(),
+                recipient: json!({ "userId": "u1" }),
+                subject: String::new(),
+                body: body.into(),
+                idempotency_key: None,
+                metadata: json!({}),
+            })
+            .await
+            .expect("seed notification")
+    }
+
+    #[tokio::test]
+    async fn queue_claim_error_nacks_and_never_acks() {
+        let store = Store::connect(None).await.expect("memory store");
+        let created = seed(&store, "org:qa", "claim blip").await;
+        store.simulate_failure("claim_one").await;
+        let (queue, url) =
+            spawn_fake_queue(vec![queue_message(&created.id, "org:qa", "r-claim")]).await;
+        let state = queue_state(store.clone(), url, 120).await;
+        consume_from_queue(&state, "qa-consumer").await;
+        assert!(
+            queue.acks.lock().await.is_empty(),
+            "a store error at claim must never ack"
+        );
+        let nacks = queue.nacks.lock().await;
+        assert_eq!(nacks.len(), 1);
+        assert_eq!(nacks[0]["receipt"], json!("r-claim"));
+        assert_eq!(nacks[0]["requeue"], json!(true));
+        drop(nacks);
+        let row = store.get("org:qa", &created.id).await.unwrap().unwrap();
+        assert_eq!(row.status, "queued", "nothing was claimed");
+    }
+
+    #[tokio::test]
+    async fn redelivery_recovers_notification_stranded_in_sending() {
+        let store = Store::connect(None).await.expect("memory store");
+        let created = seed(&store, "org:qa", "recover me").await;
+        // A worker claimed the row, then died before any terminal update.
+        store
+            .claim_one("org:qa", &created.id)
+            .await
+            .unwrap()
+            .unwrap();
+        // Visibility 0 → the 'sending' row is immediately re-claimable.
+        let (queue, url) =
+            spawn_fake_queue(vec![queue_message(&created.id, "org:qa", "r-recover")]).await;
+        let state = queue_state(store.clone(), url, 0).await;
+        consume_from_queue(&state, "qa-consumer").await;
+        assert!(queue.nacks.lock().await.is_empty());
+        assert_eq!(queue.acks.lock().await.len(), 1);
+        let row = store.get("org:qa", &created.id).await.unwrap().unwrap();
+        assert_eq!(row.status, "delivered", "the stranded row was recovered");
+        assert_eq!(row.attempts.as_array().map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn fresh_sending_redelivery_is_acked_as_dedupe() {
+        let store = Store::connect(None).await.expect("memory store");
+        let created = seed(&store, "org:qa", "in flight").await;
+        // Another live consumer owns the row right now.
+        store
+            .claim_one("org:qa", &created.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let (queue, url) =
+            spawn_fake_queue(vec![queue_message(&created.id, "org:qa", "r-fresh")]).await;
+        let state = queue_state(store.clone(), url, 3600).await;
+        consume_from_queue(&state, "qa-consumer").await;
+        assert!(queue.nacks.lock().await.is_empty());
+        assert_eq!(queue.acks.lock().await.len(), 1);
+        let row = store.get("org:qa", &created.id).await.unwrap().unwrap();
+        assert_eq!(row.status, "sending", "the in-flight owner keeps the row");
+        assert_eq!(row.attempts, json!([]), "no duplicate delivery");
+    }
+
+    #[tokio::test]
+    async fn redelivery_of_unknown_notification_is_acked_as_dedupe() {
+        let store = Store::connect(None).await.expect("memory store");
+        let (queue, url) =
+            spawn_fake_queue(vec![queue_message("00000000-0000-0000-0000-000000000000", "org:qa", "r-unknown")])
+                .await;
+        let state = queue_state(store, url, 120).await;
+        consume_from_queue(&state, "qa-consumer").await;
+        assert!(queue.nacks.lock().await.is_empty());
+        assert_eq!(queue.acks.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn preference_store_error_blocks_delivery() {
+        let store = Store::connect(None).await.expect("memory store");
+        let created = seed(&store, "org:qa", "consent fail-closed").await;
+        store.simulate_failure("get_preference").await;
+        let (queue, url) =
+            spawn_fake_queue(vec![queue_message(&created.id, "org:qa", "r-pref")]).await;
+        let state = queue_state(store.clone(), url, 120).await;
+        consume_from_queue(&state, "qa-consumer").await;
+        // Fail closed on consent: no ack, no delivery attempt.
+        assert!(queue.acks.lock().await.is_empty());
+        let nacks = queue.nacks.lock().await;
+        assert_eq!(nacks.len(), 1);
+        assert_eq!(nacks[0]["requeue"], json!(true));
+        drop(nacks);
+        let row = store.get("org:qa", &created.id).await.unwrap().unwrap();
+        assert_eq!(row.status, "sending");
+        assert_eq!(
+            row.attempts, json!([]),
+            "a preference-store error must never be treated as 'subscribed'"
+        );
+    }
+
+    #[tokio::test]
+    async fn delivered_persist_failure_nacks_for_redelivery() {
+        let store = Store::connect(None).await.expect("memory store");
+        let created = seed(&store, "org:qa", "delivered blip").await;
+        store.simulate_failure("update").await;
+        let (queue, url) =
+            spawn_fake_queue(vec![queue_message(&created.id, "org:qa", "r-persist")]).await;
+        let state = queue_state(store.clone(), url, 120).await;
+        consume_from_queue(&state, "qa-consumer").await;
+        assert!(queue.acks.lock().await.is_empty());
+        assert_eq!(queue.nacks.lock().await.len(), 1);
+        let row = store.get("org:qa", &created.id).await.unwrap().unwrap();
+        assert_eq!(
+            row.status, "sending",
+            "the row stays claimable instead of being stranded"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_sweep_recovers_stale_sending_rows() {
+        let store = Store::connect(None).await.expect("memory store");
+        let created = seed(&store, "org:qa", "swept after crash").await;
+        // Worker claimed, crashed; the queue copy is gone entirely.
+        store
+            .claim_one("org:qa", &created.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let state = AppState {
+            store: store.clone(),
+            config: Config {
+                port: 0,
+                is_prod: false,
+                internal_secret: String::new(),
+                cors_origins: vec![],
+                max_attempts: 5,
+                rate_limit: 120,
+                queue_url: String::new(),
+                queue_name: "notifications".into(),
+                use_queue: false,
+                tick_ms: 500,
+                sending_visibility_seconds: 0,
+            },
+            limiter: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let (claimed, delivered, failed) = process_pending_once(&state, 10).await.unwrap();
+        assert_eq!((claimed, delivered, failed), (1, 1, 0));
+        let row = store.get("org:qa", &created.id).await.unwrap().unwrap();
+        assert_eq!(row.status, "delivered");
     }
 }
