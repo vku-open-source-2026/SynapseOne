@@ -10,7 +10,7 @@ import {
   __clearMem, createWorkflowRec, getWorkflowRec, updateWorkflowRec, createExecutionRec,
   claimExecutionRec, listExpiredRunningExecutions, reclaimExpiredExecution,
   createHumanTaskRec, listOverdueHumanTasks, transitionHumanTaskRec,
-  countActiveExecutionsForTenant,
+  countActiveExecutionsForTenant, claimWebhookDelivery, hitWebhookRate, claimCronSlot,
 } from './store';
 
 const TENANT = { sub: 'user-1', org: 'org-durable', account: 'acc-durable', kind: 'user' };
@@ -100,5 +100,32 @@ describe('durable workflow state', () => {
       runner: 'system', queue_name: 'synapseone-wf-system',
     });
     assert.equal(await countActiveExecutionsForTenant('org:org-durable'), 1);
+  });
+
+  it('webhook dedupe claims once per delivery key inside the TTL', async () => {
+    assert.equal(await claimWebhookDelivery('wf-1', 'key-a', 60_000), true);
+    assert.equal(await claimWebhookDelivery('wf-1', 'key-a', 60_000), false);
+    // Different keys and different workflows are independent.
+    assert.equal(await claimWebhookDelivery('wf-1', 'key-b', 60_000), true);
+    assert.equal(await claimWebhookDelivery('wf-2', 'key-a', 60_000), true);
+    // An expired TTL frees the key again.
+    assert.equal(await claimWebhookDelivery('wf-1', 'key-c', 1000), true);
+    await new Promise((r) => setTimeout(r, 1100));
+    assert.equal(await claimWebhookDelivery('wf-1', 'key-c', 60_000), true);
+  });
+
+  it('webhook rate buckets count fixed one-minute windows', async () => {
+    const first = await hitWebhookRate('wf-rate');
+    assert.equal(first.count, 1);
+    const second = await hitWebhookRate('wf-rate');
+    assert.equal(second.count, 2);
+    assert.equal(second.resetMs, first.resetMs);
+  });
+
+  it('cron slots are claimed once (second claim for the same slot loses)', async () => {
+    assert.equal(await claimCronSlot('wf-cron', 'i:123'), true);
+    assert.equal(await claimCronSlot('wf-cron', 'i:123'), false);
+    assert.equal(await claimCronSlot('wf-cron', 'i:124'), true);
+    assert.equal(await claimCronSlot('wf-other', 'i:123'), true);
   });
 });

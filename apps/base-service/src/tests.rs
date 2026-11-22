@@ -2904,6 +2904,54 @@ async fn search_semantic_hybrid_facets_filters_pagination_and_deletes() {
     assert_eq!(empty["total"], 0);
 }
 
+#[tokio::test]
+async fn search_drops_rows_missing_from_the_primary_store() {
+    // Fault injection for the best-effort index path: remove the document
+    // straight from the primary store so its index row goes stale (as after
+    // a failed remove_document_index). The read path must not return it.
+    let state = test_state().await;
+    let app = build_app(state.clone());
+    seed_search(&app).await;
+    let headers = user_headers("tenant-a", "analyst-1");
+    let (_, _, before) = call(
+        &app,
+        "POST",
+        "/v1/search",
+        &headers,
+        Some(json!({"query": "electricity outage", "mode": "semantic"})),
+    )
+    .await;
+    let hit = before["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["documentId"] == "inc-2")
+        .expect("inc-2 is indexed");
+    let collection_id = hit["collectionId"].as_str().unwrap().to_string();
+    assert!(state
+        .store
+        .delete_document(&collection_id, "inc-2", None)
+        .await
+        .expect("primary delete"));
+    let (status, _, after) = call(
+        &app,
+        "POST",
+        "/v1/search",
+        &headers,
+        Some(json!({"query": "electricity outage", "mode": "semantic"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert!(
+        !after["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["documentId"] == "inc-2"),
+        "stale index row must be filtered: {after}"
+    );
+}
+
 type FaststoreRequests = Arc<Mutex<Vec<(String, String, HashMap<String, String>, String)>>>;
 
 #[derive(Clone, Default)]

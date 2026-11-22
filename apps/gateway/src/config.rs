@@ -274,12 +274,47 @@ pub fn validate_security_config(
     }
     if is_prod && authz_mode == AuthzMode::Audit && audit_ack.trim().is_empty() {
         return Err(
-            "[gateway] AUTHZ_MODE=audit is a rollout override. Set AUTHZ_MODE=enforce, or acknowledge it with AUTHZ_AUDIT_ACK='owner=<name>;expires=<date>;reason=<why>'. \
+            "[gateway] AUTHZ_MODE=audit is a rollout override. Set AUTHZ_MODE=enforce, or acknowledge it with AUTHZ_AUDIT_ACK='owner=<name>;expires=<YYYY-MM-DD>;reason=<why>'. \
              Audit mode never blocks a would-deny decision."
                 .into(),
         );
     }
+    if is_prod && authz_mode == AuthzMode::Audit {
+        // An audit override without an owner and a future expiry is an
+        // indefinite enforcement hole: reject it at boot, not in review.
+        let ack = audit_ack.trim();
+        let owner = ack.split(';').find_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            (key.trim() == "owner").then(|| value.trim()).filter(|v| !v.is_empty())
+        });
+        let expires = ack.split(';').find_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            (key.trim() == "expires").then(|| value.trim().to_string())
+        });
+        let expiry_ok = expires.as_deref().is_some_and(|date| {
+            let bytes = date.as_bytes();
+            bytes.len() == 10
+                && bytes[4] == b'-'
+                && bytes[7] == b'-'
+                && bytes
+                    .iter()
+                    .enumerate()
+                    .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit())
+                && date >= today_utc().as_str()
+        });
+        if owner.is_none() || !expiry_ok {
+            return Err(
+                "[gateway] AUTHZ_AUDIT_ACK must name an owner and a non-past expiry date: 'owner=<name>;expires=<YYYY-MM-DD>;reason=<why>'."
+                    .into(),
+            );
+        }
+    }
     Ok(())
+}
+
+/// Current UTC date as `YYYY-MM-DD` (no clock dependency beyond std + chrono).
+fn today_utc() -> String {
+    chrono::Utc::now().format("%Y-%m-%d").to_string()
 }
 
 fn ready_upstreams_from_env() -> Vec<ReadyUpstream> {

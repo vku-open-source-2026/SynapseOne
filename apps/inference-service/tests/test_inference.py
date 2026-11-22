@@ -74,9 +74,11 @@ def test_internal_secret_auth():
         # /v1/* with valid header passes auth. With no real model available
         # and mock mode off, the embeddings route now fails closed (#98):
         # 503 model_degraded, never silent mock vectors.
-        with patch.object(embedding_engine, "load_model", return_value=False), \
-                patch.object(embedding_engine, "_is_loaded", False), \
-                patch.object(embedding_engine, "_load_error", "no backend in test env"):
+        with (
+            patch.object(embedding_engine, "load_model", return_value=False),
+            patch.object(embedding_engine, "_is_loaded", False),
+            patch.object(embedding_engine, "_load_error", "no backend in test env"),
+        ):
             res_ok = client.post(
                 "/v1/embeddings",
                 json={"input": "hello"},
@@ -129,9 +131,7 @@ def _force_real_model_unavailable(monkeypatch):
 
 def test_embeddings_fail_closed_when_model_never_loaded(monkeypatch):
     _force_real_model_unavailable(monkeypatch)
-    res = client.post(
-        "/v1/embeddings", json={"input": "hello"}, headers=auth_headers()
-    )
+    res = client.post("/v1/embeddings", json={"input": "hello"}, headers=auth_headers())
     assert res.status_code == 503
     body = res.json()
     assert body["error"] == "model_degraded"
@@ -166,9 +166,7 @@ def test_embeddings_explicit_mock_mode_still_serves(monkeypatch):
     # served, and only then.
     monkeypatch.setattr(settings, "INFERENCE_MOCK_MODELS", True)
     monkeypatch.setattr(embedding_engine, "_is_loaded", False)
-    res = client.post(
-        "/v1/embeddings", json={"input": "hello"}, headers=auth_headers()
-    )
+    res = client.post("/v1/embeddings", json={"input": "hello"}, headers=auth_headers())
     assert res.status_code == 200
     body = res.json()
     assert body["object"] == "list"

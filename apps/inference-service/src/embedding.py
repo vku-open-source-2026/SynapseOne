@@ -239,9 +239,7 @@ class EmbeddingEngine:
             except Exception as exc:  # noqa: BLE001 - fail closed, never mock
                 self._load_error = str(exc)
                 logger.exception("embedding inference failed")
-                raise EmbeddingModelError(
-                    f"embedding inference failed: {exc}"
-                ) from exc
+                raise EmbeddingModelError(f"embedding inference failed: {exc}") from exc
         else:
             # A real model was expected but never loaded: fail closed.
             raise EmbeddingModelError(

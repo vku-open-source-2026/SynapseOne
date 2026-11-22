@@ -56,8 +56,8 @@
       },
       "indexes": {},
       "foreignKeys": {
-        "lds_attributes_datasource_id_lds_datasources_id_fk": {
-          "name": "lds_attributes_datasource_id_lds_datasources_id_fk",
+        "lds_attributes_datasource_id_fkey": {
+          "name": "lds_attributes_datasource_id_fkey",
           "tableFrom": "lds_attributes",
           "tableTo": "lds_datasources",
           "columnsFrom": [
@@ -317,8 +317,8 @@
         }
       },
       "foreignKeys": {
-        "lds_records_datasource_id_lds_datasources_id_fk": {
-          "name": "lds_records_datasource_id_lds_datasources_id_fk",
+        "lds_records_datasource_id_fkey": {
+          "name": "lds_records_datasource_id_fkey",
           "tableFrom": "lds_records",
           "tableTo": "lds_datasources",
           "columnsFrom": [

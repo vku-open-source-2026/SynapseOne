@@ -292,3 +292,55 @@ export const runnerUsageHourly = pgTable(
     index('idx_synapseone_inference_jobs_runner').on(t.runnerId, t.createdAt.desc()),
   ],
 );
+
+/**
+ * Durable webhook idempotency receipts (#95.3). The in-memory dedupe map is
+ * per-process: every replica must see the same deliveries, so receipts are
+ * persisted with a TTL and pruned lazily on insert.
+ */
+export const webhookDeliveries = pgTable(
+  'synapseone_workflow_webhook_deliveries',
+  {
+    workflowId: text('workflow_id').notNull(),
+    deliveryKey: text('delivery_key').notNull(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.workflowId, t.deliveryKey] }),
+    index('idx_synapseone_webhook_deliveries_expiry').on(t.expiresAt),
+  ],
+);
+
+/**
+ * Durable per-workflow webhook rate buckets (#95.3). Fixed one-minute
+ * windows; the count is incremented in the same transaction as the dedupe
+ * insert so concurrent replicas share one budget.
+ */
+export const webhookRateBuckets = pgTable(
+  'synapseone_workflow_webhook_rate_buckets',
+  {
+    workflowId: text('workflow_id').notNull(),
+    windowStart: timestamp('window_start', { withTimezone: true }).notNull(),
+    count: integer('count').notNull().default(1),
+  },
+  (t) => [
+    primaryKey({ columns: [t.workflowId, t.windowStart] }),
+  ],
+);
+
+/**
+ * Durable cron slot claims (#95.3). The in-memory `lastCronRun` map resets
+ * on every restart (refiring all crons) and is invisible to other replicas.
+ * Each tick claims its slot (interval bucket or wall-clock timestamp) inside
+ * one advisory-locked transaction; only the claim winner enqueues. `claimedAt`
+ * doubles as the persisted last-run marker for observability.
+ */
+export const cronClaims = pgTable(
+  'synapseone_workflow_cron_claims',
+  {
+    workflowId: text('workflow_id').primaryKey(),
+    slotKey: text('slot_key').notNull(),
+    claimedAt: timestamp('claimed_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+);

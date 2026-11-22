@@ -134,6 +134,26 @@ describe('first-party credential lifecycle', () => {
     assert.equal(me.data.error, 'account_deactivated');
   });
 
+  it('rejects user-bound API keys after the owner is deactivated', async () => {
+    const reg = await register('cred-key-deact', 'keydeact@cred.local');
+    const orgs = await call('GET', '/v1/orgs', undefined, reg.accessToken);
+    const orgId = orgs.data[0].id;
+    const acc = await call('POST', `/v1/orgs/${orgId}/accounts`, { slug: 'prod', displayName: 'Prod' }, reg.accessToken);
+    assert.equal(acc.status, 201, JSON.stringify(acc.data));
+    const minted = await call('POST', `/v1/accounts/${acc.data.id}/keys`, {
+      name: 'owner-key', userId: reg.user.id, scopes: ['*:read'],
+    }, reg.accessToken);
+    assert.equal(minted.status, 201, JSON.stringify(minted.data));
+    const key = minted.data.apiKey || `${minted.data.keyPrefix}.${minted.data.secret}`;
+    const valid = await call('GET', '/v1/auth/verify', undefined, undefined, { 'x-api-key': key });
+    assert.equal(valid.status, 200, JSON.stringify(valid.data));
+    // Deactivation without an explicit key sweep must still kill the key:
+    // verification re-checks the owner's active flag.
+    await setUserActive(reg.user.id, false);
+    const after = await call('GET', '/v1/auth/verify', undefined, undefined, { 'x-api-key': key });
+    assert.equal(after.status, 401, JSON.stringify(after.data));
+  });
+
   it('rejects access tokens after a session revocation epoch bump', async () => {
     const reg = await register('cred-revoke', 'revoke@cred.local');
     const before = await call('GET', '/v1/orgs', undefined, reg.accessToken);

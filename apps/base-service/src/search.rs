@@ -5,7 +5,11 @@
 //! The index is a denormalised projection: collection/tenant/ACL/text plus a
 //! deterministic local embedding. It is rebuilt by POST /v1/search/reindex and
 //! every query re-checks tenant and document ACLs — the index is never a way
-//! around collection scoping.
+//! around collection scoping. Index writes are best-effort (a failed
+//! upsert/remove is logged but never fails the document write), so the read
+//! path additionally drops rows whose document no longer exists in the
+//! primary store: without this a deleted document stays searchable until the
+//! next reindex.
 
 use std::collections::HashSet;
 
@@ -541,6 +545,71 @@ async fn load_records(
         .collect())
 }
 
+/// Drop index rows whose document no longer exists in the primary store.
+///
+/// Index maintenance is best-effort (see the callers in `api.rs`): a failed
+/// upsert/remove must not fail the document write, so a stale row can linger
+/// after an index outage. Re-checking existence on the read path keeps
+/// deleted documents out of results until the next reindex repairs the rows.
+/// A failed existence probe keeps every row (fail-open for availability: the
+/// probe queries the same store the index query just used).
+pub async fn retain_existing(store: &Store, records: &mut Vec<StoredSearchRecord>) {
+    if records.is_empty() {
+        return;
+    }
+    if let Some(pool) = store.pool() {
+        let mut live: HashSet<(String, String)> = HashSet::new();
+        for chunk in records.chunks(500) {
+            let mut sql = String::from(
+                "SELECT collection_id, id FROM synapseone_base_documents WHERE (collection_id, id) IN (",
+            );
+            for (index, _) in chunk.iter().enumerate() {
+                if index > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&format!("(${}, ${})", index * 2 + 1, index * 2 + 2));
+            }
+            sql.push(')');
+            let mut query = sqlx::query(&sql);
+            for record in chunk {
+                query = query.bind(&record.collection_id).bind(&record.document_id);
+            }
+            match query.fetch_all(pool).await {
+                Ok(rows) => {
+                    for row in rows {
+                        let collection_id: String = row.try_get("collection_id").unwrap_or_default();
+                        let id: String = row.try_get("id").unwrap_or_default();
+                        live.insert((collection_id, id));
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("[base][search] existence re-check failed: {error}");
+                    return;
+                }
+            }
+        }
+        let before = records.len();
+        records.retain(|record| {
+            live.contains(&(record.collection_id.clone(), record.document_id.clone()))
+        });
+        let dropped = before - records.len();
+        if dropped > 0 {
+            tracing::warn!(
+                "[base][search] dropped {dropped} stale index row(s) missing from the primary store"
+            );
+        }
+        return;
+    }
+    if let Some(memory) = store.memory().await {
+        records.retain(|record| {
+            memory.documents.contains_key(&(
+                record.collection_id.clone(),
+                record.document_id.clone(),
+            ))
+        });
+    }
+}
+
 fn acl_allows(record: &StoredSearchRecord, scope: &SearchScope) -> bool {
     if scope.platform {
         return true;
@@ -736,6 +805,9 @@ pub async fn search_records(
     }
     let mut rows = load_records(store, scope).await?;
     rows.retain(|record| acl_allows(record, scope));
+    // The index is best-effort: drop rows whose document is gone from the
+    // primary store (deleted documents must not stay searchable).
+    retain_existing(store, &mut rows).await;
     if !scope.machine {
         rows.retain(|record| {
             !crate::util::is_reserved_collection(

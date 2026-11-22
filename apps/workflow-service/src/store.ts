@@ -21,7 +21,7 @@ import {
   fitRunnerResources,
   sanitizeResourceSample,
 } from './runner-resources';
-import { credentials, executions, humanTasks, inferenceJobs, runnerUsageHourly, secrets, secretVersions, workflowRunnerInstances, workflowRunners, workflows } from './schema';
+import { credentials, cronClaims, executions, humanTasks, inferenceJobs, runnerUsageHourly, secrets, secretVersions, webhookDeliveries, webhookRateBuckets, workflowRunnerInstances, workflowRunners, workflows } from './schema';
 
 /** Caller principal stamped by the gateway (P0-2). Anonymous when called
  *  directly with only the internal secret (dev/tests). */
@@ -205,7 +205,7 @@ function getDirectPool(): Pool | null {
   }
   return directPool;
 }
-const db = pool ? drizzle(pool, { schema: { credentials, executions, inferenceJobs, runnerUsageHourly, workflowRunnerInstances, workflowRunners, workflows } }) : null;
+const db = pool ? drizzle(pool, { schema: { credentials, cronClaims, executions, humanTasks, inferenceJobs, runnerUsageHourly, secrets, secretVersions, webhookDeliveries, webhookRateBuckets, workflowRunnerInstances, workflowRunners, workflows } }) : null;
 
 export function useDb(): boolean {
   return !!db;
@@ -1176,6 +1176,152 @@ export async function findActiveWebhookWorkflow(path: string): Promise<StoredWor
 export async function listActiveCronWorkflows(): Promise<StoredWorkflow[]> {
   const all = await listWorkflowRecs();
   return all.filter((w) => w.active && (w.nodes || []).some((n) => isCronType((n as any)?.type)));
+}
+
+// ---------- durable webhook/cron coordination (#95.3) ----------
+//
+// The in-memory webhook dedupe/rate maps and the `lastCronRun` map are
+// per-process: a restart refires every cron and a second replica double-fires
+// webhooks. The functions below persist the same state in Postgres so every
+// replica shares one budget and one claim; the in-memory maps stay as the
+// fallback when DATABASE_URL is unset (dev/test single process).
+
+const memWebhookDeliveries = new Map<string, number>(); // `${workflowId}:${key}` -> expiresAtMs
+const memWebhookRate = new Map<string, { count: number; reset: number }>(); // `${workflowId}:${minute}` -> bucket
+const memCronClaims = new Map<string, { slot: string; at: number }>(); // workflowId -> claim
+
+/** Claim a webhook delivery key. Returns true when this call is the first
+ *  delivery (proceed), false when the key was already seen inside its TTL
+ *  (caller must answer 409 duplicate_delivery). */
+export async function claimWebhookDelivery(workflowId: string, key: string, ttlMs: number): Promise<boolean> {
+  const nowMs = Date.now();
+  const expiresAt = new Date(nowMs + Math.max(1000, ttlMs));
+  if (db) {
+    await ensureTables();
+    try {
+      return await db.transaction(async (tx) => {
+        // Lazy prune: expired receipts for this workflow only.
+        await tx.execute(sql`delete from synapseone_workflow_webhook_deliveries where workflow_id = ${workflowId} and expires_at < now()`);
+        const rows = await tx
+          .insert(webhookDeliveries)
+          .values({ workflowId, deliveryKey: key, expiresAt })
+          .onConflictDoNothing()
+          .returning({ workflowId: webhookDeliveries.workflowId });
+        return rows.length > 0;
+      });
+    } catch {
+      // Fall through to the in-memory map rather than failing the webhook.
+    }
+  }
+  const mapKey = `${workflowId}:${key}`;
+  const seenAt = memWebhookDeliveries.get(mapKey);
+  if (seenAt && seenAt > nowMs) return false;
+  memWebhookDeliveries.set(mapKey, expiresAt.getTime());
+  if (memWebhookDeliveries.size > 10000) {
+    for (const [k, exp] of memWebhookDeliveries) {
+      if (exp <= nowMs) memWebhookDeliveries.delete(k);
+      if (memWebhookDeliveries.size <= 8000) break;
+    }
+  }
+  return true;
+}
+
+/** Increment the fixed one-minute rate bucket. Returns the new count and the
+ *  bucket reset time; the caller compares against the workflow rpm. */
+export async function hitWebhookRate(workflowId: string): Promise<{ count: number; resetMs: number }> {
+  const nowMs = Date.now();
+  const minute = Math.floor(nowMs / 60000) * 60000;
+  const resetMs = minute + 60000;
+  if (db) {
+    await ensureTables();
+    try {
+      const windowStart = new Date(minute);
+      const count = await db.transaction(async (tx) => {
+        await tx.execute(sql`delete from synapseone_workflow_webhook_rate_buckets where workflow_id = ${workflowId} and window_start < ${windowStart}`);
+        const rows = await tx
+          .insert(webhookRateBuckets)
+          .values({ workflowId, windowStart, count: 1 })
+          .onConflictDoUpdate({
+            target: [webhookRateBuckets.workflowId, webhookRateBuckets.windowStart],
+            set: { count: sql`${webhookRateBuckets.count} + 1` },
+          })
+          .returning({ count: webhookRateBuckets.count });
+        return rows[0] ? Number(rows[0].count) : 1;
+      });
+      return { count, resetMs };
+    } catch {
+      // Fall through to the in-memory bucket rather than failing the webhook.
+    }
+  }
+  const mapKey = `${workflowId}:${minute}`;
+  const bucket = memWebhookRate.get(mapKey);
+  if (!bucket || nowMs >= bucket.reset) {
+    memWebhookRate.set(mapKey, { count: 1, reset: resetMs });
+    return { count: 1, resetMs };
+  }
+  bucket.count++;
+  return { count: bucket.count, resetMs: bucket.reset };
+}
+
+/**
+ * Claim one cron slot for a workflow. Returns true only for the replica that
+ * wins the slot — every other replica (and a repeated tick for the same
+ * slot) must skip. A crash between claim and enqueue skips that slot; the
+ * next slot retries, which is strictly better than every replica firing.
+ */
+export async function claimCronSlot(workflowId: string, slot: string): Promise<boolean> {
+  if (db) {
+    await ensureTables();
+    try {
+      return await db.transaction(async (tx) => {
+        // Serialize same-workflow claimants; a contended lock means another
+        // replica is claiming right now — skip instead of double-firing.
+        const locked = await tx.execute(
+          sql`select pg_try_advisory_xact_lock(hashtext('synapseone_workflow_cron'), hashtext(${workflowId})) as ok`,
+        );
+        const ok = (locked as any)?.rows?.[0]?.ok === true;
+        if (!ok) return false;
+        const existing = await tx
+          .select({ slot: cronClaims.slotKey })
+          .from(cronClaims)
+          .where(eq(cronClaims.workflowId, workflowId))
+          .limit(1);
+        if (existing[0] && existing[0].slot === slot) return false;
+        await tx
+          .insert(cronClaims)
+          .values({ workflowId, slotKey: slot, claimedAt: new Date() })
+          .onConflictDoUpdate({
+            target: cronClaims.workflowId,
+            set: { slotKey: slot, claimedAt: new Date() },
+          });
+        return true;
+      });
+    } catch {
+      return false;
+    }
+  }
+  const prev = memCronClaims.get(workflowId);
+  if (prev && prev.slot === slot) return false;
+  memCronClaims.set(workflowId, { slot, at: Date.now() });
+  return true;
+}
+
+/** Last claimed cron slot (persisted last-run marker for observability). */
+export async function lastCronSlot(workflowId: string): Promise<string | null> {
+  if (db) {
+    await ensureTables();
+    try {
+      const rows = await db
+        .select({ slot: cronClaims.slotKey })
+        .from(cronClaims)
+        .where(eq(cronClaims.workflowId, workflowId))
+        .limit(1);
+      return rows[0] ? String(rows[0].slot) : null;
+    } catch {
+      return null;
+    }
+  }
+  return memCronClaims.get(workflowId)?.slot ?? null;
 }
 
 // ---------- credentials (P0-4): account-scoped secrets, encrypted at rest ----------

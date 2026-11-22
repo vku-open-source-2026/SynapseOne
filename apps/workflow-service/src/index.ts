@@ -22,6 +22,7 @@ import {
   createWorkflowRec, getWorkflowRec, listWorkflowRecs, updateWorkflowRec, deleteWorkflowRec,
   createExecutionRec, getExecutionRec, listExecutionRecs, findActiveWebhookWorkflow,
   listActiveCronWorkflows, ensureTables, useDb, StoredWorkflow, StoredCredential,
+  claimWebhookDelivery, hitWebhookRate, claimCronSlot,
   createCredentialRec, getCredentialRec, listCredentialRecs, deleteCredentialRec, rotateCredentialRec,
   toPublicCredential, decryptSecret,
   createHumanTaskRec, getHumanTaskRec, listHumanTaskRecs, transitionHumanTaskRec, toPublicHumanTask,
@@ -2416,12 +2417,12 @@ export function createApp(): express.Express {
   // Data-plane mutation audit (#32): actor/tenant/action/result per write.
   app.use(auditMiddleware('workflow'));
 
-  // ---- inbound webhook hardening (P0-5): per-workflow auth, rate limit, idempotency ----
+  // ---- inbound webhook hardening (P0-5): per-workflow auth, durable
+  // rate limit + idempotency (persisted in Postgres so every replica shares
+  // one budget; in-memory fallback without DATABASE_URL).
   // Node params contract (validated at save time):
   //   auth: { mode: none|secret-header|hmac-sha256|jwt, header?, credentialId? }
   //   rateLimit: { rpm } (default 600, 1..60000) · idempotency: { header, ttlSeconds }
-  const webhookRate = new Map<string, { count: number; reset: number }>();
-  const webhookDedupe = new Map<string, number>();
   function webhookNodeFor(wf: StoredWorkflow, clean: string): any | null {
     for (const n of wf.nodes || []) {
       if (!isWebhookType((n as any)?.type)) continue;
@@ -2486,18 +2487,15 @@ export function createApp(): express.Express {
       }
       const node = webhookNodeFor(wf, clean);
       const params = (node as any)?.parameters || {};
-      // Rate limit (fixed window per workflow).
+      // Rate limit (fixed one-minute window per workflow, durable across
+      // replicas via Postgres; in-memory fallback without DATABASE_URL).
       const rpm = Math.min(Math.max(Number(params?.rateLimit?.rpm) || 600, 1), 60000);
       const nowMs = Date.now();
-      const bucket = webhookRate.get(wf.id);
-      if (!bucket || nowMs >= bucket.reset) webhookRate.set(wf.id, { count: 1, reset: nowMs + 60000 });
-      else {
-        bucket.count++;
-        if (bucket.count > rpm) {
-          recordWebhookReject('rate_limited');
-          res.setHeader('Retry-After', Math.max(1, Math.ceil((bucket.reset - nowMs) / 1000)));
-          return res.status(429).json({ error: 'rate_limited', message: `webhook exceeds ${rpm}/min` });
-        }
+      const bucket = await hitWebhookRate(wf.id);
+      if (bucket.count > rpm) {
+        recordWebhookReject('rate_limited');
+        res.setHeader('Retry-After', Math.max(1, Math.ceil((bucket.resetMs - nowMs) / 1000)));
+        return res.status(429).json({ error: 'rate_limited', message: `webhook exceeds ${rpm}/min` });
       }
       // Auth.
       const auth = webhookAuthOf(node);
@@ -2539,23 +2537,17 @@ export function createApp(): express.Express {
         }
       }
       // Idempotency: replayed delivery keys within TTL are rejected (409).
+      // Receipts are durable across replicas via Postgres; in-memory
+      // fallback without DATABASE_URL.
       const idem = (params as any)?.idempotency;
       if (idem && typeof idem === 'object' && typeof idem.header === 'string' && idem.header) {
         const keyVal = String(req.headers[String(idem.header).toLowerCase()] || '');
         if (keyVal) {
           const ttlMs = Math.min(Math.max(Number(idem.ttlSeconds) || 3600, 60), 86400) * 1000;
-          const dk = `${wf.id}:${keyVal.slice(0, 256)}`;
-          const seenAt = webhookDedupe.get(dk);
-          if (seenAt && nowMs - seenAt < ttlMs) {
+          const first = await claimWebhookDelivery(wf.id, keyVal.slice(0, 256), ttlMs);
+          if (!first) {
             recordWebhookReject('duplicate');
             return res.status(409).json({ error: 'duplicate_delivery', message: 'delivery key already processed' });
-          }
-          webhookDedupe.set(dk, nowMs);
-          if (webhookDedupe.size > 10000) {
-            for (const [k, t] of webhookDedupe) {
-              if (nowMs - t >= ttlMs) webhookDedupe.delete(k);
-              if (webhookDedupe.size <= 8000) break;
-            }
           }
         }
       }
@@ -6678,6 +6670,8 @@ export function buildTemplate(name: string, workflowName?: string): any | null {
   }
   return null;
 }
+/** Local pre-filter for the cron loop; the authoritative cross-replica gate
+ *  is the durable slot claim in the store (claimCronSlot). */
 const lastCronRun = new Map<string, number>();
 
 /** Recover executions whose runner/worker died mid-job (expired lease) and
@@ -6770,6 +6764,12 @@ function startCronLoop(): void {
         } else if (!(wallClock && wallClock <= now && last < wallClock)) {
           continue;
         }
+        // Durable cross-replica claim: the slot (interval bucket or the
+        // wall-clock timestamp) is claimed in Postgres, so N replicas ticking
+        // the same schedule enqueue exactly once. The local map stays as a
+        // cheap pre-filter; the claim is authoritative.
+        const slot = interval ? `i:${Math.floor(now / interval)}` : `w:${wallClock}`;
+        if (!(await claimCronSlot(wf.id, slot))) continue;
         lastCronRun.set(wf.id, now);
         try {
           const runPrincipal = workflowRunPrincipal(wf);

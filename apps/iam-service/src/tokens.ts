@@ -9,7 +9,7 @@ import jwt from 'jsonwebtoken';
 import { randomBytes, randomUUID } from 'crypto';
 import { and, desc, eq, gt, isNull, or, sql } from 'drizzle-orm';
 import { ensureTables, getDb, useDb, __mem, hashSecret, hashCandidates, bumpAuthVersion } from './db';
-import { apiKeys, executionDelegations, platformRunnerKeys, refreshTokens } from './schema';
+import { apiKeys, executionDelegations, platformRunnerKeys, refreshTokens, users } from './schema';
 
 /** Fail fast on weak/default JWT secrets in production; warn loudly in dev. */
 function jwtSecret(): string {
@@ -635,6 +635,28 @@ export interface VerifiedApiKey {
 /** last_used_at is written at most once per minute per key (hot-path friendly). */
 const LAST_USED_THROTTLE_MS = 60_000;
 
+/**
+ * A user-bound API key must stop working when its owner is deactivated, even
+ * if the deactivate path missed the revocation sweep. Password change/reset
+ * revokes keys outright (revokeApiKeysForUser); this check closes the
+ * deactivation gap at verification time for both backends.
+ */
+async function isApiKeyOwnerActive(userId: string | null | undefined): Promise<boolean> {
+  if (!userId) return true;
+  if (useDb()) {
+    const db = getDb()!;
+    await ensureTables();
+    const rows = await db.select({ active: users.active })
+      .from(users).where(eq(users.id, userId)).limit(1);
+    const row = rows[0];
+    if (!row) return false;
+    return row.active !== false;
+  }
+  const u = (__mem.users as Map<string, any>).get(userId);
+  if (!u) return false;
+  return u.active !== false;
+}
+
 export async function verifyApiKey(raw: string): Promise<VerifiedApiKey | null> {
   if (!raw || typeof raw !== 'string' || raw.length > 512) return null;
   // Thử peppered hash trước, legacy sau (rotation-safe cho key cũ).
@@ -661,6 +683,7 @@ async function verifyApiKeyByHash(hash: string): Promise<VerifiedApiKey | null> 
     const row = rows[0];
     if (!row || row.revokedAt) return null;
     if (row.expiresAt && new Date(row.expiresAt).getTime() < Date.now()) return null;
+    if (!(await isApiKeyOwnerActive(row.userId))) return null;
     if (!row.lastUsedAt || Date.now() - new Date(row.lastUsedAt).getTime() > LAST_USED_THROTTLE_MS) {
       // Best-effort usage stamp; verification never fails because of it.
       db.update(apiKeys).set({ lastUsedAt: sql`now()` })
@@ -672,6 +695,7 @@ async function verifyApiKeyByHash(hash: string): Promise<VerifiedApiKey | null> 
   const rec = __mem.apiKeys.get(hash);
   if (!rec || rec.revoked_at) return null;
   if (rec.expires_at && new Date(rec.expires_at).getTime() < Date.now()) return null;
+  if (!(await isApiKeyOwnerActive(rec.user_id))) return null;
   rec.last_used_at = new Date().toISOString();
   return { id: rec.id, account_id: rec.account_id, user_id: rec.user_id || null, scopes: rec.scopes || [] };
 }
