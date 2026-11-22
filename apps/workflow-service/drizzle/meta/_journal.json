@@ -92,6 +92,13 @@
       "when": 1800000500000,
       "tag": "0012_runner_usage_hourly",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1800000600000,
+      "tag": "0013_wonderful_mercury",
+      "breakpoints": true
     }
   ]
 }

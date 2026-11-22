@@ -1736,9 +1736,12 @@ async fn create_document(
             }
             _ => ApiError::from(crate::error::InternalError(error.message)),
         })?;
-    let _ =
+    if let Err(error) =
         crate::search::upsert_document_index(&state.store, &state.config, &collection, &document)
-            .await;
+            .await
+    {
+        tracing::warn!("[base][search] index upsert failed: {error}");
+    }
     state
         .cache
         .delete_document(&headers, &collection.id, &id)
@@ -1850,9 +1853,12 @@ async fn put_document(
         )
         .await
         .map_err(store_error)?;
-    let _ =
+    if let Err(error) =
         crate::search::upsert_document_index(&state.store, &state.config, &collection, &result.doc)
-            .await;
+            .await
+    {
+        tracing::warn!("[base][search] index upsert failed: {error}");
+    }
     state
         .cache
         .delete_document(&headers, &collection.id, &id)
@@ -1967,9 +1973,12 @@ async fn patch_document(
         )
         .await
         .map_err(store_error)?;
-    let _ =
+    if let Err(error) =
         crate::search::upsert_document_index(&state.store, &state.config, &collection, &result.doc)
-            .await;
+            .await
+    {
+        tracing::warn!("[base][search] index upsert failed: {error}");
+    }
     state
         .cache
         .delete_document(&headers, &collection.id, &id)
@@ -2035,7 +2044,11 @@ async fn delete_document(
     if !ok {
         return Err(ApiError::not_found(format!("document '{id}' not found")));
     }
-    let _ = crate::search::remove_document_index(&state.store, &collection.id, &id).await;
+    if let Err(error) =
+        crate::search::remove_document_index(&state.store, &collection.id, &id).await
+    {
+        tracing::warn!("[base][search] index remove failed: {error}");
+    }
     state
         .cache
         .delete_document(&headers, &collection.id, &id)
@@ -2111,9 +2124,12 @@ async fn increment_document(
             }
             _ => ApiError::from(crate::error::InternalError(error.message)),
         })?;
-    let _ =
+    if let Err(error) =
         crate::search::upsert_document_index(&state.store, &state.config, &collection, &document)
-            .await;
+            .await
+    {
+        tracing::warn!("[base][search] index upsert failed: {error}");
+    }
     state
         .cache
         .delete_document(&headers, &collection.id, &id)
@@ -2286,13 +2302,16 @@ async fn batch_documents(
                         .create_document(&collection.id, &id, data)
                         .await
                         .map_err(|error| (store_code(&error), error.message))?;
-                    let _ = crate::search::upsert_document_index(
+                    if let Err(error) = crate::search::upsert_document_index(
                         &state.store,
                         &state.config,
                         &collection,
                         &document,
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::warn!("[base][search] index upsert failed: {error}");
+                    }
                     Ok(json!({
                         "index": index,
                         "ok": true,
@@ -2328,13 +2347,16 @@ async fn batch_documents(
                         )
                         .await
                         .map_err(|error| (store_code(&error), error.message))?;
-                    let _ = crate::search::upsert_document_index(
+                    if let Err(error) = crate::search::upsert_document_index(
                         &state.store,
                         &state.config,
                         &collection,
                         &result.doc,
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::warn!("[base][search] index upsert failed: {error}");
+                    }
                     Ok(json!({
                         "index": index,
                         "ok": true,
@@ -2376,9 +2398,12 @@ async fn batch_documents(
                         .await
                         .map_err(|error| (store_code(&error), error.message))?;
                     if ok {
-                        let _ =
+                        if let Err(error) =
                             crate::search::remove_document_index(&state.store, &collection.id, &id)
-                                .await;
+                                .await
+                        {
+                            tracing::warn!("[base][search] index remove failed: {error}");
+                        }
                     }
                     Ok(json!({
                         "index": index,

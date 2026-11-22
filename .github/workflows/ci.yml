@@ -67,7 +67,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [base-service, queue-service, gateway, ocs-service, faststore-service]
+        service: [ai-service, base-service, queue-service, gateway, ocs-service, faststore-service, stream-service, lds-service, notifications-service, warehouse-service]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

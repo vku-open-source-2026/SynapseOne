@@ -1493,7 +1493,14 @@ fn trust_proxy_and_config_guards() {
     assert!(validate_security_config(true, false, AuthzMode::Off, false, "").is_err());
     assert!(validate_security_config(true, true, AuthzMode::Off, true, "").is_err());
     assert!(validate_security_config(true, true, AuthzMode::Audit, true, "").is_err());
-    assert!(validate_security_config(true, true, AuthzMode::Audit, true, "owner=security;expires=2026-12-01").is_ok());
+    assert!(validate_security_config(true, true, AuthzMode::Audit, true, "owner=security;expires=2030-12-01").is_ok());
+    assert!(validate_security_config(true, true, AuthzMode::Audit, true, "owner=security;expires=2030-12-01;reason=migration").is_ok());
+    // An audit override without an owner or with a missing/malformed/past
+    // expiry must fail closed: otherwise audit mode is an indefinite hole.
+    assert!(validate_security_config(true, true, AuthzMode::Audit, true, "expires=2030-12-01").is_err());
+    assert!(validate_security_config(true, true, AuthzMode::Audit, true, "owner=security").is_err());
+    assert!(validate_security_config(true, true, AuthzMode::Audit, true, "owner=security;expires=soon").is_err());
+    assert!(validate_security_config(true, true, AuthzMode::Audit, true, "owner=security;expires=2000-01-01").is_err());
     assert!(validate_security_config(true, true, AuthzMode::Enforce, true, "").is_ok());
     assert!(validate_security_config(false, false, AuthzMode::Off, true, "").is_ok());
     let mut prod = test_config("http://127.0.0.1:1");

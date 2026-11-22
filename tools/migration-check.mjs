@@ -6,11 +6,41 @@
  * older than the last applied migration, so a newly generated migration must
  * always carry a timestamp greater than every previous entry.
  */
-import { readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const roots = ['apps/base-service', 'apps/iam-service', 'apps/workflow-service', 'apps/lds-service'];
 let failed = false;
+
+/**
+ * Named constraints (FOREIGN KEY / UNIQUE / CHECK / PRIMARY KEY) declared in
+ * the latest migration's SQL must be recorded under the same name in that
+ * entry's snapshot. #84: 0008 SQL created `..._fkey` while the snapshot
+ * recorded a different `..._fk` name, so a future `drizzle-kit generate`
+ * would emit a destructive rename and fresh installs would diverge from
+ * production. Only the latest entry is gated: earlier entries predate
+ * consistent per-entry snapshots and are grandfathered.
+ */
+function checkSnapshotAgreement(root, entry) {
+  const snapName = `${String(entry.idx).padStart(4, '0')}_snapshot.json`;
+  const snapPath = join(root, 'drizzle', 'meta', snapName);
+  if (!existsSync(snapPath)) return; // older entries predate per-entry snapshots
+  const sqlFiles = readdirSync(join(root, 'drizzle'))
+    .filter((name) => name.startsWith(entry.tag) && name.endsWith('.sql'));
+  if (!sqlFiles.length) return;
+  const snapshot = readFileSync(snapPath, 'utf8');
+  const names = new Set();
+  for (const file of sqlFiles) {
+    const sql = readFileSync(join(root, 'drizzle', file), 'utf8');
+    for (const match of sql.matchAll(/CONSTRAINT\s+"([^"]+)"/g)) names.add(match[1]);
+  }
+  for (const name of names) {
+    if (!snapshot.includes(`"${name}"`)) {
+      console.error(`migration-check: ${root} entry ${entry.tag} declares CONSTRAINT "${name}" but ${snapName} records a different name (snapshot/SQL drift)`);
+      failed = true;
+    }
+  }
+}
 
 for (const root of roots) {
   const path = join(root, 'drizzle', 'meta', '_journal.json');
@@ -33,7 +63,9 @@ for (const root of roots) {
       failed = true;
     }
   }
+  const entries = journal.entries || [];
+  if (entries.length) checkSnapshotAgreement(root, entries[entries.length - 1]);
 }
 
 if (failed) process.exit(1);
-console.log('migration-check: OK (journal timestamps are strictly increasing)');
+console.log('migration-check: OK (journal timestamps are strictly increasing; snapshots agree with SQL constraint names)');

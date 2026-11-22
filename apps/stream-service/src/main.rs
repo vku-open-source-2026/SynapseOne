@@ -973,6 +973,10 @@ mod tests {
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt;
 
+    /// The audit buffer is process-global; request-issuing tests hold this
+    /// across their body so parallel tests cannot interleave audit events.
+    static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn test_state() -> AppState {
         AppState {
             engine: Engine::Memory(MemoryEngine::new()),
@@ -1019,6 +1023,7 @@ mod tests {
 
     #[tokio::test]
     async fn topic_lifecycle() {
+        let _serial = TEST_SERIAL.lock().await;
         let app = build_app(test_state());
         let (status, body) = send(
             app.clone(),
@@ -1055,6 +1060,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_read_and_batch() {
+        let _serial = TEST_SERIAL.lock().await;
         let app = build_app(test_state());
         send(app.clone(), "PUT", "/v1/stream/topics/sensors", None).await;
         let (status, first) = send(
@@ -1096,6 +1102,7 @@ mod tests {
 
     #[tokio::test]
     async fn consumer_groups_ack_and_destroy() {
+        let _serial = TEST_SERIAL.lock().await;
         let app = build_app(test_state());
         send(app.clone(), "PUT", "/v1/stream/topics/jobs", None).await;
         send(
@@ -1162,6 +1169,7 @@ mod tests {
 
     #[tokio::test]
     async fn tenant_isolation() {
+        let _serial = TEST_SERIAL.lock().await;
         let app = build_app(test_state());
         let (status, _) = send(
             app.clone(),
@@ -1189,6 +1197,7 @@ mod tests {
 
     #[tokio::test]
     async fn mutation_audit_records_actor_and_action() {
+        let _serial = TEST_SERIAL.lock().await;
         audit::clear();
         let app = build_app(test_state());
         send(
@@ -1219,6 +1228,9 @@ mod tests {
             .unwrap()
             .contains("super-secret-value"));
 
+        // Read-only POSTs must not audit. (The audit buffer is process-global;
+        // this file serializes request-issuing tests on TEST_SERIAL so a
+        // parallel test cannot record between the two length reads.)
         let before = audit::events().len();
         send(
             app,

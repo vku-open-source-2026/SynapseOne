@@ -8,7 +8,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { signAccess, verifyAccess, newRefreshToken, storeRefresh, consumeRefresh, consumeAndRevokeRefresh, revokeRefresh, revokeAllRefresh, revokeApiKey, createApiKeyRecord, verifyApiKey } from './tokens';
-import { logAudit, listAudit } from './db';
+import { logAudit, listAudit, upsertUser, setUserActive } from './db';
 
 describe('access tokens', () => {
   it('sign/verify roundtrip', () => {
@@ -61,22 +61,33 @@ describe('refresh + api keys (memory)', () => {
     assert.equal(results.filter(Boolean).length, 1);
   });
   it('api key roundtrip', async () => {
-    const k = await createApiKeyRecord('acc1', 'u1', 't', ['*'], null);
+    const k = await createApiKeyRecord('acc1', null, 't', ['*'], null);
     assert.ok(k.value.startsWith('synapseone_'));
     const v = await verifyApiKey(k.value);
     assert.equal(v?.account_id, 'acc1');
     assert.equal(await verifyApiKey('synapseone_bogus'), null);
   });
   it('expired api key rejected', async () => {
-    const k = await createApiKeyRecord('acc1', 'u1', 't', ['*'], new Date(Date.now() - 1000));
+    const k = await createApiKeyRecord('acc1', null, 't', ['*'], new Date(Date.now() - 1000));
     assert.equal(await verifyApiKey(k.value), null);
   });
   it('revoked api key rejected; double revoke false', async () => {
-    const k = await createApiKeyRecord('acc1', 'u1', 't', ['*'], null);
+    const k = await createApiKeyRecord('acc1', null, 't', ['*'], null);
     assert.equal(await revokeApiKey(k.id), true);
     assert.equal(await verifyApiKey(k.value), null);
     assert.equal(await revokeApiKey(k.id), false);
     assert.equal(await revokeApiKey('nope'), false);
+  });
+  it('user-bound api key dies with its owner (unknown/deactivated)', async () => {
+    // A key bound to a user that does not exist must not verify (fail-closed).
+    const orphan = await createApiKeyRecord('acc1', 'no-such-user', 't', ['*'], null);
+    assert.equal(await verifyApiKey(orphan.value), null);
+    // A live owner verifies; deactivation kills the key without a sweep.
+    const owner = await upsertUser('org-key-owner', 'owner@key.local', 'Owner');
+    const k = await createApiKeyRecord('acc1', owner.id, 't', ['*'], null);
+    assert.equal((await verifyApiKey(k.value))?.account_id, 'acc1');
+    assert.equal(await setUserActive(owner.id, false), true);
+    assert.equal(await verifyApiKey(k.value), null);
   });
   it('pepper changes stored hash but keeps verify working', async () => {
     const { hashSecret, hashSecretLegacy } = await import('./db');
