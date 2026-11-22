@@ -21,12 +21,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with: { node-version: 20 }
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with: { python-version: "3.11" }
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with: { go-version: "1.22" }
       - run: npm install --workspaces
       - run: npm run build --workspaces --if-present
@@ -43,7 +43,7 @@ jobs:
       - run: npm audit --omit=dev --audit-level=critical
       # Copyleft gate (zero-dep script) + SBOM artifact.
       - run: node tools/license-check.cjs --sbom sbom.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with: { name: sbom, path: sbom.json }
       - run: go vet ./... && go test ./...
         working-directory: sdks/sdk-go
@@ -69,7 +69,7 @@ jobs:
       matrix:
         service: [ai-service, base-service, queue-service, gateway, ocs-service, faststore-service, stream-service, lds-service, notifications-service, warehouse-service]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: cargo test
         run: cargo test --locked
@@ -80,8 +80,8 @@ jobs:
     needs: build-test
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
       # Build the control/data services that carry the release contract.
       # Inference/model images are built and published by their own release
       # pipeline; rebuilding the multi-GB model stack on every PR is not a gate.
@@ -96,10 +96,10 @@ jobs:
     needs: build-test
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with: { node-version: 20 }
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with: { python-version: "3.11" }
       - run: |
           cp .env.example .env
