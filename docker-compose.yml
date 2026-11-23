@@ -141,7 +141,28 @@ services:
 
   s3-init:
     image: amazon/aws-cli:latest
-    entrypoint: ["sh", "-c", "for i in $(seq 1 30); do aws --endpoint-url http://s3:9090 s3api head-bucket --bucket $${S3_BUCKET} >/dev/null 2>&1 && break; aws --endpoint-url http://s3:9090 s3 mb s3://$${S3_BUCKET} && break; sleep 2; done; aws --endpoint-url http://s3:9090 s3 ls || true"]
+    # Create the bucket, then prove the object-write path is live before OCS
+    # starts. SeaweedFS can answer metadata calls before its first volume is
+    # ready; without this probe the first tenant bucket create can race it.
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -eu
+        for i in $(seq 1 60); do
+          aws --endpoint-url http://s3:9090 s3 mb "s3://$${S3_BUCKET}" >/dev/null 2>&1 || true
+          if aws --endpoint-url http://s3:9090 s3api head-bucket --bucket "$${S3_BUCKET}" >/dev/null 2>&1; then
+            echo probe > /tmp/s3-probe
+            if aws --endpoint-url http://s3:9090 s3 cp /tmp/s3-probe "s3://$${S3_BUCKET}/.s3-ready" >/dev/null 2>&1; then
+              aws --endpoint-url http://s3:9090 s3 rm "s3://$${S3_BUCKET}/.s3-ready" >/dev/null 2>&1 || true
+              echo "s3 ready"
+              exit 0
+            fi
+          fi
+          sleep 2
+        done
+        echo "s3 did not become writable" >&2
+        exit 1
     environment:
       AWS_ACCESS_KEY_ID: ${STORAGE_S3_ACCESS_KEY:-${S3_ACCESS_KEY:-test}}
       AWS_SECRET_ACCESS_KEY: ${STORAGE_S3_SECRET_KEY:-${S3_SECRET_KEY:-test}}

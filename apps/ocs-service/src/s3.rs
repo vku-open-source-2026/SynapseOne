@@ -361,29 +361,40 @@ impl S3Client {
     ) -> Result<reqwest::Response, String> {
         let payload = body.unwrap_or(&[]);
         let payload_hash = sha256_hex(payload);
-        let signed = sign_request(
-            &self.cfg,
-            method,
-            key,
-            query,
-            headers,
-            &payload_hash,
-            Utc::now(),
-        )?;
         let method =
             reqwest::Method::from_bytes(method.as_bytes()).map_err(|error| error.to_string())?;
         let send_body = !matches!(method.as_str(), "GET" | "HEAD");
-        let mut builder = self.http.request(method, &signed.url);
-        for (name, value) in &signed.headers {
-            builder = builder.header(name, value);
-        }
-        if let Some(body) = body {
-            builder = builder.header("content-length", body.len().to_string());
-            if send_body {
-                builder = builder.body(body.to_vec());
+        // S3 backends can transiently answer 5xx while a new volume comes
+        // online. Every operation this client issues is idempotent, so retry
+        // the request with a short backoff instead of surfacing a 502.
+        for attempt in 0..3 {
+            let signed = sign_request(
+                &self.cfg,
+                method.as_str(),
+                key,
+                query,
+                headers,
+                &payload_hash,
+                Utc::now(),
+            )?;
+            let mut builder = self.http.request(method.clone(), &signed.url);
+            for (name, value) in &signed.headers {
+                builder = builder.header(name, value);
             }
+            if let Some(body) = body {
+                builder = builder.header("content-length", body.len().to_string());
+                if send_body {
+                    builder = builder.body(body.to_vec());
+                }
+            }
+            let response = builder.send().await.map_err(|error| error.to_string())?;
+            if response.status().is_server_error() && attempt < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(250 * (1 << attempt))).await;
+                continue;
+            }
+            return Ok(response);
         }
-        builder.send().await.map_err(|error| error.to_string())
+        unreachable!("the retry loop always returns")
     }
 
     async fn failure(prefix: &str, response: reqwest::Response) -> String {
