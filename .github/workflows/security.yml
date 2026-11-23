@@ -36,6 +36,10 @@ jobs:
           fail-on-severity: critical
 
   codeql:
+    # Code scanning needs GitHub Advanced Security on private repositories.
+    # Skip it there unless the repository opts in via CODEQL_ENABLED=true
+    # (for example after GHAS is enabled for the organization).
+    if: vars.CODEQL_ENABLED == 'true' || !github.event.repository.private
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:

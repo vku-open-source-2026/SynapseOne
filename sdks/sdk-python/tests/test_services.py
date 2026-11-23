@@ -251,16 +251,22 @@ def test_deprecated_wrappers_warn_and_forward():
         c = _client(srv)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
+            # Sockets from earlier tests can be collected during these calls and
+            # emit ResourceWarning; this test only covers the deprecation contract.
+            warnings.simplefilter("ignore", ResourceWarning)
             c.list_templates()
             c.list_lds_licenses()
         assert _seen["path"] == "/v1/lds/licenses", _seen
         messages = [str(w.message) for w in caught]
         assert any("client.workflow.list_templates()" in m for m in messages), messages
         assert any("client.lds.list_licenses()" in m for m in messages), messages
-        assert all(w.category is DeprecationWarning for w in caught), caught
+        deprecated = [w for w in caught if "is deprecated" in str(w.message)]
+        assert deprecated, caught
+        assert all(w.category is DeprecationWarning for w in deprecated), caught
         # namespaced calls do not warn
         with warnings.catch_warnings(record=True) as caught2:
             warnings.simplefilter("always")
+            warnings.simplefilter("ignore", ResourceWarning)
             c.workflow.list_templates()
             c.lds.list_licenses()
         assert caught2 == []
