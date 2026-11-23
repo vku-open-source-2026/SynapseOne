@@ -367,7 +367,7 @@ impl S3Client {
         // S3 backends can transiently answer 5xx while a new volume comes
         // online. Every operation this client issues is idempotent, so retry
         // the request with a short backoff instead of surfacing a 502.
-        for attempt in 0..3 {
+        for attempt in 0..5 {
             let signed = sign_request(
                 &self.cfg,
                 method.as_str(),
@@ -388,8 +388,8 @@ impl S3Client {
                 }
             }
             let response = builder.send().await.map_err(|error| error.to_string())?;
-            if response.status().is_server_error() && attempt < 2 {
-                tokio::time::sleep(std::time::Duration::from_millis(250 * (1 << attempt))).await;
+            if response.status().is_server_error() && attempt < 4 {
+                tokio::time::sleep(std::time::Duration::from_millis(500 * (1 << attempt))).await;
                 continue;
             }
             return Ok(response);
