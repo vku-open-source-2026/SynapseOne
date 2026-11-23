@@ -103,6 +103,11 @@ jobs:
         with: { node-version: 20 }
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
+      - name: Free runner disk before the compose build
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo docker system prune -af --volumes || true
+          df -h /
       - run: |
           cp .env.example .env
           # The e2e stack seeds no IAM policies; run the local transport with
@@ -110,6 +115,14 @@ jobs:
           sed -i 's/^AUTHZ_MODE=.*/AUTHZ_MODE=off/' .env
           sed -i 's/^AUTHZ_MODE_REQUIRED=.*/AUTHZ_MODE_REQUIRED=false/' .env
       - name: Compose up (single retry for transient registry/health failures)
+        env:
+          # The e2e suite uses a fake inference backend; skip the multi-GB
+          # model/torch stack that the release pipeline builds separately.
+          INFERENCE_INSTALL_MODELS: '0'
+          INFERENCE_INSTALL_TORCH: '0'
+          INFERENCE_PREFETCH_EMBEDDING: '0'
+          # Hosted runners are memory/disk constrained; serialize image builds.
+          COMPOSE_PARALLEL_LIMIT: '1'
         run: |
           set -e
           ok=0
