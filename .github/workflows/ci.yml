@@ -94,7 +94,9 @@ jobs:
   e2e-compose:
     runs-on: ubuntu-latest
     needs: build-test
-    timeout-minutes: 60
+    # Cold-cache image builds for the full stack can exceed an hour on busy
+    # hosted runners; the suite itself runs in a few minutes after compose up.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
