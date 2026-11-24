@@ -38,7 +38,9 @@ Format based on Keep a Changelog; versioning follows SemVer.
   disables Postgres idle timeouts for itself, and a heartbeat re-acquires the
   lease after a database restart. Production Postgres' `idle_session_timeout`
   previously killed the idle lock connection and left `/ready` degraded until a
-  manual restart.
+  manual restart. The Iceberg catalog engine also enables `pool_pre_ping`, so a
+  pooled catalog connection killed by the same timeout is replaced instead of
+  returning a transient 503.
 - Stream consumer groups now reclaim unacknowledged entries after
   `claimIdleMs` (default 30s) before delivering new entries, so a crash between
   read and ack is re-delivered instead of silently losing the batch.

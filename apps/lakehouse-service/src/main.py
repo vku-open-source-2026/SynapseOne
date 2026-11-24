@@ -297,6 +297,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     props = {
         "uri": config.catalog_uri,
         "warehouse": config.warehouse,
+        # Production Postgres enforces idle_session_timeout=10min. PyIceberg
+        # pools its catalog connections; without pre-ping the first request
+        # after an idle period fails with a broken pipe and /ready flaps 503.
+        "pool_pre_ping": "true",
     }
     if config.s3_access_key:
         props.update(
