@@ -16,6 +16,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -164,7 +165,13 @@ def _coerce_value(field_type: IcebergType, value: Any) -> Any:
     if value is None:
         return None
     if isinstance(field_type, StringType):
-        return value if isinstance(value, str) else json.dumps(value) if isinstance(value, (dict, list)) else str(value)
+        return (
+            value
+            if isinstance(value, str)
+            else json.dumps(value)
+            if isinstance(value, (dict, list))
+            else str(value)
+        )
     if isinstance(field_type, LongType):
         return int(value)
     if isinstance(field_type, DoubleType):
@@ -174,7 +181,11 @@ def _coerce_value(field_type: IcebergType, value: Any) -> Any:
             return value
         return str(value).lower() in {"1", "true", "yes", "on"}
     if isinstance(field_type, DateType):
-        return value if isinstance(value, date) and not isinstance(value, datetime) else date.fromisoformat(str(value)[:10])
+        return (
+            value
+            if isinstance(value, date) and not isinstance(value, datetime)
+            else date.fromisoformat(str(value)[:10])
+        )
     if isinstance(field_type, TimestampType):
         if isinstance(value, datetime):
             parsed = value
@@ -302,22 +313,54 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # The SQL catalog itself has no cross-process writer lease. Enforce a
     # single active writer with a session-scoped Postgres advisory lock; the
     # lock is released automatically if the process dies.
-    writer_lock_connection = None
-    if config.catalog_uri.startswith("postgresql"):
-        from sqlalchemy import create_engine, text
+    lock_state: dict[str, Any] = {"engine": None, "conn": None, "lost": False}
 
-        lock_engine = create_engine(config.catalog_uri, pool_pre_ping=True)
-        writer_lock_connection = lock_engine.connect()
-        acquired = writer_lock_connection.execute(
-            text("select pg_try_advisory_lock(hashtext('synapseone_lakehouse_single_writer'))")
-        ).scalar()
+    def acquire_writer_lock() -> bool:
+        """Connect (or reconnect) and take the advisory lock.
+
+        The dedicated lock session opts out of the server-side idle timeouts:
+        production Postgres runs with `idle_session_timeout=10min`, which
+        otherwise kills an idle advisory-lock session and wedges readiness.
+        """
+        from sqlalchemy import text as sql_text
+
+        engine = lock_state["engine"]
+        if engine is None:
+            return False
+        conn = engine.connect()
+        try:
+            conn.execute(sql_text("set idle_session_timeout = 0"))
+            conn.execute(sql_text("set idle_in_transaction_session_timeout = 0"))
+            acquired = conn.execute(
+                sql_text(
+                    "select pg_try_advisory_lock(hashtext('synapseone_lakehouse_single_writer'))"
+                )
+            ).scalar()
+        except Exception:
+            conn.close()
+            raise
         if not acquired:
-            writer_lock_connection.close()
+            conn.close()
+            return False
+        lock_state["conn"] = conn
+        lock_state["lost"] = False
+        return True
+
+    if config.catalog_uri.startswith("postgresql"):
+        from sqlalchemy import create_engine
+
+        lock_state["engine"] = create_engine(
+            config.catalog_uri,
+            pool_pre_ping=True,
+            pool_size=1,
+            max_overflow=0,
+            isolation_level="AUTOCOMMIT",
+        )
+        if not acquire_writer_lock():
             raise RuntimeError(
                 "another Lakehouse writer holds the PostgreSQL advisory lock; "
                 "drain the old replica before starting a new one"
             )
-    writer_lock_state = {"lost": False}
 
     def assert_writer_lock() -> None:
         """Fail closed when the catalog writer lease is no longer provable.
@@ -325,26 +368,76 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         The session-scoped advisory lock is released automatically if its
         PostgreSQL connection dies. A process that keeps writing after that
         could race a replacement replica, so every mutation re-checks the
-        dedicated lock connection before touching the catalog.
+        dedicated lock connection before touching the catalog and re-acquires
+        the lease after a transient Postgres restart.
         """
-        if writer_lock_connection is None:
+        if lock_state["engine"] is None:
             return
-        if writer_lock_state["lost"]:
-            raise WriterLockLost("the Lakehouse writer lock connection is lost")
         from sqlalchemy import text as sql_text
 
-        try:
-            with catalog_lock:
-                writer_lock_connection.execute(sql_text("select 1"))
-        except Exception as exc:  # noqa: BLE001 - mark the writer unhealthy
-            writer_lock_state["lost"] = True
-            raise WriterLockLost("the Lakehouse writer lock connection is lost") from exc
+        with catalog_lock:
+            if lock_state["lost"] or lock_state["conn"] is None:
+                try:
+                    if not acquire_writer_lock():
+                        raise WriterLockLost(
+                            "another Lakehouse writer holds the PostgreSQL advisory lock"
+                        )
+                except WriterLockLost:
+                    raise
+                except Exception as exc:
+                    raise WriterLockLost(
+                        "the Lakehouse writer lock connection is lost"
+                    ) from exc
+            try:
+                lock_state["conn"].execute(sql_text("select 1"))
+            except Exception as exc:
+                lock_state["lost"] = True
+                try:
+                    lock_state["conn"].close()
+                except Exception:  # noqa: S110 - already broken
+                    pass
+                lock_state["conn"] = None
+                raise WriterLockLost(
+                    "the Lakehouse writer lock connection is lost"
+                ) from exc
+
+    def writer_lock_heartbeat() -> None:
+        """Keep the lease session non-idle and recover it after a DB restart."""
+        from sqlalchemy import text as sql_text
+
+        interval = max(5.0, float(os.getenv("LAKEHOUSE_LOCK_HEARTBEAT_SECONDS", "30")))
+        while True:
+            time.sleep(interval)
+            if lock_state["engine"] is None:
+                continue
+            try:
+                with catalog_lock:
+                    if lock_state["lost"] or lock_state["conn"] is None:
+                        acquire_writer_lock()
+                    else:
+                        lock_state["conn"].execute(sql_text("select 1"))
+            except Exception:  # noqa: BLE001 - readiness keeps reporting degraded
+                lock_state["lost"] = True
+                try:
+                    if lock_state["conn"] is not None:
+                        lock_state["conn"].close()
+                except Exception:  # noqa: S110 - already broken
+                    pass
+                lock_state["conn"] = None
+
+    if lock_state["engine"] is not None:
+        threading.Thread(
+            target=writer_lock_heartbeat,
+            name="lakehouse-lock-heartbeat",
+            daemon=True,
+        ).start()
 
     metrics = {"appends": 0, "queries": 0, "errors": 0, "requests": 0}
 
-    app = FastAPI(title="Synapse Lakehouse", version=VERSION, docs_url=None, redoc_url=None)
-    # Keep the advisory-lock connection alive for the process lifetime.
-    app.state.writer_lock_connection = writer_lock_connection
+    app = FastAPI(
+        title="Synapse Lakehouse", version=VERSION, docs_url=None, redoc_url=None
+    )
+    app.state.writer_lock_state = lock_state
 
     @app.middleware("http")
     async def guard(request: Request, call_next):
@@ -359,13 +452,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     return JSONResponse({"error": "unauthorized"}, status_code=401)
             elif config.is_prod:
                 return JSONResponse(
-                    {"error": "misconfigured", "message": "internal secret required in production"},
+                    {
+                        "error": "misconfigured",
+                        "message": "internal secret required in production",
+                    },
                     status_code=500,
                 )
             tenant = _tenant(request.headers)
             if tenant is None:
                 return JSONResponse(
-                    {"error": "tenant_scope_required", "message": "org or account headers required"},
+                    {
+                        "error": "tenant_scope_required",
+                        "message": "org or account headers required",
+                    },
                     status_code=403,
                 )
             request.state.tenant = tenant[1]
@@ -381,20 +480,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def fail(exc: Exception) -> JSONResponse:
         metrics["errors"] += 1
         if isinstance(exc, (NoSuchNamespaceError, NoSuchTableError)):
-            return JSONResponse({"error": "not_found", "message": str(exc)}, status_code=404)
+            return JSONResponse(
+                {"error": "not_found", "message": str(exc)}, status_code=404
+            )
         if isinstance(exc, (NamespaceAlreadyExistsError, TableAlreadyExistsError)):
-            return JSONResponse({"error": "already_exists", "message": str(exc)}, status_code=409)
+            return JSONResponse(
+                {"error": "already_exists", "message": str(exc)}, status_code=409
+            )
         if isinstance(exc, NamespaceNotEmptyError):
-            return JSONResponse({"error": "namespace_not_empty", "message": str(exc)}, status_code=409)
+            return JSONResponse(
+                {"error": "namespace_not_empty", "message": str(exc)}, status_code=409
+            )
         if isinstance(exc, QuotaExceeded):
-            return JSONResponse({"error": "quota_exceeded", "message": str(exc)}, status_code=409)
+            return JSONResponse(
+                {"error": "quota_exceeded", "message": str(exc)}, status_code=409
+            )
         if isinstance(exc, CommitFailedException):
-            return JSONResponse({"error": "commit_conflict", "message": str(exc)}, status_code=409)
+            return JSONResponse(
+                {"error": "commit_conflict", "message": str(exc)}, status_code=409
+            )
         if isinstance(exc, WriterLockLost):
-            return JSONResponse({"error": "writer_lock_lost", "message": str(exc)}, status_code=503)
+            return JSONResponse(
+                {"error": "writer_lock_lost", "message": str(exc)}, status_code=503
+            )
         if isinstance(exc, (ValidationError, ValueError)):
-            return JSONResponse({"error": "invalid_request", "message": str(exc)}, status_code=400)
-        return JSONResponse({"error": "internal", "message": "lakehouse operation failed"}, status_code=500)
+            return JSONResponse(
+                {"error": "invalid_request", "message": str(exc)}, status_code=400
+            )
+        return JSONResponse(
+            {"error": "internal", "message": "lakehouse operation failed"},
+            status_code=500,
+        )
 
     def tenant_of(request: Request) -> str:
         return request.state.tenant
@@ -414,9 +530,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             assert_writer_lock()
             with catalog_lock:
                 catalog.list_namespaces()
-            return {"ok": True, "status": "ready", "writerLock": "held" if writer_lock_connection is not None else "not-configured"}
+            return {
+                "ok": True,
+                "status": "ready",
+                "writerLock": "held"
+                if lock_state["conn"] is not None
+                else "not-configured",
+            }
         except Exception as exc:  # noqa: BLE001 - readiness must report failure
-            return JSONResponse({"ok": False, "status": "degraded", "error": str(exc)}, status_code=503)
+            return JSONResponse(
+                {"ok": False, "status": "degraded", "error": str(exc)}, status_code=503
+            )
 
     @app.get("/metrics", response_class=PlainTextResponse)
     def prometheus():
@@ -517,7 +641,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             physical = _physical(tenant, namespace.lower())
             with catalog_lock:
-                tables = [identifier[-1] for identifier in catalog.list_tables(physical)]
+                tables = [
+                    identifier[-1] for identifier in catalog.list_tables(physical)
+                ]
             return {"items": sorted(tables)}
         except Exception as exc:  # noqa: BLE001
             return fail(exc)
@@ -547,7 +673,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         tenant = tenant_of(request)
         try:
             with catalog_lock:
-                table = catalog.load_table(_physical(tenant, namespace.lower()) + (table_name.lower(),))
+                table = catalog.load_table(
+                    _physical(tenant, namespace.lower()) + (table_name.lower(),)
+                )
                 meta = _table_meta(table)
             return {"namespace": namespace, "name": table_name, **meta}
         except Exception as exc:  # noqa: BLE001
@@ -561,7 +689,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             with catalog_lock:
                 # drop_table removes the catalog pointer only. Data files are
                 # retained (no purge) so a mistaken drop never deletes bytes.
-                catalog.drop_table(_physical(tenant, namespace.lower()) + (table_name.lower(),))
+                catalog.drop_table(
+                    _physical(tenant, namespace.lower()) + (table_name.lower(),)
+                )
             return {
                 "namespace": namespace,
                 "name": table_name,
@@ -571,8 +701,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except Exception as exc:  # noqa: BLE001
             return fail(exc)
 
-    @app.post("/v1/lakehouse/namespaces/{namespace}/tables/{table_name}/rows", status_code=201)
-    def append_rows(request: Request, namespace: str, table_name: str, body: dict = Body(...)):
+    @app.post(
+        "/v1/lakehouse/namespaces/{namespace}/tables/{table_name}/rows", status_code=201
+    )
+    def append_rows(
+        request: Request, namespace: str, table_name: str, body: dict = Body(...)
+    ):
         tenant = tenant_of(request)
         assert_writer_lock()
         try:
@@ -580,7 +714,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
             physical = _physical(tenant, namespace.lower()) + (table_name.lower(),)
             key = str(body.get("idempotencyKey", "")).strip()[:200]
-            if isinstance(body.get("rows"), list) and len(body["rows"]) > config.max_rows_per_append:
+            if (
+                isinstance(body.get("rows"), list)
+                and len(body["rows"]) > config.max_rows_per_append
+            ):
                 raise QuotaExceeded(
                     f"rows per append exceeds quota ({config.max_rows_per_append})"
                 )
@@ -599,7 +736,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 rows = _rows_for_schema(table.schema(), body.get("rows"))
                 if config.max_bytes > 0:
                     estimated = len(
-                        json.dumps(rows, separators=(",", ":"), default=str).encode("utf-8")
+                        json.dumps(rows, separators=(",", ":"), default=str).encode(
+                            "utf-8"
+                        )
                     )
                     # Conservative pre-write guard; the exact Parquet size is
                     # only known after the write. Historical snapshots and
@@ -626,7 +765,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return fail(exc)
 
     @app.post("/v1/lakehouse/namespaces/{namespace}/tables/{table_name}/query")
-    def query_rows(request: Request, namespace: str, table_name: str, body: dict = Body(...)):
+    def query_rows(
+        request: Request, namespace: str, table_name: str, body: dict = Body(...)
+    ):
         tenant = tenant_of(request)
         try:
             limit = int(body.get("limit", 1000))
@@ -635,7 +776,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if snapshot_id is not None:
                 snapshot_id = int(snapshot_id)
             with catalog_lock:
-                table = catalog.load_table(_physical(tenant, namespace.lower()) + (table_name.lower(),))
+                table = catalog.load_table(
+                    _physical(tenant, namespace.lower()) + (table_name.lower(),)
+                )
                 scan = table.scan(snapshot_id=snapshot_id, limit=limit)
                 arrow = scan.to_arrow()
                 current = table.current_snapshot()
@@ -667,7 +810,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "physicalCleanup": "disabled",
                     "reason": "snapshot expiry/orphan cleanup requires an operator-reviewed Iceberg maintenance job",
                     "snapshotCount": len(table.snapshots()),
-                    "currentSnapshotId": str(snapshot.snapshot_id) if snapshot else None,
+                    "currentSnapshotId": str(snapshot.snapshot_id)
+                    if snapshot
+                    else None,
                     "currentSnapshotBytes": _snapshot_bytes(table),
                     "referencedFilesRetained": True,
                 }
@@ -679,7 +824,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         tenant = tenant_of(request)
         try:
             with catalog_lock:
-                table = catalog.load_table(_physical(tenant, namespace.lower()) + (table_name.lower(),))
+                table = catalog.load_table(
+                    _physical(tenant, namespace.lower()) + (table_name.lower(),)
+                )
                 snapshots = [
                     {
                         "snapshotId": str(snapshot.snapshot_id),
@@ -701,7 +848,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return fail(exc)
 
     @app.post("/v1/lakehouse/namespaces/{namespace}/tables/{table_name}/schema")
-    def evolve_schema(request: Request, namespace: str, table_name: str, body: dict = Body(...)):
+    def evolve_schema(
+        request: Request, namespace: str, table_name: str, body: dict = Body(...)
+    ):
         tenant = tenant_of(request)
         assert_writer_lock()
         try:
@@ -709,7 +858,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not isinstance(additions, list) or not additions:
                 raise ValueError("add must be a non-empty array")
             with catalog_lock:
-                table = catalog.load_table(_physical(tenant, namespace.lower()) + (table_name.lower(),))
+                table = catalog.load_table(
+                    _physical(tenant, namespace.lower()) + (table_name.lower(),)
+                )
                 with table.update_schema() as update:
                     for column in additions:
                         if not isinstance(column, dict):
@@ -722,7 +873,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             _field_type(str(column.get("type", ""))),
                             required=bool(column.get("required", False)),
                         )
-                table = catalog.load_table(_physical(tenant, namespace.lower()) + (table_name.lower(),))
+                table = catalog.load_table(
+                    _physical(tenant, namespace.lower()) + (table_name.lower(),)
+                )
                 meta = _table_meta(table)
             return {"ok": True, **meta}
         except Exception as exc:  # noqa: BLE001

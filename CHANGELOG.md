@@ -30,6 +30,15 @@ Format based on Keep a Changelog; versioning follows SemVer.
 
 ### Fixed
 
+- **Login after revocation.** `upsertUser` now projects `auth_version`, so
+  dev/OIDC/register sessions mint tokens with the current version. Previously a
+  `logout-all`, refresh-token reuse revoke or admin session revoke left every
+  subsequent login immediately rejected as `token_revoked`.
+- **Lakehouse writer lease.** The advisory-lock session now runs in autocommit,
+  disables Postgres idle timeouts for itself, and a heartbeat re-acquires the
+  lease after a database restart. Production Postgres' `idle_session_timeout`
+  previously killed the idle lock connection and left `/ready` degraded until a
+  manual restart.
 - Stream consumer groups now reclaim unacknowledged entries after
   `claimIdleMs` (default 30s) before delivering new entries, so a crash between
   read and ack is re-delivered instead of silently losing the batch.
