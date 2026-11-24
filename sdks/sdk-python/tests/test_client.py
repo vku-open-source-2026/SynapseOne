@@ -565,7 +565,9 @@ def test_lakehouse_namespace_table_and_snapshot_routes():
         assert _seen["path"] == "/v1/lakehouse/namespaces"
         assert json.loads(_seen["body"]) == {"name": "analytics"}
 
-        c.lakehouse.append("analytics", "events", [{"id": "a"}], idempotency_key="batch-1")
+        c.lakehouse.append(
+            "analytics", "events", [{"id": "a"}], idempotency_key="batch-1"
+        )
         assert _seen["path"] == "/v1/lakehouse/namespaces/analytics/tables/events/rows"
         assert json.loads(_seen["body"]) == {
             "rows": [{"id": "a"}],

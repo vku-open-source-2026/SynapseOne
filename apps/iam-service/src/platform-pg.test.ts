@@ -27,6 +27,17 @@ describe('platform owner guards on PostgreSQL', { skip: !enabled }, () => {
     await ensureTables();
   });
 
+  it('returns the current auth_version so re-login after revocation is valid', async () => {
+    const db = getDb()!;
+    const suffix = `${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+    const org = await createOrganization(`authver-pg-${suffix}`, 'Auth Version PG QA');
+    const user = await upsertUser(org.id, `authver-${suffix}@example.test`);
+    assert.equal(user.auth_version, 0);
+    await db.execute(sql`update users set auth_version = 7 where id = ${user.id}`);
+    const again = await upsertUser(org.id, `authver-${suffix}@example.test`);
+    assert.equal(again.auth_version, 7, 'upsertUser must project auth_version for issueSession');
+  });
+
   it('applies the consumed_at migration and serializes concurrent owner revocation', async () => {
     const db = getDb()!;
     const column = await db.execute(sql`

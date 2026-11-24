@@ -84,4 +84,6 @@ class LakehouseService:
         return self._req("GET", f"{self._table(namespace, table)}/snapshots")
 
     def evolve(self, namespace: str, table: str, add: list[dict]) -> dict:
-        return self._req("POST", f"{self._table(namespace, table)}/schema", {"add": add})
+        return self._req(
+            "POST", f"{self._table(namespace, table)}/schema", {"add": add}
+        )

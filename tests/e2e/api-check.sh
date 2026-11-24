@@ -86,6 +86,14 @@ RT2=$(curl -s -XPOST "$BASE/v1/auth/refresh" -H'Content-Type: application/json' 
 [ -n "$RT2" ] && [ "$RT2" != "null" ] && [ "$RT2" != "$RT1" ] && ok rotation || bad rotation ""
 curl -s "$BASE/v1/auth/refresh" -XPOST -H'Content-Type: application/json' -d"{\"refreshToken\":\"$RT1\"}" | grep -q invalid_refresh && ok rotation-single-use || bad rotation-single-use ""
 curl -s -XPOST "$BASE/v1/auth/logout" -H'Content-Type: application/json' -d"{\"refreshToken\":\"$RT2\"}" | grep -q '"ok":true' && ok logout || bad logout ""
+
+# Replaying the consumed refresh token above is a theft signal: by design IAM
+# revokes the whole token family and bumps auth_version, so the access token
+# minted at login is now dead. Sign in again for the remaining checks.
+LOGIN=$(curl -s -XPOST "$BASE/v1/auth/login" -H'Content-Type: application/json' -d'{"email":"e2e@acme.local","orgSlug":"acme"}')
+TOK=$(echo "$LOGIN" | jq -r .accessToken)
+[ -n "$TOK" ] && [ "$TOK" != "null" ] && ok relogin-after-reuse || bad relogin-after-reuse "$LOGIN"
+H="Authorization: Bearer $TOK"
 fi
 
 # SynapseLDS: create -> schema (reserved rejected) -> ingest -> NGSI-LD export (no _core leak) -> delete

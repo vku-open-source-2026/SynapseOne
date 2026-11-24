@@ -550,7 +550,9 @@ class IamService:
     def update_role(self, role_id: str, description: str) -> dict:
         """Update a role description."""
         return self._req(
-            "PATCH", f"/v1/roles/{quote(role_id, safe='')}", {"description": description}
+            "PATCH",
+            f"/v1/roles/{quote(role_id, safe='')}",
+            {"description": description},
         )
 
     def delete_role(self, role_id: str) -> dict:
@@ -572,7 +574,10 @@ class IamService:
         )
 
     def update_policy(
-        self, policy_id: str, description: str | None = None, document: dict | None = None
+        self,
+        policy_id: str,
+        description: str | None = None,
+        document: dict | None = None,
     ) -> dict:
         """Update a policy description and/or document."""
         body: dict[str, Any] = {}

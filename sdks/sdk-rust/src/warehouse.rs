@@ -101,7 +101,9 @@ impl WarehouseService {
     }
 
     pub async fn preview_ocs(&self, input: Value) -> Result<Value> {
-        self.client.post(format!("{PREFIX}/etl/ocs/preview"), input).await
+        self.client
+            .post(format!("{PREFIX}/etl/ocs/preview"), input)
+            .await
     }
 
     pub async fn import_ocs(&self, input: Value) -> Result<Value> {

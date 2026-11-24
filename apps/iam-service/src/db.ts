@@ -467,6 +467,7 @@ export async function upsertUser(orgId: string, email: string, displayName?: str
         externalSub: schema.users.externalSub,
         active: schema.users.active,
         isOrgAdmin: schema.users.isOrgAdmin,
+        authVersion: schema.users.authVersion,
       });
     return userRow(rows[0]);
   }

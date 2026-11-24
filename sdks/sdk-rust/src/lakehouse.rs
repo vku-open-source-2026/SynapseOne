@@ -41,10 +41,7 @@ impl LakehouseService {
 
     pub async fn tables(&self, namespace: &str) -> Result<Value> {
         self.client
-            .get(format!(
-                "{PREFIX}/namespaces/{}/tables",
-                segment(namespace)
-            ))
+            .get(format!("{PREFIX}/namespaces/{}/tables", segment(namespace)))
             .await
     }
 

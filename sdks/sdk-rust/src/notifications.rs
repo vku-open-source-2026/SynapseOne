@@ -72,15 +72,11 @@ impl NotificationsService {
         if !subject.is_empty() {
             payload["subject"] = json!(subject);
         }
-        self.client
-            .post("/v1/notifications", payload)
-            .await
+        self.client.post("/v1/notifications", payload).await
     }
 
     pub async fn create_template(&self, input: Value) -> Result<Value> {
-        self.client
-            .post("/v1/notifications/templates", input)
-            .await
+        self.client.post("/v1/notifications/templates", input).await
     }
 
     pub async fn list_templates(
@@ -90,10 +86,7 @@ impl NotificationsService {
         limit: u32,
         offset: u32,
     ) -> Result<Value> {
-        let mut params = vec![
-            ("limit", limit.to_string()),
-            ("offset", offset.to_string()),
-        ];
+        let mut params = vec![("limit", limit.to_string()), ("offset", offset.to_string())];
         if let Some(q) = q.filter(|value| !value.is_empty()) {
             params.push(("q", q.to_string()));
         }
@@ -120,10 +113,7 @@ impl NotificationsService {
     pub async fn update_template(&self, template_id: &str, patch: Value) -> Result<Value> {
         self.client
             .patch(
-                format!(
-                    "/v1/notifications/templates/{}",
-                    segment(template_id)
-                ),
+                format!("/v1/notifications/templates/{}", segment(template_id)),
                 patch,
             )
             .await

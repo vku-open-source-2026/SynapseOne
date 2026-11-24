@@ -209,18 +209,30 @@ async fn warehouse_methods_target_registered_routes() {
     }
     let warehouse = client(&server).warehouse();
     warehouse.datasets().await.unwrap();
-    warehouse.create_dataset(json!({ "name": "ds", "columns": [] })).await.unwrap();
+    warehouse
+        .create_dataset(json!({ "name": "ds", "columns": [] }))
+        .await
+        .unwrap();
     warehouse.dataset("ds1").await.unwrap();
-    warehouse.update_dataset("ds1", json!({ "name": "renamed" })).await.unwrap();
+    warehouse
+        .update_dataset("ds1", json!({ "name": "renamed" }))
+        .await
+        .unwrap();
     warehouse.delete_dataset("ds1").await.unwrap();
     warehouse.ingest("ds1", json!([])).await.unwrap();
     warehouse.query("select 1", Some(10)).await.unwrap();
     warehouse.templates().await.unwrap();
     warehouse.pipeline_status().await.unwrap();
     warehouse.jobs().await.unwrap();
-    warehouse.create_job(json!({ "mode": "batch" })).await.unwrap();
+    warehouse
+        .create_job(json!({ "mode": "batch" }))
+        .await
+        .unwrap();
     warehouse.get_job("j1").await.unwrap();
-    warehouse.update_job("j1", json!({ "name": "renamed" })).await.unwrap();
+    warehouse
+        .update_job("j1", json!({ "name": "renamed" }))
+        .await
+        .unwrap();
     warehouse.delete_job("j1").await.unwrap();
     warehouse.run_job("j1").await.unwrap();
     warehouse.pause_job("j1").await.unwrap();
