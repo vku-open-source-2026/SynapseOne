@@ -9,15 +9,18 @@ from synapseone_sdk import SynapseOneClient
 
 base = os.environ.get("SYNAPSEONE_BASE_URL", "http://127.0.0.1:18128")
 c = SynapseOneClient(base)
-login = c.login("pyfull@acme.local")
+# The CI pre-check signs in as ci@acme.local first, making it the bootstrap org
+# admin. Account/role/policy creation is an admin mutation under enforce mode.
+login = c.login("ci@acme.local")
 r = c.refresh(login["refreshToken"])
 print("PY_REFRESH", bool(r["accessToken"]))
 c.token = r["accessToken"]
 org = c.list_orgs()[0]
-slug = f"pyfull-{int(time.time()) % 100000}"
+suffix = f"{int(time.time()) % 100000}-{os.urandom(3).hex()}"
+slug = f"pyfull-{suffix}"
 acc = c.create_account(org["id"], slug, "PY")
 assert c.list_accounts(org["id"]), "list_accounts empty"
-u = c.create_user(org["id"], f"pynu-{int(time.time()) % 100000}@acme.local")
+u = c.create_user(org["id"], f"pynu-{suffix}@acme.local")
 role = c.create_role(acc["id"], "r")
 pol = c.create_policy(
     acc["id"], "p", {"Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]}
@@ -30,7 +33,7 @@ assert c.get_template("webhook-to-log")["name"]
 assert c.list_templates()
 
 # SynapseBase Vector search check
-vcol = f"pyvec-{int(time.time()) % 100000}"
+vcol = f"pyvec-{suffix}"
 c.base.create_collection(
     vcol,
     mapping={
