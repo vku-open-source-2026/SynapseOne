@@ -92,6 +92,20 @@
       "when": 1796000800000,
       "tag": "0012_execution_delegations",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1796000900000,
+      "tag": "0013_shocking_shinobi_shaw",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1798001000000,
+      "tag": "0014_burly_silver_sable",
+      "breakpoints": true
     }
   ]
 }

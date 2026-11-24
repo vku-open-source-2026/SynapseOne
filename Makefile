@@ -1,4 +1,4 @@
-.PHONY: help bootstrap build test lint license-check compose-up compose-down compose-logs e2e sdk-check clean
+.PHONY: help bootstrap build test test-rust lint license-check compose-up compose-down compose-logs e2e sdk-check clean
 
 help:
 	@echo "synapseone make targets:"
@@ -25,6 +25,15 @@ runner-image:
 
 test:
 	npm run test --workspaces --if-present
+
+# The TypeScript suites above are the reference implementation. These are the
+# Rust binaries that actually ship in the container images.
+test-rust:
+	for svc in ai-service base-service faststore-service gateway lds-service \
+		notifications-service ocs-service queue-service stream-service warehouse-service; do \
+		echo "== cargo test $$svc =="; \
+		(cd apps/$$svc && cargo test --locked) || exit $$?; \
+	done
 
 lint:
 	npm run lint --workspaces --if-present || true

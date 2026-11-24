@@ -316,18 +316,11 @@ fn stream_error_response(error: StreamError) -> Response {
     let status = match error.code {
         "not_found" => StatusCode::NOT_FOUND,
         "conflict" => StatusCode::CONFLICT,
+        "retention_gap" => StatusCode::GONE,
         "storage_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::BAD_REQUEST,
     };
     json_error(status, error.code, Some(error.message))
-}
-
-fn internal_error(error: impl std::fmt::Display) -> Response {
-    json_error(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "internal_error",
-        Some(error.to_string()),
-    )
 }
 
 fn js_string(value: Option<&Value>) -> Option<String> {
@@ -575,10 +568,9 @@ async fn publish_event(
             Some("Missing payload in request body".into()),
         );
     }
-    let serialized = serde_json::to_string(body.get("payload").unwrap())
-        .unwrap_or_default()
-        .chars()
-        .count();
+    let serialized = serde_json::to_vec(body.get("payload").unwrap())
+        .map(|value| value.len())
+        .unwrap_or(0);
     if serialized > state.config.max_payload_bytes {
         return json_error(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -633,7 +625,23 @@ async fn publish_batch(
             Some(format!("Batch size exceeds maximum of {MAX_BATCH}")),
         );
     }
-    let inputs = events.iter().map(publish_input).collect();
+    let mut inputs = Vec::with_capacity(events.len());
+    let mut total_bytes = 0usize;
+    for event in events {
+        let input = publish_input(event);
+        total_bytes += serde_json::to_vec(&input.payload).map(|value| value.len()).unwrap_or(0);
+        if total_bytes > state.config.max_payload_bytes {
+            return json_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                Some(format!(
+                    "Batch payload exceeds limit of {} bytes",
+                    state.config.max_payload_bytes
+                )),
+            );
+        }
+        inputs.push(input);
+    }
     match state.engine.publish_batch(&tenant, &topic_name, inputs).await {
         Ok(events) => {
             let count = events.len();
@@ -657,7 +665,8 @@ async fn read_events(
     let options = ReadOptions {
         from_id: js_string(object.get("fromId")),
         count: number_value(object.get("count")).map(|value| value.min(1000)),
-        block_ms: number_value(object.get("blockMs")),
+        // Cap blocking so one client cannot pin a request/connection for days.
+        block_ms: number_value(object.get("blockMs")).map(|value| value.clamp(0, 25_000)),
     };
     match state.engine.read(&tenant, &topic_name, options).await {
         Ok(events) => {
@@ -755,8 +764,13 @@ async fn read_group(
     let options = GroupReadOptions {
         consumer: js_string(object.get("consumer")).unwrap_or_else(|| "default-worker".into()),
         count: number_value(object.get("count")).map(|value| value.min(100)),
-        block_ms: number_value(object.get("blockMs")),
+        block_ms: number_value(object.get("blockMs")).map(|value| value.clamp(0, 25_000)),
         auto_ack: object.get("autoAck").map(truthy).unwrap_or(false),
+        claim_idle_ms: Some(
+            number_value(object.get("claimIdleMs"))
+                .unwrap_or(30_000)
+                .clamp(0, 3_600_000),
+        ),
     };
     match state
         .engine

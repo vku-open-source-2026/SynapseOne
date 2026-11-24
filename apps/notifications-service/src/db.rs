@@ -35,6 +35,35 @@ pub struct NotificationRecord {
     /// Set once the notification was successfully handed to SynapseQueue.
     /// Rows left NULL are drained by the local worker (publish failed/queue off).
     pub published_at: Option<String>,
+    /// Template used at enqueue time (content is already rendered/immutable).
+    pub template_id: Option<String>,
+    pub template_version: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateRecord {
+    pub id: String,
+    pub tenant: String,
+    pub slug: String,
+    pub name: String,
+    pub subject: String,
+    pub body: String,
+    pub variables: Vec<String>,
+    pub version: i64,
+    pub archived_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewTemplate {
+    pub tenant: String,
+    pub slug: String,
+    pub name: String,
+    pub subject: String,
+    pub body: String,
+    pub variables: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,12 +85,15 @@ pub struct NewNotification {
     pub body: String,
     pub idempotency_key: Option<String>,
     pub metadata: Value,
+    pub template_id: Option<String>,
+    pub template_version: Option<i64>,
 }
 
 #[derive(Default)]
 struct MemoryStore {
     notifications: HashMap<String, NotificationRecord>,
     preferences: HashMap<String, PreferenceRecord>,
+    templates: HashMap<String, TemplateRecord>,
     /// Test-only: when set, the next call to the matching method returns a
     /// simulated store error once, so handler fail-closed paths can be
     /// exercised without a real database.
@@ -147,7 +179,26 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS notifications_tenant_created ON notifications (tenant, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS notifications_due ON notifications (status, next_attempt_at)",
             "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS published_at timestamptz",
+            "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS template_id uuid",
+            "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS template_version integer",
             "CREATE INDEX IF NOT EXISTS notifications_unpublished ON notifications (status, next_attempt_at) WHERE published_at IS NULL",
+            r#"
+            CREATE TABLE IF NOT EXISTS notification_templates (
+              id uuid PRIMARY KEY,
+              tenant text NOT NULL,
+              slug text NOT NULL,
+              name text NOT NULL,
+              subject text NOT NULL DEFAULT '',
+              body text NOT NULL,
+              variables jsonb NOT NULL DEFAULT '[]'::jsonb,
+              version integer NOT NULL DEFAULT 1,
+              archived_at timestamptz,
+              created_at timestamptz NOT NULL DEFAULT now(),
+              updated_at timestamptz NOT NULL DEFAULT now()
+            )
+            "#,
+            "CREATE UNIQUE INDEX IF NOT EXISTS notification_templates_tenant_slug ON notification_templates (tenant, slug)",
+            "CREATE INDEX IF NOT EXISTS notification_templates_tenant ON notification_templates (tenant, created_at DESC)",
             r#"
             CREATE TABLE IF NOT EXISTS notification_preferences (
               tenant text NOT NULL,
@@ -186,6 +237,8 @@ impl Store {
             next_attempt_at: now,
             dead_reason: None,
             published_at: None,
+            template_id: input.template_id,
+            template_version: input.template_version,
         };
         match &self.backend {
             Backend::Postgres(pool) => {
@@ -193,8 +246,8 @@ impl Store {
                 let row = sqlx::query(
                     r#"
                     INSERT INTO notifications
-                      (id, tenant, channel, recipient, subject, body, status, attempts, idempotency_key, metadata, created_at, updated_at, next_attempt_at)
-                    VALUES ($1,$2,$3,$4,$5,$6,'queued','[]'::jsonb,$7,$8,now(),now(),now())
+                      (id, tenant, channel, recipient, subject, body, status, attempts, idempotency_key, metadata, created_at, updated_at, next_attempt_at, template_id, template_version)
+                    VALUES ($1,$2,$3,$4,$5,$6,'queued','[]'::jsonb,$7,$8,now(),now(),now(),$9,$10)
                     ON CONFLICT (tenant, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
                     RETURNING *
                     "#,
@@ -207,6 +260,8 @@ impl Store {
                 .bind(&record.body)
                 .bind(&record.idempotency_key)
                 .bind(&record.metadata)
+                .bind(record.template_id.as_ref().and_then(|v| v.parse::<Uuid>().ok()))
+                .bind(record.template_version)
                 .fetch_optional(pool)
                 .await
                 .map_err(|e| format!("insert notification: {e}"))?;
@@ -609,6 +664,51 @@ impl Store {
         }
     }
 
+    /// Manual retry for a failed or dead notification. It starts a fresh
+    /// attempt budget and clears the publish marker so the durable outbox
+    /// republishes it; only failed/dead rows are eligible.
+    pub async fn retry(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<Option<NotificationRecord>, String> {
+        match &self.backend {
+            Backend::Postgres(pool) => {
+                let row = sqlx::query(
+                    r#"
+                    UPDATE notifications
+                    SET status='queued', attempts='[]'::jsonb, next_attempt_at=now(),
+                        dead_reason=NULL, published_at=NULL, updated_at=now()
+                    WHERE tenant=$1 AND id=$2::uuid AND status IN ('failed','dead')
+                    RETURNING *
+                    "#,
+                )
+                .bind(tenant)
+                .bind(id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| format!("retry notification: {e}"))?;
+                row.as_ref().map(row_to_record).transpose()
+            }
+            Backend::Memory(memory) => {
+                let mut mem = memory.lock().await;
+                let Some(n) = mem.notifications.get_mut(id) else {
+                    return Ok(None);
+                };
+                if n.tenant != tenant || !matches!(n.status.as_str(), "failed" | "dead") {
+                    return Ok(None);
+                }
+                n.status = "queued".into();
+                n.attempts = json!([]);
+                n.next_attempt_at = iso(Utc::now());
+                n.dead_reason = None;
+                n.published_at = None;
+                n.updated_at = iso(Utc::now());
+                Ok(Some(n.clone()))
+            }
+        }
+    }
+
     pub async fn cancel(&self, tenant: &str, id: &str) -> Result<Option<NotificationRecord>, String> {
         match &self.backend {
             Backend::Postgres(pool) => {
@@ -774,6 +874,276 @@ impl Store {
         }
     }
 
+    pub async fn create_template(&self, input: NewTemplate) -> Result<TemplateRecord, String> {
+        let now = iso(Utc::now());
+        let record = TemplateRecord {
+            id: Uuid::new_v4().to_string(),
+            tenant: input.tenant,
+            slug: input.slug,
+            name: input.name,
+            subject: input.subject,
+            body: input.body,
+            variables: input.variables,
+            version: 1,
+            archived_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        match &self.backend {
+            Backend::Postgres(pool) => {
+                let id: Uuid = record.id.parse().map_err(|_| "invalid uuid")?;
+                let row = sqlx::query(
+                    r#"
+                    INSERT INTO notification_templates
+                      (id, tenant, slug, name, subject, body, variables, version)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,1)
+                    RETURNING *
+                    "#,
+                )
+                .bind(id)
+                .bind(&record.tenant)
+                .bind(&record.slug)
+                .bind(&record.name)
+                .bind(&record.subject)
+                .bind(&record.body)
+                .bind(json!(record.variables))
+                .fetch_one(pool)
+                .await
+                .map_err(|e| {
+                    if e.to_string().contains("duplicate key") {
+                        "template slug exists".to_string()
+                    } else {
+                        format!("insert template: {e}")
+                    }
+                })?;
+                row_to_template(&row)
+            }
+            Backend::Memory(memory) => {
+                let mut mem = memory.lock().await;
+                if mem
+                    .templates
+                    .values()
+                    .any(|t| t.tenant == record.tenant && t.slug == record.slug)
+                {
+                    return Err("template slug exists".into());
+                }
+                mem.templates.insert(record.id.clone(), record.clone());
+                Ok(record)
+            }
+        }
+    }
+
+    pub async fn get_template(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<Option<TemplateRecord>, String> {
+        match &self.backend {
+            Backend::Postgres(pool) => {
+                let id: Uuid = id.parse().map_err(|_| "invalid template id")?;
+                let row = sqlx::query(
+                    "SELECT * FROM notification_templates WHERE tenant=$1 AND id=$2 LIMIT 1",
+                )
+                .bind(tenant)
+                .bind(id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| format!("get template: {e}"))?;
+                row.as_ref().map(row_to_template).transpose()
+            }
+            Backend::Memory(memory) => Ok(memory
+                .lock()
+                .await
+                .templates
+                .get(id)
+                .filter(|t| t.tenant == tenant)
+                .cloned()),
+        }
+    }
+
+    pub async fn get_template_by_slug(
+        &self,
+        tenant: &str,
+        slug: &str,
+    ) -> Result<Option<TemplateRecord>, String> {
+        match &self.backend {
+            Backend::Postgres(pool) => {
+                let row = sqlx::query(
+                    "SELECT * FROM notification_templates WHERE tenant=$1 AND slug=$2 LIMIT 1",
+                )
+                .bind(tenant)
+                .bind(slug)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| format!("get template: {e}"))?;
+                row.as_ref().map(row_to_template).transpose()
+            }
+            Backend::Memory(memory) => Ok(memory
+                .lock()
+                .await
+                .templates
+                .values()
+                .find(|t| t.tenant == tenant && t.slug == slug)
+                .cloned()),
+        }
+    }
+
+    pub async fn list_templates(
+        &self,
+        tenant: &str,
+        q: &str,
+        include_archived: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<TemplateRecord>, i64), String> {
+        match &self.backend {
+            Backend::Postgres(pool) => {
+                let needle = format!("%{q}%");
+                let total = sqlx::query(
+                    r#"
+                    SELECT count(*)::bigint AS n FROM notification_templates
+                    WHERE tenant=$1 AND ($3 OR archived_at IS NULL)
+                      AND ($2='' OR slug ILIKE $4 OR name ILIKE $4)
+                    "#,
+                )
+                .bind(tenant)
+                .bind(q)
+                .bind(include_archived)
+                .bind(&needle)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| format!("count templates: {e}"))?
+                .try_get::<i64, _>("n")
+                .map_err(err)?;
+                let rows = sqlx::query(
+                    r#"
+                    SELECT * FROM notification_templates
+                    WHERE tenant=$1 AND ($3 OR archived_at IS NULL)
+                      AND ($2='' OR slug ILIKE $4 OR name ILIKE $4)
+                    ORDER BY created_at DESC, id
+                    LIMIT $5 OFFSET $6
+                    "#,
+                )
+                .bind(tenant)
+                .bind(q)
+                .bind(include_archived)
+                .bind(&needle)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| format!("list templates: {e}"))?;
+                let items = rows.iter().map(row_to_template).collect::<Result<Vec<_>, _>>()?;
+                Ok((items, total))
+            }
+            Backend::Memory(memory) => {
+                let mem = memory.lock().await;
+                let needle = q.to_lowercase();
+                let mut rows: Vec<TemplateRecord> = mem
+                    .templates
+                    .values()
+                    .filter(|t| t.tenant == tenant)
+                    .filter(|t| include_archived || t.archived_at.is_none())
+                    .filter(|t| {
+                        needle.is_empty()
+                            || t.slug.to_lowercase().contains(&needle)
+                            || t.name.to_lowercase().contains(&needle)
+                    })
+                    .cloned()
+                    .collect();
+                rows.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
+                let total = rows.len() as i64;
+                let page = rows
+                    .into_iter()
+                    .skip(offset.max(0) as usize)
+                    .take(limit.max(0) as usize)
+                    .collect();
+                Ok((page, total))
+            }
+        }
+    }
+
+    pub async fn update_template(
+        &self,
+        tenant: &str,
+        id: &str,
+        name: Option<String>,
+        subject: Option<String>,
+        body: Option<String>,
+        variables: Option<Vec<String>>,
+    ) -> Result<Option<TemplateRecord>, String> {
+        match &self.backend {
+            Backend::Postgres(pool) => {
+                let id: Uuid = id.parse().map_err(|_| "invalid template id")?;
+                let row = sqlx::query(
+                    r#"
+                    UPDATE notification_templates
+                    SET name=COALESCE($3,name), subject=COALESCE($4,subject),
+                        body=COALESCE($5,body), variables=COALESCE($6,variables),
+                        version=version+1, updated_at=now()
+                    WHERE tenant=$1 AND id=$2
+                    RETURNING *
+                    "#,
+                )
+                .bind(tenant)
+                .bind(id)
+                .bind(name)
+                .bind(subject)
+                .bind(body)
+                .bind(variables.map(|v| json!(v)))
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| format!("update template: {e}"))?;
+                row.as_ref().map(row_to_template).transpose()
+            }
+            Backend::Memory(memory) => {
+                let mut mem = memory.lock().await;
+                let Some(t) = mem.templates.get_mut(id) else {
+                    return Ok(None);
+                };
+                if t.tenant != tenant {
+                    return Ok(None);
+                }
+                if let Some(v) = name { t.name = v; }
+                if let Some(v) = subject { t.subject = v; }
+                if let Some(v) = body { t.body = v; }
+                if let Some(v) = variables { t.variables = v; }
+                t.version += 1;
+                t.updated_at = iso(Utc::now());
+                Ok(Some(t.clone()))
+            }
+        }
+    }
+
+    pub async fn archive_template(&self, tenant: &str, id: &str) -> Result<bool, String> {
+        match &self.backend {
+            Backend::Postgres(pool) => {
+                let id: Uuid = id.parse().map_err(|_| "invalid template id")?;
+                let result = sqlx::query(
+                    "UPDATE notification_templates SET archived_at=now(), updated_at=now() WHERE tenant=$1 AND id=$2 AND archived_at IS NULL",
+                )
+                .bind(tenant)
+                .bind(id)
+                .execute(pool)
+                .await
+                .map_err(|e| format!("archive template: {e}"))?;
+                Ok(result.rows_affected() > 0)
+            }
+            Backend::Memory(memory) => {
+                let mut mem = memory.lock().await;
+                let Some(t) = mem.templates.get_mut(id) else {
+                    return Ok(false);
+                };
+                if t.tenant != tenant || t.archived_at.is_some() {
+                    return Ok(false);
+                }
+                t.archived_at = Some(iso(Utc::now()));
+                t.updated_at = iso(Utc::now());
+                Ok(true)
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub async fn clear_memory(&self) {
         if let Backend::Memory(memory) = &self.backend {
@@ -823,6 +1193,35 @@ fn row_to_record(row: &sqlx::postgres::PgRow) -> Result<NotificationRecord, Stri
             .try_get::<Option<DateTime<Utc>>, _>("published_at")
             .map_err(err)?
             .map(iso),
+        template_id: row
+            .try_get::<Option<Uuid>, _>("template_id")
+            .map_err(err)?
+            .map(|v| v.to_string()),
+        template_version: row.try_get("template_version").map_err(err)?,
+    })
+}
+
+fn row_to_template(row: &sqlx::postgres::PgRow) -> Result<TemplateRecord, String> {
+    Ok(TemplateRecord {
+        id: row.try_get::<Uuid, _>("id").map_err(err)?.to_string(),
+        tenant: row.try_get("tenant").map_err(err)?,
+        slug: row.try_get("slug").map_err(err)?,
+        name: row.try_get("name").map_err(err)?,
+        subject: row.try_get("subject").map_err(err)?,
+        body: row.try_get("body").map_err(err)?,
+        variables: row
+            .try_get::<Value, _>("variables")
+            .map_err(err)?
+            .as_array()
+            .map(|items| items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
+        version: row.try_get("version").map_err(err)?,
+        archived_at: row
+            .try_get::<Option<DateTime<Utc>>, _>("archived_at")
+            .map_err(err)?
+            .map(iso),
+        created_at: row.try_get::<DateTime<Utc>, _>("created_at").map_err(err).map(iso)?,
+        updated_at: row.try_get::<DateTime<Utc>, _>("updated_at").map_err(err).map(iso)?,
     })
 }
 

@@ -7,7 +7,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useAuth } from '../lib/auth.jsx';
 import { api } from '../lib/api.js';
-import { Btn, Card, Empty, Err, Field, InlineLoader, Input, Modal, PageTitle, Table, TableSkeleton } from '../components/ui.jsx';
+import { Btn, Card, Empty, Err, Field, InlineLoader, Input, Modal, PageTitle, Pager, SearchBox, Table, TableSkeleton } from '../components/ui.jsx';
 import { ScopeBar, useScope } from '../components/Scope.jsx';
 
 export default function Roles() {
@@ -22,6 +22,10 @@ export default function Roles() {
   const [formErr, setFormErr] = useState(null);
   const [deleting, setDeleting] = useState(null);
   const [slug, setSlug] = useState('');
+  const [q, setQ] = useState('');
+  const [offset, setOffset] = useState(0);
+  const [total, setTotal] = useState(0);
+  const limit = 20;
 
   const load = async () => {
     if (!scope.accountId) {
@@ -31,8 +35,9 @@ export default function Roles() {
     }
     setErr(null);
     try {
-      const v = await api.roles(scope.accountId, headers);
-      setRows(Array.isArray(v) ? v : []);
+      const v = await api.rolesPaged(scope.accountId, { limit, offset, q }, headers);
+      setRows(Array.isArray(v?.items) ? v.items : []);
+      setTotal(Number(v?.total) || 0);
     } catch (e) {
       setErr(e);
     } finally {
@@ -41,8 +46,10 @@ export default function Roles() {
   };
 
   useEffect(() => {
-    load();
-  }, [scope.accountId, headers]);
+    const t = setTimeout(load, 250);
+    return () => clearTimeout(t);
+  }, [scope.accountId, headers, offset, q]);
+  useEffect(() => { setOffset(0); }, [q]);
 
   useEffect(() => {
     setExpanded(null);
@@ -190,6 +197,7 @@ export default function Roles() {
           </form>
         </Card>
       )}
+      <SearchBox value={q} onChange={setQ} placeholder="Search roles…" />
       <Card>
         {!loaded ? (
           <TableSkeleton rows={5} cols={3} />

@@ -384,6 +384,13 @@ impl FileBackend {
             .map_err(|error| error.to_string())?;
         let manifest: serde_json::Value =
             serde_json::from_slice(&manifest_body).map_err(|error| error.to_string())?;
+        let manifest_key = manifest
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if manifest_key != key {
+            return Err("multipart upload key does not match the initiation key".into());
+        }
         let content_type = manifest
             .get("contentType")
             .and_then(serde_json::Value::as_str)

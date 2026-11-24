@@ -148,6 +148,10 @@ async function runClaimed(
       node_runs: mergedRuns as any,
       error: result.error ?? null,
       workerId: WORKER_ID,
+      // Bind the resume right to the exact engine-created task/node pair.
+      // API-created tasks and arbitrary node names can never resume this run.
+      pauseTaskId: result.pause?.task?.id ? String(result.pause.task.id) : null,
+      pauseNode: result.pause?.node ? String(result.pause.node) : null,
     });
     return;
   }

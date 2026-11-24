@@ -28,7 +28,7 @@ use crate::util::{iso, js_string, number_value, truthy};
 
 const DATASET_COLUMNS: &str =
     "id, name, description, columns_json, mode, stream_topic, created_at, updated_at";
-const JOB_COLUMNS: &str = "id, name, mode, status, target_dataset_id, sql, stream_topic, stream_group, batch_size, interval_ms, write_mode, created_at, updated_at, last_run_at, last_error";
+const JOB_COLUMNS: &str = "id, name, mode, status, target_dataset_id, sql, stream_topic, stream_group, batch_size, interval_ms, write_mode, destination, lakehouse_namespace, lakehouse_table, source_collection, source_database, created_at, updated_at, last_run_at, last_error";
 
 /// Bind values used by the store. All dynamic SQL is parameterised.
 #[derive(Debug, Clone)]
@@ -304,10 +304,10 @@ fn to_job(row: &Map<String, Value>) -> JobMeta {
     JobMeta {
         id: js_string(row.get("id")),
         name: js_string(row.get("name")),
-        mode: if row.get("mode").and_then(Value::as_str) == Some("stream") {
-            "stream".into()
-        } else {
-            "batch".into()
+        mode: match row.get("mode").and_then(Value::as_str) {
+            Some("stream") => "stream".into(),
+            Some("base") => "base".into(),
+            _ => "batch".into(),
         },
         status: if row.get("status").and_then(Value::as_str) == Some("paused") {
             "paused".into()
@@ -325,6 +325,14 @@ fn to_job(row: &Map<String, Value>) -> JobMeta {
         } else {
             "append".into()
         },
+        destination: match row.get("destination").and_then(Value::as_str) {
+            Some("lakehouse") => "lakehouse".into(),
+            _ => "warehouse".into(),
+        },
+        lakehouse_namespace: value_text(row.get("lakehouse_namespace")),
+        lakehouse_table: value_text(row.get("lakehouse_table")),
+        source_collection: value_text(row.get("source_collection")),
+        source_database: value_text(row.get("source_database")),
         created_at: js_string(row.get("created_at")),
         updated_at: js_string(row.get("updated_at")),
         last_run_at: value_text(row.get("last_run_at")),
@@ -484,6 +492,14 @@ impl WarehouseStore {
             .map_err(|error| internal_error(format!("open duckdb {path}: {error}")))?;
         conn.execute_batch(&format!("SET threads={}", self.inner.options.threads))
             .map_err(|error| internal_error(format!("set duckdb threads: {error}")))?;
+        // Tenant SQL must never be able to read the container filesystem,
+        // attach external databases, or load extensions. Lock configuration
+        // after the internal settings above so a query cannot re-enable it.
+        conn.execute_batch(
+            "SET enable_external_access=false;
+             SET lock_configuration=true;",
+        )
+        .map_err(|error| internal_error(format!("lock duckdb configuration: {error}")))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS _datasets (
                 id VARCHAR PRIMARY KEY,
@@ -502,6 +518,15 @@ impl WarehouseStore {
                 applied_at VARCHAR NOT NULL,
                 PRIMARY KEY (event_id, dataset_id)
             );
+            CREATE TABLE IF NOT EXISTS _stream_state (
+                dataset_id VARCHAR NOT NULL,
+                document_id VARCHAR NOT NULL,
+                version BIGINT NOT NULL,
+                created_at VARCHAR NOT NULL,
+                deleted BOOLEAN NOT NULL,
+                updated_at VARCHAR NOT NULL,
+                PRIMARY KEY (dataset_id, document_id)
+            );
             CREATE TABLE IF NOT EXISTS _jobs (
                 id VARCHAR PRIMARY KEY,
                 name VARCHAR NOT NULL,
@@ -514,6 +539,11 @@ impl WarehouseStore {
                 batch_size INTEGER,
                 interval_ms INTEGER,
                 write_mode VARCHAR,
+                destination VARCHAR DEFAULT 'warehouse',
+                lakehouse_namespace VARCHAR,
+                lakehouse_table VARCHAR,
+                source_collection VARCHAR,
+                source_database VARCHAR,
                 created_at VARCHAR NOT NULL,
                 updated_at VARCHAR NOT NULL,
                 last_run_at VARCHAR,
@@ -521,6 +551,14 @@ impl WarehouseStore {
             );",
         )
         .map_err(|error| internal_error(format!("ensure duckdb metadata: {error}")))?;
+        // Additive migration for tenant databases created by an older release.
+        let _ = conn.execute_batch(
+            "ALTER TABLE _jobs ADD COLUMN IF NOT EXISTS destination VARCHAR DEFAULT 'warehouse';
+             ALTER TABLE _jobs ADD COLUMN IF NOT EXISTS lakehouse_namespace VARCHAR;
+             ALTER TABLE _jobs ADD COLUMN IF NOT EXISTS lakehouse_table VARCHAR;
+             ALTER TABLE _jobs ADD COLUMN IF NOT EXISTS source_collection VARCHAR;
+             ALTER TABLE _jobs ADD COLUMN IF NOT EXISTS source_database VARCHAR;",
+        );
         Ok(Arc::new(TenantDb {
             conn: Mutex::new(conn),
         }))
@@ -702,6 +740,63 @@ impl WarehouseStore {
         .await
     }
 
+    pub async fn update_dataset(
+        &self,
+        tenant: &str,
+        id: &str,
+        name: Option<String>,
+        description: Option<String>,
+    ) -> Result<Option<DatasetMeta>, WarehouseError> {
+        let id = id.to_string();
+        self.with_conn(tenant, move |conn| {
+            let result = read_all(
+                conn,
+                &format!("SELECT {DATASET_COLUMNS} FROM _datasets WHERE id = ?"),
+                &[Param::Text(id.clone())],
+            )
+            .map_err(|error| internal_error(format!("get dataset: {error}")))?;
+            let Some(row) = result.rows.first() else {
+                return Ok(None);
+            };
+            let next_name = name.clone().unwrap_or_else(|| js_string(row.get("name")));
+            let next_description =
+                description.clone().unwrap_or_else(|| js_string(row.get("description")));
+            let updated_at = iso(Utc::now());
+            execute(
+                conn,
+                "UPDATE _datasets SET name = ?, description = ?, updated_at = ? WHERE id = ?",
+                &[
+                    Param::Text(next_name),
+                    Param::Text(next_description),
+                    Param::Text(updated_at),
+                    Param::Text(id.clone()),
+                ],
+            )
+            .map_err(|error| internal_error(format!("update dataset: {error}")))?;
+            let fresh = read_all(
+                conn,
+                &format!("SELECT {DATASET_COLUMNS} FROM _datasets WHERE id = ?"),
+                &[Param::Text(id.clone())],
+            )
+            .map_err(|error| internal_error(format!("reload dataset: {error}")))?;
+            let Some(row) = fresh.rows.first() else {
+                return Ok(None);
+            };
+            let count = read_all(
+                conn,
+                &format!(
+                    "SELECT count(*) AS n FROM {}",
+                    quote_ident(&table_name(&id))
+                ),
+                &[],
+            )
+            .map_err(|error| internal_error(format!("count dataset rows: {error}")))?;
+            let row_count = value_i64(count.rows.first().and_then(|row| row.get("n")));
+            Ok(Some(to_dataset(row, row_count)))
+        })
+        .await
+    }
+
     pub async fn delete_dataset(&self, tenant: &str, id: &str) -> Result<bool, WarehouseError> {
         let id = id.to_string();
         self.with_conn(tenant, move |conn| {
@@ -732,6 +827,12 @@ impl WarehouseStore {
                 &[Param::Text(id.clone())],
             )
             .map_err(|error| internal_error(format!("delete dataset markers: {error}")))?;
+            execute(
+                conn,
+                "DELETE FROM _stream_state WHERE dataset_id = ?",
+                &[Param::Text(id.clone())],
+            )
+            .map_err(|error| internal_error(format!("delete dataset stream state: {error}")))?;
             execute(
                 conn,
                 "DELETE FROM _datasets WHERE id = ?",
@@ -847,6 +948,211 @@ impl WarehouseStore {
         .await
     }
 
+    /// Remove every row from a dataset without deleting its definition.
+    /// Used by full-snapshot ETL before appending the source pages.
+    /// Atomically replace every row in a dataset. Used by snapshot ETL after
+    /// the source has been fully fetched, so an upstream failure cannot leave
+    /// the previous dataset empty or half-written.
+    pub async fn replace_dataset_rows(
+        &self,
+        tenant: &str,
+        dataset: &DatasetMeta,
+        rows: &[Value],
+    ) -> Result<usize, WarehouseError> {
+        let dataset = dataset.clone();
+        let rows = rows.to_vec();
+        self.with_conn(tenant, move |conn| {
+            conn.execute_batch("BEGIN")
+                .map_err(|error| internal_error(format!("begin dataset replace: {error}")))?;
+            let result = (|| -> Result<usize, WarehouseError> {
+                execute(
+                    conn,
+                    &format!("DELETE FROM {}", quote_ident(&table_name(&dataset.id))),
+                    &[],
+                )
+                .map_err(|error| internal_error(format!("clear dataset rows: {error}")))?;
+                let mut inserted = 0usize;
+                for chunk in rows.chunks(5000) {
+                    inserted += Self::insert_rows_on_conn(conn, &dataset, chunk)?;
+                }
+                execute(
+                    conn,
+                    "UPDATE _datasets SET updated_at = ? WHERE id = ?",
+                    &[
+                        Param::Text(iso(Utc::now())),
+                        Param::Text(dataset.id.clone()),
+                    ],
+                )
+                .map_err(|error| internal_error(format!("touch dataset: {error}")))?;
+                Ok(inserted)
+            })();
+            match result {
+                Ok(inserted) => {
+                    conn.execute_batch("COMMIT")
+                        .map_err(|error| internal_error(format!("commit dataset replace: {error}")))?;
+                    Ok(inserted)
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
+        })
+        .await
+    }
+
+    fn file_reader_sql(path: &str, format: &str) -> Result<String, WarehouseError> {
+        let escaped = path.replace('\'', "''");
+        match format {
+            "csv" => Ok(format!(
+                "read_csv_auto('{escaped}', header=true, sample_size=10000, ignore_errors=false)"
+            )),
+            "json" | "jsonl" => Ok(format!("read_json_auto('{escaped}')")),
+            "parquet" => Ok(format!("read_parquet('{escaped}')")),
+            other => Err(WarehouseError::bad_request(
+                "invalid_ocs_format",
+                format!("unsupported OCS file format '{other}' (csv, jsonl, parquet)"),
+            )),
+        }
+    }
+
+    /// Infer the schema and return a small sample for an authorized OCS file.
+    /// The file is read in a separate trusted in-memory DuckDB connection so
+    /// the tenant sandbox keeps external access disabled.
+    pub async fn preview_ocs_file(
+        &self,
+        _tenant: &str,
+        path: &str,
+        format: &str,
+    ) -> Result<(Vec<Value>, Vec<Value>), WarehouseError> {
+        let path = path.to_string();
+        let format = format.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open_in_memory()
+                .map_err(|error| internal_error(format!("open OCS preview engine: {error}")))?;
+            conn.execute_batch(
+                "SET memory_limit='512MB'; SET threads=1; SET preserve_insertion_order=false;",
+            )
+            .map_err(|error| internal_error(format!("limit OCS preview engine: {error}")))?;
+            let reader = Self::file_reader_sql(&path, &format)?;
+            let described = read_all(&conn, &format!("DESCRIBE SELECT * FROM {reader}"), &[])
+                .map_err(|error| internal_error(format!("describe OCS file: {error}")))?;
+            let columns: Vec<Value> = described
+                .rows
+                .iter()
+                .filter_map(|row| {
+                    let name = row.get("column_name").and_then(Value::as_str)?;
+                    let source_type = row.get("column_type").and_then(Value::as_str).unwrap_or("");
+                    let warehouse_type = if source_type.contains("INT")
+                        || source_type.contains("DECIMAL")
+                        || source_type.contains("DOUBLE")
+                        || source_type.contains("FLOAT")
+                        || source_type.contains("REAL")
+                    {
+                        "number"
+                    } else if source_type.contains("BOOL") {
+                        "boolean"
+                    } else if source_type.contains("TIMESTAMP") || source_type.contains("DATE") {
+                        "timestamp"
+                    } else {
+                        "string"
+                    };
+                    Some(serde_json::json!({
+                        "name": name,
+                        "sourceType": source_type,
+                        "type": warehouse_type,
+                    }))
+                })
+                .collect();
+            let sample = read_all(
+                &conn,
+                &format!("SELECT * FROM {reader} LIMIT 20"),
+                &[],
+            )
+            .map_err(|error| internal_error(format!("preview OCS file: {error}")))?;
+            Ok((columns, sample.rows.into_iter().map(Value::Object).collect()))
+        })
+        .await
+        .map_err(|error| internal_error(format!("OCS preview task: {error}")))?
+    }
+
+    /// Import a staged CSV/JSONL/Parquet file into a tenant dataset. The file
+    /// is parsed in a trusted isolated engine, then rows are inserted through
+    /// the same validated tenant path as any other trusted ingestion.
+    pub async fn import_ocs_file(
+        &self,
+        tenant: &str,
+        dataset: &DatasetMeta,
+        path: &str,
+        format: &str,
+        write_mode: &str,
+        max_rows: i64,
+    ) -> Result<usize, WarehouseError> {
+        let dataset = dataset.clone();
+        let path = path.to_string();
+        let format = format.to_string();
+        let write_mode = write_mode.to_string();
+        let max_rows = max_rows.clamp(1, 1_000_000);
+        let rows = tokio::task::spawn_blocking(move || {
+            let conn = Connection::open_in_memory()
+                .map_err(|error| internal_error(format!("open OCS import engine: {error}")))?;
+            conn.execute_batch(
+                "SET memory_limit='512MB'; SET threads=1; SET preserve_insertion_order=false;",
+            )
+            .map_err(|error| internal_error(format!("limit OCS import engine: {error}")))?;
+            let reader = Self::file_reader_sql(&path, &format)?;
+            let result = read_all(
+                &conn,
+                &format!("SELECT * FROM {reader} LIMIT {max_rows}"),
+                &[],
+            )
+            .map_err(|error| internal_error(format!("read OCS file: {error}")))?;
+            Ok::<Vec<Value>, WarehouseError>(result.rows.into_iter().map(Value::Object).collect())
+        })
+        .await
+        .map_err(|error| internal_error(format!("OCS import task: {error}")))??;
+        self.with_conn(tenant, move |conn| {
+            conn.execute_batch("BEGIN")
+                .map_err(|error| internal_error(format!("begin OCS import: {error}")))?;
+            let result = (|| -> Result<usize, WarehouseError> {
+                if write_mode == "replace" {
+                    execute(
+                        conn,
+                        &format!("DELETE FROM {}", quote_ident(&table_name(&dataset.id))),
+                        &[],
+                    )
+                    .map_err(|error| internal_error(format!("clear OCS target: {error}")))?;
+                }
+                let mut inserted = 0usize;
+                for chunk in rows.chunks(5000) {
+                    inserted += Self::insert_rows_on_conn(conn, &dataset, chunk)?;
+                }
+                execute(
+                    conn,
+                    "UPDATE _datasets SET updated_at = ? WHERE id = ?",
+                    &[
+                        Param::Text(iso(Utc::now())),
+                        Param::Text(dataset.id.clone()),
+                    ],
+                )
+                .map_err(|error| internal_error(format!("touch dataset: {error}")))?;
+                Ok(inserted)
+            })();
+            match result {
+                Ok(inserted) => {
+                    conn.execute_batch("COMMIT")
+                        .map_err(|error| internal_error(format!("commit OCS import: {error}")))?;
+                    Ok(inserted)
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
+        })
+        .await
+    }
+
     /// Durable stream materialisation: rows + event-id marker commit together.
     /// A crash before ack leaves the marker, so redelivery is a no-op.
     pub async fn ingest_stream_events(
@@ -881,7 +1187,138 @@ impl WarehouseStore {
                         duplicates += 1;
                         continue;
                     }
-                    if !event.rows.is_empty() {
+                    // Base document-change events describe the current state of
+                    // one document incarnation. A high-water mark prevents a
+                    // delayed older update from overwriting a newer row or a
+                    // delayed create from resurrecting a deleted document.
+                    // A changed `created_at` is a re-created document and is
+                    // allowed to start again at version 1.
+                    let mut apply = true;
+                    let has_document_id = dataset
+                        .columns
+                        .iter()
+                        .any(|column| column.name == "document_id");
+                    if let (Some(document_id), Some(version)) =
+                        (event.document_id.as_deref(), event.version)
+                    {
+                        let state = read_all(
+                            conn,
+                            "SELECT version, created_at, deleted FROM _stream_state WHERE dataset_id = ? AND document_id = ?",
+                            &[
+                                Param::Text(dataset.id.clone()),
+                                Param::Text(document_id.to_string()),
+                            ],
+                        )
+                        .map_err(|error| internal_error(format!("read stream state: {error}")))?;
+                        if let Some(row) = state.rows.first() {
+                            let prev_version = value_i64(row.get("version"));
+                            let prev_created = row
+                                .get("created_at")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            let prev_deleted = row
+                                .get("deleted")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
+                            let created = event.created_at.as_deref().unwrap_or("");
+                            // Only two non-empty, different creation timestamps
+                            // prove a new document incarnation. Empty legacy
+                            // timestamps keep the version-only rule.
+                            let new_incarnation = !prev_created.is_empty()
+                                && !created.is_empty()
+                                && prev_created != created;
+                            if !new_incarnation {
+                                let is_delete =
+                                    event.base_operation.as_deref() == Some("delete");
+                                apply = if is_delete {
+                                    // Base emits the document's existing version
+                                    // for a tombstone, so an equal-version delete
+                                    // is valid exactly once.
+                                    version > prev_version
+                                        || (version == prev_version && !prev_deleted)
+                                } else {
+                                    // Upserts must advance the version.
+                                    version > prev_version
+                                };
+                            }
+                        }
+                        if apply && has_document_id {
+                            execute(
+                                conn,
+                                &format!(
+                                    "DELETE FROM {} WHERE document_id = ?",
+                                    quote_ident(&table_name(&dataset.id))
+                                ),
+                                &[Param::Text(document_id.to_string())],
+                            )
+                            .map_err(|error| {
+                                internal_error(format!("replace Base document row: {error}"))
+                            })?;
+                        }
+                        if apply {
+                            if event.base_operation.as_deref() != Some("delete")
+                                && !event.rows.is_empty()
+                            {
+                                inserted +=
+                                    Self::insert_rows_on_conn(conn, &dataset, &event.rows)?
+                                        as i64;
+                            }
+                            execute(
+                                conn,
+                                "DELETE FROM _stream_state WHERE dataset_id = ? AND document_id = ?",
+                                &[
+                                    Param::Text(dataset.id.clone()),
+                                    Param::Text(document_id.to_string()),
+                                ],
+                            )
+                            .map_err(|error| {
+                                internal_error(format!("replace stream state: {error}"))
+                            })?;
+                            execute(
+                                conn,
+                                "INSERT INTO _stream_state (dataset_id, document_id, version, created_at, deleted, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                                &[
+                                    Param::Text(dataset.id.clone()),
+                                    Param::Text(document_id.to_string()),
+                                    Param::Int(version),
+                                    Param::Text(
+                                        event.created_at.clone().unwrap_or_default(),
+                                    ),
+                                    Param::Bool(
+                                        event.base_operation.as_deref() == Some("delete"),
+                                    ),
+                                    Param::Text(iso(Utc::now())),
+                                ],
+                            )
+                            .map_err(|error| {
+                                internal_error(format!("write stream state: {error}"))
+                            })?;
+                        }
+                    } else if let (Some(document_id), true) =
+                        (event.document_id.as_deref(), has_document_id)
+                    {
+                        // Non-versioned document events keep the documented
+                        // last-writer-wins replacement behavior.
+                        execute(
+                            conn,
+                            &format!(
+                                "DELETE FROM {} WHERE document_id = ?",
+                                quote_ident(&table_name(&dataset.id))
+                            ),
+                            &[Param::Text(document_id.to_string())],
+                        )
+                        .map_err(|error| {
+                            internal_error(format!("replace Base document row: {error}"))
+                        })?;
+                        if event.base_operation.as_deref() != Some("delete")
+                            && !event.rows.is_empty()
+                        {
+                            inserted +=
+                                Self::insert_rows_on_conn(conn, &dataset, &event.rows)? as i64;
+                        }
+                    } else if event.base_operation.as_deref() != Some("delete")
+                        && !event.rows.is_empty()
+                    {
                         inserted += Self::insert_rows_on_conn(conn, &dataset, &event.rows)? as i64;
                     }
                     execute(
@@ -1021,6 +1458,56 @@ impl WarehouseStore {
         .await
     }
 
+    pub async fn update_job_name(
+        &self,
+        tenant: &str,
+        id: &str,
+        name: String,
+    ) -> Result<Option<JobMeta>, WarehouseError> {
+        let id = id.to_string();
+        self.with_conn(tenant, move |conn| {
+            let existing = read_all(
+                conn,
+                &format!("SELECT {JOB_COLUMNS} FROM _jobs WHERE id = ?"),
+                &[Param::Text(id.clone())],
+            )
+            .map_err(|error| internal_error(format!("get job: {error}")))?;
+            let Some(row) = existing.rows.first() else {
+                return Ok(None);
+            };
+            let mode = js_string(row.get("mode"));
+            let status = row.get("status").and_then(Value::as_str).unwrap_or_default();
+            // Only a continuous stream worker is genuinely "executing"; batch/
+            // Base/Lakehouse jobs store `running` as their idle state and can be
+            // renamed safely (the rename does not touch the job definition).
+            if mode == "stream" && status == "running" {
+                return Err(WarehouseError::new(
+                    axum::http::StatusCode::CONFLICT,
+                    "job_running",
+                    "pause the stream job before changing its configuration",
+                ));
+            }
+            execute(
+                conn,
+                "UPDATE _jobs SET name = ?, updated_at = ? WHERE id = ?",
+                &[
+                    Param::Text(name),
+                    Param::Text(iso(Utc::now())),
+                    Param::Text(id.clone()),
+                ],
+            )
+            .map_err(|error| internal_error(format!("update job: {error}")))?;
+            let fresh = read_all(
+                conn,
+                &format!("SELECT {JOB_COLUMNS} FROM _jobs WHERE id = ?"),
+                &[Param::Text(id)],
+            )
+            .map_err(|error| internal_error(format!("reload job: {error}")))?;
+            Ok(fresh.rows.first().map(to_job))
+        })
+        .await
+    }
+
     pub async fn find_job_by_name(
         &self,
         tenant: &str,
@@ -1048,7 +1535,7 @@ impl WarehouseStore {
             execute(
                 conn,
                 &format!(
-                    "INSERT INTO _jobs ({JOB_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    "INSERT INTO _jobs ({JOB_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 ),
                 &[
                     Param::Text(id.clone()),
@@ -1062,6 +1549,11 @@ impl WarehouseStore {
                     Param::Int(input.batch_size),
                     Param::Int(input.interval_ms),
                     Param::Text(input.write_mode.clone()),
+                    Param::Text(input.destination.clone()),
+                    input.lakehouse_namespace.clone().map_or(Param::Null, Param::Text),
+                    input.lakehouse_table.clone().map_or(Param::Null, Param::Text),
+                    input.source_collection.clone().map_or(Param::Null, Param::Text),
+                    input.source_database.clone().map_or(Param::Null, Param::Text),
                     Param::Text(now.clone()),
                     Param::Text(now.clone()),
                     Param::Null,
@@ -1081,6 +1573,11 @@ impl WarehouseStore {
                 batch_size: input.batch_size,
                 interval_ms: input.interval_ms,
                 write_mode: input.write_mode,
+                destination: input.destination,
+                lakehouse_namespace: input.lakehouse_namespace,
+                lakehouse_table: input.lakehouse_table,
+                source_collection: input.source_collection,
+                source_database: input.source_database,
                 created_at: now.clone(),
                 updated_at: now,
                 last_run_at: None,

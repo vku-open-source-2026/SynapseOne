@@ -1239,6 +1239,13 @@ fn scope_rules_match_typescript_suite() {
         None,
         None
     ));
+    assert!(scope_allows(
+        &["base:Read".into()],
+        "/v1/base/collections",
+        "GET",
+        None,
+        None
+    ));
     assert!(!scope_allows(
         &["base:read".into()],
         "/v1/faststore/keys/a",
@@ -1252,6 +1259,14 @@ fn scope_rules_match_typescript_suite() {
         "POST",
         None,
         None
+    ));
+    // An action override must not be satisfiable by the raw HTTP method name.
+    assert!(!scope_allows(
+        &["platform:post".into()],
+        "/v1/platform/orgs",
+        "POST",
+        Some("platform"),
+        Some("platform:Admin")
     ));
     assert!(scope_allows(
         &["iam:write".into()],

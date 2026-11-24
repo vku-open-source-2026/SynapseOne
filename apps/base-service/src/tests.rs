@@ -1248,6 +1248,218 @@ async fn spawn_stream_stub() -> (String, StreamCapture) {
     (format!("http://{address}"), capture)
 }
 
+#[derive(Clone)]
+struct FailingStream {
+    status: StatusCode,
+    poison_document: Option<String>,
+    calls: Arc<Mutex<usize>>,
+}
+
+async fn failing_stream_stub(
+    axum::extract::State(state): axum::extract::State<FailingStream>,
+    request: HttpRequest<Body>,
+) -> axum::response::Response {
+    *state.calls.lock().await += 1;
+    let bytes = to_bytes(request.into_body(), usize::MAX).await.unwrap();
+    let body: Value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    let poison = state.poison_document.as_deref().is_some_and(|document| {
+        body.get("events")
+            .and_then(Value::as_array)
+            .map(|events| {
+                events.iter().any(|event| {
+                    event
+                        .get("payload")
+                        .and_then(|payload| payload.get("document_id"))
+                        .and_then(Value::as_str)
+                        == Some(document)
+                })
+            })
+            .unwrap_or(false)
+    });
+    let fail = if state.poison_document.is_some() {
+        poison
+    } else {
+        !state.status.is_success()
+    };
+    if fail {
+        let status = if poison {
+            StatusCode::BAD_REQUEST
+        } else {
+            state.status
+        };
+        return (
+            status,
+            axum::Json(json!({"error": "stub_failure", "message": "synthetic stream failure"})),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::CREATED,
+        axum::Json(json!({"ok": true, "events": []})),
+    )
+        .into_response()
+}
+
+async fn spawn_failing_stream(
+    status: StatusCode,
+    poison_document: Option<&str>,
+) -> (String, Arc<Mutex<usize>>) {
+    let state = FailingStream {
+        status,
+        poison_document: poison_document.map(str::to_string),
+        calls: Arc::new(Mutex::new(0)),
+    };
+    let calls = state.calls.clone();
+    let app = Router::new()
+        .fallback(failing_stream_stub)
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{address}"), calls)
+}
+
+async fn seed_two_documents(store: &Store, app: &Router) -> Vec<crate::store::OutboxEvent> {
+    let headers = user_headers("tenant-a", "user-1");
+    create_collection(app, &headers, json!({"name": "users"})).await;
+    create_doc(
+        app,
+        &headers,
+        "users",
+        json!({"id": "good", "data": {"n": 1}}),
+    )
+    .await;
+    create_doc(
+        app,
+        &headers,
+        "users",
+        json!({"id": "bad", "data": {"n": 2}}),
+    )
+    .await;
+    store.list_unpublished(100).await.unwrap()
+}
+
+#[tokio::test]
+async fn outbox_transient_failure_backs_off_without_blocking_the_batch() {
+    let (url, _) = spawn_failing_stream(StatusCode::SERVICE_UNAVAILABLE, None).await;
+    let mut config = Config::for_test();
+    config.stream_service_url = url;
+    config.outbox_retry_base_ms = 500;
+    config.outbox_retry_max_ms = 500;
+    let store = Store::connect(None).await.unwrap();
+    let app = build_app(AppState::new(store.clone(), config.clone()));
+    let events = seed_two_documents(&store, &app).await;
+    assert_eq!(events.len(), 2);
+
+    assert_eq!(crate::outbox::relay_outbox_once(&store, &config, 100).await, 0);
+    let stats = store.outbox_stats().await.unwrap();
+    assert_eq!((stats.pending, stats.dead_lettered), (2, 0));
+    assert!(
+        store.list_unpublished(100).await.unwrap().is_empty(),
+        "a backed-off event must not occupy the next relay batch"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    assert_eq!(store.list_unpublished(100).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn outbox_permanent_failure_quarantines_only_the_poison_event() {
+    let (url, _) = spawn_failing_stream(StatusCode::BAD_REQUEST, Some("bad")).await;
+    let mut config = Config::for_test();
+    config.stream_service_url = url;
+    config.outbox_max_attempts = 10;
+    let store = Store::connect(None).await.unwrap();
+    let app = build_app(AppState::new(store.clone(), config.clone()));
+    seed_two_documents(&store, &app).await;
+
+    assert_eq!(crate::outbox::relay_outbox_once(&store, &config, 100).await, 1);
+    let stats = store.outbox_stats().await.unwrap();
+    assert_eq!((stats.pending, stats.dead_lettered), (0, 1));
+    let dead = store
+        .list_dead_lettered(10, Some("tenant-a"), None, false)
+        .await
+        .unwrap();
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].document_id, "bad");
+    assert_eq!(dead[0].attempts, 1);
+}
+
+#[tokio::test]
+async fn outbox_transient_retries_reach_the_attempt_cap_and_quarantine() {
+    let (url, _) = spawn_failing_stream(StatusCode::SERVICE_UNAVAILABLE, None).await;
+    let mut config = Config::for_test();
+    config.stream_service_url = url;
+    config.outbox_retry_base_ms = 40;
+    config.outbox_retry_max_ms = 40;
+    config.outbox_max_attempts = 2;
+    let store = Store::connect(None).await.unwrap();
+    let app = build_app(AppState::new(store.clone(), config.clone()));
+    seed_two_documents(&store, &app).await;
+
+    assert_eq!(crate::outbox::relay_outbox_once(&store, &config, 100).await, 0);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(crate::outbox::relay_outbox_once(&store, &config, 100).await, 0);
+    let stats = store.outbox_stats().await.unwrap();
+    assert_eq!((stats.pending, stats.dead_lettered), (0, 2));
+}
+
+#[tokio::test]
+async fn outbox_dead_letters_are_tenant_visible_and_replayable() {
+    let (url, _) = spawn_failing_stream(StatusCode::BAD_REQUEST, Some("bad")).await;
+    let mut config = Config::for_test();
+    config.stream_service_url = url;
+    config.outbox_max_attempts = 10;
+    let store = Store::connect(None).await.unwrap();
+    let app = build_app(AppState::new(store.clone(), config.clone()));
+    seed_two_documents(&store, &app).await;
+    assert_eq!(crate::outbox::relay_outbox_once(&store, &config, 100).await, 1);
+
+    let (status, _, visible) = call(
+        &app,
+        "GET",
+        "/v1/base/outbox",
+        &user_headers("tenant-a", "user-1"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{visible}");
+    assert_eq!(visible["count"], 1);
+    assert_eq!(visible["items"][0]["documentId"], "bad");
+
+    let (status, _, hidden) = call(
+        &app,
+        "GET",
+        "/v1/base/outbox",
+        &user_headers("tenant-b", "user-2"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{hidden}");
+    assert_eq!(hidden["count"], 0);
+
+    let event_id = visible["items"][0]["eventId"].as_str().unwrap();
+    let (status, _, replay) = call(
+        &app,
+        "POST",
+        &format!("/internal/base/outbox/{event_id}/replay"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    let stats = store.outbox_stats().await.unwrap();
+    assert_eq!((stats.pending, stats.dead_lettered), (1, 0));
+}
+
 #[tokio::test]
 async fn outbox_relay_publishes_once() {
     let (url, capture) = spawn_stream_stub().await;
@@ -1286,6 +1498,114 @@ async fn outbox_relay_publishes_once() {
 }
 
 #[tokio::test]
+async fn postgres_outbox_quarantine_and_replay_when_configured() {
+    let Ok(url) = std::env::var("BASE_TEST_DATABASE_URL") else {
+        return;
+    };
+    if url.trim().is_empty() {
+        return;
+    }
+    let store = Store::connect_with_direct(Some(&url), Some(&url))
+        .await
+        .expect("postgres connect");
+    let suffix: String = crate::util::random_id().chars().take(10).collect();
+    let event_id = format!("pg-outbox-{suffix}");
+    let org = format!("pg-outbox-org-{suffix}");
+    let pool = store.pool().expect("pool");
+    sqlx::query(
+        r#"INSERT INTO synapseone_base_outbox
+             (event_id, org_id, collection_id, document_id, operation, payload)
+           VALUES ($1, $2, 'pg-collection', 'pg-document', 'create', $3::jsonb)"#,
+    )
+    .bind(&event_id)
+    .bind(&org)
+    .bind(json!({"event_id": event_id, "organization_id": org}).to_string())
+    .execute(pool)
+    .await
+    .expect("insert outbox row");
+
+    let due = store.list_unpublished(500).await.unwrap();
+    assert!(due.iter().any(|row| row.event_id == event_id));
+
+    store
+        .record_failure(
+            &event_id,
+            "transient",
+            Some(chrono::Utc::now() + chrono::Duration::minutes(10)),
+            false,
+        )
+        .await
+        .unwrap();
+    let due = store.list_unpublished(500).await.unwrap();
+    assert!(
+        !due.iter().any(|row| row.event_id == event_id),
+        "future next_attempt_at must be excluded"
+    );
+
+    store
+        .record_failure(&event_id, "poison", None, true)
+        .await
+        .unwrap();
+    let dead = store
+        .list_dead_lettered(200, Some(&org), None, false)
+        .await
+        .unwrap();
+    let row = dead
+        .iter()
+        .find(|row| row.event_id == event_id)
+        .expect("dead-lettered row visible");
+    assert_eq!(row.attempts, 2);
+    assert_eq!(row.last_error.as_deref(), Some("poison"));
+
+    assert!(store.requeue_dead_letter(&event_id).await.unwrap());
+    let due = store.list_unpublished(500).await.unwrap();
+    assert!(
+        due.iter().any(|row| row.event_id == event_id),
+        "replayed row must be due again"
+    );
+
+    let _ = sqlx::query("DELETE FROM synapseone_base_outbox WHERE org_id = $1")
+        .bind(&org)
+        .execute(pool)
+        .await;
+}
+
+#[tokio::test]
+async fn deleting_a_collection_emits_document_tombstones() {
+    let state = test_state().await;
+    let store = state.store.clone();
+    let app = build_app(state);
+    let headers = user_headers("tenant-a", "user-1");
+    create_collection(&app, &headers, json!({"name": "users"})).await;
+    create_doc(
+        &app,
+        &headers,
+        "users",
+        json!({"id": "gone-1", "data": {"n": 1}}),
+    )
+    .await;
+    let (status, _, _) = call(
+        &app,
+        "DELETE",
+        "/v1/base/collections/users",
+        &headers,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let pending = store.list_unpublished(100).await.unwrap();
+    assert!(
+        pending
+            .iter()
+            .any(|event| {
+                event.payload.get("document_id").and_then(Value::as_str) == Some("gone-1")
+                    && event.payload.get("operation").and_then(Value::as_str) == Some("delete")
+            }),
+        "collection delete must enqueue a tombstone for each document"
+    );
+}
+
+#[tokio::test]
 async fn backfill_is_idempotent_and_replayable() {
     let state = test_state().await;
     let app = build_app(state);
@@ -1319,6 +1639,35 @@ async fn backfill_is_idempotent_and_replayable() {
     .await;
     assert_eq!(second["enqueued"], 0);
 
+    // Delete and re-create the same document id: the version resets to 1, but
+    // the new incarnation must still emit its own backfill event.
+    let (deleted, _, _) = call(
+        &app,
+        "DELETE",
+        "/v1/base/collections/users/documents/snap-1",
+        &headers,
+        None,
+    )
+    .await;
+    assert!(deleted.is_success(), "delete failed: {deleted}");
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    create_doc(
+        &app,
+        &headers,
+        "users",
+        json!({"id": "snap-1", "data": {"n": 2}}),
+    )
+    .await;
+    let (_, _, recreated) = call(
+        &app,
+        "POST",
+        "/internal/base/collections/users/backfill",
+        &headers,
+        Some(json!({"limit": 100})),
+    )
+    .await;
+    assert_eq!(recreated["enqueued"], 1, "re-created document must enqueue");
+
     let since = percent_encoding::utf8_percent_encode(
         "1970-01-01T00:00:00.000Z",
         percent_encoding::NON_ALPHANUMERIC,
@@ -1343,7 +1692,8 @@ async fn backfill_is_idempotent_and_replayable() {
                     .starts_with("backfill:")
         })
         .collect();
-    assert_eq!(backfilled.len(), 1);
+    assert_eq!(backfilled.len(), 2);
+    assert_ne!(backfilled[0]["eventId"], backfilled[1]["eventId"]);
 }
 
 #[tokio::test]
@@ -1912,6 +2262,18 @@ async fn document_listing_exposes_total_and_cursor_envelope() {
         Some("5")
     );
     assert!(bare.is_array());
+
+    let (status, _, objects) = call(
+        &app,
+        "GET",
+        "/v1/base/collections/paged/documents?limit=1&as=object",
+        &headers,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(objects[0]["object"].is_object());
+    assert!(objects[0].get("data").is_none());
 }
 
 #[tokio::test]

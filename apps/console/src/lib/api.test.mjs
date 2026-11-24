@@ -200,6 +200,38 @@ describe('console silent refresh', () => {
     ]);
   });
 
+  it('search api client methods hit the right paths and verbs', async () => {
+    const seen = [];
+    globalThis.fetch = async (url, init = {}) => {
+      seen.push(`${init.method || 'GET'} ${String(url).replace(/^https?:\/\/[^/]+/, '')}`);
+      return { status: 200, ok: true, text: async () => '{"items":[]}', headers: new Map() };
+    };
+    authStore.get = () => null;
+    await api.search({ query: 'flood', mode: 'hybrid' }, {});
+    await api.searchStatus({});
+    await api.searchReindex({}, {});
+    assert.deepEqual(seen, [
+      'POST /v1/search',
+      'GET /v1/search/status',
+      'POST /v1/search/reindex',
+    ]);
+  });
+
+  it('warehouse/lakehouse ETL and maintenance methods hit the right paths', async () => {
+    const seen = [];
+    globalThis.fetch = async (url, init = {}) => {
+      seen.push(`${init.method || 'GET'} ${String(url).replace(/^https?:\/\/[^/]+/, '')}`);
+      return { status: 200, ok: true, text: async () => '{"ok":true}', headers: new Map() };
+    };
+    authStore.get = () => null;
+    await api.warehouseEtlBaseLakehouse({ collection: 'parks', namespace: 'analytics', table: 'parks_changes' }, {});
+    await api.lakehouseMaintenance('analytics', 'parks_changes', {});
+    assert.deepEqual(seen, [
+      'POST /v1/warehouse/etl/base-lakehouse',
+      'GET /v1/lakehouse/namespaces/analytics/tables/parks_changes/maintenance',
+    ]);
+  });
+
   it('base, queue, and faststore api client methods hit the right paths and verbs', async () => {
     const seen = [];
     globalThis.fetch = async (url, init = {}) => {
@@ -214,6 +246,7 @@ describe('console silent refresh', () => {
     await api.baseCreateDocument('c1', { object: { a: 1 } }, A);
     await api.baseQuery('c1', { where: {} }, A);
     await api.baseIncrement('c1', 'd1', { field: 'count', by: 1 }, A);
+    await api.baseOutbox({ limit: 50 }, A);
 
     await api.queueList(A);
     await api.queueCreate('q1', { maxAttempts: 5 }, A);
@@ -239,6 +272,7 @@ describe('console silent refresh', () => {
       'POST /v1/base/collections/c1/documents',
       'POST /v1/base/collections/c1/query',
       'POST /v1/base/collections/c1/documents/d1/increment',
+      'GET /v1/base/outbox?limit=50',
       'GET /v1/queue/queues',
       'PUT /v1/queue/queues/q1',
       'POST /v1/queue/queues/q1/messages',

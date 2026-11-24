@@ -19,6 +19,8 @@ reads which key (audited from source):
 | `INFERENCE_SERVICE_URL` | `http://inference:4008` | Inference upstream (also probed by `/ready`) |
 | `OCS_SERVICE_URL` | `http://ocs:4010` | SynapseOCS upstream |
 | `NOTIFICATIONS_SERVICE_URL` | `http://notifications:4011` | SynapseNotifications upstream |
+| `WAREHOUSE_SERVICE_URL` | `http://warehouse:4012` | Synapse Warehouse upstream |
+| `LAKEHOUSE_SERVICE_URL` | `http://lakehouse:4013` | Synapse Lakehouse upstream |
 | `AUTHZ_MODE` | `off` | central policy enforcement: `off` = tenant isolation only; `audit` = decide every authenticated request via IAM, log + header `x-synapseone-authz: would-deny`, never block; `enforce` = `403 access_denied`, IAM unreachable → `503 authz_unavailable` |
 | `AUTHZ_CACHE_TTL_MS` | 30000 | decision cache per principal/action/resource (0 disables, max 300000) — policy changes take effect after at most this long |
 | `AUTHZ_MODE_REQUIRED` | `false` | production fail-closed guard: when `true`, gateway refuses to boot with `AUTHZ_MODE=off` |
@@ -29,7 +31,7 @@ reads which key (audited from source):
 | `PLATFORM_ORG_SLUG` | `synapseone-platform` | reserved organization for platform staff |
 | `PLATFORM_BOOTSTRAP_SECRET` | — | one-time internal first-owner bootstrap; empty disables the endpoint |
 | `PLATFORM_RECOVERY_SECRET` | — | internal break-glass reset for a platform administrator who lost MFA |
-| `IAM_SENSITIVE_MUTATION_MODE` | `audit` | `audit` logs would-deny; `enforce` requires an org administrator for privileged IAM mutations |
+| `IAM_SENSITIVE_MUTATION_MODE` | `audit` | `audit` logs would-deny; `enforce` requires an org administrator for privileged IAM mutations. Production boot **requires `enforce`**; `.env.example` sets it. |
 | `IAM_ALLOW_DIRECT_ORG_CREATE` | `true` dev / `false` prod | direct `POST /v1/orgs`; platform API creates orgs with a first admin |
 | `IAM_JWT_SECRET` | — | **must match** IAM, used to verify Bearer tokens |
 | `GATEWAY_ROUTES_PATH` | `./routes.yaml` | routing table |
@@ -40,6 +42,8 @@ reads which key (audited from source):
 | `HSTS_ENABLED` | `false` | `true` → send `Strict-Transport-Security` (only behind TLS) |
 | `TRUST_PROXY` | `false` | Express trust-proxy: unset/`0` = direct exposure; `1` behind one nginx/Ingress hop; or a CIDR/name list. `true` is rejected (XFF spoofing). |
 | `INFERENCE_RATE_LIMIT_PER_MIN` | `60` | per-tenant AI/inference quota; `429` + `Retry-After` when exceeded |
+| `GATEWAY_SESSION_CACHE_MS` | `2000` | session/credential revalidation cache (1–30000 ms). Suspension, disable, account retirement and key revocation take effect within this window; 403 results are cached for the same window. |
+| `AUTHZ_CACHE_TTL_MS` | `30000` | policy decision cache per principal/action/resource (0 disables, max 300000). Role/policy edits take effect within this window; lifecycle state is checked by the 2 s session cache first. |
 | `VALKEY_URL` / `REDIS_URL` | — (memory) | `redis://...` → Redis-protocol backend for services that opt in (legacy name `REDIS_URL` still honoured). The gateway's edge limiter is in-memory. |
 | `GATEWAY_HOST_PORT` | 8080 | host port (compose only) |
 
@@ -49,11 +53,10 @@ reads which key (audited from source):
 |---|---|---|
 | `PORT` | 4001 | listen port |
 | `DATABASE_URL` | — (memory) | `postgres://...` → enables the Postgres backend |
-| `REDIS_URL` | — | reserved (centralized session/ratelimit, v0.2) |
 | `IAM_JWT_SECRET` | — | HS256 for access/service JWTs (≥32 random chars); boot fails in `NODE_ENV=production` when weak/default |
 | `IAM_JWT_EXPIRES_IN` / `IAM_REFRESH_EXPIRES_IN` | 3600 / 2592000 (seconds) | token TTLs (clamped 60–86400 / 3600–315360000; garbage env falls back to default) |
 | `IAM_API_KEY_PEPPER` | — (plain SHA-256) | HMAC pepper for API-key/refresh-token hashes at rest; keys created before the pepper still verify (legacy fallback) |
-| `IAM_MFA_ENCRYPTION_KEY` | — (HKDF of `IAM_JWT_SECRET`) | 32-byte key (hex/base64) sealing TOTP secrets with AES-256-GCM. Set it explicitly in production; changing it invalidates enrolled authenticators |
+| `IAM_MFA_ENCRYPTION_KEY` | — (HKDF of `IAM_JWT_SECRET`) | 32-byte key (hex/base64) sealing TOTP secrets with AES-256-GCM. Set it explicitly in production. Existing seals made with the legacy HKDF key remain readable (fallback); new seals use this key. Keep the old key available until all users re-enrol. |
 | `IAM_MFA_ISSUER` | `SynapseOne` | issuer label in the `otpauth://` URL shown by authenticator apps |
 | `IAM_LOGIN_MAX_FAILURES` / `IAM_LOGIN_LOCKOUT_SECONDS` | `5` / `900` | consecutive wrong passwords or MFA codes before a temporary lock (`429 account_locked` + `Retry-After`); org admins can `POST /v1/users/:id/unlock` |
 | `IAM_LOGIN_RATE_LIMIT_PER_MIN` / `IAM_MFA_RATE_LIMIT_PER_MIN` | `60` / `60` | per-IP request ceiling on `POST /v1/auth/login` and on the MFA, MFA-reset and unlock routes (`429 rate_limited`); complements the per-user lockout |
@@ -68,7 +71,7 @@ reads which key (audited from source):
 | `OIDC_ISSUER` / `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` / `OIDC_REDIRECT_URI` | see `.env.example` | federated OIDC (Authentik/Keycloak). For SPA login, point `OIDC_REDIRECT_URI` at the Console's `/oidc/callback` page (e.g. `https://cloud.example.com/oidc/callback`) |
 | `IAM_REGISTRATION_ENABLED` | `true` | first-party registration (`POST /v1/auth/register`); set `false` for OIDC-only deployments |
 | `IAM_REGISTRATION_ALLOW_NEW_ORGS` | `true` | self-service creation of a brand-new org on register; joining an existing org always requires an invitation |
-| `IAM_EXPOSE_LIFECYCLE_TOKENS` | `false` | **opt-in** dev convenience: return reset/verification tokens in API responses when no mailer is wired. Forced off in production (`NODE_ENV=production`, or `SYNAPSEONE_ENV`/`SYNAPSEDX_ENV`/`APP_ENV`/`ENVIRONMENT` = `production`/`prod`) |
+| `IAM_EXPOSE_LIFECYCLE_TOKENS` | `false` | **opt-in** dev convenience for self-service **password-reset and email-verify** tokens when no mailer is wired. Always off in production (`NODE_ENV=production`, or `SYNAPSEONE_ENV`/`SYNAPSEDX_ENV`/`APP_ENV`/`ENVIRONMENT` = `production`/`prod`). Organization/user activation codes are returned only by authorized admin/platform routes (platform owner/operator + step-up where required), never by public recovery endpoints. |
 | `IAM_RESET_TOKEN_TTL_SECONDS` / `IAM_VERIFY_TOKEN_TTL_SECONDS` | `3600` / `86400` | single-use token TTLs (clamped) |
 | `OIDC_ALLOWED_ORGS` | — (any slug) | comma-separated org **slugs** allowed through OIDC → `403 org_not_allowed` otherwise. A new slug is self-service (org is created on first login); joining an **existing** org always requires an existing membership (`403 org_membership_required`) |
 
@@ -143,9 +146,60 @@ attributes default-deny; visibility is resolved at read time from the registry
 | `DATABASE_URL` | — (memory) | `postgres://...` → Postgres backend; **required in production** (otherwise a per-process in-memory store) |
 | `BASE_MAX_DOCUMENT_BYTES` | 262144 | max serialized document size, clamped 1024..4194304 |
 | `BASE_QUERY_SCAN_LIMIT` | 200000 | in-memory fallback only: max documents scanned per query (batched), clamped 100..1000000. Postgres queries use pushdown and never hit this cap |
+| `STREAM_SERVICE_URL` | — | enables the transactional-outbox relay to SynapseStream; empty disables delivery |
+| `BASE_OUTBOX_STREAM_TOPIC` | `base-changes` | destination topic |
+| `BASE_OUTBOX_RELAY_MS` | 1000 | relay poll interval, clamped 100..60000 |
+| `BASE_OUTBOX_MAX_ATTEMPTS` | 20 | transient failures before quarantine, clamped 1..1000 |
+| `BASE_OUTBOX_RETRY_BASE_MS` | 1000 | first exponential-backoff step, clamped 50..600000 |
+| `BASE_OUTBOX_RETRY_MAX_MS` | 300000 | backoff cap, clamped between base and 3600000 |
 | `SYNAPSEONE_INTERNAL_SECRET` | — (dev) | requires a matching `x-synapseone-internal` header on every `/v1/*` — blocks direct `:4005` bypass |
 | `HSTS_ENABLED` / `CORS_ORIGIN` | `false` / — | same semantics as the other services |
 | `BASE_SERVICE_HOST_PORT` | `127.0.0.1:4005` | compose host binding |
+
+## Warehouse — Synapse Warehouse (`apps/warehouse-service`)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `PORT` | 4012 | listen port (gateway route `/v1/warehouse`) |
+| `WAREHOUSE_DATA_DIR` | `/data/warehouse` | durable DuckDB directory; `:memory:` is rejected in production |
+| `WAREHOUSE_OCS_MAX_FILE_BYTES` | `67108864` | maximum staged OCS object size for CSV/JSONL/Parquet import |
+| `OCS_SERVICE_URL` | `http://ocs:4010` | trusted OCS object source for Warehouse file ingestion |
+| `WAREHOUSE_THREADS` | 2 | DuckDB worker threads per tenant connection |
+| `WAREHOUSE_QUERY_TIMEOUT_MS` | 15000 | query timeout, bounded by the service |
+| `WAREHOUSE_MAX_BODY` | 8mb | request body cap |
+| `STREAM_SERVICE_URL` | `http://stream:4009` | stream ETL source and topic setup |
+| `BASE_SERVICE_URL` | `http://base:4005` | Base snapshot ETL source |
+| `SYNAPSEONE_INTERNAL_SECRET` | — | required in production; service-to-service auth |
+| `CORS_ORIGIN` | — | allowed browser origins (comma-separated) |
+| `WAREHOUSE_SERVICE_HOST_PORT` | `127.0.0.1:4012` | compose host binding |
+
+Warehouse images link the official DuckDB 2.0.0 shared library (pinned URL +
+SHA256 in the Dockerfile) instead of compiling the bundled C++ engine. Tenant
+SQL still runs with external file/network access disabled.
+
+## Lakehouse — Apache Iceberg (`apps/lakehouse-service`)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `PORT` | 4013 | listen port (gateway route `/v1/lakehouse`) |
+| `LAKEHOUSE_CATALOG_URI` | — (SQLite dev fallback) | SQLAlchemy URI for the Iceberg SQL catalog; production requires Postgres (`postgresql+pg8000://...`, BSD-licensed driver) |
+| `LAKEHOUSE_WAREHOUSE` | — (file dev fallback) | `s3://bucket/prefix` for Parquet/metadata; production requires S3 |
+| `LAKEHOUSE_S3_ENDPOINT` | — | S3-compatible endpoint (SeaweedFS/OCS backend) |
+| `LAKEHOUSE_S3_ACCESS_KEY` / `LAKEHOUSE_S3_SECRET_KEY` | — | service-owned S3 credentials (never tenant credentials) |
+| `LAKEHOUSE_S3_REGION` | `us-east-1` | S3 signing region |
+| `LAKEHOUSE_MAX_NAMESPACES` | 20 | per-tenant namespace quota |
+| `LAKEHOUSE_MAX_TABLES_PER_NAMESPACE` | 100 | per-namespace table quota |
+| `LAKEHOUSE_MAX_ROWS_PER_APPEND` | 5000 | append row cap |
+| `LAKEHOUSE_MAX_BYTES` | 1073741824 | tenant byte quota; estimated from current-snapshot file sizes plus the incoming JSON payload |
+| `SYNAPSEONE_INTERNAL_SECRET` | — | required in production; tenant headers are trusted only with it |
+| `LAKEHOUSE_SERVICE_HOST_PORT` | `127.0.0.1:4013` | compose host binding |
+
+The service creates real Iceberg v2 metadata, Parquet files, manifests and
+snapshots through PyIceberg. Data files are retained on table drop; snapshot
+expiration/orphan cleanup is an explicit operator action, not automatic.
+Warehouse reads tables through a trusted internal materialization
+(`POST /v1/warehouse/etl/lakehouse`), never by granting tenant SQL filesystem
+access.
 
 ## Faststore — Synapse Faststore (`apps/faststore-service`)
 

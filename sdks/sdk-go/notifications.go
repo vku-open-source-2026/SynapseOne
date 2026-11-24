@@ -26,7 +26,9 @@ type SendNotificationInput struct {
 	Channels       []string              `json:"channels,omitempty"`
 	Recipient      NotificationRecipient `json:"recipient"`
 	Subject        string                `json:"subject,omitempty"`
-	Body           string                `json:"body"`
+	Body           string                `json:"body,omitempty"`
+	TemplateID     string                `json:"templateId,omitempty"`
+	TemplateSlug   string                `json:"templateSlug,omitempty"`
 	Data           map[string]any        `json:"data,omitempty"`
 	IdempotencyKey string                `json:"idempotencyKey,omitempty"`
 }
@@ -81,6 +83,97 @@ func (c *Client) ListNotifications(status string, limit int) ([]any, error) {
 // CancelNotification cancels a queued/failed notification.
 func (c *Client) CancelNotification(id string) (map[string]any, error) {
 	b, err := c.do("POST", "/v1/notifications/"+pathEscape(id)+"/cancel", map[string]any{})
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// RetryNotification re-queues a failed/dead notification.
+func (c *Client) RetryNotification(id string) (map[string]any, error) {
+	b, err := c.do("POST", "/v1/notifications/"+pathEscape(id)+"/retry", map[string]any{})
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// CreateNotificationTemplate creates a tenant-owned template.
+func (c *Client) CreateNotificationTemplate(body map[string]any) (map[string]any, error) {
+	b, err := c.do("POST", "/v1/notifications/templates", body)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ListNotificationTemplates lists/search templates with optional archiving.
+func (c *Client) ListNotificationTemplates(params map[string]string) (map[string]any, error) {
+	b, err := c.do("GET", "/v1/notifications/templates"+queryString(params), nil)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetNotificationTemplate reads one template.
+func (c *Client) GetNotificationTemplate(id string) (map[string]any, error) {
+	b, err := c.do("GET", "/v1/notifications/templates/"+pathEscape(id), nil)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// UpdateNotificationTemplate updates template content (version increments).
+func (c *Client) UpdateNotificationTemplate(id string, body map[string]any) (map[string]any, error) {
+	b, err := c.do("PATCH", "/v1/notifications/templates/"+pathEscape(id), body)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// DeleteNotificationTemplate archives a template.
+func (c *Client) DeleteNotificationTemplate(id string) (map[string]any, error) {
+	b, err := c.do("DELETE", "/v1/notifications/templates/"+pathEscape(id), nil)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// PreviewNotificationTemplate renders a template with data.
+func (c *Client) PreviewNotificationTemplate(id string, data map[string]any) (map[string]any, error) {
+	b, err := c.do("POST", "/v1/notifications/templates/"+pathEscape(id)+"/preview", map[string]any{"data": data})
 	if err != nil {
 		return nil, err
 	}

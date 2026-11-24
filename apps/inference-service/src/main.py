@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 VKU.VIC
+import os
 import secrets
 import threading
 import time
@@ -10,6 +11,7 @@ from fastapi import FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from . import __version__
 from .config import settings
 from .decision import DecisionRequest, RouteRequest, decision_engine
 from .embedding import (
@@ -25,7 +27,7 @@ from .llm import (
 )
 from .usage import Timer, report_usage
 
-VERSION = "0.7.0"
+VERSION = os.getenv("SYNAPSEONE_BUILD_VERSION", "").strip() or __version__
 
 
 @asynccontextmanager

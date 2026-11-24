@@ -32,6 +32,8 @@ import {
   Input,
   Modal,
   PageTitle,
+  Pager,
+  SearchBox,
   Skeleton,
   Table,
 } from '../components/ui.jsx';
@@ -70,6 +72,13 @@ export default function SynapseWarehouse() {
   const [tab, setTab] = useState('datasets');
 
   const [datasets, setDatasets] = useState([]);
+  const [datasetTotal, setDatasetTotal] = useState(0);
+  const [datasetOffset, setDatasetOffset] = useState(0);
+  const [datasetSearch, setDatasetSearch] = useState('');
+  const [jobTotal, setJobTotal] = useState(0);
+  const [jobOffset, setJobOffset] = useState(0);
+  const [jobSearch, setJobSearch] = useState('');
+  const PAGE = 100;
   const [templates, setTemplates] = useState([]);
   const [jobs, setJobs] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -93,11 +102,20 @@ export default function SynapseWarehouse() {
   const [jobOpen, setJobOpen] = useState(false);
   const [jobName, setJobName] = useState('');
   const [jobMode, setJobMode] = useState('batch');
+  const [jobSnapshotId, setJobSnapshotId] = useState('');
   const [jobTarget, setJobTarget] = useState('');
   const [jobSql, setJobSql] = useState('SELECT * FROM city_incidents LIMIT 100');
   const [jobWriteMode, setJobWriteMode] = useState('replace');
   const [jobTopic, setJobTopic] = useState('');
   const [jobIntervalMs, setJobIntervalMs] = useState(1000);
+  const [jobCollection, setJobCollection] = useState('');
+  const [jobNamespace, setJobNamespace] = useState('analytics');
+  const [jobTable, setJobTable] = useState('');
+  const [ocsBucket, setOcsBucket] = useState('');
+  const [ocsKey, setOcsKey] = useState('');
+  const [ocsFormat, setOcsFormat] = useState('');
+  const [ocsPreview, setOcsPreview] = useState(null);
+  const [ocsPreviewBusy, setOcsPreviewBusy] = useState(false);
   const [jobErr, setJobErr] = useState(null);
   const [jobSaving, setJobSaving] = useState(false);
 
@@ -106,19 +124,21 @@ export default function SynapseWarehouse() {
     setErr(null);
     try {
       const [d, t, j] = await Promise.all([
-        api.warehouseDatasets(headers),
+        api.warehouseDatasets({ limit: PAGE, offset: datasetOffset, name: datasetSearch }, headers),
         api.warehouseTemplates(headers),
-        api.warehouseJobs(headers),
+        api.warehouseJobs({ limit: PAGE, offset: jobOffset, name: jobSearch }, headers),
       ]);
       setDatasets(Array.isArray(d?.items) ? d.items : []);
+      setDatasetTotal(Number(d?.total) || 0);
       setTemplates(Array.isArray(t?.items) ? t.items : []);
       setJobs(Array.isArray(j?.items) ? j.items : []);
+      setJobTotal(Number(j?.total) || 0);
     } catch (e) {
       setErr(e);
     } finally {
       setLoading(false);
     }
-  }, [headers]);
+  }, [headers, datasetOffset, datasetSearch, jobOffset, jobSearch]);
 
   useEffect(() => {
     load();
@@ -177,6 +197,17 @@ export default function SynapseWarehouse() {
     }
   };
 
+  const renameDataset = async (d) => {
+    const name = window.prompt('Dataset display name', d.name || d.id);
+    if (name === null) return;
+    try {
+      await api.warehouseUpdateDataset(d.id, { name }, headers);
+      await load();
+    } catch (e) {
+      setErr(e);
+    }
+  };
+
   const deleteDataset = async (id) => {
     if (!window.confirm(`Delete dataset "${id}" and all of its rows?`)) return;
     try {
@@ -201,7 +232,29 @@ export default function SynapseWarehouse() {
     setJobWriteMode('replace');
     setJobTopic('');
     setJobIntervalMs(1000);
+    setOcsBucket('');
+    setOcsKey('');
+    setOcsFormat('');
+    setOcsPreview(null);
     setJobOpen(true);
+  };
+
+  const previewOcs = async () => {
+    if (!ocsBucket.trim() || !ocsKey.trim() || ocsPreviewBusy) return;
+    setOcsPreviewBusy(true);
+    setJobErr(null);
+    try {
+      setOcsPreview(await api.warehouseOcsPreview({
+        bucket: ocsBucket.trim(),
+        key: ocsKey.trim(),
+        ...(ocsFormat ? { format: ocsFormat } : {}),
+      }, headers));
+    } catch (e) {
+      setJobErr(e);
+      setOcsPreview(null);
+    } finally {
+      setOcsPreviewBusy(false);
+    }
   };
 
   const createJob = async () => {
@@ -216,14 +269,49 @@ export default function SynapseWarehouse() {
             sql: jobSql,
             writeMode: jobWriteMode,
           }
-        : {
-            name: jobName.trim() || undefined,
-            mode: 'stream',
-            targetDatasetId: jobTarget,
-            streamTopic: jobTopic.trim(),
-            intervalMs: Number(jobIntervalMs) || 1000,
-          };
-      await api.warehouseCreateJob(body, headers);
+        : jobMode === 'lakehouse'
+          ? {
+              name: jobName.trim() || undefined,
+              collection: jobCollection.trim(),
+              namespace: jobNamespace.trim(),
+              table: jobTable.trim(),
+              backfill: true,
+            }
+          : jobMode === 'ocs'
+            ? {
+                name: jobName.trim() || undefined,
+                bucket: ocsBucket.trim(),
+                key: ocsKey.trim(),
+                format: ocsFormat || undefined,
+                targetDatasetId: jobTarget,
+                writeMode: jobWriteMode,
+              }
+          : jobMode === 'base'
+            ? {
+                collection: jobCollection.trim(),
+                targetDatasetId: jobTarget,
+                writeMode: jobWriteMode,
+              }
+          : jobMode === 'lakehouse-c'
+            ? {
+                namespace: jobNamespace.trim(),
+                table: jobTable.trim(),
+                targetDatasetId: jobTarget,
+                ...(jobSnapshotId ? { snapshotId: jobSnapshotId } : {}),
+                writeMode: jobWriteMode,
+              }
+          : {
+              name: jobName.trim() || undefined,
+              mode: 'stream',
+              targetDatasetId: jobTarget,
+              streamTopic: jobTopic.trim(),
+              intervalMs: Number(jobIntervalMs) || 1000,
+            };
+      if (jobMode === 'lakehouse') await api.warehouseEtlBaseLakehouse(body, headers);
+      else if (jobMode === 'ocs') await api.warehouseEtlOcs(body, headers);
+      else if (jobMode === 'base') await api.warehouseEtlBase(body, headers);
+      else if (jobMode === 'lakehouse-c') await api.warehouseEtlLakehouse(body, headers);
+      else await api.warehouseCreateJob(body, headers);
       setJobOpen(false);
       await load();
     } catch (e) {
@@ -254,6 +342,17 @@ export default function SynapseWarehouse() {
   const resumeJob = async (id) => {
     try {
       await api.warehouseResumeJob(id, headers);
+      await load();
+    } catch (e) {
+      setErr(e);
+    }
+  };
+
+  const renameJob = async (job) => {
+    const name = window.prompt('ETL job name', job.name || job.id);
+    if (name === null) return;
+    try {
+      await api.warehouseUpdateJob(job.id, { name }, headers);
       await load();
     } catch (e) {
       setErr(e);
@@ -331,7 +430,7 @@ export default function SynapseWarehouse() {
           {loading ? (
             <Skeleton className="h-32 w-full" />
           ) : datasets.length === 0 ? (
-            <Empty text="No datasets yet. Create one, then ingest rows or run a batch ETL job into it." />
+            <Empty text="No datasets yet. Create one, then run a batch ETL job or SQL into it." />
           ) : (
             <Table head={['Dataset', 'Mode', 'Rows', 'Columns', 'Created', 'Actions']}>
               {datasets.map((d) => (
@@ -351,6 +450,7 @@ export default function SynapseWarehouse() {
                   <td className="py-2 pr-4 text-xs text-normal-text whitespace-nowrap">{fmtTime(d.createdAt)}</td>
                   <td className="py-2 pr-4 whitespace-nowrap">
                     <button type="button" className="text-xs text-main-blue hover:underline mr-3" onClick={() => useDataset(d.id)}>Query</button>
+                    <button type="button" className="text-xs text-main-blue hover:underline mr-3" onClick={() => renameDataset(d)}>Rename</button>
                     <button type="button" className="text-xs text-red-500 hover:underline" onClick={() => deleteDataset(d.id)}>Delete</button>
                   </td>
                 </tr>
@@ -360,6 +460,7 @@ export default function SynapseWarehouse() {
         </Card>
       )}
 
+      {tab === 'datasets' && <Pager total={datasetTotal} limit={PAGE} offset={datasetOffset} onChange={setDatasetOffset} loading={loading} />}
       {tab === 'sql' && (
         <div className="space-y-4">
           <Card>
@@ -412,7 +513,7 @@ export default function SynapseWarehouse() {
           <Card>
             <div className="flex items-center justify-between gap-3 mb-3">
               <h2 className="font-semibold text-main-text">ETL jobs</h2>
-              <Btn onClick={openJob} disabled={!datasets.length}><FontAwesomeIcon icon={faPlus} className="mr-1.5" />New job</Btn>
+              <Btn onClick={openJob}><FontAwesomeIcon icon={faPlus} className="mr-1.5" />New job</Btn>
             </div>
             {loading ? (
               <Skeleton className="h-32 w-full" />
@@ -445,10 +546,13 @@ export default function SynapseWarehouse() {
                         <button type="button" className="text-xs text-amber-500 hover:underline mr-3" onClick={() => pauseJob(j.id)}>
                           <FontAwesomeIcon icon={faPause} className="mr-1" />Pause
                         </button>
-                      ) : (
+                      ) : j.mode === 'stream' ? (
                         <button type="button" className="text-xs text-emerald-600 hover:underline mr-3" onClick={() => resumeJob(j.id)}>
                           <FontAwesomeIcon icon={faPlay} className="mr-1" />Resume
                         </button>
+                      ) : null}
+                      {(j.mode !== 'stream' || j.status !== 'running') && (
+                        <button type="button" className="text-xs text-main-blue hover:underline mr-3" onClick={() => renameJob(j)}>Rename</button>
                       )}
                       <button type="button" className="text-xs text-red-500 hover:underline" onClick={() => deleteJob(j.id)}>
                         <FontAwesomeIcon icon={faTrash} className="mr-1" />Delete
@@ -500,6 +604,7 @@ export default function SynapseWarehouse() {
           </Card>
         </div>
       )}
+      {tab === 'jobs' && <Pager total={jobTotal} limit={PAGE} offset={jobOffset} onChange={setJobOffset} loading={loading} />}
 
       <Modal open={createOpen} onClose={() => setCreateOpen(false)} title="New warehouse dataset">
         <Field label="Dataset id (lower-case slug)"><Input value={newId} onChange={(e) => setNewId(e.target.value)} placeholder="city_incidents" /></Field>
@@ -535,15 +640,21 @@ export default function SynapseWarehouse() {
         <Field label="Job name"><Input value={jobName} onChange={(e) => setJobName(e.target.value)} placeholder="Daily incident rollup" /></Field>
         <Field label="Mode">
           <select value={jobMode} onChange={(e) => setJobMode(e.target.value)} className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm">
-            <option value="batch">batch</option>
-            <option value="stream">stream</option>
+            <option value="batch">batch SQL</option>
+            <option value="stream">stream (continuous)</option>
+            <option value="base">base snapshot → warehouse (Path A)</option>
+            <option value="lakehouse">base → lakehouse change log (Path B)</option>
+            <option value="lakehouse-c">lakehouse → warehouse (Path C)</option>
+            <option value="ocs">ocs file (csv / jsonl / parquet)</option>
           </select>
         </Field>
-        <Field label="Target dataset">
-          <select value={jobTarget} onChange={(e) => setJobTarget(e.target.value)} className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm">
-            {datasets.map((d) => <option key={d.id} value={d.id}>{d.id}</option>)}
-          </select>
-        </Field>
+        {jobMode !== 'lakehouse' && (
+          <Field label="Target dataset">
+            <select value={jobTarget} onChange={(e) => setJobTarget(e.target.value)} className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm">
+              {datasets.map((d) => <option key={d.id} value={d.id}>{d.id}</option>)}
+            </select>
+          </Field>
+        )}
         {jobMode === 'batch' ? (
           <>
             <Field label="Transform SQL">
@@ -562,6 +673,55 @@ export default function SynapseWarehouse() {
               </select>
             </Field>
           </>
+        ) : jobMode === 'lakehouse' ? (
+          <>
+            <Field label="Base collection"><Input value={jobCollection} onChange={(e) => setJobCollection(e.target.value)} placeholder="parks" /></Field>
+            <Field label="Lakehouse namespace"><Input value={jobNamespace} onChange={(e) => setJobNamespace(e.target.value)} placeholder="analytics" /></Field>
+            <Field label="Iceberg change-log table" desc="Must have event_id, collection, document_id, operation, version, occurred_at, data, deleted.">
+              <Input value={jobTable} onChange={(e) => setJobTable(e.target.value)} placeholder="parks_changes" />
+            </Field>
+          </>
+        ) : jobMode === 'base' ? (
+          <>
+            <Field label="Base collection"><Input value={jobCollection} onChange={(e) => setJobCollection(e.target.value)} placeholder="parks" /></Field>
+            <Field label="Write mode">
+              <select value={jobWriteMode} onChange={(e) => setJobWriteMode(e.target.value)} className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm">
+                <option value="replace">replace</option>
+                <option value="append">append</option>
+              </select>
+            </Field>
+          </>
+        ) : jobMode === 'lakehouse-c' ? (
+          <>
+            <Field label="Lakehouse namespace"><Input value={jobNamespace} onChange={(e) => setJobNamespace(e.target.value)} placeholder="analytics" /></Field>
+            <Field label="Iceberg table"><Input value={jobTable} onChange={(e) => setJobTable(e.target.value)} placeholder="parks" /></Field>
+            <Field label="Snapshot id (optional)" desc="Empty uses the current snapshot."><Input value={jobSnapshotId} onChange={(e) => setJobSnapshotId(e.target.value)} placeholder="1234567890" /></Field>
+            <Field label="Write mode">
+              <select value={jobWriteMode} onChange={(e) => setJobWriteMode(e.target.value)} className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm">
+                <option value="replace">replace</option>
+                <option value="append">append</option>
+              </select>
+            </Field>
+          </>
+        ) : jobMode === 'ocs' ? (
+          <>
+            <div className="grid grid-cols-2 gap-2">
+              <Field label="OCS bucket"><Input value={ocsBucket} onChange={(e) => setOcsBucket(e.target.value)} placeholder="data" /></Field>
+              <Field label="Format"><select value={ocsFormat} onChange={(e) => setOcsFormat(e.target.value)} className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm"><option value="">from extension</option><option value="csv">csv</option><option value="jsonl">jsonl</option><option value="parquet">parquet</option></select></Field>
+            </div>
+            <Field label="Object key"><Input value={ocsKey} onChange={(e) => setOcsKey(e.target.value)} placeholder="exports/incidents.csv" /></Field>
+            <div className="flex items-center gap-2 mb-3">
+              <Btn kind="secondary" onClick={previewOcs} loading={ocsPreviewBusy} disabled={!ocsBucket.trim() || !ocsKey.trim()}>Preview schema</Btn>
+              {ocsPreview && <span className="text-[11px] text-normal-text">{ocsPreview.bytes} bytes · {ocsPreview.columns?.length || 0} columns</span>}
+            </div>
+            {ocsPreview?.columns?.length > 0 && <Code data={{ columns: ocsPreview.columns, sample: ocsPreview.rows }} />}
+            <Field label="Write mode">
+              <select value={jobWriteMode} onChange={(e) => setJobWriteMode(e.target.value)} className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm">
+                <option value="replace">replace (transactional)</option>
+                <option value="append">append (at-least-once)</option>
+              </select>
+            </Field>
+          </>
         ) : (
           <>
             <Field label="Stream topic"><Input value={jobTopic} onChange={(e) => setJobTopic(e.target.value)} placeholder="iot-sensors" /></Field>
@@ -570,7 +730,18 @@ export default function SynapseWarehouse() {
         )}
         <Err e={jobErr} />
         <div className="flex items-center gap-2 mt-4">
-          <Btn onClick={createJob} loading={jobSaving} disabled={!jobTarget || (jobMode === 'stream' && !jobTopic.trim())}>Create job</Btn>
+          <Btn
+            onClick={createJob}
+            loading={jobSaving}
+            disabled={
+              (jobMode !== 'lakehouse' && !jobTarget)
+              || (jobMode === 'stream' && !jobTopic.trim())
+              || (jobMode === 'lakehouse' && (!jobCollection.trim() || !jobNamespace.trim() || !jobTable.trim()))
+              || (jobMode === 'base' && !jobCollection.trim())
+              || (jobMode === 'lakehouse-c' && (!jobNamespace.trim() || !jobTable.trim()))
+              || (jobMode === 'ocs' && (!ocsBucket.trim() || !ocsKey.trim()))
+            }
+          >Create job</Btn>
           <Btn kind="ghost" onClick={() => setJobOpen(false)}>Cancel</Btn>
         </div>
       </Modal>

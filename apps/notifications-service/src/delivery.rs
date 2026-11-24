@@ -38,6 +38,46 @@ fn template_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"\{\{\s*([A-Za-z0-9_.-]{1,64})\s*\}\}").expect("template regex"))
 }
 
+/// Extract unique variable names from `{{var}}` placeholders.
+pub fn extract_variables(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for caps in template_re().captures_iter(text) {
+        let key = caps[1].to_string();
+        if !out.contains(&key) {
+            out.push(key);
+        }
+    }
+    out
+}
+
+/// Reject malformed placeholders instead of silently storing them.
+pub fn template_syntax_error(text: &str) -> Option<String> {
+    if text.contains("{{") || text.contains("}}") {
+        let stripped = template_re().replace_all(text, "");
+        if stripped.contains("{{") || stripped.contains("}}") {
+            return Some("malformed placeholder; use {{name}} with letters, digits, _, . or -".into());
+        }
+    }
+    None
+}
+
+pub fn missing_variables(variables: &[String], data: &Value) -> Vec<String> {
+    variables
+        .iter()
+        .filter(|key| {
+            let mut current = data;
+            for part in key.split('.') {
+                match current.get(part) {
+                    Some(next) if !next.is_null() => current = next,
+                    _ => return true,
+                }
+            }
+            false
+        })
+        .cloned()
+        .collect()
+}
+
 /// Render `{{var}}` placeholders from the notification data. Unknown keys stay.
 pub fn render_template(template: &str, data: &Value) -> String {
     template_re()

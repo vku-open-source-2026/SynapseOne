@@ -105,6 +105,10 @@ export function otpauthUrl(secretB32: string, account: string, issuer = process.
 
 // ---------------------------------------------------- secret encryption
 
+function legacyEncryptionKey(): Buffer {
+  return Buffer.from(hkdfSync('sha256', getJwtSecret(), 'synapseone-iam', 'mfa-secret-encryption', 32));
+}
+
 function encryptionKey(): Buffer {
   const raw = (process.env.IAM_MFA_ENCRYPTION_KEY || '').trim();
   if (raw) {
@@ -112,7 +116,7 @@ function encryptionKey(): Buffer {
     if (key.length === 32) return key;
     console.warn('[iam][security] IAM_MFA_ENCRYPTION_KEY must be 32 bytes (hex or base64); deriving from IAM_JWT_SECRET');
   }
-  return Buffer.from(hkdfSync('sha256', getJwtSecret(), 'synapseone-iam', 'mfa-secret-encryption', 32));
+  return legacyEncryptionKey();
 }
 
 export function sealSecret(secret: Buffer): string {
@@ -125,9 +129,22 @@ export function sealSecret(secret: Buffer): string {
 export function openSecret(sealed: string): Buffer {
   const [v, iv, tag, data] = sealed.split('.');
   if (v !== 'v1' || !iv || !tag || !data) throw new Error('unsupported MFA secret envelope');
-  const decipher = createDecipheriv('aes-256-gcm', encryptionKey(), Buffer.from(iv, 'base64'));
-  decipher.setAuthTag(Buffer.from(tag, 'base64'));
-  return Buffer.concat([decipher.update(Buffer.from(data, 'base64')), decipher.final()]);
+  // Older deployments sealed TOTP secrets with HKDF(IAM_JWT_SECRET) because
+  // Compose did not pass IAM_MFA_ENCRYPTION_KEY. Try both keys so enabling a
+  // dedicated key does not lock out every enrolled authenticator; new seals
+  // always use the configured key.
+  const keys = [encryptionKey(), legacyEncryptionKey()];
+  let lastError: unknown = new Error('unable to open MFA secret');
+  for (const key of keys) {
+    try {
+      const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(iv, 'base64'));
+      decipher.setAuthTag(Buffer.from(tag, 'base64'));
+      return Buffer.concat([decipher.update(Buffer.from(data, 'base64')), decipher.final()]);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('unable to open MFA secret');
 }
 
 // ---------------------------------------------------------- recovery codes

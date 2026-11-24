@@ -345,6 +345,14 @@ describe('platform organization lifecycle', () => {
     });
     assert.equal(login.status, 403);
     assert.equal(login.json.error, 'org_suspended');
+    // A wrong password must not reveal that the organization is suspended.
+    const oracle = await call('POST', '/v1/auth/login', {
+      email: `lifecycle-admin-${tenantSlug}@test.local`,
+      password: 'WrongLifecycle!2345',
+      orgSlug: tenantSlug,
+    });
+    assert.equal(oracle.status, 401);
+    assert.equal(oracle.json.error, 'invalid_credentials');
     const saVerify = await call('GET', '/v1/auth/verify', undefined, secondSaToken);
     assert.equal(saVerify.status, 403);
     assert.equal(saVerify.json.error, 'org_suspended');

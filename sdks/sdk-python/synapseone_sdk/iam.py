@@ -221,6 +221,12 @@ class IamService:
             "POST", "/v1/orgs", {"slug": slug, "displayName": display_name}
         )
 
+    def update_org(self, org_id: str, display_name: str) -> dict:
+        """Rename an organization (display metadata only)."""
+        return self._req(
+            "PATCH", f"/v1/orgs/{quote(org_id, safe='')}", {"displayName": display_name}
+        )
+
     def create_account(self, org_id: str, slug: str, display_name: str) -> dict:
         """Create an account inside an organization."""
         return self._req(
@@ -232,6 +238,26 @@ class IamService:
     def list_accounts(self, org_id: str) -> list:
         """List an organization's accounts."""
         return self._req("GET", f"/v1/orgs/{quote(org_id, safe='')}/accounts")
+
+    def get_account(self, account_id: str) -> dict:
+        """Read one account and its credential counts."""
+        return self._req("GET", f"/v1/accounts/{quote(account_id, safe='')}")
+
+    def update_account(self, account_id: str, display_name: str) -> dict:
+        """Rename an account (display metadata only)."""
+        return self._req(
+            "PATCH",
+            f"/v1/accounts/{quote(account_id, safe='')}",
+            {"displayName": display_name},
+        )
+
+    def update_user(self, user_id: str, display_name: str) -> dict:
+        """Update a user profile display name."""
+        return self._req(
+            "PATCH",
+            f"/v1/users/{quote(user_id, safe='')}",
+            {"displayName": display_name},
+        )
 
     def create_user(
         self, org_id: str, email: str, display_name: str | None = None
@@ -480,6 +506,14 @@ class IamService:
             "GET", f"/v1/accounts/{quote(account_id, safe='')}/service-accounts"
         )
 
+    def get_service_account(self, sa_id: str) -> dict:
+        """Read one service account and its roles."""
+        return self._req("GET", f"/v1/service-accounts/{quote(sa_id, safe='')}")
+
+    def get_api_key(self, key_id: str) -> dict:
+        """Read API-key metadata by id (never the secret)."""
+        return self._req("GET", f"/v1/keys/{quote(key_id, safe='')}")
+
     def list_roles(self, account_id: str) -> list:
         """List an account's roles."""
         return self._req("GET", f"/v1/accounts/{quote(account_id, safe='')}/roles")
@@ -513,6 +547,12 @@ class IamService:
             {"slug": slug, "description": description},
         )
 
+    def update_role(self, role_id: str, description: str) -> dict:
+        """Update a role description."""
+        return self._req(
+            "PATCH", f"/v1/roles/{quote(role_id, safe='')}", {"description": description}
+        )
+
     def delete_role(self, role_id: str) -> dict:
         """Delete a role."""
         return self._req("DELETE", f"/v1/roles/{quote(role_id, safe='')}")
@@ -530,6 +570,17 @@ class IamService:
             f"/v1/accounts/{quote(account_id, safe='')}/policies",
             {"slug": slug, "document": document, "description": description},
         )
+
+    def update_policy(
+        self, policy_id: str, description: str | None = None, document: dict | None = None
+    ) -> dict:
+        """Update a policy description and/or document."""
+        body: dict[str, Any] = {}
+        if description is not None:
+            body["description"] = description
+        if document is not None:
+            body["document"] = document
+        return self._req("PATCH", f"/v1/policies/{quote(policy_id, safe='')}", body)
 
     def delete_policy(self, policy_id: str) -> dict:
         """Delete a policy."""

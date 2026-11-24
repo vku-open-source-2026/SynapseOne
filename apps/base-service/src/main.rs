@@ -48,6 +48,9 @@ pub struct Config {
     pub outbox_stream_topic: String,
     pub stream_service_url: String,
     pub outbox_relay_ms: u64,
+    pub outbox_max_attempts: i64,
+    pub outbox_retry_base_ms: u64,
+    pub outbox_retry_max_ms: u64,
     pub inference_service_url: String,
     pub synapseone_api_key: String,
     pub audit_enabled: bool,
@@ -84,6 +87,16 @@ impl Config {
         let cache_ttl = util::env_u64("BASE_CACHE_TTL_SECONDS", 60).clamp(1, 3600) as i64;
         let cache_timeout = util::env_u64("BASE_CACHE_TIMEOUT_MS", 250).clamp(25, 5000);
         let outbox_relay_ms = util::env_u64("BASE_OUTBOX_RELAY_MS", 1000).clamp(100, 60_000);
+        let outbox_max_attempts = util::env_f64("BASE_OUTBOX_MAX_ATTEMPTS", 20.0);
+        let outbox_max_attempts = if outbox_max_attempts.is_finite() {
+            outbox_max_attempts.clamp(1.0, 1000.0) as i64
+        } else {
+            20
+        };
+        let outbox_retry_base_ms =
+            util::env_u64("BASE_OUTBOX_RETRY_BASE_MS", 1000).clamp(50, 600_000);
+        let outbox_retry_max_ms = util::env_u64("BASE_OUTBOX_RETRY_MAX_MS", 300_000)
+            .clamp(outbox_retry_base_ms, 3_600_000);
         Self {
             port: util::env_u64("PORT", 4005) as u16,
             is_prod: std::env::var("NODE_ENV").as_deref() == Ok("production"),
@@ -108,6 +121,9 @@ impl Config {
                 .trim_end_matches('/')
                 .to_string(),
             outbox_relay_ms,
+            outbox_max_attempts,
+            outbox_retry_base_ms,
+            outbox_retry_max_ms,
             inference_service_url: util::env_string("INFERENCE_SERVICE_URL", "")
                 .trim_end_matches('/')
                 .to_string(),
@@ -145,6 +161,9 @@ impl Config {
             outbox_stream_topic: "base-changes".into(),
             stream_service_url: String::new(),
             outbox_relay_ms: 1000,
+            outbox_max_attempts: 20,
+            outbox_retry_base_ms: 1000,
+            outbox_retry_max_ms: 300_000,
             inference_service_url: String::new(),
             synapseone_api_key: String::new(),
             audit_enabled: true,

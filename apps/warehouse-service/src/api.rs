@@ -2,8 +2,10 @@
 // SPDX-FileCopyrightText: 2026 VKU.VIC
 //! HTTP surface for Synapse Warehouse.
 
+use std::collections::HashMap;
+
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Extension, Path, Request, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
 use axum::http::{header as http_header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -44,6 +46,8 @@ pub struct Config {
     pub is_prod: bool,
     pub internal_secret: String,
     pub max_body_bytes: usize,
+    pub base_service_url: String,
+    pub lakehouse_service_url: String,
 }
 
 impl Config {
@@ -73,6 +77,18 @@ impl Config {
             max_body_bytes: parse_body_limit(
                 &std::env::var("WAREHOUSE_MAX_BODY").unwrap_or_else(|_| "8mb".into()),
             ),
+            base_service_url: std::env::var("BASE_SERVICE_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "http://base:4005".into())
+                .trim_end_matches('/')
+                .to_string(),
+            lakehouse_service_url: std::env::var("LAKEHOUSE_SERVICE_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "http://lakehouse:4013".into())
+                .trim_end_matches('/')
+                .to_string(),
         }
     }
 
@@ -82,6 +98,15 @@ impl Config {
         }
         if self.internal_secret.is_empty() {
             return Err("[warehouse] SYNAPSEONE_INTERNAL_SECRET is required in production".into());
+        }
+        let data_dir = std::env::var("WAREHOUSE_DATA_DIR").unwrap_or_default();
+        if std::env::var("WAREHOUSE_IN_MEMORY").as_deref() == Ok("1")
+            || data_dir.trim() == ":memory:"
+        {
+            return Err(
+                "[warehouse] WAREHOUSE_IN_MEMORY/:memory: is forbidden in production (analytics must survive restart)"
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -431,9 +456,52 @@ async fn metrics(State(state): State<AppState>) -> Response {
 async fn list_datasets(
     State(state): State<AppState>,
     Extension(tenant): Extension<Tenant>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, WarehouseError> {
     let items = state.store.list_datasets(tenant_of(&tenant)).await?;
-    Ok(Json(json!({ "items": items })).into_response())
+    let name = params
+        .get("name")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    let mode = params
+        .get("mode")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    let filtered: Vec<_> = items
+        .into_iter()
+        .filter(|dataset| {
+            name.as_ref()
+                .is_none_or(|needle| dataset.name.to_ascii_lowercase().contains(needle))
+                && mode
+                    .as_ref()
+                    .is_none_or(|wanted| dataset.mode.eq_ignore_ascii_case(wanted))
+        })
+        .collect();
+    let total = filtered.len();
+    let (offset, limit) = page_params(&params);
+    let page: Vec<_> = filtered.into_iter().skip(offset).take(limit).collect();
+    Ok(Json(json!({
+        "items": page,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "nextOffset": if offset + limit < total { Some(offset + limit) } else { None::<usize> },
+    }))
+    .into_response())
+}
+
+fn page_params(params: &HashMap<String, String>) -> (usize, usize) {
+    let offset = params
+        .get("offset")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(1_000_000);
+    let limit = params
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(200)
+        .clamp(1, 200);
+    (offset, limit)
 }
 
 async fn create_dataset(
@@ -489,6 +557,45 @@ async fn get_dataset(
     Path(id): Path<String>,
 ) -> Result<Response, WarehouseError> {
     match state.store.get_dataset(tenant_of(&tenant), &id).await? {
+        Some(dataset) => Ok(Json(dataset).into_response()),
+        None => Err(WarehouseError::new(
+            StatusCode::NOT_FOUND,
+            "dataset_not_found",
+            "dataset not found",
+        )),
+    }
+}
+
+async fn update_dataset(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<Response, WarehouseError> {
+    let body = body_value(&body)?;
+    let object = body
+        .as_object()
+        .ok_or_else(|| WarehouseError::bad_request("invalid_body", "body must be a JSON object"))?;
+    if !object.contains_key("name") && !object.contains_key("description") {
+        return Err(WarehouseError::bad_request(
+            "invalid_body",
+            "send at least one of name or description",
+        ));
+    }
+    let name = match object.get("name") {
+        Some(value) => Some(require_string(Some(value), "name", 120)?),
+        None => None,
+    };
+    let description = match object.get("description") {
+        Some(value) if !value.is_null() => Some(optional_string(Some(value), 500).unwrap_or_default()),
+        Some(_) => Some(String::new()),
+        None => None,
+    };
+    match state
+        .store
+        .update_dataset(tenant_of(&tenant), &id, name, description)
+        .await?
+    {
         Some(dataset) => Ok(Json(dataset).into_response()),
         None => Err(WarehouseError::new(
             StatusCode::NOT_FOUND,
@@ -623,6 +730,11 @@ async fn etl_batch(
                 } else {
                     "append".into()
                 },
+                destination: "warehouse".into(),
+                lakehouse_namespace: None,
+                lakehouse_table: None,
+                source_collection: None,
+                source_database: None,
             },
         )
         .await?;
@@ -688,6 +800,11 @@ async fn etl_stream(
                 batch_size: positive_int(body.get("batchSize"), 100, 1, 100),
                 interval_ms: positive_int(body.get("intervalMs"), 1000, 100, 60000),
                 write_mode: "append".into(),
+                destination: "warehouse".into(),
+                lakehouse_namespace: None,
+                lakehouse_table: None,
+                source_collection: None,
+                source_database: None,
             },
         )
         .await?;
@@ -699,6 +816,1003 @@ async fn etl_stream(
         Json(json!({ "ok": true, "created": true, "job": job })),
     )
         .into_response())
+}
+
+fn base_slug(value: &str, field: &str) -> Result<String, WarehouseError> {
+    let text = value.trim();
+    if text.is_empty()
+        || text.len() > 120
+        || !text
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+    {
+        return Err(WarehouseError::bad_request(
+            "invalid_source",
+            format!("{field} must be 1..120 chars of letters, numbers, '_' or '-'"),
+        ));
+    }
+    Ok(text.to_string())
+}
+
+fn base_document_row(item: &Value, collection: &str) -> Value {
+    let data = item
+        .get("data")
+        .or_else(|| item.get("object"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let mut row = if data.is_object() {
+        data
+    } else {
+        json!({ "value": data })
+    };
+    if let Some(object) = row.as_object_mut() {
+        object
+            .entry("document_id")
+            .or_insert_with(|| item.get("id").cloned().unwrap_or(Value::Null));
+        object
+            .entry("collection")
+            .or_insert_with(|| Value::String(collection.to_string()));
+        object
+            .entry("version")
+            .or_insert_with(|| item.get("version").cloned().unwrap_or(Value::Null));
+        object
+            .entry("created_at")
+            .or_insert_with(|| item.get("createdAt").cloned().unwrap_or(Value::Null));
+        object
+            .entry("updated_at")
+            .or_insert_with(|| item.get("updatedAt").cloned().unwrap_or(Value::Null));
+    }
+    row
+}
+
+fn ocs_format(requested: Option<&str>, key: &str) -> Result<String, WarehouseError> {
+    let explicit = requested.map(|value| value.trim().to_ascii_lowercase());
+    let format = match explicit.as_deref() {
+        Some("csv") => "csv",
+        Some("json") | Some("jsonl") | Some("ndjson") => "jsonl",
+        Some("parquet") => "parquet",
+        Some("") | None => {
+            let extension = key.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+            match extension.as_str() {
+                "csv" => "csv",
+                "json" | "jsonl" | "ndjson" => "jsonl",
+                "parquet" => "parquet",
+                _ => {
+                    return Err(WarehouseError::bad_request(
+                        "ocs_format_required",
+                        "format is required (csv, jsonl, parquet) when the key has no known extension",
+                    ))
+                }
+            }
+        }
+        Some(other) => {
+            return Err(WarehouseError::bad_request(
+                "invalid_ocs_format",
+                format!("format '{other}' is not supported (csv, jsonl, parquet)"),
+            ))
+        }
+    };
+    Ok(format.to_string())
+}
+
+fn valid_ocs_bucket(bucket: &str) -> bool {
+    let bytes = bucket.as_bytes();
+    (3..=63).contains(&bytes.len())
+        && bytes.first().is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'.' || *b == b'-')
+}
+
+fn ocs_object_url(base: &str, bucket: &str, key: &str) -> Result<reqwest::Url, WarehouseError> {
+    if !valid_ocs_bucket(bucket) {
+        return Err(WarehouseError::bad_request(
+            "invalid_bucket",
+            "bucket must be 3..63 lowercase letters, digits, dots or hyphens",
+        ));
+    }
+    if key.is_empty() || key.len() > 1024 || key.starts_with('/') || key.contains("..") || key.contains('\0') {
+        return Err(WarehouseError::bad_request(
+            "invalid_object_key",
+            "object key must be 1..1024 characters and must not start with / or contain ..",
+        ));
+    }
+    let mut url = reqwest::Url::parse(&format!(
+        "{}/v1/ocs/buckets/{}/objects",
+        base.trim_end_matches('/'),
+        bucket
+    ))
+    .map_err(|_| WarehouseError::bad_request("invalid_ocs_url", "OCS_SERVICE_URL is invalid"))?;
+    url.path_segments_mut()
+        .map_err(|_| WarehouseError::bad_request("invalid_ocs_url", "OCS_SERVICE_URL is invalid"))?
+        .extend(key.split('/').filter(|segment| !segment.is_empty()));
+    Ok(url)
+}
+
+async fn fetch_ocs_file(
+    state: &AppState,
+    tenant: &Tenant,
+    bucket: &str,
+    key: &str,
+) -> Result<Vec<u8>, WarehouseError> {
+    let base = std::env::var("OCS_SERVICE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "http://ocs:4010".into());
+    let url = ocs_object_url(&base, bucket, key)?;
+    let mut request = reqwest::Client::new().get(url);
+    let (tenant_header, tenant_value) = if let Some(org) = tenant_of(tenant).strip_prefix("org:") {
+        ("x-synapseone-org", org.to_string())
+    } else if let Some(account) = tenant_of(tenant).strip_prefix("account:") {
+        ("x-synapseone-account", account.to_string())
+    } else {
+        return Err(WarehouseError::new(
+            StatusCode::FORBIDDEN,
+            "tenant_scope_required",
+            "OCS ingestion requires an organization or account scope",
+        ));
+    };
+    request = request.header(tenant_header, tenant_value);
+    if !state.config.internal_secret.is_empty() {
+        request = request.header("x-synapseone-internal", state.config.internal_secret.as_str());
+    }
+    let response = request.send().await.map_err(|error| {
+        WarehouseError::new(
+            StatusCode::BAD_GATEWAY,
+            "ocs_upstream_error",
+            format!("OCS request failed: {error}"),
+        )
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        let message: String = text.chars().take(300).collect();
+        return Err(WarehouseError::new(
+            StatusCode::BAD_GATEWAY,
+            "ocs_upstream_error",
+            format!("OCS returned {}: {message}", status.as_u16()),
+        ));
+    }
+    let max_bytes = std::env::var("WAREHOUSE_OCS_MAX_FILE_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(64 * 1024 * 1024)
+        .clamp(1024 * 1024, 512 * 1024 * 1024);
+    if response.content_length().is_some_and(|length| length > max_bytes as u64) {
+        return Err(WarehouseError::bad_request(
+            "ocs_file_too_large",
+            format!("OCS object exceeds the {max_bytes}-byte ingestion limit"),
+        ));
+    }
+    let bytes = response.bytes().await.map_err(|error| {
+        WarehouseError::new(
+            StatusCode::BAD_GATEWAY,
+            "ocs_upstream_error",
+            format!("OCS body read failed: {error}"),
+        )
+    })?;
+    if bytes.len() > max_bytes {
+        return Err(WarehouseError::bad_request(
+            "ocs_file_too_large",
+            format!("OCS object exceeds the {max_bytes}-byte ingestion limit"),
+        ));
+    }
+    Ok(bytes.to_vec())
+}
+
+async fn stage_ocs_file(bytes: &[u8], format: &str) -> Result<std::path::PathBuf, WarehouseError> {
+    let path = std::env::temp_dir().join(format!(
+        "synapseone-warehouse-ocs-{}.{}",
+        Uuid::new_v4(),
+        format
+    ));
+    tokio::fs::write(&path, bytes).await.map_err(|error| {
+        WarehouseError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ocs_stage_failed",
+            format!("could not stage OCS file: {error}"),
+        )
+    })?;
+    Ok(path)
+}
+
+async fn etl_ocs_preview(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
+    body: Bytes,
+) -> Result<Response, WarehouseError> {
+    let body = body_value(&body)?;
+    let bucket = require_string(body.get("bucket"), "bucket", 63)?;
+    let key = require_string(body.get("key"), "key", 1024)?;
+    let format = ocs_format(body.get("format").and_then(Value::as_str), &key)?;
+    let bytes = fetch_ocs_file(&state, &tenant, &bucket, &key).await?;
+    let path = stage_ocs_file(&bytes, &format).await?;
+    let result = state
+        .store
+        .preview_ocs_file(tenant_of(&tenant), path.to_string_lossy().as_ref(), &format)
+        .await;
+    let _ = tokio::fs::remove_file(&path).await;
+    let (columns, rows) = result?;
+    Ok(Json(json!({
+        "ok": true,
+        "bucket": bucket,
+        "key": key,
+        "format": format,
+        "bytes": bytes.len(),
+        "columns": columns,
+        "rows": rows,
+    }))
+    .into_response())
+}
+
+async fn etl_ocs(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
+    body: Bytes,
+) -> Result<Response, WarehouseError> {
+    let body = body_value(&body)?;
+    let bucket = require_string(body.get("bucket"), "bucket", 63)?;
+    let key = require_string(body.get("key"), "key", 1024)?;
+    let format = ocs_format(body.get("format").and_then(Value::as_str), &key)?;
+    let target_dataset_id = require_string(body.get("targetDatasetId"), "targetDatasetId", 64)?;
+    let dataset = state
+        .store
+        .get_dataset(tenant_of(&tenant), &target_dataset_id)
+        .await?
+        .ok_or_else(|| WarehouseError::new(StatusCode::NOT_FOUND, "dataset_not_found", "target dataset not found"))?;
+    let write_mode = match body.get("writeMode").and_then(Value::as_str) {
+        None | Some("replace") => "replace",
+        Some("append") => "append",
+        Some(_) => return Err(WarehouseError::bad_request("invalid_write_mode", "writeMode must be 'replace' or 'append'")),
+    };
+    let max_rows = positive_int(body.get("maxRows"), 100_000, 1, 1_000_000);
+    let name = match body.get("name") {
+        Some(value) if !value.is_null() => require_string(Some(value), "name", 120)?,
+        _ => format!("ocs-{}-{}-{target_dataset_id}", bucket, key.rsplit('/').next().unwrap_or("file")),
+    };
+    let bytes = fetch_ocs_file(&state, &tenant, &bucket, &key).await?;
+    let path = stage_ocs_file(&bytes, &format).await?;
+    let job = state
+        .store
+        .create_job(
+            tenant_of(&tenant),
+            NewJob {
+                name,
+                mode: "batch".into(),
+                target_dataset_id,
+                sql: None,
+                stream_topic: None,
+                stream_group: None,
+                batch_size: max_rows,
+                interval_ms: 1000,
+                write_mode: write_mode.into(),
+                destination: "warehouse".into(),
+                lakehouse_namespace: None,
+                lakehouse_table: None,
+                source_collection: None,
+                source_database: None,
+            },
+        )
+        .await?;
+    let result = state
+        .store
+        .import_ocs_file(
+            tenant_of(&tenant),
+            &dataset,
+            path.to_string_lossy().as_ref(),
+            &format,
+            write_mode,
+            max_rows,
+        )
+        .await;
+    let _ = tokio::fs::remove_file(&path).await;
+    match result {
+        Ok(rows) => {
+            state
+                .store
+                .record_job_run(tenant_of(&tenant), &job.id, rows as i64)
+                .await?;
+            Ok((StatusCode::CREATED, Json(json!({
+                "ok": true,
+                "job": job,
+                "rows": rows,
+                "bytes": bytes.len(),
+                "format": format,
+                "bucket": bucket,
+                "key": key,
+                "writeMode": write_mode,
+            }))).into_response())
+        }
+        Err(error) => {
+            let _ = state.store.record_job_error(tenant_of(&tenant), &job.id, &error).await;
+            let _ = state.store.set_job_status(tenant_of(&tenant), &job.id, "error").await;
+            Err(error)
+        }
+    }
+}
+
+/// Copy a Base collection into a Warehouse dataset. This is the batch source
+/// connector; incremental changes travel through the Base outbox → Stream →
+/// stream ETL path. `replace` clears the target once before the snapshot,
+/// `append` is at-least-once and relies on the caller's dedupe/query.
+async fn etl_base(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
+    body: Bytes,
+) -> Result<Response, WarehouseError> {
+    let body = body_value(&body)?;
+    let target_dataset_id = require_string(body.get("targetDatasetId"), "targetDatasetId", 64)?;
+    let dataset = state
+        .store
+        .get_dataset(tenant_of(&tenant), &target_dataset_id)
+        .await?
+        .ok_or_else(|| {
+            WarehouseError::new(
+                StatusCode::NOT_FOUND,
+                "dataset_not_found",
+                "target dataset not found",
+            )
+        })?;
+    let collection = base_slug(
+        &require_string(body.get("collection"), "collection", 120)?,
+        "collection",
+    )?;
+    let database = match body.get("database").and_then(Value::as_str) {
+        Some(value) if !value.trim().is_empty() => Some(base_slug(value, "database")?),
+        _ => None,
+    };
+    let write_mode = match body.get("writeMode").and_then(Value::as_str) {
+        None | Some("replace") => "replace",
+        Some("append") => "append",
+        Some(_) => {
+            return Err(WarehouseError::bad_request(
+                "invalid_write_mode",
+                "writeMode must be 'replace' or 'append'",
+            ))
+        }
+    };
+    let page_size = positive_int(body.get("pageSize"), 1000, 1, 1000);
+    let max_rows = positive_int(body.get("maxRows"), 100_000, 1, 1_000_000);
+    let (tenant_header, tenant_value) = if let Some(org) = tenant_of(&tenant).strip_prefix("org:") {
+        ("x-synapseone-org", org.to_string())
+    } else if let Some(account) = tenant_of(&tenant).strip_prefix("account:") {
+        ("x-synapseone-account", account.to_string())
+    } else {
+        return Err(WarehouseError::new(
+            StatusCode::FORBIDDEN,
+            "tenant_scope_required",
+            "Base ingestion requires an organization or account scope",
+        ));
+    };
+    let name = match body.get("name") {
+        Some(value) if !value.is_null() => require_string(Some(value), "name", 120)?,
+        _ => format!("base-{collection}-{target_dataset_id}"),
+    };
+    let job = state
+        .store
+        .create_job(
+            tenant_of(&tenant),
+            NewJob {
+                name,
+                mode: "base".into(),
+                target_dataset_id: target_dataset_id.clone(),
+                sql: None,
+                stream_topic: None,
+                stream_group: None,
+                batch_size: page_size,
+                interval_ms: 1000,
+                write_mode: write_mode.into(),
+                destination: "warehouse".into(),
+                lakehouse_namespace: None,
+                lakehouse_table: None,
+                source_collection: None,
+                source_database: None,
+            },
+        )
+        .await?;
+    let client = reqwest::Client::new();
+    let base = state.config.base_service_url.trim_end_matches('/');
+    let result: Result<(usize, usize), WarehouseError> = async {
+        let mut offset = 0i64;
+        let mut inserted = 0usize;
+        let mut pages = 0usize;
+        let mut collected: Vec<Value> = Vec::new();
+        loop {
+            let loaded = if write_mode == "replace" {
+                collected.len()
+            } else {
+                inserted
+            };
+            if loaded >= max_rows as usize {
+                break;
+            }
+            let path = match &database {
+                Some(database) => format!(
+                    "/v1/base/databases/{database}/collections/{collection}/documents"
+                ),
+                None => format!("/v1/base/collections/{collection}/documents"),
+            };
+            let mut request = client
+                .get(format!(
+                    "{base}{path}?limit={page_size}&offset={offset}&withTotal=1"
+                ))
+                .header(tenant_header, &tenant_value);
+            if !state.config.internal_secret.is_empty() {
+                request = request.header(
+                    "x-synapseone-internal",
+                    state.config.internal_secret.as_str(),
+                );
+            }
+            let response = request.send().await.map_err(|error| {
+                WarehouseError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "base_upstream_error",
+                    format!("Base request failed: {error}"),
+                )
+            })?;
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            if !status.is_success() {
+                let message: String = text.chars().take(300).collect();
+                return Err(WarehouseError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "base_upstream_error",
+                    format!("Base returned {}: {message}", status.as_u16()),
+                ));
+            }
+            let value: Value = serde_json::from_str(&text).map_err(|_| {
+                WarehouseError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "base_upstream_error",
+                    "Base returned a non-JSON response",
+                )
+            })?;
+            let items = value
+                .get("items")
+                .and_then(Value::as_array)
+                .or_else(|| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if items.is_empty() {
+                break;
+            }
+            pages += 1;
+            let total = value.get("total").and_then(Value::as_i64).unwrap_or(0);
+            let loaded = if write_mode == "replace" {
+                collected.len()
+            } else {
+                inserted
+            };
+            let remaining = max_rows as usize - loaded;
+            let take = items.len().min(remaining);
+            let rows: Vec<Value> = items
+                .iter()
+                .take(take)
+                .map(|item| base_document_row(item, &collection))
+                .collect();
+            if write_mode == "replace" {
+                collected.extend(rows);
+            } else {
+                inserted += state
+                    .store
+                    .insert_rows(tenant_of(&tenant), &dataset, &rows)
+                    .await?;
+            }
+            offset += items.len() as i64;
+            if take < items.len()
+                || items.len() < page_size as usize
+                || (total > 0 && offset >= total)
+            {
+                break;
+            }
+        }
+        if write_mode == "replace" {
+            inserted = state
+                .store
+                .replace_dataset_rows(tenant_of(&tenant), &dataset, &collected)
+                .await?;
+        }
+        Ok((inserted, pages))
+    }
+    .await;
+
+    match result {
+        Ok((inserted, pages)) => {
+            state
+                .store
+                .record_job_run(tenant_of(&tenant), &job.id, inserted as i64)
+                .await?;
+            Ok((
+                StatusCode::CREATED,
+                Json(json!({
+                    "ok": true,
+                    "job": job,
+                    "rows": inserted,
+                    "pages": pages,
+                    "source": "base",
+                    "collection": collection,
+                    "writeMode": write_mode,
+                })),
+            )
+                .into_response())
+        }
+        Err(error) => {
+            let _ = state
+                .store
+                .record_job_error(tenant_of(&tenant), &job.id, &error)
+                .await;
+            let _ = state
+                .store
+                .set_job_status(tenant_of(&tenant), &job.id, "error")
+                .await;
+            Err(error)
+        }
+    }
+}
+
+fn lakehouse_slug(value: &str, field: &str) -> Result<String, WarehouseError> {
+    let text = value.trim().to_ascii_lowercase();
+    if text.is_empty()
+        || text.len() > 41
+        || !text
+            .chars()
+            .next()
+            .map(|ch| ch.is_ascii_lowercase())
+            .unwrap_or(false)
+        || !text
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        return Err(WarehouseError::bad_request(
+            "invalid_source",
+            format!("{field} must match [a-z][a-z0-9_]{{0,40}}"),
+        ));
+    }
+    Ok(text)
+}
+
+/// Create a durable Base → Stream → Lakehouse ETL job. The destination table
+/// is an append-only Iceberg change log; `write_mode` is always append.
+async fn etl_base_lakehouse(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
+    body: Bytes,
+) -> Result<Response, WarehouseError> {
+    let body = body_value(&body)?;
+    let collection = base_slug(
+        &require_string(body.get("collection"), "collection", 120)?,
+        "collection",
+    )?;
+    let database = match body.get("database").and_then(Value::as_str) {
+        Some(value) if !value.trim().is_empty() => Some(base_slug(value, "database")?),
+        _ => None,
+    };
+    let namespace = lakehouse_slug(
+        &require_string(body.get("namespace"), "namespace", 41)?,
+        "namespace",
+    )?;
+    let table = lakehouse_slug(
+        &require_string(body.get("table"), "table", 41)?,
+        "table",
+    )?;
+    let stream_topic = match body.get("streamTopic").and_then(Value::as_str) {
+        Some(value) if !value.trim().is_empty() => topic_name(Some(&Value::String(value.into())))?,
+        _ => "base-changes".into(),
+    };
+    let stream_group = match body.get("streamGroup").and_then(Value::as_str) {
+        Some(value) if !value.trim().is_empty() => group_name(Some(&Value::String(value.into())))?,
+        _ => format!("warehouse_lakehouse_{}", Uuid::new_v4()),
+    };
+    let batch_size = positive_int(body.get("batchSize"), 100, 1, 100);
+    let interval_ms = positive_int(body.get("intervalMs"), 1000, 100, 60000);
+    let name = match body.get("name") {
+        Some(value) if !value.is_null() => require_string(Some(value), "name", 120)?,
+        _ => format!("base-lakehouse-{collection}-{table}"),
+    };
+    let (tenant_header, tenant_value) = if let Some(org) = tenant_of(&tenant).strip_prefix("org:") {
+        ("x-synapseone-org", org.to_string())
+    } else if let Some(account) = tenant_of(&tenant).strip_prefix("account:") {
+        ("x-synapseone-account", account.to_string())
+    } else {
+        return Err(WarehouseError::new(
+            StatusCode::FORBIDDEN,
+            "tenant_scope_required",
+            "Lakehouse ingestion requires an organization or account scope",
+        ));
+    };
+    let mut metadata_request = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/lakehouse/namespaces/{namespace}/tables/{table}",
+            state.config.lakehouse_service_url
+        ))
+        .header(tenant_header, &tenant_value);
+    if !state.config.internal_secret.is_empty() {
+        metadata_request = metadata_request.header(
+            "x-synapseone-internal",
+            state.config.internal_secret.as_str(),
+        );
+    }
+    let metadata_response = metadata_request.send().await.map_err(|error| {
+        WarehouseError::new(
+            StatusCode::BAD_GATEWAY,
+            "lakehouse_upstream_error",
+            format!("Lakehouse table lookup failed: {error}"),
+        )
+    })?;
+    let metadata_status = metadata_response.status();
+    let metadata_text = metadata_response.text().await.unwrap_or_default();
+    if !metadata_status.is_success() {
+        return Err(WarehouseError::bad_request(
+            "lakehouse_table_not_found",
+            format!(
+                "Lakehouse table {namespace}.{table} is not available ({})",
+                metadata_status.as_u16()
+            ),
+        ));
+    }
+    let metadata: Value = serde_json::from_str(&metadata_text).map_err(|_| {
+        WarehouseError::bad_request(
+            "invalid_lakehouse_schema",
+            "Lakehouse table metadata is not valid JSON",
+        )
+    })?;
+    let columns: Vec<&str> = metadata
+        .get("schema")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("name").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    let required = [
+        "event_id",
+        "collection",
+        "document_id",
+        "operation",
+        "version",
+        "occurred_at",
+        "data",
+        "deleted",
+    ];
+    let missing: Vec<&str> = required
+        .iter()
+        .copied()
+        .filter(|name| !columns.contains(name))
+        .collect();
+    if !missing.is_empty() {
+        return Err(WarehouseError::bad_request(
+            "invalid_lakehouse_schema",
+            format!(
+                "Lakehouse table needs columns: {}",
+                missing.join(", ")
+            ),
+        ));
+    }
+
+    let job = state
+        .store
+        .create_job(
+            tenant_of(&tenant),
+            NewJob {
+                name,
+                mode: "stream".into(),
+                target_dataset_id: String::new(),
+                sql: None,
+                stream_topic: Some(stream_topic),
+                stream_group: Some(stream_group),
+                batch_size,
+                interval_ms,
+                write_mode: "append".into(),
+                destination: "lakehouse".into(),
+                lakehouse_namespace: Some(namespace.clone()),
+                lakehouse_table: Some(table.clone()),
+                source_collection: Some(collection.clone()),
+                source_database: database.clone(),
+            },
+        )
+        .await?;
+
+    let backfill = body.get("backfill").map(truthy).unwrap_or(true);
+    let backfill_result = if backfill {
+        let mut url = format!(
+            "{}/internal/base/collections/{collection}/backfill",
+            state.config.base_service_url
+        );
+        if let Some(database) = &database {
+            url.push_str(&format!("?database={database}"));
+        }
+        let client = reqwest::Client::new();
+        let mut after_id: Option<String> = None;
+        let mut enqueued = 0i64;
+        let mut scanned = 0i64;
+        let mut pages = 0i64;
+        loop {
+            let mut payload = json!({"limit": 1000});
+            if let Some(after) = &after_id {
+                payload["afterId"] = json!(after);
+            }
+            let mut request = client
+                .post(&url)
+                .header(tenant_header, &tenant_value)
+                .json(&payload);
+            if !state.config.internal_secret.is_empty() {
+                request = request.header(
+                    "x-synapseone-internal",
+                    state.config.internal_secret.as_str(),
+                );
+            }
+            let response = request.send().await.map_err(|error| {
+                WarehouseError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "base_upstream_error",
+                    format!("Base backfill request failed: {error}"),
+                )
+            })?;
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            if !status.is_success() {
+                let message: String = text.chars().take(300).collect();
+                let _ = state
+                    .store
+                    .record_job_error(
+                        tenant_of(&tenant),
+                        &job.id,
+                        format!("Base backfill failed: {} {message}", status.as_u16()),
+                    )
+                    .await;
+                let _ = state
+                    .store
+                    .set_job_status(tenant_of(&tenant), &job.id, "error")
+                    .await;
+                return Err(WarehouseError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "base_upstream_error",
+                    format!("Base backfill -> {}: {message}", status.as_u16()),
+                ));
+            }
+            let value: Value = serde_json::from_str(&text).map_err(|_| {
+                WarehouseError::bad_request(
+                    "invalid_backfill_response",
+                    "Base backfill returned a non-JSON response",
+                )
+            })?;
+            pages += 1;
+            enqueued += value.get("enqueued").and_then(Value::as_i64).unwrap_or(0);
+            scanned += value.get("scanned").and_then(Value::as_i64).unwrap_or(0);
+            let has_more = value
+                .get("hasMore")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let next = value
+                .get("nextAfter")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            match next {
+                Some(next) if has_more => {
+                    if after_id.as_deref() == Some(next.as_str()) {
+                        return Err(WarehouseError::bad_request(
+                            "invalid_backfill_cursor",
+                            "Base backfill did not advance its cursor",
+                        ));
+                    }
+                    if pages >= 1000 {
+                        return Err(WarehouseError::bad_request(
+                            "backfill_too_large",
+                            "Base backfill exceeded 1,000 pages; narrow the collection or seed it in stages",
+                        ));
+                    }
+                    after_id = Some(next);
+                }
+                _ => break,
+            }
+        }
+        json!({
+            "enqueued": enqueued,
+            "scanned": scanned,
+            "pages": pages,
+            "hasMore": false,
+        })
+    } else {
+        json!({"skipped": true})
+    };
+
+    state
+        .stream
+        .spawn(tenant_of(&tenant).to_string(), job.id.clone());
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "ok": true,
+            "job": job,
+            "backfill": backfill_result,
+            "semantics": "append-only Iceberg change log",
+        })),
+    )
+        .into_response())
+}
+
+async fn etl_lakehouse(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
+    body: Bytes,
+) -> Result<Response, WarehouseError> {
+    let body = body_value(&body)?;
+    let target_dataset_id = require_string(body.get("targetDatasetId"), "targetDatasetId", 64)?;
+    let dataset = state
+        .store
+        .get_dataset(tenant_of(&tenant), &target_dataset_id)
+        .await?
+        .ok_or_else(|| {
+            WarehouseError::new(
+                StatusCode::NOT_FOUND,
+                "dataset_not_found",
+                "target dataset not found",
+            )
+        })?;
+    let namespace = lakehouse_slug(
+        &require_string(body.get("namespace"), "namespace", 41)?,
+        "namespace",
+    )?;
+    let table = lakehouse_slug(
+        &require_string(body.get("table"), "table", 41)?,
+        "table",
+    )?;
+    let write_mode = match body.get("writeMode").and_then(Value::as_str) {
+        None | Some("replace") => "replace",
+        Some("append") => "append",
+        Some(_) => {
+            return Err(WarehouseError::bad_request(
+                "invalid_write_mode",
+                "writeMode must be 'replace' or 'append'",
+            ))
+        }
+    };
+    let limit = positive_int(body.get("limit"), 5000, 1, 5000);
+    let snapshot_id = match body.get("snapshotId") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(number)) => number.as_i64(),
+        Some(Value::String(text)) => text.parse::<i64>().ok(),
+        Some(_) => None,
+    };
+    let (tenant_header, tenant_value) = if let Some(org) = tenant_of(&tenant).strip_prefix("org:") {
+        ("x-synapseone-org", org.to_string())
+    } else if let Some(account) = tenant_of(&tenant).strip_prefix("account:") {
+        ("x-synapseone-account", account.to_string())
+    } else {
+        return Err(WarehouseError::new(
+            StatusCode::FORBIDDEN,
+            "tenant_scope_required",
+            "Lakehouse ingestion requires an organization or account scope",
+        ));
+    };
+    let name = match body.get("name") {
+        Some(value) if !value.is_null() => require_string(Some(value), "name", 120)?,
+        _ => format!("lakehouse-{namespace}-{table}-{target_dataset_id}"),
+    };
+    let job = state
+        .store
+        .create_job(
+            tenant_of(&tenant),
+            NewJob {
+                name,
+                mode: "lakehouse".into(),
+                target_dataset_id: target_dataset_id.clone(),
+                sql: None,
+                stream_topic: None,
+                stream_group: None,
+                batch_size: limit,
+                interval_ms: 1000,
+                write_mode: write_mode.into(),
+                destination: "warehouse".into(),
+                lakehouse_namespace: None,
+                lakehouse_table: None,
+                source_collection: None,
+                source_database: None,
+            },
+        )
+        .await?;
+    let mut payload = json!({ "limit": limit });
+    if let Some(snapshot_id) = snapshot_id {
+        payload["snapshotId"] = json!(snapshot_id);
+    }
+    let mut request = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/lakehouse/namespaces/{namespace}/tables/{table}/query",
+            state.config.lakehouse_service_url
+        ))
+        .header(tenant_header, &tenant_value)
+        .json(&payload);
+    if !state.config.internal_secret.is_empty() {
+        request = request.header(
+            "x-synapseone-internal",
+            state.config.internal_secret.as_str(),
+        );
+    }
+    let result: Result<(usize, Value, Value), WarehouseError> = async {
+        let response = request.send().await.map_err(|error| {
+            WarehouseError::new(
+                StatusCode::BAD_GATEWAY,
+                "lakehouse_upstream_error",
+                format!("Lakehouse request failed: {error}"),
+            )
+        })?;
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let message: String = text.chars().take(300).collect();
+            return Err(WarehouseError::new(
+                StatusCode::BAD_GATEWAY,
+                "lakehouse_upstream_error",
+                format!("Lakehouse returned {}: {message}", status.as_u16()),
+            ));
+        }
+        let value: Value = serde_json::from_str(&text).map_err(|_| {
+            WarehouseError::new(
+                StatusCode::BAD_GATEWAY,
+                "lakehouse_upstream_error",
+                "Lakehouse returned a non-JSON response",
+            )
+        })?;
+        let rows = value
+            .get("rows")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let snapshot = value.get("snapshotId").cloned().unwrap_or(Value::Null);
+        let inserted = if write_mode == "replace" {
+            state
+                .store
+                .replace_dataset_rows(tenant_of(&tenant), &dataset, &rows)
+                .await?
+        } else if rows.is_empty() {
+            0
+        } else {
+            state
+                .store
+                .insert_rows(tenant_of(&tenant), &dataset, &rows)
+                .await?
+        };
+        Ok((inserted, snapshot, value))
+    }
+    .await;
+    match result {
+        Ok((inserted, snapshot, value)) => {
+            state
+                .store
+                .record_job_run(tenant_of(&tenant), &job.id, inserted as i64)
+                .await?;
+            Ok((
+                StatusCode::CREATED,
+                Json(json!({
+                    "ok": true,
+                    "job": job,
+                    "rows": inserted,
+                    "source": "lakehouse",
+                    "namespace": namespace,
+                    "table": table,
+                    "snapshotId": snapshot,
+                    "upstreamRowCount": value.get("rowCount").cloned().unwrap_or(Value::Null),
+                    "writeMode": write_mode,
+                })),
+            )
+                .into_response())
+        }
+        Err(error) => {
+            let _ = state
+                .store
+                .record_job_error(tenant_of(&tenant), &job.id, &error)
+                .await;
+            let _ = state
+                .store
+                .set_job_status(tenant_of(&tenant), &job.id, "error")
+                .await;
+            Err(error)
+        }
+    }
 }
 
 async fn templates() -> Response {
@@ -719,9 +1833,75 @@ async fn pipeline_status(
 async fn list_jobs(
     State(state): State<AppState>,
     Extension(tenant): Extension<Tenant>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, WarehouseError> {
     let items = state.store.list_jobs(tenant_of(&tenant)).await?;
-    Ok(Json(json!({ "items": items })).into_response())
+    let status = params
+        .get("status")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    let mode = params
+        .get("mode")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    let target = params
+        .get("targetDatasetId")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let name = params
+        .get("name")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    let filtered: Vec<_> = items
+        .into_iter()
+        .filter(|job| {
+            status
+                .as_ref()
+                .is_none_or(|wanted| job.status.eq_ignore_ascii_case(wanted))
+                && mode
+                    .as_ref()
+                    .is_none_or(|wanted| job.mode.eq_ignore_ascii_case(wanted))
+                && target
+                    .as_ref()
+                    .is_none_or(|wanted| job.target_dataset_id == *wanted)
+                && name
+                    .as_ref()
+                    .is_none_or(|needle| job.name.to_ascii_lowercase().contains(needle))
+        })
+        .collect();
+    let total = filtered.len();
+    let (offset, limit) = page_params(&params);
+    let page: Vec<_> = filtered.into_iter().skip(offset).take(limit).collect();
+    Ok(Json(json!({
+        "items": page,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "nextOffset": if offset + limit < total { Some(offset + limit) } else { None::<usize> },
+    }))
+    .into_response())
+}
+
+async fn update_job(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<Response, WarehouseError> {
+    let body = body_value(&body)?;
+    let name = require_string(body.get("name"), "name", 120)?;
+    match state
+        .store
+        .update_job_name(tenant_of(&tenant), &id, name)
+        .await?
+    {
+        Some(job) => Ok(Json(job).into_response()),
+        None => Err(WarehouseError::new(
+            StatusCode::NOT_FOUND,
+            "job_not_found",
+            "job not found",
+        )),
+    }
 }
 
 async fn create_job(
@@ -788,6 +1968,11 @@ async fn create_job(
                 batch_size: positive_int(body.get("batchSize"), 100, 1, 100),
                 interval_ms: positive_int(body.get("intervalMs"), 1000, 100, 60000),
                 write_mode: write_mode.into(),
+                destination: "warehouse".into(),
+                lakehouse_namespace: None,
+                lakehouse_table: None,
+                source_collection: None,
+                source_database: None,
             },
         )
         .await?;
@@ -975,16 +2160,24 @@ pub fn build_app(state: AppState) -> Router {
         )
         .route(
             "/v1/warehouse/datasets/{id}",
-            get(get_dataset).delete(delete_dataset),
+            get(get_dataset).patch(update_dataset).delete(delete_dataset),
         )
         .route("/v1/warehouse/datasets/{id}/rows", post(insert_rows))
         .route("/v1/warehouse/query", post(run_query))
         .route("/v1/warehouse/etl/batch", post(etl_batch))
         .route("/v1/warehouse/etl/stream", post(etl_stream))
+        .route("/v1/warehouse/etl/ocs/preview", post(etl_ocs_preview))
+        .route("/v1/warehouse/etl/ocs", post(etl_ocs))
+        .route("/v1/warehouse/etl/base", post(etl_base))
+        .route("/v1/warehouse/etl/base-lakehouse", post(etl_base_lakehouse))
+        .route("/v1/warehouse/etl/lakehouse", post(etl_lakehouse))
         .route("/v1/warehouse/templates", get(templates))
         .route("/v1/warehouse/pipeline/status", get(pipeline_status))
         .route("/v1/warehouse/jobs", get(list_jobs).post(create_job))
-        .route("/v1/warehouse/jobs/{id}", get(get_job).delete(delete_job))
+        .route(
+            "/v1/warehouse/jobs/{id}",
+            get(get_job).patch(update_job).delete(delete_job),
+        )
         .route("/v1/warehouse/jobs/{id}/run", post(run_job))
         .route("/v1/warehouse/jobs/{id}/pause", post(pause_job))
         .route("/v1/warehouse/jobs/{id}/resume", post(resume_job))

@@ -496,3 +496,27 @@ export function Code({ data, limit = CODE_LIMIT, wrap = false }) {
     </div>
   );
 }
+
+export function Pager({ total = 0, limit = 50, offset = 0, onChange, loading = false }) {
+  const from = total === 0 ? 0 : offset + 1;
+  const to = Math.min(offset + limit, total);
+  const canPrev = offset > 0 && !loading;
+  const canNext = offset + limit < total && !loading;
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-2 mt-3 text-xs text-normal-text">
+      <span>{from}–{to} of {total}</span>
+      <div className="flex items-center gap-2">
+        <button type="button" disabled={!canPrev} onClick={() => onChange(Math.max(0, offset - limit))} className="px-3 py-1.5 rounded-xl border border-slate-200 disabled:opacity-40 hover:bg-slate-50">Previous</button>
+        <button type="button" disabled={!canNext} onClick={() => onChange(offset + limit)} className="px-3 py-1.5 rounded-xl border border-slate-200 disabled:opacity-40 hover:bg-slate-50">Next</button>
+      </div>
+    </div>
+  );
+}
+
+export function SearchBox({ value, onChange, placeholder = 'Search…' }) {
+  return (
+    <div className="mb-3">
+      <Input value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} aria-label={placeholder} />
+    </div>
+  );
+}

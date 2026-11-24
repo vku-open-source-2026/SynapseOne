@@ -186,10 +186,16 @@ pub fn scope_allows(
         method.to_ascii_uppercase()
     };
     let concrete = method.to_ascii_lowercase();
-    let exact_override = action_override.is_some();
+    // Generic read/write actions still accept legacy verb-style scopes
+    // (`faststore:get`). Custom actions such as `platform:Admin` must not be
+    // satisfiable by the bare HTTP method (`platform:post`).
+    let exact_override = action_override.is_some()
+        && !matches!(requirement.action.as_str(), "read" | "write");
     let mut alternatives = HashSet::new();
     alternatives.insert(format!("{}:{}", requirement.service, requirement.action));
-    alternatives.insert(format!("{}:{}", requirement.service, concrete));
+    if !exact_override {
+        alternatives.insert(format!("{}:{}", requirement.service, concrete));
+    }
     alternatives.insert(format!("{}:*", requirement.service));
     alternatives.insert(format!("*:{}", requirement.action));
     if !exact_override && !requirement.read {
@@ -210,5 +216,7 @@ pub fn scope_allows(
     if section_regex().is_match(last) {
         alternatives.insert(format!("{}:{last}", requirement.service));
     }
-    scopes.iter().any(|scope| alternatives.contains(scope))
+    scopes
+        .iter()
+        .any(|scope| alternatives.contains(&scope.to_ascii_lowercase()))
 }

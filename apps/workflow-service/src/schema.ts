@@ -60,6 +60,12 @@ export const executions = pgTable(
     workflowRevision: integer('workflow_revision'),
     resumeNode: text('resume_node'),
     resumeOutput: jsonb('resume_output').$type<any>(),
+    /** Engine-created human-task checkpoint. A paused execution may only be
+     *  resumed by this exact task; API-created tasks can never resume it. */
+    pauseTaskId: text('pause_task_id'),
+    /** Node that paused the execution. Resume always starts here, never at a
+     *  caller-supplied node. */
+    pauseNode: text('pause_node'),
     startedAt: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
     finishedAt: timestamp('finished_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -185,6 +191,9 @@ export const workflowRunners = pgTable(
     kind: text('kind').notNull().default('workflow'),
     /** tenant = user/account runner; platform = owner-managed system compute. */
     scope: text('scope').notNull().default('tenant'),
+    /** account = may claim only its own account's work; org = explicit
+     *  organization-wide compute (requires an org admin to create). */
+    audience: text('audience').notNull().default('account'),
     /** custom | hybrid | system (platform workers are built into workflow-service). */
     mode: text('mode').notNull().default('custom'),
     queue: text('queue').notNull(),

@@ -198,7 +198,7 @@ describe('authorized identity contexts', () => {
     const stale = await call('GET', '/v1/auth/me', undefined, switchedToken);
     assert.equal(stale.status, 403);
     assert.equal(stale.data.error, 'org_suspended');
-    const login = await call('POST', '/v1/auth/login', { email: EMAIL, orgSlug: orgB.slug, password: PASSWORD });
+    const login = await call('POST', '/v1/auth/login', { email: EMAIL, orgSlug: orgB.slug, password: TARGET_PASSWORD });
     assert.equal(login.status, 403);
     assert.equal(login.data.error, 'org_suspended');
     await setOrganizationStatus(orgB.id, 'active', platformUser.id, '');

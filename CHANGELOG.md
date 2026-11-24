@@ -5,7 +5,169 @@ Format based on Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Security
+- **Workflow approval checkpoints:** a paused execution now stores the exact
+  engine-created `pause_task_id`/`pause_node`; API-created or legacy tasks can no
+  longer resume it (`not_pause_checkpoint`). Inline webhook/cron/test runs now
+  create the same durable task as queue runs.
+- **Runner audience:** tenant runners default to `account`; organization-wide
+  runners require an explicit admin grant. Claims and inference jobs are checked
+  against the execution/job account or org.
+- **Warehouse SQL sandbox:** tenant DuckDB connections disable external file
+  access and lock configuration; quoted path replacement scans and
+  `main._*`/schema-qualified internal tables are rejected.
+- **IAM policy conditions** fail closed and are validated at write time; a
+  consumed refresh token replayed after rotation revokes the whole token family,
+  while a token revoked by logout or an admin session revoke returns `401`
+  without killing the user's other sessions; break-glass `reset-mfa` also
+  revokes sessions.
+- **Platform last-owner guard:** grant/demotion/revocation now run the owner
+  count and mutation under one advisory lock (or memory mutex), so concurrent
+  requests cannot remove every active platform owner. Nested transactions join
+  the ambient transaction so the change and its audit row stay atomic.
+- **MFA key migration:** enabling `IAM_MFA_ENCRYPTION_KEY` remains compatible
+  with secrets sealed under the legacy JWT-derived key.
+
+### Fixed
+
+- Stream consumer groups now reclaim unacknowledged entries after
+  `claimIdleMs` (default 30s) before delivering new entries, so a crash between
+  read and ack is re-delivered instead of silently losing the batch.
+- IAM machine credentials (API keys/service-account tokens) no longer inherit
+  the human same-org fallback for account-scoped reads. An account key can read
+  its own account, but a sibling account's keys/roles/policies now return `403`;
+  org administrators can still inspect a retired account's detail before
+  reactivation.
+- Stream reads now fail with `410 retention_gap` when a pending entry was
+  trimmed by `maxLen`/`minId`/`retention` instead of silently skipping it; the
+  error lists the missing ids so operators can rebuild/reset the group. The
+  Redis path checks `XAUTOCLAIM` deleted ids and walks its cursor instead of
+  rescanning from `0-0`; the in-memory engine drops the unrecoverable ids after
+  reporting them once so the group can continue.
+- Warehouse snapshot ETL stages the source before replacing a dataset, so a
+  failed Base/Lakehouse read preserves the previous rows instead of leaving an
+  empty or half-written dataset.
+- Warehouse current-state ETL keeps a per-dataset document high-water mark:
+  older updates cannot overwrite newer rows, and a delayed create cannot
+  resurrect a deleted document. Re-created documents are distinguished by
+  collection id + creation timestamp.
+- Base→Lakehouse backfill pages through every cursor (`hasMore`/`nextAfter`)
+  instead of silently stopping at 1000 documents; the change-log key includes
+  the collection id and document creation timestamp.
+- Deleting a Base collection now emits a delete tombstone for every document
+  before removing data/search entries.
+- Workflow inline resume records and enforces the executable graph revision;
+  a late approval expires the paused execution; deleting a workflow with
+  queued/running/paused executions is refused; webhook idempotency receipts are
+  released when dispatch fails; suspended organizations cannot start new
+  webhook/cron/queued work.
+- IAM production boot requires `IAM_SENSITIVE_MUTATION_MODE=enforce`; refresh
+  rotation validates active user/org before persisting a replacement; a wrong
+  password no longer reveals organization suspension; platform sessions check
+  `auth_version`; authorized admin routes return one-time activation codes so
+  onboarding works without a mailer.
+- Console adds cancel for queued/paused executions, pending human-task
+  approve/reject, org-admin grant/revoke, MFA-reset confirmation, safe
+  Faststore TTL/lock handling, and stale-response guards for Base/Lakehouse.
+- Compose now actually passes documented IAM MFA/lockout/retention/registration
+  controls, gateway inference quota, workflow runner/queue controls, and
+  notification retry settings; production overlay pins warehouse to
+  gateway-only and requires CORS/internal secret.
+- `pg-backup` and `s3-backup` retry failed runs with bounded backoff instead of
+  waiting a full day; both write `.last-status.json` for monitoring.
+- LDS applies the Drizzle migration through the shared journal and its image now
+  ships the migration SQL; OCS multipart completion validates the initiation key
+  and the Docker build contexts exclude Rust `target/`.
+- SDK packages include `LICENSE`/`NOTICE`; inference reports the platform
+  version instead of the stale `0.7.0`.
+- Gateway credential-scope matching is case-insensitive, so legacy
+  `base:Read`-style scopes authorize reads while still refusing writes.
+
+### Changed
+
+- **Rust Warehouse SDK cleanup:** removed speculative
+  `reports`/`dashboards`/`use_cases`/`workflow_templates` methods and the
+  nonexistent `/v1/warehouse/status` call. The client now matches the shipped
+  service (pipeline status, dataset/job CRUD, Path A/B/C ETL) and a wiremock
+  contract test pins every Warehouse path.
+- Notifications documentation now states the real rendering contract (inline
+  `{{var}}` variables; no stored template resource) and removes the stale
+  “templates” claim.
+- Regenerated the Rust AI-service `catalog.json` from the TypeScript catalog
+  source: it was missing 50 endpoints (account lifecycle, ETL/OCS, Lakehouse,
+  search, notifications, metadata updates), so the guidance assistant saw a
+  smaller API surface than the Console try-it catalog.
+
 ### Added
+
+- **Account retirement.** Organization admins can retire one account with
+  `POST /v1/accounts/:accountId/retire` without affecting sibling accounts.
+  Retirement revokes account API keys and service accounts, blocks account-bound
+  credentials/contexts, preserves resources and audits the action; reactivation
+  never restores revoked credentials.
+- **Structured OCS ingestion.** Warehouse can preview and import CSV, JSONL and
+  Parquet objects through the authorized OCS API into a tenant dataset
+  (`POST /v1/warehouse/etl/ocs/preview`, `POST /v1/warehouse/etl/ocs`). Replace
+  is transactional; append is at-least-once; file size, row count and schema are
+  bounded.
+- **Resume reconciliation.** The workflow reclaimer resolves decisions stuck in
+  `resuming` after a crash: paused runs get the task back, accepted/terminal
+  runs complete it. Runner deletion is refused while targeted/queued work would
+  be stranded.
+- **Mutable display metadata.** `PATCH /v1/orgs/:orgId`, `/v1/accounts/:accountId`
+  and `/v1/users/:userId` update display names only (self or org admin), with
+  audit rows; identity, slug and lifecycle fields stay immutable. Roles and
+  policies gained audited description/document updates. `GET /v1/keys/:id` and
+  `GET /v1/service-accounts/:id` return metadata without secrets.
+- **Notification retry.** `POST /v1/notifications/:id/retry` re-queues a
+  `failed`/`dead` notification with a fresh attempt budget and clears the
+  publish marker; the Console exposes Retry and recipient preferences.
+- **Warehouse dataset/job management.** `PATCH /v1/warehouse/datasets/:id`
+  updates name/description and `PATCH /v1/warehouse/jobs/:id` renames a
+  non-stream job or a paused stream job (`409 job_running` while a stream worker
+  is active). Dataset and job lists accept
+  bounded `limit`/`offset` plus name/mode/status/target filters; the Console,
+  SDKs and CLI expose both operations and the new Path A/Path C ETL modes.
+- **Console Notifications and account lifecycle controls.** Tenant admins can
+  retire/reactivate accounts and operators can queue, inspect and cancel
+  notifications; the Warehouse ETL dialog supports OCS preview/import.
+- **Base outbox reliability.** Failed change events now retry with exponential
+  backoff and deterministic jitter, permanent payload errors are quarantined,
+  attempts are capped, and quarantined events are visible at
+  `GET /v1/base/outbox` / `GET /internal/base/outbox` and can be replayed
+  without changing their event id. Metrics and alerts cover pending age and
+  dead letters.
+- **Synapse Lakehouse (Apache Iceberg).** A tenant-scoped Iceberg v2 catalog
+  backed by Postgres metadata and real Parquet data files in the shared
+  S3-compatible store, implemented with PyIceberg. Namespaces, snapshots and
+  time travel, additive schema evolution, idempotent appends, bounded scans,
+  namespace/table/row quotas, and safe catalog drops that retain data files.
+  Warehouse materializes authorized tables through a trusted internal connector
+  (`POST /v1/warehouse/etl/lakehouse`); tenant SQL never receives filesystem
+  access. Console/SDK/CLI surfaces were added. Tenant byte quotas are enforced
+  from the current snapshot plus a conservative incoming-payload estimate, a
+  PostgreSQL advisory lock enforces one active writer, and the maintenance
+  endpoint reports lifecycle candidates without deleting data.
+- **Base → Lakehouse change log (Path B).**
+  `POST /v1/warehouse/etl/base-lakehouse` backfills a Base collection and then
+  streams outbox changes into an append-only Iceberg table
+  (`event_id, collection, document_id, operation, version, occurred_at, data,
+  deleted`). The Warehouse worker appends idempotently
+  (`base:<collection_id>:<document_id>:<created_at>:<version>:<upsert|delete>`) and only ACKs
+  the Stream message after the Lakehouse commit, so restart/replay is safe.
+  Console, JS/Python/Go/Rust SDKs and the CLI expose the job.
+- **Base snapshot ETL and current-state stream materialization.**
+  `POST /v1/warehouse/etl/base` copies a Base collection into a DuckDB dataset
+  (replace/append); Base document-change events now replace or delete the
+  current Warehouse row instead of appending duplicates, with `_ingest_events`
+  idempotency.
+- **Execution cancellation:** `POST /v1/executions/:id/cancel` cancels a
+  `queued` or human-`paused` execution, closes its checkpoint task, and refuses
+  to steal a running runner's lease. The JS, Python and Go SDKs expose
+  `cancelExecution` / `cancel_execution` / `CancelExecution`.
+- **Console Search:** tenant-scoped full-text, semantic and hybrid search over
+  SynapseBase documents, with collection/limit filters, facets, index status and
+  reindex.
 - **Owner-scoped platform runners.** Platform owners can manage shared system
   compute connectors from `/admin/runners` (`/v1/platform/runners`). Platform
   runners authenticate with a dedicated IAM `platform_runner_keys` credential

@@ -115,10 +115,14 @@ export const baseOutbox = pgTable(
     payload: jsonb('payload').$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
     publishedAt: timestamp('published_at', { withTimezone: true }),
     attempts: integer('attempts').notNull().default(0),
+    nextAttemptAt: timestamp('next_attempt_at', { withTimezone: true }).notNull().defaultNow(),
+    lastAttemptAt: timestamp('last_attempt_at', { withTimezone: true }),
+    deadLetteredAt: timestamp('dead_lettered_at', { withTimezone: true }),
     lastError: text('last_error'),
   },
   (t) => [
     index('idx_base_outbox_unpublished').on(t.publishedAt, t.occurredAt),
+    index('idx_base_outbox_due').on(t.publishedAt, t.deadLetteredAt, t.nextAttemptAt, t.occurredAt),
     index('idx_base_outbox_collection').on(t.collectionId, t.occurredAt),
   ],
 );

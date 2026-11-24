@@ -4,7 +4,8 @@ SynapseOne ships with metrics out of the box: the gateway exposes Prometheus
 metrics at `GET /metrics` (`gateway_requests_total` + Node runtime metrics),
 `lds-service` exposes `synapseone_lds_http_requests_total` +
 `synapseone_lds_datasources_total` / `synapseone_lds_records_total`,
-`workflow-service` exposes `synapseone_workflow_runs_total`, and compose adds
+`workflow-service` exposes `synapseone_workflow_runs_total`, `base-service`
+exposes `synapseone_base_outbox_pending`, and compose adds
 Prometheus (scrape + graph/alerts UI) + PG/Valkey exporters.
 
 ## Run
@@ -21,14 +22,24 @@ open http://localhost:9091  # Prometheus graph + /alerts + /targets
 | `gateway` | `gateway:8080/metrics` | `prom-client` in `apps/gateway` |
 | `workflow` | `workflow:4002/metrics` | in-process counters in `apps/workflow-service` |
 | `lds` | `lds:4004/metrics` | in-process counters in `apps/lds-service` |
+| `base` | `base:4005/metrics` | outbox/search counters in `apps/base-service` |
+| `faststore` | `faststore:4006/metrics` | in-process counters in `apps/faststore-service` |
+| `queue` | `queue:4007/metrics` | in-process counters in `apps/queue-service` |
+| `lakehouse` | `lakehouse:4013/metrics` | append/query/error counters in `apps/lakehouse-service` |
 | `postgres` | `postgres-exporter:9187` | `prometheuscommunity/postgres-exporter` |
 | `valkey` | `valkey-exporter:9121` | `oliver006/redis_exporter` (Valkey speaks the Redis protocol) |
 | `prometheus` | self | built-in |
 
 Config: `infra/monitoring/prometheus/prometheus.yml` (mounted read-only —
 `docker compose restart prometheus` to pick up config changes). Alert rules in
-`infra/monitoring/prometheus/alerts.yml` (`GatewayDown`, `PostgresDown`,
+`infra/monitoring/prometheus/alerts.yml` (`GatewayDown`, `BaseServiceDown`,
+`BaseOutboxBacklog`, `BaseOutboxDeadLetter`, `LakehouseDown`, `PostgresDown`,
 `ValkeyDown` — visible on Prometheus `/alerts`; wire Alertmanager when needed).
+`BaseOutboxBacklog` fires when `synapseone_base_outbox_pending` stays above zero
+for 15 minutes; `BaseOutboxDeadLetter` fires when quarantined events remain for
+5 minutes. Check Stream reachability, the outbox `attempts`/`last_error`
+columns, then inspect `GET /internal/base/outbox` and replay after fixing the
+cause.
 
 ## Request telemetry (usage analytics)
 

@@ -7,7 +7,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useAuth } from '../lib/auth.jsx';
 import { api } from '../lib/api.js';
-import { Badge, Btn, Card, Code, Empty, Err, Field, Input, Modal, PageTitle, Table, TableSkeleton } from '../components/ui.jsx';
+import { Badge, Btn, Card, Code, Empty, Err, Field, Input, Modal, PageTitle, Pager, SearchBox, Table, TableSkeleton } from '../components/ui.jsx';
 import { ScopeBar, useScope } from '../components/Scope.jsx';
 
 const when = (v) => (v ? new Date(v).toLocaleString() : '–');
@@ -36,6 +36,11 @@ export default function Keys() {
   const [revoking, setRevoking] = useState(null);
   const [rotating, setRotating] = useState(null);
   const [sessions, setSessions] = useState(null);
+  const [q, setQ] = useState('');
+  const [status, setStatus] = useState('');
+  const [offset, setOffset] = useState(0);
+  const [total, setTotal] = useState(0);
+  const limit = 20;
   const loadSeq = useRef(0);
 
   const load = async () => {
@@ -47,8 +52,8 @@ export default function Keys() {
     const my = ++loadSeq.current;
     setErr(null);
     try {
-      const v = await api.listKeys(scope.accountId, headers);
-      if (loadSeq.current === my) setRows(Array.isArray(v) ? v : []);
+      const v = await api.keysPaged(scope.accountId, { limit, offset, q, status }, headers);
+      if (loadSeq.current === my) { setRows(Array.isArray(v?.items) ? v.items : []); setTotal(Number(v?.total) || 0); }
     } catch (e) {
       if (loadSeq.current === my) setErr(e);
     } finally {
@@ -67,8 +72,10 @@ export default function Keys() {
   };
 
   useEffect(() => {
-    load();
-  }, [scope.accountId, headers]);
+    const t = setTimeout(load, 250);
+    return () => clearTimeout(t);
+  }, [scope.accountId, headers, offset, q, status]);
+  useEffect(() => { setOffset(0); }, [q, status]);
 
   useEffect(() => {
     loadSessions();
@@ -151,6 +158,15 @@ export default function Keys() {
       <PageTitle title="API Keys & Sessions" sub="Scoped, owner-bound, rotatable credentials, secrets are shown only once" right={<Btn onClick={() => { setFormErr(null); setOpen(true); }}>+ New key</Btn>} />
       <Err e={err} />
       <ScopeBar scope={scope} />
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="flex-1 min-w-[240px]"><SearchBox value={q} onChange={setQ} placeholder="Search API keys…" /></div>
+        <select value={status} onChange={(e) => setStatus(e.target.value)} className="mb-3 px-3 py-2 rounded-2xl border border-slate-200 text-sm bg-white">
+          <option value="">All statuses</option>
+          <option value="active">Active</option>
+          <option value="revoked">Revoked</option>
+          <option value="expired">Expired</option>
+        </select>
+      </div>
       <Card>
         <p className="text-sm text-normal-text mb-3">
           Keys belong to account <b className="text-main-text">{scope.accounts.find((a) => a.id === scope.accountId)?.slug || '–'}</b>.

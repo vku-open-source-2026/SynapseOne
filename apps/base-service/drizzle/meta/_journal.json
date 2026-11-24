@@ -71,6 +71,13 @@
       "when": 1797000000001,
       "tag": "0009_base_multidb_runtime_repair",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1798000000000,
+      "tag": "0010_misty_pretty_boy",
+      "breakpoints": true
     }
   ]
 }

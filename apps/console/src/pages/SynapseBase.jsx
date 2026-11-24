@@ -19,6 +19,7 @@ import {
   faPen,
   faBolt,
   faClock,
+  faTriangleExclamation,
 } from '@fortawesome/free-solid-svg-icons';
 import { useAuth } from '../lib/auth.jsx';
 import { api } from '../lib/api.js';
@@ -70,6 +71,7 @@ export default function SynapseBase() {
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState(null);
   const [selectedCol, setSelectedCol] = useState(null);
+  const [collectionStats, setCollectionStats] = useState(null);
   const [colSearch, setColSearch] = useState('');
   const [activeTab, setActiveTab] = useState('documents'); // 'documents' | 'mapping' | 'query' | 'changes'
 
@@ -114,8 +116,12 @@ export default function SynapseBase() {
   // Change feed state
   const [changes, setChanges] = useState([]);
   const [changesLoading, setChangesLoading] = useState(false);
+  const [outboxOpen, setOutboxOpen] = useState(false);
+  const [outboxLoading, setOutboxLoading] = useState(false);
+  const [outboxItems, setOutboxItems] = useState([]);
 
   const loadSeq = useRef(0);
+  const docsSeq = useRef(0);
 
   const loadDatabases = async () => {
     try {
@@ -171,6 +177,16 @@ export default function SynapseBase() {
       ? selectedDb
       : undefined;
 
+  useEffect(() => {
+    let live = true;
+    setCollectionStats(null);
+    if (!selectedCol) return () => { live = false; };
+    api.baseCollectionStats(selectedCol, headers, dbArg)
+      .then((value) => { if (live) setCollectionStats(value); })
+      .catch(() => { if (live) setCollectionStats(null); });
+    return () => { live = false; };
+  }, [selectedCol, dbArg, headers]);
+
   // Sync mapping draft when collection changes
   useEffect(() => {
     if (currentCollection) {
@@ -181,23 +197,34 @@ export default function SynapseBase() {
 
   const loadDocs = async () => {
     if (!selectedCol) return;
+    const seq = ++docsSeq.current;
+    const collection = selectedCol;
+    const database = dbArg;
     setDocsLoading(true);
+    setDocs([]);
+    setDocsTotal(0);
     try {
       if (viewMode === 'object') {
-        const qRes = await api.baseQuery(selectedCol, { as: 'object', limit: 50 }, headers, dbArg);
+        const qRes = await api.baseQuery(collection, { as: 'object', limit: 50 }, headers, database);
+        if (seq !== docsSeq.current) return;
         const items = qRes?.items || [];
         setDocs(items);
         setDocsTotal(qRes?.total ?? items.length);
       } else {
-        const res = await api.baseDocuments(selectedCol, { limit: 50 }, headers, dbArg);
+        const res = await api.baseDocuments(collection, { limit: 50 }, headers, database);
+        if (seq !== docsSeq.current) return;
         const items = Array.isArray(res) ? res : (res?.items || []);
         setDocs(items);
         setDocsTotal(res?.total ?? items.length);
       }
     } catch (e) {
-      setErr(e);
+      if (seq === docsSeq.current) {
+        setErr(e);
+        setDocs([]);
+        setDocsTotal(0);
+      }
     } finally {
-      setDocsLoading(false);
+      if (seq === docsSeq.current) setDocsLoading(false);
     }
   };
 
@@ -220,6 +247,23 @@ export default function SynapseBase() {
     } finally {
       setChangesLoading(false);
     }
+  };
+
+  const loadOutbox = async () => {
+    setOutboxLoading(true);
+    try {
+      const res = await api.baseOutbox({ limit: 50 }, headers);
+      setOutboxItems(res?.items || []);
+    } catch (e) {
+      setErr(e);
+    } finally {
+      setOutboxLoading(false);
+    }
+  };
+
+  const openOutbox = async () => {
+    setOutboxOpen(true);
+    await loadOutbox();
   };
 
   const handleCreateCollection = async (e) => {
@@ -420,6 +464,9 @@ export default function SynapseBase() {
         sub="Self-managed document database with logical object ↔ data mapping, queries, and atomic counters."
         right={
           <div className="flex gap-2">
+            <Btn kind="secondary" onClick={openOutbox}>
+              <FontAwesomeIcon icon={faTriangleExclamation} className="mr-1.5" /> Outbox
+            </Btn>
             <Btn kind="secondary" onClick={loadCollections} loading={loading}>
               <FontAwesomeIcon icon={faRotateRight} className="mr-1.5" /> Refresh
             </Btn>
@@ -581,6 +628,10 @@ export default function SynapseBase() {
                     {currentCollection?.description && (
                       <p className="text-xs text-normal-text mt-0.5">{currentCollection.description}</p>
                     )}
+                    <p className="text-xs text-normal-text mt-0.5">
+                      {collectionStats?.documents ?? '…'} documents
+                      {collectionStats?.bytes ? ` · ${collectionStats.bytes} bytes` : ''}
+                    </p>
                   </div>
 
                   <div className="flex items-center gap-2">
@@ -865,6 +916,53 @@ export default function SynapseBase() {
           )}
         </div>
       </div>
+
+      {/* Modal: Quarantined outbox events */}
+      {outboxOpen && (
+        <Modal title="SynapseBase Outbox" onClose={() => setOutboxOpen(false)}>
+          <div className="space-y-3">
+            <p className="text-xs text-normal-text">
+              Events that exhausted retries or hit a permanent payload error. An operator can replay
+              them from the internal outbox endpoint after fixing the cause; event ids are preserved
+              for downstream deduplication.
+            </p>
+            <div className="flex justify-end">
+              <Btn kind="secondary" onClick={loadOutbox} loading={outboxLoading}>
+                <FontAwesomeIcon icon={faRotateRight} className="mr-1.5" /> Refresh
+              </Btn>
+            </div>
+            {outboxLoading ? (
+              <TableSkeleton rows={3} />
+            ) : outboxItems.length === 0 ? (
+              <Empty
+                title="Outbox is clear"
+                sub="No quarantined change events for this tenant."
+                icon={faTriangleExclamation}
+              />
+            ) : (
+              <div className="space-y-2 max-h-[55vh] overflow-y-auto pr-1">
+                {outboxItems.map((event) => (
+                  <div key={event.eventId} className="p-3 rounded-2xl border border-amber-200 bg-amber-50/50 text-xs">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="font-mono text-main-text truncate">{event.eventId}</span>
+                      <Badge tone="amber">{event.attempts} attempts</Badge>
+                    </div>
+                    <div className="mt-1 text-normal-text">
+                      {event.operation} · {event.documentId} · collection {event.collectionId}
+                    </div>
+                    {event.lastError && (
+                      <pre className="mt-2 whitespace-pre-wrap text-[11px] text-red-600">{event.lastError}</pre>
+                    )}
+                    <div className="mt-1 text-[11px] text-normal-text">
+                      quarantined {event.deadLetteredAt ? new Date(event.deadLetteredAt).toLocaleString() : '—'}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </Modal>
+      )}
 
       {/* Modal: Create Collection */}
       {createColOpen && (

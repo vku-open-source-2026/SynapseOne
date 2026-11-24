@@ -23,19 +23,23 @@ class NotificationsService:
     def send(
         self,
         recipient: dict[str, Any],
-        body: str,
+        body: str | None = None,
         channel: str | None = None,
         channels: list[str] | None = None,
         subject: str = "",
         data: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
+        template_id: str | None = None,
+        template_slug: str | None = None,
     ) -> dict:
-        """Queue a notification (one record per channel)."""
-        payload: dict[str, Any] = {
-            "recipient": recipient,
-            "body": body,
-            "subject": subject,
-        }
+        """Queue a notification (one record per channel) from inline text or a template."""
+        payload: dict[str, Any] = {"recipient": recipient, "subject": subject}
+        if body is not None:
+            payload["body"] = body
+        if template_id:
+            payload["templateId"] = template_id
+        if template_slug:
+            payload["templateSlug"] = template_slug
         if channel:
             payload["channel"] = channel
         if channels:
@@ -58,6 +62,74 @@ class NotificationsService:
     def cancel(self, notification_id: str) -> dict:
         return self._http.request(
             "POST", f"{_PREFIX}/{quote(notification_id, safe='')}/cancel", {}
+        )
+
+    def retry(self, notification_id: str) -> dict:
+        """Restart a failed/dead delivery with a fresh attempt budget."""
+        return self._http.request(
+            "POST", f"{_PREFIX}/{quote(notification_id, safe='')}/retry", {}
+        )
+
+    def create_template(
+        self, slug: str, name: str, body: str, subject: str = ""
+    ) -> dict:
+        return self._http.request(
+            "POST",
+            f"{_PREFIX}/templates",
+            {"slug": slug, "name": name, "subject": subject, "body": body},
+        )
+
+    def list_templates(
+        self,
+        q: str = "",
+        include_archived: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict:
+        params = [f"limit={int(limit)}", f"offset={int(offset)}"]
+        if q:
+            params.append("q=" + quote(q, safe=""))
+        if include_archived:
+            params.append("includeArchived=true")
+        return self._http.request("GET", f"{_PREFIX}/templates?{'&'.join(params)}")
+
+    def get_template(self, template_id: str) -> dict:
+        return self._http.request(
+            "GET", f"{_PREFIX}/templates/{quote(template_id, safe='')}"
+        )
+
+    def update_template(
+        self,
+        template_id: str,
+        name: str | None = None,
+        subject: str | None = None,
+        body: str | None = None,
+    ) -> dict:
+        payload: dict[str, Any] = {}
+        if name is not None:
+            payload["name"] = name
+        if subject is not None:
+            payload["subject"] = subject
+        if body is not None:
+            payload["body"] = body
+        return self._http.request(
+            "PATCH",
+            f"{_PREFIX}/templates/{quote(template_id, safe='')}",
+            payload,
+        )
+
+    def delete_template(self, template_id: str) -> dict:
+        return self._http.request(
+            "DELETE", f"{_PREFIX}/templates/{quote(template_id, safe='')}"
+        )
+
+    def preview_template(
+        self, template_id: str, data: dict[str, Any] | None = None
+    ) -> dict:
+        return self._http.request(
+            "POST",
+            f"{_PREFIX}/templates/{quote(template_id, safe='')}/preview",
+            {"data": data or {}},
         )
 
     def get_preference(self, recipient: str) -> dict:

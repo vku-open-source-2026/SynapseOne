@@ -122,6 +122,13 @@ export class WorkflowService {
     const qs = includeData ? '?includeData=true' : '';
     return this.http.req(`/v1/executions/${encodeURIComponent(id)}${qs}`);
   }
+  /** Cancel a queued or human-paused execution. Running executions return 409. */
+  cancelExecution(id: string, reason?: string) {
+    return this.http.req(`/v1/executions/${encodeURIComponent(id)}/cancel`, {
+      method: 'POST',
+      body: JSON.stringify(reason ? { reason } : {}),
+    });
+  }
   listExecutions(query: string | Record<string, string | number | boolean | undefined> = ''): Promise<any[]> {
     let q = '';
     if (typeof query === 'string') {

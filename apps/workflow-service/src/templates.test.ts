@@ -995,10 +995,12 @@ describe('credentials, webhook hardening, tenant, revision, metrics (P0/P2)', ()
     assert.equal(first.status, 200);
     const replay = await fetch(`${base}/webhook/guarded`, { method: 'POST', headers: { ...authed, 'x-delivery': 'd1' }, body: '{}' });
     assert.equal(replay.status, 409);
-    // rpm=4 (the earlier 401 already consumed one slot): two more fresh keys
-    // pass, the next fresh call is over budget.
+    // rpm=4. The unauthenticated 401 is rejected before the bucket is
+    // charged, so it must not consume the legitimate budget: first + replayed
+    // delivery + d2 + d3 fill the window, and d4 is over budget.
     assert.equal((await fetch(`${base}/webhook/guarded`, { method: 'POST', headers: { ...authed, 'x-delivery': 'd2' }, body: '{}' })).status, 200);
-    assert.equal((await fetch(`${base}/webhook/guarded`, { method: 'POST', headers: { ...authed, 'x-delivery': 'd3' }, body: '{}' })).status, 429);
+    assert.equal((await fetch(`${base}/webhook/guarded`, { method: 'POST', headers: { ...authed, 'x-delivery': 'd3' }, body: '{}' })).status, 200);
+    assert.equal((await fetch(`${base}/webhook/guarded`, { method: 'POST', headers: { ...authed, 'x-delivery': 'd4' }, body: '{}' })).status, 429);
   });
 
   it('webhook HMAC auth verifies the raw body (P0-5)', async () => {

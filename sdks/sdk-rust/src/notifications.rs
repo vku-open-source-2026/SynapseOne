@@ -53,6 +53,103 @@ impl NotificationsService {
             .map(|response| response.body)
     }
 
+    pub async fn send_template(
+        &self,
+        recipient: Value,
+        template_id: &str,
+        data: Value,
+        channel: Option<&str>,
+        subject: &str,
+    ) -> Result<Value> {
+        let mut payload = json!({
+            "recipient": recipient,
+            "templateId": template_id,
+            "data": data,
+        });
+        if let Some(channel) = channel {
+            payload["channel"] = json!(channel);
+        }
+        if !subject.is_empty() {
+            payload["subject"] = json!(subject);
+        }
+        self.client
+            .post("/v1/notifications", payload)
+            .await
+    }
+
+    pub async fn create_template(&self, input: Value) -> Result<Value> {
+        self.client
+            .post("/v1/notifications/templates", input)
+            .await
+    }
+
+    pub async fn list_templates(
+        &self,
+        q: Option<&str>,
+        include_archived: bool,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Value> {
+        let mut params = vec![
+            ("limit", limit.to_string()),
+            ("offset", offset.to_string()),
+        ];
+        if let Some(q) = q.filter(|value| !value.is_empty()) {
+            params.push(("q", q.to_string()));
+        }
+        if include_archived {
+            params.push(("includeArchived", "true".into()));
+        }
+        self.client
+            .get(format!(
+                "/v1/notifications/templates?{}",
+                query_string(&params)
+            ))
+            .await
+    }
+
+    pub async fn get_template(&self, template_id: &str) -> Result<Value> {
+        self.client
+            .get(format!(
+                "/v1/notifications/templates/{}",
+                segment(template_id)
+            ))
+            .await
+    }
+
+    pub async fn update_template(&self, template_id: &str, patch: Value) -> Result<Value> {
+        self.client
+            .patch(
+                format!(
+                    "/v1/notifications/templates/{}",
+                    segment(template_id)
+                ),
+                patch,
+            )
+            .await
+    }
+
+    pub async fn delete_template(&self, template_id: &str) -> Result<Value> {
+        self.client
+            .delete(format!(
+                "/v1/notifications/templates/{}",
+                segment(template_id)
+            ))
+            .await
+    }
+
+    pub async fn preview_template(&self, template_id: &str, data: Value) -> Result<Value> {
+        self.client
+            .post(
+                format!(
+                    "/v1/notifications/templates/{}/preview",
+                    segment(template_id)
+                ),
+                json!({ "data": data }),
+            )
+            .await
+    }
+
     pub async fn get(&self, notification_id: &str) -> Result<Value> {
         self.client
             .get(format!("/v1/notifications/{}", segment(notification_id)))
@@ -73,6 +170,15 @@ impl NotificationsService {
         self.client
             .post(
                 format!("/v1/notifications/{}/cancel", segment(notification_id)),
+                json!({}),
+            )
+            .await
+    }
+
+    pub async fn retry(&self, notification_id: &str) -> Result<Value> {
+        self.client
+            .post(
+                format!("/v1/notifications/{}/retry", segment(notification_id)),
                 json!({}),
             )
             .await

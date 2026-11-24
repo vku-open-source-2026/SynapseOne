@@ -4,3 +4,5 @@ npm-debug.log
 .git
 .env
 *.test.ts
+
+target

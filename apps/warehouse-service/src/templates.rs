@@ -84,6 +84,23 @@ pub fn etl_templates() -> Vec<EtlTemplate> {
             stream_topic_hint: None,
         },
         EtlTemplate {
+            id: "base-snapshot".into(),
+            name: "Base collection snapshot".into(),
+            mode: "base".into(),
+            description:
+                "Copy a SynapseBase collection into a dataset. Use replace for a full snapshot; incremental changes follow the Base outbox → Stream → stream-ETL path."
+                    .into(),
+            write_mode: Some("replace".into()),
+            sql_template: None,
+            target_columns: Some(vec![
+                column("document_id", "string"),
+                column("name", "string"),
+                column("version", "number"),
+                column("updated_at", "timestamp"),
+            ]),
+            stream_topic_hint: None,
+        },
+        EtlTemplate {
             id: "stream-sensor-ingest".into(),
             name: "Sensor stream ingest".into(),
             mode: "stream".into(),

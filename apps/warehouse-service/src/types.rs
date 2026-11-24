@@ -43,6 +43,11 @@ pub struct JobMeta {
     pub batch_size: i64,
     pub interval_ms: i64,
     pub write_mode: String,
+    pub destination: String,
+    pub lakehouse_namespace: Option<String>,
+    pub lakehouse_table: Option<String>,
+    pub source_collection: Option<String>,
+    pub source_database: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub last_run_at: Option<String>,
@@ -98,10 +103,24 @@ pub struct NewJob {
     pub batch_size: i64,
     pub interval_ms: i64,
     pub write_mode: String,
+    pub destination: String,
+    pub lakehouse_namespace: Option<String>,
+    pub lakehouse_table: Option<String>,
+    pub source_collection: Option<String>,
+    pub source_database: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct StreamEventRows {
     pub event_id: String,
     pub rows: Vec<Value>,
+    /// Set for a SynapseBase document-change event. The worker replaces the
+    /// current row for this document instead of appending a duplicate.
+    pub document_id: Option<String>,
+    /// `create|update|delete` for a Base event; `delete` removes the row.
+    pub base_operation: Option<String>,
+    /// Base document version (used for the current-state high-water mark).
+    pub version: Option<i64>,
+    /// Base document creation timestamp; a change means the id was re-created.
+    pub created_at: Option<String>,
 }

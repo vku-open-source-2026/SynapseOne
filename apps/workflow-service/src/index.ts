@@ -22,16 +22,16 @@ import {
   createWorkflowRec, getWorkflowRec, listWorkflowRecs, updateWorkflowRec, deleteWorkflowRec,
   createExecutionRec, getExecutionRec, listExecutionRecs, findActiveWebhookWorkflow,
   listActiveCronWorkflows, ensureTables, useDb, StoredWorkflow, StoredCredential,
-  claimWebhookDelivery, hitWebhookRate, claimCronSlot,
+  claimWebhookDelivery, releaseWebhookDelivery, hitWebhookRate, claimCronSlot,
   createCredentialRec, getCredentialRec, listCredentialRecs, deleteCredentialRec, rotateCredentialRec,
   toPublicCredential, decryptSecret,
   createHumanTaskRec, getHumanTaskRec, listHumanTaskRecs, transitionHumanTaskRec, toPublicHumanTask,
   claimExecutionResume, finishExecutionRec,
   claimExecutionRec, heartbeatExecutionRec, releaseExecutionRec, pauseExecutionRec,
-  queueExecutionResume, restoreExecutionPaused, savePausedExecutionRec,
-  listExpiredRunningExecutions, reclaimExpiredExecution, listOverdueHumanTasks,
+  queueExecutionResume, restoreExecutionPaused, savePausedExecutionRec, cancelExecutionRec,
+  listExpiredRunningExecutions, reclaimExpiredExecution, listOverdueHumanTasks, listStaleResumingHumanTasks,
   countActiveExecutionsForTenant, activeExecutionCountsByTenant, pingDb,
-  createRunnerRec, getRunnerRec, listRunnerRecs, heartbeatRunnerRec, deleteRunnerRec,
+  createRunnerRec, getRunnerRec, listRunnerRecs, heartbeatRunnerRec, deleteRunnerRec, countActiveExecutionsForRunner,
   upsertRunnerInstance, listRunnerInstances, listRunnerInstancesForRunners, deleteRunnerInstance,
   markRunnerInstancesOffline, updateRunnerRec,
   recordRunnerResourceUsage, listRunnerUsageHourly, listRunnerUsageRequests,
@@ -154,6 +154,32 @@ function canAccessExecution(e: { principal?: Principal | null }, p: Principal | 
   return false;
 }
 
+/** Runner claim boundary. Account runners are the default and may only claim
+ *  work whose principal is bound to the same account. Org runners are an
+ *  explicit admin grant and may claim only their own organization's work. */
+function runnerAudienceAllows(
+  runner: { scope?: string | null; audience?: string | null; org_id?: string | null; account_id?: string | null },
+  execution: { principal?: Principal | null } | null | undefined,
+): boolean {
+  if (runner.scope === 'platform') return true;
+  const owner = execution?.principal;
+  if (runner.audience === 'org') {
+    return !!runner.org_id && !!owner?.org && owner.org === runner.org_id;
+  }
+  return !!runner.account_id && !!owner?.account && owner.account === runner.account_id;
+}
+
+/** Cancellation is stricter than read access: a tenant member may not cancel
+ * another user's run merely because both share an organization. Account-level
+ * machine credentials may cancel their account's runs; org admins may cancel
+ * within their org. */
+function canCancelExecution(e: StoredExecution, p: Principal | null | undefined): boolean {
+  if (!p) return false;
+  if (p.isOrgAdmin === true && p.org && e.principal?.org === p.org) return true;
+  if (p.account && e.principal?.account === p.account) return true;
+  return !!p.sub && e.principal?.sub === p.sub;
+}
+
 /** API viewers must also satisfy the workflow policy. Runner claims retain
  * their separately authenticated tenant/queue checks below. */
 async function canReadExecution(e: StoredExecution, p: Principal | null | undefined): Promise<boolean> {
@@ -226,6 +252,8 @@ export const synapseoneCall: SynapseOneCall = async (resource, operation, args, 
         actor: actorFor(w.id, runPrincipal),
         startedAt,
         finishedAt,
+        workflow_revision: w.revision,
+        ...pauseBinding(r),
       });
       if (r.status !== 'success') {
         throw new Error(`synapseone.api: workflows.execute '${w.name}' failed: ${String((r as any).error || 'unknown error').slice(0, 300)}`);
@@ -1284,6 +1312,45 @@ export function maskSecrets(v: any, depth = 0, seen: Set<any> = new Set()): any 
   return out;
 }
 
+/** Persist the exact human-task checkpoint created by the engine. A paused
+ *  execution without this binding cannot be resumed (fail closed). */
+function pauseBinding(r: { pause?: { node?: string; task?: any } } | null | undefined): {
+  pause_task_id: string | null;
+  pause_node: string | null;
+} {
+  const taskId = r?.pause?.task?.id;
+  return {
+    pause_task_id: typeof taskId === 'string' && taskId ? taskId : null,
+    pause_node: r?.pause?.node ? String(r.pause.node).slice(0, 128) : null,
+  };
+}
+
+/** Create the real durable task for an inline trigger that has no worker.
+ *  The execution row is created after the run, so the caller supplies the
+ *  pre-generated id. */
+function inlineHumanTaskSink(executionId: string, wf: StoredWorkflow, principal: Principal | null) {
+  return {
+    create: async (task: any) => {
+      const rec = await createHumanTaskRec({
+        id: randomUUID(),
+        execution_id: executionId,
+        workflow_id: wf.id,
+        node_name: task.node,
+        title: task.title,
+        description: task.description,
+        assignee: task.assignee,
+        candidate_roles: task.candidateRoles,
+        decision_schema: task.decisionSchema,
+        payload: task.payload,
+        deadline: task.deadline,
+        org_id: principal?.org || wf.org_id || null,
+        account_id: principal?.account || wf.account_id || null,
+      });
+      return toPublicHumanTask(rec);
+    },
+  };
+}
+
 function toApiExecution(e: any, includeData: boolean): any {
   const base: any = {
     id: e.id,
@@ -1411,6 +1478,39 @@ function httpError(status: number, code: string, message: string): Error & { sta
 
 /** Create a queued execution row and publish its job. Inputs and definitions
  *  stay in Postgres; only `{executionId}` travels through SynapseQueue. */
+const IAM_STATUS_BASE = (process.env.IAM_SERVICE_URL || 'http://iam:4001').replace(/\/$/, '');
+const IAM_STATUS_SECRET = process.env.SYNAPSEONE_INTERNAL_SECRET || '';
+const orgStatusCache = new Map<string, { suspended: boolean; expires: number }>();
+
+/** New asynchronous work must not start for a suspended tenant. The check is
+ *  cached for five seconds because enqueue is on the webhook/cron hot path;
+ *  IAM owns the authoritative status and fails soft only if unreachable. */
+async function orgSuspended(orgId: string | null | undefined): Promise<boolean> {
+  if (!orgId || !IAM_STATUS_BASE) return false;
+  const now = Date.now();
+  const hit = orgStatusCache.get(orgId);
+  if (hit && hit.expires > now) return hit.suspended;
+  let suspended = false;
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 500);
+    const r = await fetch(`${IAM_STATUS_BASE}/internal/orgs/${encodeURIComponent(orgId)}/status`, {
+      headers: { ...(IAM_STATUS_SECRET ? { 'x-synapseone-internal': IAM_STATUS_SECRET } : {}) },
+      signal: ctl.signal,
+    }).finally(() => clearTimeout(timer));
+    if (r.status === 404) suspended = false;
+    else if (r.ok) {
+      const body: any = await r.json().catch(() => null);
+      suspended = body?.status === 'suspended';
+    }
+  } catch {
+    suspended = false;
+  }
+  if (orgStatusCache.size > 5000) orgStatusCache.clear();
+  orgStatusCache.set(orgId, { suspended, expires: now + 5000 });
+  return suspended;
+}
+
 async function enqueueExecution(args: {
   wf: StoredWorkflow;
   input: any;
@@ -1418,6 +1518,10 @@ async function enqueueExecution(args: {
   principal: Principal | null;
   delaySeconds?: number;
 }): Promise<{ execution: StoredExecution; queue: string; mode: WorkflowRunnerMode }> {
+  const orgId = args.principal?.org || args.wf.org_id || null;
+  if (orgId && await orgSuspended(orgId)) {
+    throw httpError(403, 'org_suspended', 'this organization is suspended');
+  }
   const mode = runnerModeForSettings(args.wf.settings);
   if (mode === 'inline') throw httpError(400, 'inline_mode', 'this workflow is configured for inline execution');
   if (!queueTransportEnabled()) {
@@ -2236,6 +2340,7 @@ function toApiRunner(r: StoredWorkflowRunner, instances: StoredRunnerInstance[] 
     name: r.name,
     kind: r.kind,
     scope: r.scope || 'tenant',
+    audience: r.audience || 'account',
     mode: r.mode,
     queue: r.queue,
     inferenceQueue: r.inference_queue || null,
@@ -2467,6 +2572,8 @@ export function createApp(): express.Express {
   // rate limiting and idempotency are enforced here (P0-5); the payload
   // is capped at 200KB.
   const handleInboundWebhook = async (req: express.Request, res: express.Response) => {
+    let webhookWfId: string | null = null;
+    let deliveryKey: string | null = null;
     try {
       const rawPath = String((req.params as any)?.path || req.path.replace(/^\/webhook\/?/, ''));
       const clean = rawPath.replace(/^\/+|\/+$/g, '').split('?')[0].slice(0, 128);
@@ -2475,9 +2582,14 @@ export function createApp(): express.Express {
         return res.status(404).json({ error: 'webhook_not_found' });
       }
       const wf = await findActiveWebhookWorkflow(clean);
+      webhookWfId = wf?.id || null;
       if (!wf) {
         recordWebhookReject('not_found');
         return res.status(404).json({ error: 'webhook_not_found' });
+      }
+      if (wf.org_id && await orgSuspended(wf.org_id)) {
+        recordWebhookReject('org_suspended');
+        return res.status(403).json({ error: 'org_suspended', message: 'this organization is suspended' });
       }
       // An owner-only graph cannot be made callable by an anonymous webhook,
       // even if its trigger was accidentally imported with auth.mode=none.
@@ -2487,17 +2599,14 @@ export function createApp(): express.Express {
       }
       const node = webhookNodeFor(wf, clean);
       const params = (node as any)?.parameters || {};
-      // Rate limit (fixed one-minute window per workflow, durable across
-      // replicas via Postgres; in-memory fallback without DATABASE_URL).
-      const rpm = Math.min(Math.max(Number(params?.rateLimit?.rpm) || 600, 1), 60000);
-      const nowMs = Date.now();
-      const bucket = await hitWebhookRate(wf.id);
-      if (bucket.count > rpm) {
-        recordWebhookReject('rate_limited');
-        res.setHeader('Retry-After', Math.max(1, Math.ceil((bucket.resetMs - nowMs) / 1000)));
-        return res.status(429).json({ error: 'rate_limited', message: `webhook exceeds ${rpm}/min` });
+      const declaredMethod = String(params.httpMethod || 'POST').toUpperCase();
+      if (req.method !== declaredMethod && !(declaredMethod === 'GET' && req.method === 'HEAD')) {
+        recordWebhookReject('method_not_allowed');
+        res.setHeader('Allow', declaredMethod);
+        return res.status(405).json({ error: 'method_not_allowed', message: `this webhook accepts ${declaredMethod}` });
       }
-      // Auth.
+      // Auth must run before the rate bucket is charged; otherwise an
+      // unauthenticated caller can exhaust a tenant's legitimate budget.
       const auth = webhookAuthOf(node);
       if (auth.mode !== 'none') {
         let secret: string | null = null;
@@ -2536,20 +2645,15 @@ export function createApp(): express.Express {
           return res.status(401).json({ error: 'unauthorized', message: 'invalid webhook credentials' });
         }
       }
-      // Idempotency: replayed delivery keys within TTL are rejected (409).
-      // Receipts are durable across replicas via Postgres; in-memory
-      // fallback without DATABASE_URL.
-      const idem = (params as any)?.idempotency;
-      if (idem && typeof idem === 'object' && typeof idem.header === 'string' && idem.header) {
-        const keyVal = String(req.headers[String(idem.header).toLowerCase()] || '');
-        if (keyVal) {
-          const ttlMs = Math.min(Math.max(Number(idem.ttlSeconds) || 3600, 60), 86400) * 1000;
-          const first = await claimWebhookDelivery(wf.id, keyVal.slice(0, 256), ttlMs);
-          if (!first) {
-            recordWebhookReject('duplicate');
-            return res.status(409).json({ error: 'duplicate_delivery', message: 'delivery key already processed' });
-          }
-        }
+      // Rate limit (fixed one-minute window per workflow, durable across
+      // replicas via Postgres; in-memory fallback without DATABASE_URL).
+      const rpm = Math.min(Math.max(Number(params?.rateLimit?.rpm) || 600, 1), 60000);
+      const nowMs = Date.now();
+      const bucket = await hitWebhookRate(wf.id);
+      if (bucket.count > rpm) {
+        recordWebhookReject('rate_limited');
+        res.setHeader('Retry-After', Math.max(1, Math.ceil((bucket.resetMs - nowMs) / 1000)));
+        return res.status(429).json({ error: 'rate_limited', message: `webhook exceeds ${rpm}/min` });
       }
       let input: any = {};
       if (req.method === 'GET' || req.method === 'HEAD') {
@@ -2570,6 +2674,21 @@ export function createApp(): express.Express {
       if (!queueTransportEnabled() && (runnerMode === 'custom' || runnerMode === 'hybrid' || runnerMode === 'system')) {
         return res.status(503).json({ error: 'queue_unavailable', message: `workflow requires a ${runnerMode} runner queue but SynapseQueue is not configured` });
       }
+      // Claim the idempotency receipt only after the request is valid and the
+      // transport is available; release it if dispatch fails.
+      const idem = (params as any)?.idempotency;
+      if (idem && typeof idem === 'object' && typeof idem.header === 'string' && idem.header) {
+        const keyVal = String(req.headers[String(idem.header).toLowerCase()] || '');
+        if (keyVal) {
+          deliveryKey = keyVal.slice(0, 256);
+          const ttlMs = Math.min(Math.max(Number(idem.ttlSeconds) || 3600, 60), 86400) * 1000;
+          const first = await claimWebhookDelivery(wf.id, deliveryKey, ttlMs);
+          if (!first) {
+            recordWebhookReject('duplicate');
+            return res.status(409).json({ error: 'duplicate_delivery', message: 'delivery key already processed' });
+          }
+        }
+      }
       if (queueTransportEnabled() && runnerMode !== 'inline') {
         const { execution, queue } = await enqueueExecution({
           wf, input, triggeredBy: 'webhook', principal: runPrincipal,
@@ -2584,21 +2703,30 @@ export function createApp(): express.Express {
         }
         return res.status(202).json(queuedResponse(execution, queue));
       }
+      const executionId = randomUUID();
       const r = await runWorkflow(
         { nodes: wf.nodes as any, connections: wf.connections as any, name: wf.name, settings: wf.settings as any },
         input,
-        { triggeredBy: 'webhook', principal: runPrincipal, credentialResolver: makeCredentialResolver(runPrincipal), synapseoneCall },
+        {
+          triggeredBy: 'webhook', principal: runPrincipal,
+          credentialResolver: makeCredentialResolver(runPrincipal), synapseoneCall,
+          humanTask: inlineHumanTaskSink(executionId, wf, runPrincipal),
+        },
       );
       const finishedAt = new Date().toISOString();
       recordRun('webhook', r.status, r.nodeRuns);
       const exec = await createExecutionRec({
+        id: executionId,
         workflow_id: wf.id, workflow_name: wf.name, status: r.status,
         input, output: r.output, node_runs: r.nodeRuns as any,
         error: (r as any).error ?? null, triggered_by: 'webhook',
         principal: runPrincipal, actor: actorFor(wf.id, runPrincipal), startedAt, finishedAt,
+        workflow_revision: wf.revision,
+        ...pauseBinding(r),
       });
       res.status(r.status === 'success' ? 200 : 500).json({ ok: r.status === 'success', output: r.output, executionId: exec.id, error: (r as any).error ?? undefined });
     } catch (e: any) {
+      if (deliveryKey && webhookWfId) await releaseWebhookDelivery(webhookWfId, deliveryKey).catch(() => undefined);
       console.error('[workflow] webhook failed:', e?.message || e);
       res.status(500).json({ error: 'internal' });
     }
@@ -2727,6 +2855,8 @@ export function createApp(): express.Express {
       input, output: r.output, node_runs: r.nodeRuns as any,
       error: (r as any).error ?? null, triggered_by: 'mcp',
       principal: runPrincipal, actor: actorFor(wf.id, runPrincipal), startedAt, finishedAt,
+      workflow_revision: wf.revision,
+      ...pauseBinding(r),
     });
     if (r.status === 'paused') {
       return {
@@ -3218,6 +3348,8 @@ function tenantBinding(
       input, output: r.output, node_runs: r.nodeRuns as any,
       error: (r as any).error ?? null, triggered_by: 'manual',
       principal, actor: actorFor(wf.id, principal), startedAt, finishedAt,
+      workflow_revision: wf.revision,
+      ...pauseBinding(r),
     });
     if (r.status === 'paused') {
       return res.status(202).json({
@@ -3358,6 +3490,39 @@ function tenantBinding(
     res.json(toApiExecution(e, includeData));
   });
 
+  // Cancel a queued or paused execution. Running executions are left to their
+  // lease owner; the worker/runner must report a terminal result.
+  app.post('/v1/executions/:id/cancel', async (req, res) => {
+    const id = idGate(req, res);
+    if (id === null) return;
+    const principal = principalFromHeaders(req);
+    const execution = await getExecutionRec(id);
+    if (!execution || !await canReadExecution(execution, principal)) {
+      return res.status(404).json({ error: 'not_found', message: 'execution not found' });
+    }
+    if (!canCancelExecution(execution, principal)) {
+      return res.status(403).json({ error: 'forbidden', message: 'you cannot cancel this execution' });
+    }
+    const reason = String((req.body || {}).reason || 'cancelled by user').slice(0, 500);
+    const cancelled = await cancelExecutionRec(id, reason);
+    if (!cancelled) {
+      return res.status(409).json({
+        error: 'execution_not_cancellable',
+        message: 'only queued or human-paused executions can be cancelled; a running runner keeps its lease',
+        status: execution.status,
+      });
+    }
+    // Close any pending/claimed human checkpoints so they cannot be approved
+    // after the execution has been cancelled.
+    const tasks = await listHumanTaskRecs({ executionId: id, limit: 200 });
+    for (const task of tasks) {
+      if (task.status === 'pending' || task.status === 'claimed') {
+        await transitionHumanTaskRec(task.id, ['pending', 'claimed'], { status: 'cancelled' }).catch(() => null);
+      }
+    }
+    res.json(toApiExecution(cancelled, true));
+  });
+
   // ---------- self-hosted workflow runners ----------
   // A runner is a tenant-owned worker that consumes a SynapseQueue workflow
   // queue. Users create a runner, mint an IAM API key for it, and deploy the
@@ -3380,6 +3545,25 @@ function tenantBinding(
       });
     }
     const mode: 'custom' | 'hybrid' = b.mode === 'hybrid' ? 'hybrid' : 'custom';
+    // Account runners may only claim their own account's executions. Org-wide
+    // compute is an explicit admin grant, never a default for any member.
+    const requestedAudience: 'account' | 'org' = b.audience === 'org'
+      ? 'org'
+      : b.audience === 'account'
+        ? 'account'
+        : (principal.account ? 'account' : 'org');
+    if (requestedAudience === 'org' && principal.isOrgAdmin !== true) {
+      return res.status(403).json({
+        error: 'org_admin_required',
+        message: 'organization-wide runners require an organization administrator; use an account-bound key or ask an admin',
+      });
+    }
+    if (requestedAudience === 'account' && !principal.account) {
+      return res.status(400).json({
+        error: 'account_required',
+        message: 'account-scoped runners require an account-bound credential',
+      });
+    }
     const defaultWorkflowQueue = mode === 'hybrid' ? DEFAULT_SHARED_QUEUE : DEFAULT_CUSTOM_QUEUE;
     const queue = String(b.queue || (kind === 'inference' ? DEFAULT_INFERENCE_QUEUE : defaultWorkflowQueue)).trim();
     if (!isQueueName(queue)) {
@@ -3408,6 +3592,7 @@ function tenantBinding(
       name,
       kind,
       scope: 'tenant',
+      audience: requestedAudience,
       mode,
       queue,
       inference_queue: inferenceQueue,
@@ -3714,6 +3899,14 @@ function tenantBinding(
   app.delete('/v1/workflow-runners/:id', async (req, res) => {
     const runner = await loadRunnerForRequest(req, res);
     if (!runner) return;
+    const active = await countActiveExecutionsForRunner(runner.id, runner.queue, runner.mode !== 'system');
+    if (active > 0) {
+      return res.status(409).json({
+        error: 'runner_has_active_executions',
+        message: `drain or cancel ${active} queued/running execution(s) before deleting this runner`,
+        active,
+      });
+    }
     res.json({ ok: true, id: runner.id, deleted: await deleteRunnerRec(runner.id) });
   });
 
@@ -4385,6 +4578,14 @@ function tenantBinding(
     // could still touch the platform queue if deletion succeeded alone.
     await revokeAllPlatformRunnerKeysViaIam(runner.id);
     await revokeExecutionDelegationsViaIam({ runnerId: runner.id });
+    const active = await countActiveExecutionsForRunner(runner.id, runner.queue, false);
+    if (active > 0) {
+      return res.status(409).json({
+        error: 'runner_has_active_executions',
+        message: `drain or cancel ${active} queued/running execution(s) before deleting this runner`,
+        active,
+      });
+    }
     res.json({ ok: true, id: runner.id, scope: 'platform', deleted: await deleteRunnerRec(runner.id) });
   });
 
@@ -4566,6 +4767,16 @@ function tenantBinding(
     if (!job || (!platformRunner && !canAccessInferenceJob(job, principalFromHeaders(req)))) {
       res.status(404).json({ error: 'not_found', message: 'inference job not found' });
       return null;
+    }
+    if (!platformRunner && !runnerAudienceAllows(runner, {
+      principal: job.org_id || job.account_id
+        ? { sub: '', org: job.org_id || undefined, account: job.account_id || undefined }
+        : null,
+    })) {
+      return res.status(403).json({
+        error: 'runner_audience',
+        message: 'this runner is not authorized for the inference job tenant',
+      });
     }
     const expectedQueue = runner.scope === 'platform'
       ? DEFAULT_SYSTEM_INFERENCE_QUEUE
@@ -4791,6 +5002,12 @@ function tenantBinding(
     if (!execution || (!platformRunner && !canAccessExecution(execution, principal))) {
       res.status(404).json({ error: 'not_found', message: 'execution not found' });
       return null;
+    }
+    if (!platformRunner && !runnerAudienceAllows(runner, execution)) {
+      return res.status(403).json({
+        error: 'runner_audience',
+        message: 'this runner is not authorized for the execution tenant',
+      });
     }
     if (!platformRunner) {
       const workflow = await getWorkflowRec(execution.workflow_id);
@@ -5126,7 +5343,7 @@ function tenantBinding(
       }
       const task = pause.task || {};
       const wf = await getWorkflowRec(ctx.execution.workflow_id);
-      await createHumanTaskRec({
+      const createdTask = await createHumanTaskRec({
         execution_id: ctx.execution.id,
         workflow_id: ctx.execution.workflow_id,
         node_name: String(pause.node).slice(0, 128),
@@ -5143,6 +5360,8 @@ function tenantBinding(
       const paused = await pauseExecutionRec(ctx.execution.id, {
         output, node_runs: nodeRuns, error, workerId: ctx.runner.id,
         instanceId: ctx.instanceId, attempt: ctx.attempt || undefined,
+        pauseTaskId: createdTask.id,
+        pauseNode: String(pause.node),
       });
       if (!paused) return res.status(409).json({ error: 'not_running' });
       await revokeExecutionDelegationsViaIam({ executionId: ctx.execution.id });
@@ -5173,6 +5392,16 @@ function tenantBinding(
     const cur = await getWorkflowRec(id);
     if (cur && !canAccessWorkflow(cur, principalFromHeaders(req))) {
       return res.status(404).json({ error: 'not_found', message: 'workflow not found' });
+    }
+    for (const status of ['queued', 'running', 'paused']) {
+      const active = await listExecutionRecs({ workflowId: id, status, limit: 1 });
+      if (active.items.length) {
+        return res.status(409).json({
+          error: 'workflow_has_active_executions',
+          message: `cancel active ${status} executions before deleting this workflow`,
+          status,
+        });
+      }
     }
     const ok = await deleteWorkflowRec(id);
     if (!ok) return res.status(404).json({ error: 'not_found', message: 'workflow not found' });
@@ -5350,6 +5579,16 @@ function tenantBinding(
     if (b.executionId) {
       const execution = await getExecutionRec(String(b.executionId));
       if (!execution || !await canReadExecution(execution, principal)) return res.status(404).json({ error: 'not_found' });
+      // A paused execution already owns exactly one engine-created approval
+      // checkpoint. Creating a second task here would let an org member forge
+      // an approval and choose the resume node; standalone tasks are still
+      // allowed for every non-paused execution.
+      if (execution.status === 'paused') {
+        return res.status(409).json({
+          error: 'pause_checkpoint_exists',
+          message: 'this execution is paused on an engine-created task; decide that task instead',
+        });
+      }
       if (linkedWorkflowId && linkedWorkflowId !== execution.workflow_id) return res.status(400).json({ error: 'workflow_mismatch' });
       linkedWorkflowId = execution.workflow_id;
     }
@@ -5428,10 +5667,25 @@ function tenantBinding(
     if (!canActOnHumanTask(task, principal)) return res.status(403).json({ error: 'not_assignee' });
     if (task.status === 'completed' || task.status === 'rejected') return res.status(409).json({ error: 'already_decided', status: task.status });
     if (task.status === 'expired' || task.status === 'cancelled') return res.status(409).json({ error: 'task_closed', status: task.status });
+    // Resolve the execution before reserving the task. Only the exact task
+    // the engine created for this pause may resume it, and only at its
+    // recorded node. Legacy/unbound paused runs fail closed rather than
+    // accepting a fabricated approval.
+    let checkpointExec: StoredExecution | null = null;
+    if (task.execution_id) {
+      checkpointExec = await getExecutionRec(task.execution_id);
+      if (!checkpointExec) return res.status(409).json({ error: 'execution_not_found' });
+      if (checkpointExec.status === 'paused') {
+        if (!checkpointExec.pause_task_id || checkpointExec.pause_task_id !== task.id || !checkpointExec.pause_node) {
+          return res.status(409).json({
+            error: 'not_pause_checkpoint',
+            message: 'this task is not the engine-created checkpoint for the paused execution',
+          });
+        }
+      }
+    }
     if (task.deadline && new Date(task.deadline).getTime() < Date.now()) {
-      await transitionHumanTaskRec(task.id, ['pending', 'claimed'], {
-        status: 'expired', escalated_at: new Date().toISOString(),
-      });
+      await expireHumanTask(task, true);
       return res.status(409).json({ error: 'task_expired' });
     }
     const b = (req.body || {}) as any;
@@ -5467,12 +5721,30 @@ function tenantBinding(
     const completeTask = () => transitionHumanTaskRec(task.id, ['resuming'], { status: nextStatus });
     let resumed: any = null;
     if (updated.execution_id) {
-      const exec = await getExecutionRec(updated.execution_id);
+      const exec = checkpointExec || await getExecutionRec(updated.execution_id);
       const wf = updated.workflow_id ? await getWorkflowRec(updated.workflow_id) : null;
       if (exec && exec.status === 'paused' && wf && canAccessWorkflow(wf, exec.principal || principal)) {
         const output = { humanTask: { id: updated.id, status: nextStatus, decision: updated.decision, note: updated.note }, ...(updated.decision || {}) };
+        // Never trust task.node_name for execution. The checkpoint node is
+        // authoritative and was persisted by the engine at pause time.
+        const resumeNode = exec.pause_node;
+        if (!resumeNode) {
+          await restoreTask();
+          return res.status(409).json({ error: 'not_pause_checkpoint' });
+        }
+        if (exec.workflow_revision != null
+          && wf.revision != null
+          && Number(exec.workflow_revision) !== Number(wf.revision)) {
+          await restoreTask();
+          return res.status(409).json({
+            error: 'workflow_revision_conflict',
+            message: 'the workflow changed after this execution paused; review the new revision and start a new run',
+            expectedRevision: exec.workflow_revision,
+            actualRevision: wf.revision,
+          });
+        }
         if (exec.queue_name && exec.runner !== 'inline') {
-          const queued = await queueExecutionResume(exec.id, { node: updated.node_name, output });
+          const queued = await queueExecutionResume(exec.id, { node: resumeNode, output });
           if (!queued) {
             await restoreTask();
             return res.status(409).json({ error: 'already_resumed', status: 'running' });
@@ -5505,7 +5777,7 @@ function tenantBinding(
             {
               triggeredBy: 'human-task', principal: exec.principal || principal,
               credentialResolver: makeCredentialResolver(exec.principal || principal), synapseoneCall,
-              resumeFrom: { node: updated.node_name, output },
+              resumeFrom: { node: resumeNode, output },
               humanTask: {
                 create: async (nodeTask: any) => {
                   const rec = await createHumanTaskRec({
@@ -5526,7 +5798,12 @@ function tenantBinding(
           if (r.status === 'paused') {
             // A second human-task node pauses the same execution: persist the
             // new checkpoint instead of marking the run successful.
-            await savePausedExecutionRec(exec.id, { output: r.output, node_runs: mergedRuns as any });
+            await savePausedExecutionRec(exec.id, {
+              output: r.output,
+              node_runs: mergedRuns as any,
+              pauseTaskId: r.pause?.task?.id ? String(r.pause.task.id) : null,
+              pauseNode: r.pause?.node ? String(r.pause.node) : null,
+            });
             await completeTask();
             recordRun('human-task', 'paused', r.nodeRuns);
             resumed = {
@@ -5604,6 +5881,11 @@ function tenantBinding(
     const principal = principalFromHeaders(req);
     const task = await getHumanTaskRec(String(req.params.id || ''));
     if (!task || !await canAccessHumanTask(task, principal)) return res.status(404).json({ error: 'not_found' });
+    // Expiring a pending approval is a destructive action. Only an assignee /
+    // candidate-role holder or an organization administrator may force it.
+    if (!canActOnHumanTask(task, principal) && principal?.isOrgAdmin !== true) {
+      return res.status(403).json({ error: 'not_assignee' });
+    }
     const result = await expireHumanTask(task, (req.body || {}).force === true);
     if (!result.ok) return res.status(result.status || 409).json({ error: result.error });
     res.json({ task: toPublicHumanTask(result.task) });
@@ -5811,15 +6093,28 @@ function tenantBinding(
     }
     const principal = principalFromHeaders(req);
     const startedAt = new Date().toISOString();
-    const r = await runWorkflow(definition, input ?? {}, { triggeredBy: 'test', principal, credentialResolver: makeCredentialResolver(principal), synapseoneCall });
+    const executionId = randomUUID();
+    const syntheticWfId = `test-${randomUUID().slice(0, 8)}`;
+    const testWf: StoredWorkflow = attach || {
+      id: syntheticWfId, name: 'test-run', nodes: [], connections: {},
+      settings: {}, active: false, org_id: principal?.org || null, account_id: principal?.account || null,
+      owner_sub: principal?.sub || null, run_as: null, revision: 1, created_at: startedAt, updated_at: startedAt,
+    };
+    const r = await runWorkflow(definition, input ?? {}, {
+      triggeredBy: 'test', principal, credentialResolver: makeCredentialResolver(principal), synapseoneCall,
+      humanTask: inlineHumanTaskSink(executionId, testWf, principal),
+    });
     const finishedAt = new Date().toISOString();
     recordRun('test', r.status, r.nodeRuns);
-    const wfId = attach ? attach.id : `test-${randomUUID().slice(0, 8)}`;
+    const wfId = attach ? attach.id : syntheticWfId;
     const exec = await createExecutionRec({
+      id: executionId,
       workflow_id: wfId, workflow_name: attach ? attach.name : 'test-run', status: r.status,
       input: input ?? {}, output: r.output, node_runs: r.nodeRuns as any,
       error: (r as any).error ?? null, triggered_by: 'test',
       principal, actor: actorFor(wfId, principal), startedAt, finishedAt,
+      workflow_revision: attach ? attach.revision : undefined,
+      ...pauseBinding(r),
     });
     res.status(r.status === 'success' ? 200 : 500).json({
       ok: r.status === 'success', output: r.output, nodeRuns: r.nodeRuns,
@@ -6677,7 +6972,7 @@ const lastCronRun = new Map<string, number>();
 /** Recover executions whose runner/worker died mid-job (expired lease) and
  *  expire human tasks whose deadline passed. The queue is at-least-once, so a
  *  duplicate republish is harmless: claimExecutionRec is the exactly-one guard. */
-export async function reclaimWorkflowStateOnce(): Promise<{ reclaimed: number; republished: number; expiredTasks: number }> {
+export async function reclaimWorkflowStateOnce(opts: { resumeStaleMs?: number } = {}): Promise<{ reclaimed: number; republished: number; expiredTasks: number; reconciledTasks: number }> {
   let reclaimed = 0;
   let republished = 0;
   let expiredTasks = 0;
@@ -6717,6 +7012,42 @@ export async function reclaimWorkflowStateOnce(): Promise<{ reclaimed: number; r
       }
     }
   }
+  // Reconcile decisions that were reserved as `resuming` but whose process
+  // died before dispatch. This is the durable recovery path for the
+  // reservation→dispatch crash window: a still-paused execution gets its task
+  // back for retry; an accepted/terminal execution completes the task.
+  const staleResumeAfterMs = opts.resumeStaleMs ?? Math.max(15, Number(process.env.WORKFLOW_RESUME_STALE_SECONDS || 60) || 60) * 1000;
+  const resuming = await listStaleResumingHumanTasks(staleResumeAfterMs, 200).catch(() => []);
+  let reconciledTasks = 0;
+  for (const task of resuming) {
+    const exec = task.execution_id ? await getExecutionRec(task.execution_id).catch(() => null) : null;
+    if (!exec) {
+      const closed = await transitionHumanTaskRec(task.id, ['resuming'], {
+        status: 'cancelled', escalated_at: new Date().toISOString(),
+      }).catch(() => null);
+      if (closed) reconciledTasks += 1;
+      continue;
+    }
+    if (exec.status === 'paused') {
+      const restored = await transitionHumanTaskRec(task.id, ['resuming'], {
+        status: task.claimed_by ? 'claimed' : 'pending',
+        claimed_by: task.claimed_by || null,
+        claimed_at: task.claimed_at || null,
+        completed_by: null,
+        completed_at: null,
+        decision: null,
+        note: null,
+        escalated_at: null,
+      }).catch(() => null);
+      if (restored) reconciledTasks += 1;
+      continue;
+    }
+    const decision = task.decision && typeof task.decision === 'object' ? task.decision as any : {};
+    const done = await transitionHumanTaskRec(task.id, ['resuming'], {
+      status: decision.approved === false ? 'rejected' : 'completed',
+    }).catch(() => null);
+    if (done) reconciledTasks += 1;
+  }
   const overdue = await listOverdueHumanTasks(200).catch(() => []);
   for (const task of overdue) {
     const updated = await transitionHumanTaskRec(task.id, ['pending', 'claimed'], {
@@ -6735,7 +7066,7 @@ export async function reclaimWorkflowStateOnce(): Promise<{ reclaimed: number; r
       }
     }
   }
-  return { reclaimed, republished, expiredTasks };
+  return { reclaimed, republished, expiredTasks, reconciledTasks };
 }
 
 export function startWorkflowReclaimer(): void {
@@ -6755,6 +7086,7 @@ function startCronLoop(): void {
       const actives = await listActiveCronWorkflows();
       const now = Date.now();
       for (const wf of actives) {
+        if (wf.org_id && await orgSuspended(wf.org_id)) continue;
         const interval = workflowCronIntervalMs({ nodes: wf.nodes as any });
         const wallClock = !interval ? workflowCronNextRunAt({ nodes: wf.nodes as any }, now) : null;
         if (!interval && !wallClock) continue;
@@ -6787,18 +7119,26 @@ function startCronLoop(): void {
             continue;
           }
           const startedAt = new Date().toISOString();
+          const executionId = randomUUID();
           const r = await runWorkflow(
             { nodes: wf.nodes as any, connections: wf.connections as any, name: wf.name, settings: wf.settings as any },
             { scheduledAt: startedAt },
-            { triggeredBy: 'cron', principal: runPrincipal, credentialResolver: makeCredentialResolver(runPrincipal), synapseoneCall },
+            {
+              triggeredBy: 'cron', principal: runPrincipal,
+              credentialResolver: makeCredentialResolver(runPrincipal), synapseoneCall,
+              humanTask: inlineHumanTaskSink(executionId, wf, runPrincipal),
+            },
           );
           const finishedAt = new Date().toISOString();
           recordRun('cron', r.status, r.nodeRuns);
           await createExecutionRec({
+            id: executionId,
             workflow_id: wf.id, workflow_name: wf.name, status: r.status,
             input: { scheduledAt: startedAt }, output: r.output, node_runs: r.nodeRuns as any,
             error: (r as any).error ?? null, triggered_by: 'cron',
             principal: runPrincipal, actor: actorFor(wf.id, runPrincipal), startedAt, finishedAt,
+            workflow_revision: wf.revision,
+            ...pauseBinding(r),
           });
           console.log(`[workflow][cron] ${wf.name} (${wf.id}) -> ${r.status}`);
         } catch (e: any) {

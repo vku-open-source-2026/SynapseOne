@@ -60,7 +60,7 @@ tenant. Platform calls without a tenant fail with `400 tenant_required`.
   revocation, account binding and org status. Refuses inactive/suspended target
   users or orgs, cross-tenant targets (`403 cross_tenant`) and scope escalation;
   audited.
-- `POST /v1/auth/refresh {refreshToken}` → `{accessToken, refreshToken}` (rotation: the old token is revoked)
+- `POST /v1/auth/refresh {refreshToken}` → `{accessToken, refreshToken}` (rotation: the old token is revoked and marked consumed). Presenting a consumed token again revokes the whole token family; a token revoked by logout/session revocation returns `401` without revoking the user's other sessions. Clients must serialize refresh calls: a concurrent replay is treated as token theft.
 - `POST /v1/auth/logout {refreshToken}` → `{ok}`
 - `POST /v1/auth/logout-all {refreshToken}` → `{ok, revoked}` (revokes all of your own sessions)
 - `GET /v1/auth/verify` (Bearer or X-API-Key) → `{valid, ...}`; API-key responses include the verified owning `org_id`
@@ -113,10 +113,14 @@ with AES-256-GCM using `IAM_MFA_ENCRYPTION_KEY` (32 bytes, hex/base64; derived f
 
 - `GET /v1/orgs` → `[{id, slug, display_name}]`
 - `POST /v1/orgs {slug, displayName}` → org
+- `PATCH /v1/orgs/:orgId {displayName}` → org (org admin; slug/kind/status immutable; platform org protected)
 - `GET /v1/orgs/:orgId/accounts`
 - `POST /v1/orgs/:orgId/accounts {slug, displayName}`
+- `GET /v1/accounts/:accountId` → account + credential counts
+- `PATCH /v1/accounts/:accountId {displayName}` → account (org admin; status is lifecycle-managed)
 - `GET /v1/orgs/:orgId/users` → users in the org
 - `POST /v1/orgs/:orgId/users {email, displayName}`
+- `PATCH /v1/users/:userId {displayName}` → user (self or org admin; email/sub immutable)
 
 ## Roles / Policies / Authorize
 
@@ -166,11 +170,16 @@ for `AUTHZ_CACHE_TTL_MS` (default 30 s). `reason` is one of `org-admin`,
 `policy-allow`, `scope-only`, `explicit-deny`, `implicit-deny`, `scope-deny`,
 `unknown-principal`.
 
+- `GET /v1/accounts/:accountId` → account metadata + credential counts
+- `POST /v1/accounts/:accountId/retire {reason}` → org-admin retirement; revokes all account API keys and service accounts, keeps resources
+- `POST /v1/accounts/:accountId/reactivate` → org-admin reactivation; revoked credentials stay revoked
 - `POST /v1/accounts/:accountId/roles {slug, description}`
 - `GET /v1/accounts/:accountId/roles`
+- `PATCH /v1/roles/:roleId {description}` → role (sensitive mutation)
 - `DELETE /v1/roles/:roleId`
 - `POST /v1/accounts/:accountId/policies {slug, description, document}`
 - `GET /v1/accounts/:accountId/policies`
+- `PATCH /v1/policies/:policyId {description?, document?}` → policy (validated; sensitive mutation)
 - `DELETE /v1/policies/:policyId`
 - `POST /v1/roles/:roleId/attach {policyId}`
 - `POST /v1/users/:userId/assign {roleId}`
@@ -194,6 +203,7 @@ for `AUTHZ_CACHE_TTL_MS` (default 30 s). `reason` is one of `org-admin`,
 
 - `POST /v1/accounts/:accountId/keys {name, scopes?, userId?, expiresInSeconds?}` → `{apiKey (shown once), id, prefix}`. `scopes` defaults to least-privilege `["*:read"]`; pass `["*"]` explicitly for an admin key. Scopes outside the caller's authority → `403 scope_escalation`.
 - `GET /v1/accounts/:accountId/keys` → key metadata list (id/name/prefix/scopes/expiry/revoked — never secret values)
+- `GET /v1/keys/:id` → key metadata by id (never the secret; tenant-guarded)
 - `POST /v1/keys/verify {apiKey}` → `{valid, id, account_id, org_id, user_id, scopes}`
 - `DELETE /v1/keys/:id` → revokes the key
 - `POST /v1/keys/:id/rotate {graceSeconds?}` → `{id, apiKey (shown once), prefix, rotatedFrom, oldKeyExpiresAt}` (201) —
@@ -207,6 +217,7 @@ for `AUTHZ_CACHE_TTL_MS` (default 30 s). `reason` is one of `org-admin`,
 
 - `POST /v1/accounts/:accountId/service-accounts {slug, description}` → service account
 - `GET /v1/accounts/:accountId/service-accounts` → list
+- `GET /v1/service-accounts/:id` → service account + roles (never a secret)
 - `POST /v1/service-accounts/:id/token {scopes?}` → `{accessToken (kind=service-account), expiresIn}`
 - `GET /v1/service-accounts/:id/roles` → roles granted to the service account
 - `POST /v1/service-accounts/:id/roles {roleId}` → `{ok}` (role must be in the SA's account — `403 cross_account`)
@@ -327,6 +338,7 @@ them. A payload field claiming to be an actor does not grant Tier-1 permission.
   Optional `expectedRevision=<positive integer>` checks the revision of the exact definition being executed/enqueued. A mismatch returns `409 workflow_revision_conflict` without publishing a job; malformed values return `400 invalid_revision`. The precondition is a query parameter, separate from workflow input. Platform workers and custom runner claims also reject queued jobs if the definition revision changed while waiting, including resumed jobs. They finish those executions with an error and run no nodes; submit a new execution after reviewing the new definition. Existing queued jobs without revision metadata retain legacy behavior.
 - `POST /v1/workflows/test-run {definition, input, workflowId?}` (try a definition without saving; validates + executes inline in the sandbox; persisted as a `triggered_by=test` execution — pass `workflowId` to attach it to that workflow's history; returns `{ok, output, nodeRuns, executionId}`)
 - `GET /v1/executions` (`limit,offset,workflowId,status,triggeredBy,includeData`; `limit/offset` 0..9999, `offset=0` = first page; `status` is `queued|running|paused|success|error|cancelled`; `triggeredBy` is `manual|webhook|cron|test|human-task|workflow|mcp`; secret-looking keys in payloads are masked to `***`; always returns the envelope `{data: [...]}` — SDKs/Console/CLI unwrap `.data` and also accept a bare array) / `GET /v1/executions/:id` (`?includeData=true` for per-node input/output; also carries `principal`, `actor`, `queue`, `runner`, `workerId`, `attempt`, `leaseExpiresAt`, `workflowRevision`)
+- `POST /v1/executions/:id/cancel` — cancel a `queued` or human-`paused` execution. `200` returns the cancelled execution; `409 execution_not_cancellable` for `running`/terminal runs. Cancellation closes pending/claimed human tasks and is stricter than read access (account owner, execution owner, or org admin).
 - `GET/POST/DELETE /v1/credentials[?accountId=]` (account-scoped secrets, AES-256-GCM at rest via `SYNAPSEONE_CREDENTIAL_KEY`; list/create return metadata only, never secrets; duplicate names per account are `409`)
 - Public inbound webhooks: `ANY /webhook/:path` triggers the ACTIVE workflow whose webhook node declares that `path` (also proxied at the gateway as `/webhook`, auth none — per-workflow auth below still applies):  ```bash
   curl -X POST http://localhost:4002/webhook/transform \
@@ -650,7 +662,13 @@ Every collection route below also works under
   ordered ops `create|set|update|delete|increment`; per-op results, `ok` only when
   everything succeeded; `ifVersion` is honored only by `delete`
 - `GET /v1/base/collections/:collection/changes?since=&limit=100&as=` — upserts
-  only (`deleted` is always false); reuse `nextSince`
+  and delete tombstones (`deleted:true`); reuse `nextSince`
+- `GET /v1/base/outbox?limit=50` — tenant-scoped quarantined outbox events
+  (metadata + last error, newest first); platform callers see all tenants
+- Internal `GET /internal/base/outbox` and
+  `POST /internal/base/outbox/:eventId/replay` (`x-synapseone-internal`) expose
+  global outbox stats/dead letters and requeue one event with a fresh retry
+  budget; replay keeps the event id so downstream dedupe still applies
 
 ### SynapseBase Graph (Tier-1 property graph)
 
@@ -807,7 +825,9 @@ Full guide: [queue.md](queue.md).
 
 ## Stream — distributed event streaming (`stream-service:4009`, gateway `/v1/stream`)
 
-Tenant-scoped distributed event streaming log (pluggable Valkey/Redis Streams or Kafka backend) with consumer groups, time-range replay and retention trimming.
+Tenant-scoped distributed event streaming log over Valkey/Redis Streams (the
+Kafka driver is not shipped) with consumer groups, time-range replay and
+retention trimming.
 
 - `GET /v1/stream/topics` → list topics for tenant
 - `PUT /v1/stream/topics/:topic {maxLen?, minId?, retentionMs?}` — create or update stream topic
@@ -820,8 +840,12 @@ Tenant-scoped distributed event streaming log (pluggable Valkey/Redis Streams or
 - `GET /v1/stream/topics/:topic/range?start=&end=&count=` — historical time-range query / replay
 - `PUT /v1/stream/topics/:topic/groups/:group {startId?}` — create a consumer group
 - `DELETE /v1/stream/topics/:topic/groups/:group` — destroy a consumer group
-- `POST /v1/stream/topics/:topic/groups/:group/read {consumer, count?, blockMs?, autoAck?}` — read via consumer group
+- `POST /v1/stream/topics/:topic/groups/:group/read {consumer, count?, blockMs?, autoAck?, claimIdleMs?}` — read via consumer group; first reclaims unacknowledged entries idle for `claimIdleMs` (default 30000, `0` disables), then delivers new entries
 - `POST /v1/stream/topics/:topic/groups/:group/ack {ids:[]}` — acknowledge processed event IDs
+
+Consumer-group delivery is at-least-once: a crash after read and before ack
+re-delivers the batch after `claimIdleMs`, so consumers must make destination
+writes idempotent. Ordering is per topic stream, not global.
 
 
 Delivery semantics: consuming leases a message and increments `attempts`. Ack
@@ -878,8 +902,123 @@ See `docs/notifications.md`.
 - `GET /v1/notifications?status=&limit=` → `[notification]`
 - `GET /v1/notifications/:id` → status + attempt history
 - `POST /v1/notifications/:id/cancel` → cancelled notification (`409` when not cancellable)
+- `POST /v1/notifications/:id/retry` → re-queued notification (`409` unless `failed`/`dead`); starts a fresh attempt budget
+- `POST /v1/notifications/templates {slug, name, subject?, body}` → template (variables derived from `{{var}}`; malformed placeholders `400`)
+- `GET /v1/notifications/templates?q=&includeArchived=&limit=&offset=` → `{items,total,limit,offset,nextOffset}`
+- `GET /v1/notifications/templates/:id` → template + `version` + `variables`
+- `PATCH /v1/notifications/templates/:id {name?, subject?, body?}` → template (version increments)
+- `POST /v1/notifications/templates/:id/preview {data}` → `{subject, body, variables, missing}`
+- `DELETE /v1/notifications/templates/:id` → archives the template; enqueueing from an archived template is `409`
+- Enqueue with `{templateId|templateSlug, data}` instead of `body`; missing variables → `400 missing_template_variables`.
+  Content is rendered and persisted at enqueue time, so later template edits never change queued notifications.
 - `GET/PUT /v1/notifications/preferences/:recipient` → `{tenant, recipient, channels, unsubscribed}`
 - `POST /v1/notifications/unsubscribe {recipient}` → preference
+
+## Warehouse — analytical datasets and ETL (`warehouse-service:4012`, gateway `/v1/warehouse`)
+
+Tenant-scoped DuckDB datasets with read-only SQL, batch/stream ETL and a
+source-to-dataset connector. Tenant SQL is sandboxed: external file/network
+access is disabled, configuration is locked, and only the tenant's datasets are
+addressable. All mutations require `warehouse:Write`; queries need
+`warehouse:Read`.
+
+- `GET /v1/warehouse/datasets?name=&mode=&limit=&offset=` → `{items,total,limit,offset,nextOffset}` (`limit` default/max 200);
+  `GET|PATCH|DELETE /v1/warehouse/datasets/:id` (`PATCH` accepts `name` and/or `description`)
+- `POST /v1/warehouse/datasets {id?, name, description?, columns:[{name,type}], mode?, streamTopic?}` —
+  `type` is `string|number|boolean|timestamp|json`; dataset ids are
+  tenant-scoped slugs
+- `POST /v1/warehouse/datasets/:id/rows {rows:[{...}]}` — append 1..5000 rows;
+  values are validated against the declared columns
+- `POST /v1/warehouse/query {sql, limit?}` — one read-only statement
+  (`SELECT`/`WITH`/`DESCRIBE`/`EXPLAIN`), bounded result rows and timeout
+- `GET /v1/warehouse/templates` — built-in ETL recipes
+- `GET /v1/warehouse/pipeline/status` — dataset/job counts and freshness
+- `GET /v1/warehouse/jobs?status=&mode=&targetDatasetId=&name=&limit=&offset=` →
+  `{items,total,limit,offset,nextOffset}` (`limit` default/max 200); `GET|PATCH|DELETE /v1/warehouse/jobs/:id`
+  (`PATCH` renames a non-stream job or a paused stream job; `409 job_running` while a stream worker is active);
+  `POST /v1/warehouse/jobs/:id/run`, `POST /v1/warehouse/jobs/:id/pause`,
+  `POST /v1/warehouse/jobs/:id/resume` — durable job definitions and stream
+  worker lifecycle
+- `POST /v1/warehouse/etl/batch {targetDatasetId, sql, writeMode?="append", name?}` —
+  run one read-only transformation into the target (`replace` recreates the
+  table from the query result)
+- `POST /v1/warehouse/etl/stream {targetDatasetId, streamTopic, streamGroup?, batchSize?, intervalMs?, name?}` —
+  consume a SynapseStream topic, materialize payloads and ack only after the
+  DuckDB transaction commits; event ids are recorded in `_ingest_events` so
+  redelivery is idempotent
+- `POST /v1/warehouse/etl/ocs/preview {bucket, key, format?}` — download an
+  authorized OCS object through the internal OCS API, infer CSV/JSONL/Parquet
+  columns and return a bounded sample plus `bytes`.
+- `POST /v1/warehouse/etl/ocs {bucket, key, format?, targetDatasetId, writeMode?="replace", maxRows?, name?}` —
+  import a CSV/JSONL/Parquet object into a dataset. `replace` is transactional
+  and idempotent; `append` is at-least-once. File size is bounded by
+  `WAREHOUSE_OCS_MAX_FILE_BYTES` (default 64 MiB) and rows by `maxRows`.
+- `POST /v1/warehouse/etl/base {targetDatasetId, collection, database?, writeMode?="replace", pageSize?, maxRows?, name?}` —
+  snapshot a SynapseBase collection through the internal Base API and insert
+  document `data` plus `document_id`, `collection`, `version`, `created_at`,
+  `updated_at` columns when present in the target schema. `replace` stages the
+  full snapshot and atomically swaps it in after the source read succeeds; a
+  failed read preserves the previous rows. Incremental changes use the Base
+  outbox → Stream → stream ETL path.
+- `POST /v1/warehouse/etl/base-lakehouse {collection, namespace, table, database?, streamTopic?="base-changes", backfill?=true}` —
+  create a durable Base→Stream→Lakehouse ETL job. The target Iceberg table must
+  contain `event_id, collection, document_id, operation, version, occurred_at,
+  data, deleted`. It is an **append-only change log** (updates/deletes are rows,
+  not in-place Iceberg mutations). `backfill` calls Base's deterministic
+  backfill; the worker acknowledges Stream only after Lakehouse append succeeds;
+  the idempotency key is
+  `base:<collection_id>:<document_id>:<created_at>:<version>:<upsert|delete>`
+  (`create`/`update` at one version share an upsert key; delete is separate;
+  the collection id + creation time prevent delete/re-create collisions).
+  Backfill pages through every cursor until `hasMore=false`; when `database` is
+  supplied, both the backfill and live stream are scoped to that database.
+- Internal usage rollup/summary/watermark endpoints are internal-only and not
+  routed publicly.
+
+## Lakehouse — Apache Iceberg tables (`lakehouse-service:4013`, gateway `/v1/lakehouse`)
+
+Real Iceberg v2 tables written as Parquet to the shared S3-compatible store.
+A SQL catalog (platform Postgres) owns namespace/table metadata; PyIceberg
+performs catalog commits and snapshot management. Each organization/account
+maps to a hidden physical namespace; clients cannot choose a storage location.
+The service never trusts client `x-synapseone-*` headers without the internal
+secret (the gateway strips and re-stamps them).
+
+- `GET /v1/lakehouse/namespaces` / `POST {name}` / `DELETE /:namespace` —
+  tenant-scoped logical namespaces; dropping requires an empty namespace
+- `GET /v1/lakehouse/namespaces/:namespace/tables` /
+  `POST {name, schema:[{name,type,required?}]}`
+- `GET|DELETE /v1/lakehouse/namespaces/:namespace/tables/:table` — metadata,
+  schema, location, current snapshot; delete is a catalog drop that **retains
+  data files** (`dataFilesRetained:true`) for safe manual cleanup
+- `POST /v1/lakehouse/namespaces/:namespace/tables/:table/rows {rows, idempotencyKey?}` — append up to 5000
+  rows; a repeated idempotency key returns the existing snapshot with
+  `duplicate:true` instead of writing again
+- `POST /v1/lakehouse/namespaces/:namespace/tables/:table/query {limit?, snapshotId?}` — bounded scan (max 5000
+  rows); `snapshotId` enables time travel
+- `GET /v1/lakehouse/namespaces/:namespace/tables/:table/snapshots` — snapshot ids, parent, timestamp,
+  operation and summary (snapshot ids are **strings**, they exceed JS safe
+  integer range)
+- `POST /v1/lakehouse/namespaces/:namespace/tables/:table/schema {add:[{name,type,required?}]}` — additive
+  schema evolution
+- `GET /v1/lakehouse/namespaces/:namespace/tables/:table/maintenance` —
+  non-destructive lifecycle report; `physicalCleanup:"disabled"` because
+  snapshot expiry/orphan cleanup requires an operator-reviewed Iceberg job
+- `GET /v1/lakehouse/usage` — namespace/table counts, current-snapshot bytes,
+  byte quota and configured row limits. The byte guard is an estimate from
+  current-snapshot file sizes plus the incoming JSON payload; historical
+  snapshots and orphans are excluded.
+
+Types: `string|long|double|number|boolean|timestamp|date|json` (JSON is stored
+as string). Supported table version is Iceberg v2, unpartitioned. Commit
+conflicts surface as `409 commit_conflict`; the service uses one catalog lock
+per process, so horizontally scaled replicas may retry.
+
+Warehouse integration is a trusted materialization: `POST /v1/warehouse/etl/lakehouse
+{namespace, table, targetDatasetId, snapshotId?, limit?, writeMode?}` scans the
+authorized Iceberg table through this service and inserts the rows into a
+tenant-owned DuckDB dataset. Tenant SQL never receives Iceberg filesystem
+access.
 
 ## Usage analytics & request telemetry (`iam-service`, gateway `/v1/usage`)
 

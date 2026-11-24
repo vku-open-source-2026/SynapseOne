@@ -170,3 +170,66 @@ async fn batch_update_uses_documents_batch() {
         .unwrap();
     assert_eq!(result["results"][0]["ok"], true);
 }
+
+#[tokio::test]
+async fn warehouse_methods_target_registered_routes() {
+    let server = MockServer::start().await;
+    let routes = [
+        ("GET", "/v1/warehouse/datasets"),
+        ("POST", "/v1/warehouse/datasets"),
+        ("GET", "/v1/warehouse/datasets/ds1"),
+        ("PATCH", "/v1/warehouse/datasets/ds1"),
+        ("DELETE", "/v1/warehouse/datasets/ds1"),
+        ("POST", "/v1/warehouse/datasets/ds1/rows"),
+        ("POST", "/v1/warehouse/query"),
+        ("GET", "/v1/warehouse/templates"),
+        ("GET", "/v1/warehouse/pipeline/status"),
+        ("GET", "/v1/warehouse/jobs"),
+        ("POST", "/v1/warehouse/jobs"),
+        ("GET", "/v1/warehouse/jobs/j1"),
+        ("PATCH", "/v1/warehouse/jobs/j1"),
+        ("DELETE", "/v1/warehouse/jobs/j1"),
+        ("POST", "/v1/warehouse/jobs/j1/run"),
+        ("POST", "/v1/warehouse/jobs/j1/pause"),
+        ("POST", "/v1/warehouse/jobs/j1/resume"),
+        ("POST", "/v1/warehouse/etl/batch"),
+        ("POST", "/v1/warehouse/etl/stream"),
+        ("POST", "/v1/warehouse/etl/base"),
+        ("POST", "/v1/warehouse/etl/lakehouse"),
+        ("POST", "/v1/warehouse/etl/base-lakehouse"),
+        ("POST", "/v1/warehouse/etl/ocs/preview"),
+        ("POST", "/v1/warehouse/etl/ocs"),
+    ];
+    for (verb, route) in routes {
+        Mock::given(method(verb))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(&server)
+            .await;
+    }
+    let warehouse = client(&server).warehouse();
+    warehouse.datasets().await.unwrap();
+    warehouse.create_dataset(json!({ "name": "ds", "columns": [] })).await.unwrap();
+    warehouse.dataset("ds1").await.unwrap();
+    warehouse.update_dataset("ds1", json!({ "name": "renamed" })).await.unwrap();
+    warehouse.delete_dataset("ds1").await.unwrap();
+    warehouse.ingest("ds1", json!([])).await.unwrap();
+    warehouse.query("select 1", Some(10)).await.unwrap();
+    warehouse.templates().await.unwrap();
+    warehouse.pipeline_status().await.unwrap();
+    warehouse.jobs().await.unwrap();
+    warehouse.create_job(json!({ "mode": "batch" })).await.unwrap();
+    warehouse.get_job("j1").await.unwrap();
+    warehouse.update_job("j1", json!({ "name": "renamed" })).await.unwrap();
+    warehouse.delete_job("j1").await.unwrap();
+    warehouse.run_job("j1").await.unwrap();
+    warehouse.pause_job("j1").await.unwrap();
+    warehouse.resume_job("j1").await.unwrap();
+    warehouse.run_batch(json!({})).await.unwrap();
+    warehouse.ensure_stream(json!({})).await.unwrap();
+    warehouse.base_to_warehouse(json!({})).await.unwrap();
+    warehouse.lakehouse_to_warehouse(json!({})).await.unwrap();
+    warehouse.base_to_lakehouse(json!({})).await.unwrap();
+    warehouse.preview_ocs(json!({})).await.unwrap();
+    warehouse.import_ocs(json!({})).await.unwrap();
+}

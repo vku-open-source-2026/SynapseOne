@@ -3,8 +3,8 @@
 ## Supported versions
 | Version | Supported |
 |---|---|
-| 0.3.x | ✅ |
-| < 0.3 | ❌ (upgrade) |
+| 0.9.x | ✅ |
+| < 0.9 | ❌ (upgrade) |
 
 ## Reporting a vulnerability
 - **Do not** open a public GitHub issue.
@@ -30,11 +30,11 @@
    keep working (verify tries peppered then legacy hash).
 7. `CORS_ORIGIN=https://console.your-domain` (never `*` in production).
 8. `HSTS_ENABLED=true` **only** behind TLS (see `docker-compose.tls.yml`).
-9. Rate-limit OUTSIDE the gateway (Ingress NGINX `limit_req`, Cloudflare/AWS WAF).
-   The gateway's built-in limiter was removed (ops decision — it once caused
-   spurious 429s via a shared store). Without external rate limiting there is
-   NO brute-force protection on `/v1/auth/*` (login/refresh). Never expose
-   IAM/workflow directly.
+9. Rate-limit at the edge (Ingress NGINX `limit_req`, Cloudflare/AWS WAF) and keep
+   `TRUST_PROXY=1` so the gateway's in-memory per-client limiter sees the real
+   client IP. The built-in limiter is a per-process safety net, not a shared
+   distributed quota; external limiting remains mandatory for `/v1/auth/*`
+   brute-force protection. Never expose IAM/workflow directly.
 10. Track CVEs of external engines and pin images: Authentik, PostgreSQL,
     Valkey (see `docker-compose.yml`).
 11. Console stores the session token in `localStorage` (XSS-readable by design for a
@@ -43,7 +43,9 @@
 
 ## Auth model (defense in depth)
 - Gateway is the only public entrypoint: JWT (`Authorization: Bearer`) and/or
-  `X-API-Key` on every route except `/v1/auth/*`, `/health`, `/ready`, `/metrics`.
+  `X-API-Key` on every route except explicitly public paths (`/v1/auth/*`,
+  `/health`, `/ready`, `/metrics`, public LDS reads, `/webhook/*`, `/scim/*`,
+  and token-authenticated `/v1/ocs/signed`).
 - Gateway strips all client-sent `x-synapseone-*` headers and re-emits them from the
   verified principal (spoof-proof propagation to upstreams).
 - IAM and workflow additionally require `x-synapseone-internal` (shared secret) on
@@ -74,10 +76,10 @@
   global and no host intrinsics; never treat `node:vm` alone as a sandbox.
 - IAM validates `email` (RFC, ≤320 chars, lowercased) and `slug` (`^[a-z0-9-]{1,64}$`)
   with zod on login / OIDC-callback / org / account / user creation.
-- No in-gateway rate limiting (removed by ops decision): brute-force protection
-  for `/v1/auth/*` MUST come from Ingress/WAF. The removed limiter once caused
-  spurious 429s via a shared Redis store (fixed by keyspace separation, then
-  removed entirely to keep CI/ops simple).
+- The gateway has an in-memory per-client limiter (`/v1/auth/*` 120/min,
+  `/ready` 30/min, inference per-tenant quota). It is per process, so
+  brute-force protection for `/v1/auth/*` MUST also come from Ingress/WAF and
+  `TRUST_PROXY` must be set correctly.
 - Authentik is an external engine — track its own CVEs and pin images in `docker-compose.yml`.
 
 ## Known transitive findings (accepted, tracked)

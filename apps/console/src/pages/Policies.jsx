@@ -7,7 +7,7 @@
 import React, { useEffect, useState } from 'react';
 import { useAuth } from '../lib/auth.jsx';
 import { api } from '../lib/api.js';
-import { Btn, Card, Code, Empty, Err, Field, Input, Modal, PageTitle, Table, TableSkeleton } from '../components/ui.jsx';
+import { Btn, Card, Code, Empty, Err, Field, Input, Modal, PageTitle, Pager, SearchBox, Table, TableSkeleton } from '../components/ui.jsx';
 import { ScopeBar, useScope } from '../components/Scope.jsx';
 
 const SAMPLE = JSON.stringify(
@@ -36,6 +36,10 @@ export default function Policies() {
   const [slug, setSlug] = useState('');
   const [doc, setDoc] = useState(SAMPLE);
   const [managed, setManaged] = useState([]);
+  const [q, setQ] = useState('');
+  const [offset, setOffset] = useState(0);
+  const [total, setTotal] = useState(0);
+  const limit = 20;
 
   useEffect(() => {
     if (!open || managed.length) return;
@@ -57,8 +61,9 @@ export default function Policies() {
     }
     setErr(null);
     try {
-      const v = await api.policies(scope.accountId, headers);
-      setRows(Array.isArray(v) ? v : []);
+      const v = await api.policiesPaged(scope.accountId, { limit, offset, q }, headers);
+      setRows(Array.isArray(v?.items) ? v.items : []);
+      setTotal(Number(v?.total) || 0);
     } catch (e) {
       setErr(e);
     } finally {
@@ -67,8 +72,10 @@ export default function Policies() {
   };
 
   useEffect(() => {
-    load();
-  }, [scope.accountId, headers]);
+    const t = setTimeout(load, 250);
+    return () => clearTimeout(t);
+  }, [scope.accountId, headers, offset, q]);
+  useEffect(() => { setOffset(0); }, [q]);
 
   const create = async (e) => {
     e.preventDefault();
@@ -109,6 +116,7 @@ export default function Policies() {
       <PageTitle title="Policies" sub="AWS-style JSON: Allow/Deny + Action/Resource + Condition" right={canAdmin ? <Btn onClick={() => { setFormErr(null); setOpen(true); }}>+ New</Btn> : undefined} />
       <Err e={err} />
       <ScopeBar scope={scope} />
+      <SearchBox value={q} onChange={setQ} placeholder="Search policies…" />
       <Card>
         {!loaded ? (
           <TableSkeleton rows={5} cols={3} />
@@ -131,6 +139,7 @@ export default function Policies() {
           <Empty text={scope.accountId ? 'No policies yet' : 'Pick an account to see its policies'} />
         )}
       </Card>
+      <Pager total={total} limit={limit} offset={offset} onChange={setOffset} loading={!loaded} />
       {open && (
         <Modal title="New policy" onClose={() => { setOpen(false); setFormErr(null); }}>
           <form onSubmit={create}><Err e={formErr} />

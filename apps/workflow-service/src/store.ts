@@ -111,12 +111,18 @@ export interface StoredExecution {
   workflow_revision?: number | null;
   resume_node?: string | null;
   resume_output?: any;
+  /** Bound engine-created human-task checkpoint (see schema). */
+  pause_task_id?: string | null;
+  pause_node?: string | null;
   startedAt: string;
   finishedAt: string;
 }
 
 export type RunnerMode = 'custom' | 'hybrid' | 'system';
 export type RunnerScope = 'tenant' | 'platform';
+/** Tenant runners are account-scoped by default; `org` is an explicit,
+ *  admin-only organization-wide compute grant. */
+export type RunnerAudience = 'account' | 'org';
 
 export type RunnerKind = 'workflow' | 'inference' | 'hybrid';
 
@@ -125,6 +131,7 @@ export interface StoredWorkflowRunner {
   name: string;
   kind: RunnerKind;
   scope: RunnerScope;
+  audience: RunnerAudience;
   mode: RunnerMode;
   queue: string;
   inference_queue?: string | null;
@@ -617,6 +624,8 @@ function rowToExecution(r: typeof executions.$inferSelect): StoredExecution {
     workflow_revision: r.workflowRevision != null ? Number(r.workflowRevision) : null,
     resume_node: r.resumeNode != null ? String(r.resumeNode) : null,
     resume_output: r.resumeOutput ?? null,
+    pause_task_id: r.pauseTaskId != null ? String(r.pauseTaskId) : null,
+    pause_node: r.pauseNode != null ? String(r.pauseNode) : null,
     startedAt: iso(r.startedAt),
     finishedAt: iso(r.finishedAt),
   };
@@ -779,6 +788,8 @@ export async function createExecutionRec(data: {
   workflow_revision?: number | null;
   resume_node?: string | null;
   resume_output?: any;
+  pause_task_id?: string | null;
+  pause_node?: string | null;
 }): Promise<StoredExecution> {
   const rec: StoredExecution = {
     id: data.id || randomUUID(),
@@ -805,6 +816,8 @@ export async function createExecutionRec(data: {
     workflow_revision: data.workflow_revision ?? null,
     resume_node: data.resume_node ?? null,
     resume_output: data.resume_output ?? null,
+    pause_task_id: data.pause_task_id ?? null,
+    pause_node: data.pause_node ?? null,
     startedAt: data.startedAt,
     finishedAt: data.finishedAt || data.startedAt,
   };
@@ -833,6 +846,8 @@ export async function createExecutionRec(data: {
       workflowRevision: rec.workflow_revision,
       resumeNode: rec.resume_node,
       resumeOutput: rec.resume_output ?? null,
+      pauseTaskId: rec.pause_task_id ?? null,
+      pauseNode: rec.pause_node ?? null,
       startedAt: new Date(rec.startedAt),
       finishedAt: new Date(rec.finishedAt),
     }).returning();
@@ -891,6 +906,26 @@ export async function listExecutionRecs(opts: {
   if (opts.orgId) arr = arr.filter((e) => (e.principal?.org || null) === opts.orgId);
   if (opts.accountId) arr = arr.filter((e) => (e.principal?.account || null) === opts.accountId);
   return { items: arr.slice(offset, offset + limit) };
+}
+
+/** Count work that would be stranded if a runner registration were deleted. */
+export async function countActiveExecutionsForRunner(runnerId: string, queue: string, includeQueue = true): Promise<number> {
+  const statuses = ['queued', 'running'];
+  if (db) {
+    await ensureTables();
+    const rows = await db.select({ n: sql<number>`count(*)::int` }).from(executions)
+      .where(and(
+        inArray(executions.status, statuses),
+        includeQueue
+          ? or(eq(executions.targetRunnerId, runnerId), eq(executions.queueName, queue))
+          : eq(executions.targetRunnerId, runnerId),
+      ));
+    return Number(rows[0]?.n) || 0;
+  }
+  return [...memExecutions.values()].filter((exec) =>
+    statuses.includes(exec.status)
+      && (exec.target_runner_id === runnerId || (includeQueue && exec.queue_name === queue)),
+  ).length;
 }
 
 /** Atomically claim a queued execution (or an expired running lease) for a
@@ -1098,6 +1133,9 @@ export async function pauseExecutionRec(id: string, patch: {
   workerId?: string | null;
   instanceId?: string | null;
   attempt?: number;
+  /** Exact engine-created task/node pair that owns the resume right. */
+  pauseTaskId?: string | null;
+  pauseNode?: string | null;
 }): Promise<StoredExecution | null> {
   if (db) {
     await ensureTables();
@@ -1112,6 +1150,8 @@ export async function pauseExecutionRec(id: string, patch: {
       nodeRuns: patch.node_runs,
       error: patch.error ?? null,
       leaseExpiresAt: null,
+      pauseTaskId: patch.pauseTaskId ?? null,
+      pauseNode: patch.pauseNode ?? null,
       finishedAt: new Date(),
     }).where(and(...conds)).returning();
     return rows[0] ? rowToExecution(rows[0]) : null;
@@ -1129,6 +1169,8 @@ export async function pauseExecutionRec(id: string, patch: {
     node_runs: patch.node_runs,
     error: patch.error ?? null,
     lease_expires_at: null,
+    pause_task_id: patch.pauseTaskId ?? null,
+    pause_node: patch.pauseNode ?? null,
     finishedAt: new Date().toISOString(),
   };
   memExecutions.set(id, next);
@@ -1224,6 +1266,20 @@ export async function claimWebhookDelivery(workflowId: string, key: string, ttlM
     }
   }
   return true;
+}
+
+/** Release a delivery receipt when the webhook could not be accepted (for
+ *  example an oversized body or a queue outage), so a retry is not rejected
+ *  for the whole idempotency TTL. */
+export async function releaseWebhookDelivery(workflowId: string, key: string): Promise<void> {
+  if (db) {
+    await ensureTables().catch(() => undefined);
+    await db.delete(webhookDeliveries).where(and(
+      eq(webhookDeliveries.workflowId, workflowId),
+      eq(webhookDeliveries.deliveryKey, key),
+    )).catch(() => undefined);
+  }
+  memWebhookDeliveries.delete(`${workflowId}:${key}`);
 }
 
 /** Increment the fixed one-minute rate bucket. Returns the new count and the
@@ -1758,6 +1814,46 @@ export async function transitionHumanTaskRec(
   return next;
 }
 
+/** Cancel an execution that has not started yet (queued) or is waiting on a
+ *  human checkpoint (paused). Running executions are intentionally not killed
+ *  from here: their worker/runner owns the lease and must report a terminal
+ *  state. */
+export async function cancelExecutionRec(id: string, reason = 'cancelled by user'): Promise<StoredExecution | null> {
+  const message = String(reason || 'cancelled by user').slice(0, 500);
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(executions).set({
+      status: 'cancelled',
+      error: message,
+      workerId: null,
+      runnerInstanceId: null,
+      leaseExpiresAt: null,
+      pauseTaskId: null,
+      pauseNode: null,
+      finishedAt: new Date(),
+    }).where(and(
+      eq(executions.id, id),
+      inArray(executions.status, ['queued', 'paused']),
+    )).returning();
+    return rows[0] ? rowToExecution(rows[0]) : null;
+  }
+  const cur = memExecutions.get(id);
+  if (!cur || (cur.status !== 'queued' && cur.status !== 'paused')) return null;
+  const next: StoredExecution = {
+    ...cur,
+    status: 'cancelled',
+    error: message,
+    worker_id: null,
+    runner_instance_id: null,
+    lease_expires_at: null,
+    pause_task_id: null,
+    pause_node: null,
+    finishedAt: new Date().toISOString(),
+  };
+  memExecutions.set(id, next);
+  return next;
+}
+
 /** Mark a paused execution as resumed exactly once. */
 export async function claimExecutionResume(id: string): Promise<boolean> {
   if (db) {
@@ -1799,6 +1895,8 @@ export async function finishExecutionRec(id: string, patch: {
       nodeRuns: patch.node_runs,
       error: patch.error ?? null,
       leaseExpiresAt: null,
+      pauseTaskId: null,
+      pauseNode: null,
       finishedAt: new Date(patch.finishedAt),
     }).where(and(...conds)).returning();
     return rows[0] ? rowToExecution(rows[0]) : null;
@@ -1809,7 +1907,9 @@ export async function finishExecutionRec(id: string, patch: {
   if (!runnerFenceMatches(cur.runner_instance_id, cur.attempt, cur.lease_expires_at, patch)) return null;
   const next: StoredExecution = {
     ...cur, status: patch.status, output: patch.output, node_runs: patch.node_runs,
-    error: patch.error ?? null, lease_expires_at: null, finishedAt: patch.finishedAt,
+    error: patch.error ?? null, lease_expires_at: null,
+    pause_task_id: null, pause_node: null,
+    finishedAt: patch.finishedAt,
   };
   memExecutions.set(id, next);
   return next;
@@ -1827,6 +1927,8 @@ export async function queueExecutionResume(id: string, patch: {
       status: 'queued',
       resumeNode: patch.node,
       resumeOutput: patch.output,
+      // Keep the pause binding until the worker actually resumes/finishes so
+      // a failed queue dispatch can be restored to the same approval.
       workerId: null,
       runnerInstanceId: null,
       leaseExpiresAt: null,
@@ -1882,6 +1984,8 @@ export async function savePausedExecutionRec(id: string, patch: {
   output: any;
   node_runs: StoredExecution['node_runs'];
   error?: string | null;
+  pauseTaskId?: string | null;
+  pauseNode?: string | null;
 }): Promise<StoredExecution | null> {
   if (db) {
     await ensureTables();
@@ -1890,6 +1994,8 @@ export async function savePausedExecutionRec(id: string, patch: {
       output: patch.output,
       nodeRuns: patch.node_runs,
       error: patch.error ?? null,
+      pauseTaskId: patch.pauseTaskId ?? null,
+      pauseNode: patch.pauseNode ?? null,
       workerId: null,
       runnerInstanceId: null,
       leaseExpiresAt: null,
@@ -1904,6 +2010,8 @@ export async function savePausedExecutionRec(id: string, patch: {
     output: patch.output,
     node_runs: patch.node_runs,
     error: patch.error ?? null,
+    pause_task_id: patch.pauseTaskId ?? null,
+    pause_node: patch.pauseNode ?? null,
     worker_id: null,
     runner_instance_id: null,
     lease_expires_at: null,
@@ -1961,6 +2069,24 @@ export async function reclaimExpiredExecution(id: string): Promise<StoredExecuti
 }
 
 /** Overdue pending/claimed human tasks (deadline sweeper). */
+/** Tasks stuck in `resuming` after a crash between decision reservation and
+ *  dispatch. The reclaimer reconciles them against the execution state. */
+export async function listStaleResumingHumanTasks(olderThanMs: number, limit = 100): Promise<StoredHumanTask[]> {
+  const cutoff = new Date(Date.now() - Math.max(0, olderThanMs));
+  if (db) {
+    await ensureTables();
+    const rows = await db.select().from(humanTasks)
+      .where(and(eq(humanTasks.status, 'resuming'), lt(humanTasks.updatedAt, cutoff)))
+      .orderBy(asc(humanTasks.updatedAt))
+      .limit(Math.min(Math.max(limit, 1), 500));
+    return rows.map(rowToHumanTask);
+  }
+  return [...memHumanTasks.values()]
+    .filter((task) => task.status === 'resuming' && new Date(task.updated_at).getTime() < cutoff.getTime())
+    .sort((a, b) => a.updated_at.localeCompare(b.updated_at))
+    .slice(0, Math.min(Math.max(limit, 1), 500));
+}
+
 export async function listOverdueHumanTasks(limit = 100): Promise<StoredHumanTask[]> {
   const n = Math.min(Math.max(Number(limit) || 100, 1), 500);
   const now = new Date();
@@ -2690,6 +2816,7 @@ function rowToRunner(r: typeof workflowRunners.$inferSelect): StoredWorkflowRunn
     name: String(r.name || ''),
     kind: r.kind === 'inference' || r.kind === 'hybrid' ? r.kind : 'workflow',
     scope,
+    audience: r.audience === 'org' ? 'org' : 'account',
     mode,
     queue: String(r.queue || ''),
     inference_queue: r.inferenceQueue != null ? String(r.inferenceQueue) : null,
@@ -2713,6 +2840,7 @@ export async function createRunnerRec(data: {
   name: string;
   kind?: RunnerKind;
   scope?: RunnerScope;
+  audience?: RunnerAudience;
   mode: RunnerMode;
   queue: string;
   inference_queue?: string | null;
@@ -2728,6 +2856,7 @@ export async function createRunnerRec(data: {
     name: data.name,
     kind: data.kind === 'inference' || data.kind === 'hybrid' ? data.kind : 'workflow',
     scope: data.scope === 'platform' ? 'platform' : 'tenant',
+    audience: data.audience === 'org' ? 'org' : 'account',
     mode: data.mode === 'hybrid' ? 'hybrid' : data.mode === 'system' ? 'system' : 'custom',
     queue: data.queue,
     inference_queue: cleanTenant(data.inference_queue),
@@ -2751,6 +2880,7 @@ export async function createRunnerRec(data: {
       name: rec.name,
       kind: rec.kind,
       scope: rec.scope,
+      audience: rec.audience,
       mode: rec.mode,
       queue: rec.queue,
       inferenceQueue: rec.inference_queue,

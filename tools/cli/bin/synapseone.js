@@ -585,6 +585,10 @@ async function cmdOrgs(o) {
     need(slug, 'slug');
     return out(await POST('/v1/orgs', { slug, displayName: name || slug }, o), o);
   }
+  if (sub === 'update' || sub === 'rename') {
+    need(rest[0], 'org-id'); need(rest[1] || o.name, 'display-name');
+    return out(await req('PATCH', `/v1/orgs/${encodeURIComponent(rest[0])}`, { displayName: rest[1] || o.name }, o), o);
+  }
   throw new Error(`unknown orgs subcommand '${sub}'`);
 }
 async function orgId(o, maybeId) {
@@ -603,6 +607,14 @@ async function cmdAccounts(o) {
     need(slug, 'slug');
     return out(await POST(`/v1/orgs/${org}/accounts`, { slug, displayName: name }, o), o);
   }
+  if (sub === 'update' || sub === 'rename') {
+    need(rest[0], 'account-id'); need(rest[1] || o.name, 'display-name');
+    return out(await req('PATCH', `/v1/accounts/${encodeURIComponent(rest[0])}`, { displayName: rest[1] || o.name }, o), o);
+  }
+  if (sub === 'get') {
+    need(rest[0], 'account-id');
+    return out(await GET(`/v1/accounts/${encodeURIComponent(rest[0])}`, o), o);
+  }
   const org = sub && sub !== 'list' ? sub : await orgId(o);
   return out(await GET(`/v1/orgs/${encodeURIComponent(org)}/accounts`, o), o, ['slug', 'display_name', 'id']);
 }
@@ -612,6 +624,10 @@ async function cmdUsers(o) {
     const [org, email, name] = rest;
     need(org, 'org'); need(email, 'email');
     return out(await POST(`/v1/orgs/${encodeURIComponent(org)}/users`, { email, displayName: name || email }, o), o);
+  }
+  if (sub === 'update' || sub === 'rename') {
+    need(rest[0], 'user-id'); need(rest[1] || o.name, 'display-name');
+    return out(await req('PATCH', `/v1/users/${encodeURIComponent(rest[0])}`, { displayName: rest[1] || o.name }, o), o);
   }
   if (sub === 'policies') {
     need(rest[0], 'user-id');
@@ -652,6 +668,12 @@ async function cmdRoles(o) {
     need(account, 'account'); need(slug, 'slug');
     return out(await POST(`/v1/accounts/${encodeURIComponent(account)}/roles`, { slug }, o), o);
   }
+  if (sub === 'update') {
+    need(rest[0], 'role-id');
+    const description = rest.slice(1).join(' ') || o.description;
+    need(description, 'description');
+    return out(await req('PATCH', `/v1/roles/${encodeURIComponent(rest[0])}`, { description }, o), o);
+  }
   if (sub === 'delete') {
     need(rest[0], 'role-id');
     return out(await DEL(`/v1/roles/${encodeURIComponent(rest[0])}`, o), o);
@@ -667,6 +689,14 @@ async function cmdPolicies(o) {
     if (o.managed) return out(await POST(`/v1/accounts/${encodeURIComponent(account)}/policies`, { slug, managed: o.managed }, o), o);
     need(o.file, '--file policy.json (or --managed NAME)');
     return out(await POST(`/v1/accounts/${encodeURIComponent(account)}/policies`, { slug, document: readJson(o.file) }, o), o);
+  }
+  if (sub === 'update') {
+    need(rest[0], 'policy-id');
+    const body = {};
+    if (o.description !== undefined) body.description = String(o.description);
+    if (o.file) body.document = readJson(o.file);
+    if (!Object.keys(body).length) throw new Error('policies update needs --description and/or --file');
+    return out(await req('PATCH', `/v1/policies/${encodeURIComponent(rest[0])}`, body, o), o);
   }
   if (sub === 'delete') {
     need(rest[0], 'policy-id');
@@ -730,6 +760,10 @@ async function cmdKeys(o) {
     else process.stdout.write(`${JSON.stringify(r, null, 2)}\n`);
     return;
   }
+  if (sub === 'get') {
+    need(rest[0], 'key-id');
+    return out(await GET(`/v1/keys/${encodeURIComponent(rest[0])}`, o), o);
+  }
   if (sub === 'revoke' || sub === 'delete') {
     need(rest[0], 'key-id');
     return out(await DEL(`/v1/keys/${encodeURIComponent(rest[0])}`, o), o);
@@ -757,6 +791,10 @@ async function cmdSa(o) {
     if (!o.json) console.log(`SAVE THIS TOKEN (short-lived):\n${r.accessToken}`);
     else console.log(JSON.stringify(r, null, 2));
     return;
+  }
+  if (sub === 'get') {
+    need(rest[0], 'sa-id');
+    return out(await GET(`/v1/service-accounts/${encodeURIComponent(rest[0])}`, o), o);
   }
   if (sub === 'roles') {
     need(rest[0], 'sa-id');
@@ -1831,6 +1869,41 @@ async function cmdNotifications(o) {
     return out(await POST(NOTIFICATIONS, body, o), o);
   }
   if (sub === 'cancel') return out(await POST(`${NOTIFICATIONS}/${enc(rest[0], 'notification-id')}/cancel`, {}, o), o);
+  if (sub === 'retry') return out(await POST(`${NOTIFICATIONS}/${enc(rest[0], 'notification-id')}/retry`, {}, o), o);
+  if (sub === 'templates' || sub === 'template') {
+    const [action, ...args] = rest;
+    if (!action || action === 'list') {
+      const q = queryOf({ q: o.q || o.filter, includeArchived: o.includeArchived ? 'true' : undefined, limit: o.limit, offset: o.offset });
+      const r = await GET(`${NOTIFICATIONS}/templates${q}`, o);
+      return out(r.items || r, o, ['slug', 'name', 'version', 'archivedAt', 'updatedAt']);
+    }
+    if (action === 'create') {
+      let bodyText = o.body;
+      if (bodyText === undefined && o.bodyFile) bodyText = fs.readFileSync(o.bodyFile, 'utf8');
+      return out(await POST(`${NOTIFICATIONS}/templates`, {
+        slug: need(o.slug || args[0], '--slug'),
+        name: need(o.name || args[1], '--name'),
+        subject: o.subject === undefined ? '' : String(o.subject),
+        body: need(bodyText, '--body or --body-file'),
+      }, o), o);
+    }
+    if (action === 'get') return out(await GET(`${NOTIFICATIONS}/templates/${enc(args[0], 'template-id')}`, o), o);
+    if (action === 'update') {
+      const body = {};
+      if (o.name !== undefined) body.name = String(o.name);
+      if (o.subject !== undefined) body.subject = String(o.subject);
+      if (o.body !== undefined) body.body = String(o.body);
+      if (!Object.keys(body).length) throw new Error('templates update needs --name, --subject or --body');
+      return out(await req('PATCH', `${NOTIFICATIONS}/templates/${enc(args[0], 'template-id')}`, body, o), o);
+    }
+    if (action === 'delete' || action === 'archive') {
+      return out(await DEL(`${NOTIFICATIONS}/templates/${enc(args[0], 'template-id')}`, o), o);
+    }
+    if (action === 'preview') {
+      return out(await POST(`${NOTIFICATIONS}/templates/${enc(args[0], 'template-id')}/preview`, { data: jsonArg(o, 'template data JSON') }, o), o);
+    }
+    throw new Error('usage: notifications templates [list|create|get|update|delete|preview] ...');
+  }
   if (sub === 'prefs' || sub === 'preferences') {
     const [action, recipient] = rest;
     const rid = enc(recipient, 'recipient');
@@ -1844,7 +1917,7 @@ async function cmdNotifications(o) {
   if (sub === 'unsubscribe') {
     return out(await POST(`${NOTIFICATIONS}/unsubscribe`, { recipient: need(rest[0], 'recipient') }, o), o);
   }
-  throw new Error('usage: synapseone notifications [list|get|send|cancel|prefs|unsubscribe] ...');
+  throw new Error('usage: synapseone notifications [list|get|send|cancel|retry|prefs|unsubscribe] ...');
 }
 
 // ---------- Search (SynapseBase index) ----------
@@ -2019,6 +2092,74 @@ async function inferenceJobs(o, args) {
   throw new Error('usage: inference jobs [list|get|submit] ...');
 }
 
+// ---------- Synapse Lakehouse ----------
+const LAKEHOUSE = '/v1/lakehouse';
+
+async function cmdLakehouse(o) {
+  const [sub, ...rest] = o._;
+  if (!sub || sub === 'usage') return out(await GET(`${LAKEHOUSE}/usage`, o), o);
+  if (sub === 'namespaces' || sub === 'ns') {
+    const [action, name] = rest;
+    if (!action || action === 'list') return out(await GET(`${LAKEHOUSE}/namespaces`, o), o);
+    if (action === 'create') {
+      return out(await POST(`${LAKEHOUSE}/namespaces`, { name: need(name, '<namespace>') }, o), o);
+    }
+    if (action === 'delete') {
+      return out(await DEL(`${LAKEHOUSE}/namespaces/${encodeURIComponent(need(name, '<namespace>'))}`, o), o);
+    }
+    throw new Error('usage: lakehouse namespaces [list|create|delete] <namespace>');
+  }
+  if (sub === 'tables') {
+    const namespace = need(rest[0], '<namespace>');
+    return out(await GET(`${LAKEHOUSE}/namespaces/${encodeURIComponent(namespace)}/tables`, o), o);
+  }
+  if (sub === 'table') {
+    const namespace = need(rest[0], '<namespace>');
+    const table = need(rest[1], '<table>');
+    return out(await GET(`${LAKEHOUSE}/namespaces/${encodeURIComponent(namespace)}/tables/${encodeURIComponent(table)}`, o), o);
+  }
+  if (sub === 'create') {
+    const namespace = need(rest[0], '<namespace>');
+    const table = need(rest[1], '<table>');
+    if (!o.schema) throw new Error('lakehouse create needs --schema \'[{"name":"id","type":"string"}]\'');
+    return out(await POST(`${LAKEHOUSE}/namespaces/${encodeURIComponent(namespace)}/tables`, {
+      name: table,
+      schema: JSON.parse(String(o.schema)),
+    }, o), o);
+  }
+  if (sub === 'append') {
+    const namespace = need(rest[0], '<namespace>');
+    const table = need(rest[1], '<table>');
+    if (!o.rows) throw new Error('lakehouse append needs --rows \'[{...}]\'');
+    const body = { rows: JSON.parse(String(o.rows)) };
+    if (o.idempotencyKey) body.idempotencyKey = String(o.idempotencyKey);
+    return out(await POST(`${LAKEHOUSE}/namespaces/${encodeURIComponent(namespace)}/tables/${encodeURIComponent(table)}/rows`, body, o), o);
+  }
+  if (sub === 'query') {
+    const namespace = need(rest[0], '<namespace>');
+    const table = need(rest[1], '<table>');
+    const body = {};
+    if (o.limit !== undefined) body.limit = intOpt(o.limit);
+    if (o.snapshot) body.snapshotId = String(o.snapshot);
+    const r = await POST(`${LAKEHOUSE}/namespaces/${encodeURIComponent(namespace)}/tables/${encodeURIComponent(table)}/query`, body, o);
+    if (o.json) return out(r, o);
+    out(r.rows || [], o, r.columns || undefined);
+    if (r.rowCount !== undefined) console.error(`rows: ${r.rowCount} (snapshot ${r.snapshotId || 'current'})`);
+    return;
+  }
+  if (sub === 'snapshots') {
+    const namespace = need(rest[0], '<namespace>');
+    const table = need(rest[1], '<table>');
+    return out(await GET(`${LAKEHOUSE}/namespaces/${encodeURIComponent(namespace)}/tables/${encodeURIComponent(table)}/snapshots`, o), o);
+  }
+  if (sub === 'drop') {
+    const namespace = need(rest[0], '<namespace>');
+    const table = need(rest[1], '<table>');
+    return out(await DEL(`${LAKEHOUSE}/namespaces/${encodeURIComponent(namespace)}/tables/${encodeURIComponent(table)}`, o), o);
+  }
+  throw new Error('usage: synapseone lakehouse [usage|namespaces|tables|table|create|append|query|snapshots|drop] ...');
+}
+
 // ---------- Synapse Warehouse ----------
 const WAREHOUSE = '/v1/warehouse';
 
@@ -2051,14 +2192,60 @@ async function cmdWarehouse(o) {
     if (o.writeMode) body.writeMode = String(o.writeMode);
     return out(await POST(`${WAREHOUSE}/etl/batch`, body, o), o);
   }
-  throw new Error('usage: synapseone warehouse [datasets|dataset|query|templates|jobs|job|etl-batch] ...');
+  if (sub === 'ocs-preview') {
+    return out(await POST(`${WAREHOUSE}/etl/ocs/preview`, {
+      bucket: need(o.bucket, '--bucket <name>'),
+      key: need(o.key, '--key <object-key>'),
+      ...(o.format ? { format: String(o.format) } : {}),
+    }, o), o);
+  }
+  if (sub === 'etl-ocs') {
+    return out(await POST(`${WAREHOUSE}/etl/ocs`, {
+      bucket: need(o.bucket, '--bucket <name>'),
+      key: need(o.key, '--key <object-key>'),
+      targetDatasetId: need(o.dataset, '--dataset <id>'),
+      ...(o.format ? { format: String(o.format) } : {}),
+      ...(o.writeMode ? { writeMode: String(o.writeMode) } : {}),
+      ...(o.maxRows ? { maxRows: intOpt(o.maxRows) } : {}),
+      ...(o.name ? { name: String(o.name) } : {}),
+    }, o), o);
+  }
+  if (sub === 'etl-base') {
+    return out(await POST(`${WAREHOUSE}/etl/base`, {
+      collection: need(o.collection, '--collection <name>'),
+      targetDatasetId: need(o.dataset, '--dataset <id>'),
+      ...(o.database ? { database: String(o.database) } : {}),
+      ...(o.writeMode ? { writeMode: String(o.writeMode) } : {}),
+    }, o), o);
+  }
+  if (sub === 'etl-lakehouse') {
+    return out(await POST(`${WAREHOUSE}/etl/lakehouse`, {
+      namespace: need(o.namespace, '--namespace <name>'),
+      table: need(o.table, '--table <name>'),
+      targetDatasetId: need(o.dataset, '--dataset <id>'),
+      ...(o.snapshotId ? { snapshotId: String(o.snapshotId) } : {}),
+      ...(o.limit ? { limit: intOpt(o.limit) } : {}),
+      ...(o.writeMode ? { writeMode: String(o.writeMode) } : {}),
+    }, o), o);
+  }
+  if (sub === 'etl-base-lakehouse') {
+    return out(await POST(`${WAREHOUSE}/etl/base-lakehouse`, {
+      collection: need(o.collection, '--collection <name>'),
+      namespace: need(o.namespace, '--namespace <name>'),
+      table: need(o.table, '--table <name>'),
+      ...(o.database ? { database: String(o.database) } : {}),
+      ...(o.name ? { name: String(o.name) } : {}),
+      backfill: o.backfill !== 'false',
+    }, o), o);
+  }
+  throw new Error('usage: synapseone warehouse [datasets|dataset|query|templates|jobs|job|etl-batch|etl-ocs|ocs-preview|etl-base|etl-lakehouse|etl-base-lakehouse] ...');
 }
 
 async function warehouseDataset(o, args) {
   const [sub, ...rest] = args;
   if (!sub || sub === 'list') {
-    const r = await GET(`${WAREHOUSE}/datasets`, o);
-    return out(r.datasets || r.data || r, o, ['id', 'name', 'mode', 'rowCount']);
+    const r = await GET(`${WAREHOUSE}/datasets${queryOf({ name: o.filter, mode: o.mode, limit: o.limit, offset: o.offset })}`, o);
+    return out(r.items || r.datasets || r.data || r, o, ['id', 'name', 'mode', 'rowCount']);
   }
   if (sub === 'create') {
     const columns = (o.columns || []).map((raw) => {
@@ -2075,6 +2262,13 @@ async function warehouseDataset(o, args) {
     return out(await POST(`${WAREHOUSE}/datasets`, body, o), o);
   }
   if (sub === 'get') return out(await GET(`${WAREHOUSE}/datasets/${enc(rest[0], 'dataset-id')}`, o), o);
+  if (sub === 'update' || sub === 'rename') {
+    const body = {};
+    if (o.name) body.name = String(o.name);
+    if (o.description !== undefined) body.description = String(o.description);
+    if (!Object.keys(body).length) throw new Error('warehouse dataset update needs --name and/or --description');
+    return out(await req('PATCH', `${WAREHOUSE}/datasets/${enc(rest[0], 'dataset-id')}`, body, o), o);
+  }
   if (sub === 'delete' || sub === 'rm') return out(await DEL(`${WAREHOUSE}/datasets/${enc(rest[0], 'dataset-id')}`, o), o);
   if (sub === 'rows' || sub === 'insert') {
     const raw = jsonArg(o, 'rows JSON');
@@ -2082,14 +2276,14 @@ async function warehouseDataset(o, args) {
     if (!Array.isArray(rows)) throw new Error('rows JSON must be an array or {"rows":[...]}');
     return out(await POST(`${WAREHOUSE}/datasets/${enc(rest[0], 'dataset-id')}/rows`, { rows }, o), o);
   }
-  throw new Error('usage: warehouse dataset [list|create|get|delete|rows] ...');
+  throw new Error('usage: warehouse dataset [list|create|get|update|delete|rows] ...');
 }
 
 async function warehouseJob(o, args) {
   const [sub, ...rest] = args;
   if (!sub || sub === 'list') {
-    const r = await GET(`${WAREHOUSE}/jobs`, o);
-    return out(r.jobs || r.data || r, o, ['id', 'name', 'mode', 'status', 'targetDatasetId']);
+    const r = await GET(`${WAREHOUSE}/jobs${queryOf({ status: o.status, mode: o.mode, targetDatasetId: o.dataset, name: o.filter, limit: o.limit, offset: o.offset })}`, o);
+    return out(r.items || r.jobs || r.data || r, o, ['id', 'name', 'mode', 'status', 'targetDatasetId']);
   }
   if (sub === 'create') {
     const body = {
@@ -2110,8 +2304,12 @@ async function warehouseJob(o, args) {
   const id = () => enc(rest[0], 'job-id');
   if (sub === 'get') return out(await GET(`${WAREHOUSE}/jobs/${id()}`, o), o);
   if (sub === 'run' || sub === 'pause' || sub === 'resume') return out(await POST(`${WAREHOUSE}/jobs/${id()}/${sub}`, {}, o), o);
+  if (sub === 'update' || sub === 'rename') {
+    if (!o.name) throw new Error('warehouse job update needs --name');
+    return out(await req('PATCH', `${WAREHOUSE}/jobs/${id()}`, { name: String(o.name) }, o), o);
+  }
   if (sub === 'delete' || sub === 'rm') return out(await DEL(`${WAREHOUSE}/jobs/${id()}`, o), o);
-  throw new Error('usage: warehouse job [list|create|get|run|pause|resume|delete] ...');
+  throw new Error('usage: warehouse job [list|create|get|update|run|pause|resume|delete] ...');
 }
 
 // ---------- Human tasks ----------
@@ -2208,11 +2406,11 @@ const COMMANDS = {
   config: { fn: cmdConfig, use: 'config', doc: 'Show saved config (secrets redacted)' },
   whoami: { fn: cmdMe, use: 'whoami', doc: 'Current user (/v1/auth/me)' },
   health: { fn: cmdHealth, use: 'health [--ready] [--json]', doc: 'Gateway /health or aggregate /ready (exit 3 when degraded)' },
-  orgs: { fn: cmdOrgs, use: 'orgs [list|create <slug> [name]]', doc: 'Organizations' },
-  accounts: { fn: cmdAccounts, use: 'accounts [org] [list] | accounts create [org] <slug> [name]', doc: 'Accounts' },
-  users: { fn: cmdUsers, use: 'users [org] | users create <org> <email> [name] | users policies <user-id>', doc: 'Users + effective policies' },
-  roles: { fn: cmdRoles, use: 'roles <account> [list] | roles create <account> <slug> | roles delete <id>', doc: 'Roles' },
-  policies: { fn: cmdPolicies, use: 'policies <account> [list] | policies create <account> <slug> (--file p.json | --managed ReadOnlyAccess) | policies delete <id>', doc: 'Policies' },
+  orgs: { fn: cmdOrgs, use: 'orgs [list|create <slug> [name]|update <org-id> <name>]', doc: 'Organizations' },
+  accounts: { fn: cmdAccounts, use: 'accounts [org] [list] | accounts create [org] <slug> [name] | accounts get <id> | accounts update <id> <name>', doc: 'Accounts' },
+  users: { fn: cmdUsers, use: 'users [org] | users create <org> <email> [name] | users update <user-id> <name> | users policies <user-id>', doc: 'Users + effective policies' },
+  roles: { fn: cmdRoles, use: 'roles <account> [list] | roles create <account> <slug> | roles update <role-id> <description> | roles delete <id>', doc: 'Roles' },
+  policies: { fn: cmdPolicies, use: 'policies <account> [list] | policies create <account> <slug> (--file p.json | --managed ReadOnlyAccess) | policies update <id> [--description D] [--file p.json] | policies delete <id>', doc: 'Policies' },
   'managed-policies': { fn: cmdManagedPolicies, use: 'managed-policies', doc: 'AWS-style managed policies (AdministratorAccess, ReadOnlyAccess, ...)' },
   'org-admin': { fn: cmdOrgAdmin, use: 'org-admin <user-id> on|off', doc: 'Grant/revoke organization administrator' },
   sessions: { fn: cmdSessions, use: 'sessions [list] | sessions revoke <session-id>', doc: 'Your login sessions (refresh tokens)' },
@@ -2223,8 +2421,8 @@ const COMMANDS = {
   authz: { fn: cmdAuthz, use: 'authz <user> <action> <resource> [--context k=v]', doc: 'Authorize check' },
   sim: { fn: cmdSim, use: 'sim --file policy.json <action> <resource> [--context k=v]', doc: 'Policy simulator' },
   audit: { fn: cmdAudit, use: 'audit [--limit N] [--actor ID]', doc: 'Audit log' },
-  keys: { fn: cmdKeys, use: 'keys create <account> [--name N] [--scopes a,b] [--user USER_ID] | keys list <account> | keys rotate <key-id> [--grace SECONDS] | keys revoke <key-id> | keys verify <api-key>', doc: 'API keys (scoped, owner-bound, rotatable)' },
-  sa: { fn: cmdSa, use: 'sa <account> [list] | sa create <account> <slug> | sa token <sa-id> | sa roles <sa-id> | sa grant <sa-id> <role-id> | sa revoke-role <sa-id> <role-id>', doc: 'Service accounts + their roles' },
+  keys: { fn: cmdKeys, use: 'keys create <account> [--name N] [--scopes a,b] [--user USER_ID] | keys list <account> | keys get <key-id> | keys rotate <key-id> [--grace SECONDS] | keys revoke <key-id> | keys verify <api-key>', doc: 'API keys (scoped, owner-bound, rotatable)' },
+  sa: { fn: cmdSa, use: 'sa <account> [list] | sa create <account> <slug> | sa get <sa-id> | sa token <sa-id> | sa roles <sa-id> | sa grant <sa-id> <role-id> | sa revoke-role <sa-id> <role-id>', doc: 'Service accounts + their roles' },
   credentials: { fn: cmdCredentials, use: 'credentials create <account> --name N --type bearer|basic|apiKey|oauth2 (--secret S | --secret-file F) [--expires-at ISO] | credentials [list] <account> | credentials get|delete <id> | credentials rotate <id> (--secret S | --secret-file F)', doc: 'Account credentials, secrets write-only (PROPOSED: backend in progress)' },
   workflows: { fn: cmdWorkflows, use: 'workflows [list] | workflows create --template T [--name N] | workflows create --file def.json [--name N] | workflows get|activate|deactivate <id> | workflows exec|execute <id> [--data \'{...}\'|input.json] [--file payload.json] [--wait] [--timeout MS] | workflows update [--name N] [--file def.json] <id> | workflows delete <id> | workflows test-run --file def.json [--input input.json|\'{...}\'] [--workflow-id ID]', doc: 'Workflows (local engine)' },
   runners: { fn: cmdRunners, use: 'runners [list] | runners options | runners create --name N --account ID [--mode custom|hybrid] [--queue Q] [--scopes S] | runners get|connection|instances|command|delete <id> | runners rm-instance <id> <instance-id>', doc: 'Self-hosted workflow runners (queue connectors)' },
@@ -2237,12 +2435,13 @@ const COMMANDS = {
   queue: { fn: cmdQueue, use: 'queue [list|create|get|delete|purge|stats] [name] | queue send|consume|ack|nack|heartbeat|peek|dead|replay <name> ...', doc: 'SynapseQueue: queues, publish/consume, receipts, dead letters' },
   stream: { fn: cmdStream, use: 'stream [topics|create|get|delete|stats|publish|read|range] <topic> | stream group create|read|ack|delete <topic> <group>', doc: 'SynapseStream: topics, events, consumer groups' },
   ocs: { fn: cmdOcs, use: 'ocs buckets | bucket create|get|stats|delete <name> | ls <bucket> | put|get|head|rm <bucket> <key> | copy | presign', doc: 'SynapseOCS: buckets and binary objects' },
-  notifications: { fn: cmdNotifications, use: 'notifications [list|get|send|cancel] ... | notifications prefs get|set <recipient> | notifications unsubscribe <recipient>', doc: 'SynapseNotifications: outbox, delivery and preferences' },
+  notifications: { fn: cmdNotifications, use: 'notifications [list|get|send|cancel|retry] ... | notifications templates [list|create|get|update|delete|preview] ... | notifications prefs get|set <recipient> | notifications unsubscribe <recipient>', doc: 'SynapseNotifications: outbox, delivery, retry and preferences' },
   search: { fn: cmdSearch, use: 'search \'<query>\' [--mode fulltext|semantic|hybrid] [--collection C] | search reindex | search status', doc: 'Tenant-scoped search over SynapseBase documents' },
   secrets: { fn: cmdSecrets, use: 'secrets [list|create|get|read|rotate|revoke|delete] <name>', doc: 'Tenant secret vault (versioned, encrypted at rest)' },
   inference: { fn: cmdInference, use: 'inference [health|chat|embeddings|decision|route] ... | inference jobs [list|get|submit]', doc: 'Synapse Inference: chat, embeddings, decision routing, queued jobs' },
   ai: { fn: cmdAi, use: 'ai agent <question> [--history json]', doc: 'Synapse AI agent (decision + LLM)' },
-  warehouse: { fn: cmdWarehouse, use: 'warehouse [datasets|dataset|query|templates|jobs|job|etl-batch] ...', doc: 'Synapse Warehouse: datasets, SQL queries, ETL jobs' },
+  warehouse: { fn: cmdWarehouse, use: 'warehouse [datasets|dataset|query|templates|jobs|job|etl-batch|etl-ocs|ocs-preview|etl-base-lakehouse] ...', doc: 'Synapse Warehouse: datasets, SQL queries, ETL jobs' },
+  lakehouse: { fn: cmdLakehouse, use: 'lakehouse [usage|namespaces|tables|table|create|append|query|snapshots|drop] ...', doc: 'Synapse Lakehouse: Apache Iceberg namespaces, tables, snapshots' },
   'human-tasks': { fn: cmdHumanTasks, use: 'human-tasks [list|get|create|claim|approve|reject|expire] ...', doc: 'Workflow human approval tasks' },
   usage: { fn: cmdUsage, use: 'usage summary|events [--from ISO] [--to ISO] [--feature F] [--limit N]', doc: 'Org usage analytics (summary and request events)' },
   scim: { fn: cmdScim, use: 'scim tokens | scim token create|revoke ...', doc: 'SCIM provisioning token lifecycle' },

@@ -259,7 +259,7 @@ export async function storeRefresh(userId: string, hash: string, expiresAt: Date
     await db.insert(refreshTokens).values({ userId, tokenHash: hash, expiresAt });
     return;
   }
-  __mem.refresh.set(hash, { id: randomUUID(), user_id: userId, expires_at: expiresAt.toISOString(), revoked_at: null, created_at: new Date().toISOString() });
+  __mem.refresh.set(hash, { id: randomUUID(), user_id: userId, expires_at: expiresAt.toISOString(), revoked_at: null, consumed_at: null, created_at: new Date().toISOString() });
 }
 
 export async function consumeRefresh(value: string): Promise<{ user_id: string } | null> {
@@ -323,7 +323,7 @@ async function consumeAndRevokeByHash(hash: string): Promise<{ user_id: string }
     const db = getDb()!;
     await ensureTables();
     const rows = await db.update(refreshTokens)
-      .set({ revokedAt: sql`now()` })
+      .set({ revokedAt: sql`now()`, consumedAt: sql`now()` })
       .where(and(
         eq(refreshTokens.tokenHash, hash),
         isNull(refreshTokens.revokedAt),
@@ -336,23 +336,28 @@ async function consumeAndRevokeByHash(hash: string): Promise<{ user_id: string }
   if (!rec || rec.revoked_at) return null;
   if (new Date(rec.expires_at).getTime() < Date.now()) return null;
   rec.revoked_at = new Date().toISOString();
+  rec.consumed_at = rec.revoked_at;
   return { user_id: rec.user_id };
 }
 
-/** Lookup owner of a refresh token even if revoked/expired (reuse-detection). */
-export async function findRefreshOwner(value: string): Promise<{ user_id: string } | null> {
+/**
+ * Lookup owner of a refresh token even if revoked/expired (reuse-detection).
+ * `consumed_at` distinguishes a token spent by rotation (replay = theft) from
+ * one revoked by logout/admin action (replay is expected, not a theft signal).
+ */
+export async function findRefreshOwner(value: string): Promise<{ user_id: string; consumed_at: string | null } | null> {
   for (const hash of refreshHashes(value)) {
     if (useDb()) {
       const db = getDb()!;
       await ensureTables();
       try {
-        const rows = await db.select({ userId: refreshTokens.userId })
+        const rows = await db.select({ userId: refreshTokens.userId, consumedAt: refreshTokens.consumedAt })
           .from(refreshTokens).where(eq(refreshTokens.tokenHash, hash)).limit(1);
-        if (rows[0]) return { user_id: rows[0].userId };
+        if (rows[0]) return { user_id: rows[0].userId, consumed_at: iso(rows[0].consumedAt) };
       } catch { /* ignore */ }
     } else {
       const rec = __mem.refresh.get(hash);
-      if (rec) return { user_id: rec.user_id };
+      if (rec) return { user_id: rec.user_id, consumed_at: rec.consumed_at || null };
     }
   }
   return null;

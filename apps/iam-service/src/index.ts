@@ -18,17 +18,19 @@ import {
   createRole, createPolicy,
   attachPolicy, assignRole, detachPolicy, unassignRole, policiesForUser, useDb, deleteRole, deletePolicy,
   createServiceAccount, listServiceAccounts, getServiceAccount,
-  listRoles, listPolicies, logAudit, listAudit, queryAudit, purgeAudit,
+  listRoles, listPolicies, logAudit, listAudit, queryAudit, countAudit, purgeAudit,
   getRoleById, getPolicyById, getAccountById, accountsForUser, getOrgById,
   policiesForRole, rolesForUser, ensureTables,
   setUserPassword, markEmailVerified, storeOneTimeToken, consumeOneTimeToken,
   setUserActive, updateUserProfile, publicUser, bumpAuthVersion,
   setOrgAdmin, orgHasAdmin, assignRoleToServiceAccount, unassignRoleFromServiceAccount, rolesForServiceAccount,
   countActiveOrgAdmins, setOrgAdminGuarded, setUserActiveGuarded, pingDb,
-  getPlatformAdmin, listPlatformAdmins, grantPlatformAdmin, revokePlatformAdmin, countActivePlatformOwners,
+  getPlatformAdmin, listPlatformAdmins, grantPlatformAdmin, revokePlatformAdmin,
+  grantPlatformAdminGuarded, revokePlatformAdminGuarded, countActivePlatformOwners,
   registerPlatformStepUp, consumePlatformStepUp,
   listPlatformOrganizations, getPlatformOrganization, getPlatformOrganizationResources, listPlatformUsers, getPlatformOverviewCounts, platformAuditStats,
-  setOrganizationStatus, listUserRowsByEmail, revokeServiceAccount, listPlatformAccounts,
+  setOrganizationStatus, setAccountStatus, listUserRowsByEmail, revokeServiceAccount, listPlatformAccounts,
+  updateOrganization, updateAccount, updateRole, updatePolicy,
   type PlatformAdmin, type User,
 } from './db';
 import {
@@ -123,6 +125,77 @@ function capContext(ctx: any, maxBytes = 8192): any {
     return out;
   } catch { return {}; }
 }
+type PageQuery = {
+  limit: number;
+  offset: number;
+  paged: boolean;
+  q: string;
+  sort: string;
+  order: 'asc' | 'desc';
+};
+
+/** Parse the shared management-list query contract. Returns null on invalid
+ *  input; the route answers 400 invalid_page. `paged=1` opts into the
+ *  envelope, so existing clients that expect a bare array keep working. */
+function pageQuery(
+  req: express.Request,
+  allowedSorts: string[],
+  defaultSort: string,
+): PageQuery | null {
+  const rawLimit = req.query.limit === undefined ? 50 : Number(req.query.limit);
+  const rawOffset = req.query.offset === undefined ? 0 : Number(req.query.offset);
+  if (!Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > 200) return null;
+  if (!Number.isInteger(rawOffset) || rawOffset < 0 || rawOffset > 100_000) return null;
+  const sort = typeof req.query.sort === 'string' && req.query.sort ? String(req.query.sort) : defaultSort;
+  if (!allowedSorts.includes(sort)) return null;
+  const orderRaw = typeof req.query.order === 'string' ? req.query.order.toLowerCase() : 'asc';
+  if (orderRaw !== 'asc' && orderRaw !== 'desc') return null;
+  const paged = ['1', 'true', 'yes'].includes(String(req.query.paged ?? '').toLowerCase());
+  const q = typeof req.query.q === 'string'
+    ? req.query.q.trim().slice(0, 200)
+    : typeof req.query.search === 'string'
+      ? req.query.search.trim().slice(0, 200)
+      : '';
+  return { limit: rawLimit, offset: rawOffset, paged, q, sort, order: orderRaw };
+}
+
+function filterByQuery<T>(rows: T[], q: string, text: (row: T) => string): T[] {
+  if (!q) return rows;
+  const needle = q.toLowerCase();
+  return rows.filter((row) => text(row).toLowerCase().includes(needle));
+}
+
+function sortRows<T>(
+  rows: T[],
+  query: PageQuery,
+  selectors: Record<string, (row: T) => string | number | boolean | null | undefined>,
+  tie: (row: T) => string,
+): T[] {
+  const selector = selectors[query.sort] || selectors[Object.keys(selectors)[0]];
+  const factor = query.order === 'desc' ? -1 : 1;
+  return rows.slice().sort((a, b) => {
+    const av = selector(a);
+    const bv = selector(b);
+    let cmp = 0;
+    if (typeof av === 'number' && typeof bv === 'number') cmp = av - bv;
+    else if (typeof av === 'boolean' && typeof bv === 'boolean') cmp = Number(av) - Number(bv);
+    else cmp = String(av ?? '').localeCompare(String(bv ?? ''), undefined, { sensitivity: 'base', numeric: true });
+    if (cmp === 0) cmp = tie(a).localeCompare(tie(b));
+    return cmp * factor;
+  });
+}
+
+function pagePayload<T>(query: PageQuery, total: number, items: T[]): any {
+  if (!query.paged) return items;
+  return {
+    items,
+    total,
+    limit: query.limit,
+    offset: query.offset,
+    nextOffset: query.offset + items.length < total ? query.offset + items.length : null,
+  };
+}
+
 function noStore(res: express.Response): void {
   res.setHeader('Cache-Control', 'no-store');
 }
@@ -236,18 +309,40 @@ function orgSuspendedResponse(res: express.Response): express.Response {
   return res.status(403).json({ error: 'org_suspended', message: 'This organization is suspended. Contact a platform administrator.' });
 }
 
+/** Machine credentials stay account-bound; only human login JWTs get the
+ *  same-org fallback used by the bootstrap/first-token flow. */
+function callerIsMachineCredential(req: express.Request, trustStamped: boolean): boolean {
+  if (trustStamped) {
+    const kind = firstHeader((req.headers['x-synapseone-kind'] ?? req.headers['x-synapsedx-kind']) as any);
+    if (kind && kind !== 'user') return true;
+  }
+  if (firstHeader(req.headers['x-api-key'] as any)) return true;
+  const h = firstHeader(req.headers.authorization as any);
+  if (!h.startsWith('Bearer ')) return false;
+  try {
+    const claims = verifyAccess(h.slice(7));
+    return claims.kind === 'service-account' || claims.kind === 'apikey';
+  } catch {
+    return false;
+  }
+}
+
 /** May the caller act for `accountId`? Role-based account membership first,
  *  then same-org fallback (login JWTs carry org but no account, and fresh
  *  users hold no roles yet — without this the bootstrap flow could never mint
  *  its first token). Tenant boundary stays the org. Machine
- *  (service-account) tokens are account-bound: no org fallback. */
+ *  (service-account/API-key) credentials are account-bound: no org fallback. */
 async function canActForAccount(req: express.Request, trustStamped: boolean, accountId: string): Promise<boolean> {
   const accounts = await resolveCallerAccounts(req, trustStamped);
   if (accounts && accounts.includes(accountId)) return true;
+  if (callerIsMachineCredential(req, trustStamped)) return false;
   const org = await resolveCallerOrg(req, trustStamped);
   if (!org) return false;
+  // Login JWTs carry the org but no account; account is a subordinate scope,
+  // not a second tenant boundary. Sensitive key/role/policy mutations still
+  // require an org admin in enforce mode.
   const acc = await getAccountById(accountId);
-  return !!acc && acc.org_id === org;
+  return !!acc && acc.org_id === org && (acc.status || 'active') !== 'retired';
 }
 
 /** Bootstrap rule: the first user of an organization becomes its
@@ -1001,6 +1096,9 @@ export function createApp(): express.Express {
     if (!process.env.DATABASE_URL) {
       throw new Error('[iam] DATABASE_URL must be set in production (in-memory fallback would split-brain).');
     }
+    if (sensitiveMutationMode() !== 'enforce') {
+      throw new Error('[iam] IAM_SENSITIVE_MUTATION_MODE must be enforce in production (audit/off silently allows member privilege escalation).');
+    }
     if (platformFeatureEnabled()) {
       if ((process.env.PLATFORM_ADMIN_REQUIRE_MFA ?? 'true') !== 'true') {
         throw new Error('[iam] PLATFORM_ADMIN_REQUIRE_MFA must be true when the platform console is enabled in production.');
@@ -1111,6 +1209,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
     return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 3650) : 0;
   })();
   if (RETENTION_DAYS > 0) {
+    // Retention is destructive; make the active policy unmistakable in boot
+    // logs and point operators at the backup/restore procedure.
+    console.warn(`[iam][retention] audit rows older than ${RETENTION_DAYS} days will be purged hourly (AUDIT_RETENTION_DAYS=${RETENTION_DAYS})`);
     const sweep = () => {
       purgeAudit(RETENTION_DAYS).then(
         (n) => {
@@ -1841,10 +1942,6 @@ async function auditMutation(req: express.Request, action: string, resource: str
       }
       // Constant-ish work for unknown users; never reveal whether the account exists.
       const ok = user ? await verifyPassword(password, user.password_hash) : false;
-      if (user && user.active === false) {
-        return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated by an administrator.' });
-      }
-      if (user && org && org.status === 'suspended') return orgSuspendedResponse(res);
       if (!user || !ok) {
         const lockedFor = user ? await recordLoginFailure(user.id) : 0;
         await logAudit({
@@ -1853,6 +1950,10 @@ async function auditMutation(req: express.Request, action: string, resource: str
         }).catch(() => undefined);
         return res.status(401).json({ error: 'invalid_credentials', message: 'Email or password is incorrect' });
       }
+      if (user.active === false) {
+        return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated by an administrator.' });
+      }
+      if (org && org.status === 'suspended') return orgSuspendedResponse(res);
       // Second factor: the password alone never yields a session. Failures
       // keep counting until the whole login succeeds.
       if (await mfaEnabled(user.id)) return sendMfaChallenge(res, user.id, 'pwd');
@@ -2365,24 +2466,36 @@ async function auditMutation(req: express.Request, action: string, resource: str
   });
 
   // Refresh xoay vòng NGUYÊN TỬ: consume+revoke 1 bước → replay/race đều rớt.
-  // Reuse signal: RT đã dùng rồi mà dùng lại → 401 + log để monitoring phát hiện
-  // đánh cắp (không auto-revoke cả family để tránh giết nhầm winner trong race
-  // hợp lệ; caller nghi ngờ gọi /v1/auth/logout-all).
+  // Reuse signal: one rotated token presented again revokes the whole family,
+  // because two valid holders means the token leaked. A token revoked by
+  // logout/admin action is NOT a reuse signal: its replay returns 401 but must
+  // not kill the user's other sessions.
   app.post('/v1/auth/refresh', async (req, res) => {
     const { refreshToken } = (req.body || {}) as any;
     if (!refreshToken) return res.status(400).json({ error: 'invalid_refresh_token', message: 'refreshToken required' });
     const rec = await consumeAndRevokeRefresh(refreshToken);
     if (!rec) {
       const owner = await findRefreshOwner(refreshToken).catch(() => null);
-      if (owner) console.warn(`[iam][security] refresh reuse detected for user ${owner.user_id} — possible theft, recommend logout-all`);
+      if (owner?.consumed_at) {
+        // A consumed token presented again is a reuse signal. Revoke the whole
+        // token family (and bump auth_version for access tokens) instead of
+        // only logging; otherwise a stolen token can keep a parallel chain.
+        await revokeAllRefresh(owner.user_id).catch(() => 0);
+        await logAudit({
+          actor_type: 'user', actor_id: owner.user_id, action: 'iam:auth:refresh-reuse',
+          resource: `user:${owner.user_id}`, decision: false,
+          context: { reason: 'consumed_refresh_token_replayed' },
+        }).catch(() => undefined);
+        console.warn(`[iam][security] refresh reuse detected for user ${owner.user_id} — all sessions revoked`);
+      }
       return res.status(401).json({ error: 'invalid_refresh' });
     }
-    const rt = newRefreshToken();
-    await storeRefresh(rec.user_id, rt.hash, refreshExpiry());
     const user = await getUserById(rec.user_id).catch(() => null);
     if (!user || user.active === false) return res.status(401).json({ error: 'account_deactivated' });
     const org = await getOrgById(user.org_id);
     if (org && org.status === 'suspended') return orgSuspendedResponse(res);
+    const rt = newRefreshToken();
+    await storeRefresh(rec.user_id, rt.hash, refreshExpiry());
     const roles = await rolesForUser(user.id).then((rows) => rows.map((r) => r.slug).slice(0, 50)).catch(() => []);
     const { token, expiresIn } = signAccess({
       sub: user.id, email: user.email, org: user.org_id, ver: Number(user.auth_version) || 0,
@@ -2537,14 +2650,38 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (h.startsWith('Bearer ')) {
       try {
         const decoded: any = verifyAccess(h.slice(7));
+        if (decoded.account) {
+          const claimAccount = await getAccountById(String(decoded.account));
+          if (!claimAccount) {
+            return res.status(403).json({ valid: false, error: 'account_not_found' });
+          }
+          if ((claimAccount.status || 'active') === 'retired') {
+            return res.status(403).json({ valid: false, error: 'account_retired', message: 'This account has been retired.' });
+          }
+        }
         if (decoded.kind === 'exec-delegated') {
           // Execution grants are data-plane-only and die when the execution is
           // completed/released, the runner is disabled/deleted, or they expire.
           const grant = await verifyExecutionDelegation(String(decoded.jti || ''));
           if (!grant
+            || grant.user_id !== String(decoded.sub || '')
             || grant.execution_id !== String(decoded.exec || '')
             || grant.runner_id !== String(decoded.runner || '')) {
             return res.status(401).json({ valid: false, error: 'delegation_revoked', message: 'This execution grant was revoked or expired.' });
+          }
+          // A running execution must not outlive the tenant/owner that
+          // authorized it: suspension, deactivation and session revocation
+          // take effect on the next data-plane call, not only at grant expiry.
+          const grantUser = await getUserById(String(decoded.sub || ''));
+          if (!grantUser || grantUser.active === false) {
+            return res.status(401).json({ valid: false, error: 'account_deactivated', message: 'This account has been deactivated.' });
+          }
+          if (Number(decoded.ver || 0) !== Number(grantUser.auth_version || 0)) {
+            return res.status(401).json({ valid: false, error: 'token_revoked', message: 'This session was revoked. Sign in again.' });
+          }
+          const grantOrg = await getOrgById(grantUser.org_id);
+          if (grantOrg && grantOrg.status === 'suspended') {
+            return res.status(403).json({ valid: false, error: 'org_suspended', message: 'This organization is suspended.' });
           }
         }
         if (decoded.kind !== 'service-account') {
@@ -2564,6 +2701,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
           const account = decoded.account ? await getAccountById(String(decoded.account)) : null;
           const org = account ? await getOrgById(account.org_id) : null;
           if (!sa || sa.revoked_at) return res.status(403).json({ valid: false, error: 'service_account_revoked' });
+          if (account && (account.status || 'active') === 'retired') {
+            return res.status(403).json({ valid: false, error: 'account_retired', message: 'This account has been retired.' });
+          }
           if (!account || !org || org.status === 'suspended') {
             return res.status(403).json({ valid: false, error: 'org_suspended', message: 'This organization is suspended.' });
           }
@@ -2583,6 +2723,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
       if (rec) {
         const acc = rec.account_id ? await getAccountById(rec.account_id) : null;
         const keyOrg = acc ? await getOrgById(acc.org_id) : null;
+        if (acc && (acc.status || 'active') === 'retired') {
+          return res.status(403).json({ valid: false, error: 'account_retired' });
+        }
         if (!acc || !keyOrg || keyOrg.status === 'suspended') {
           return res.status(403).json({ valid: false, error: 'org_suspended' });
         }
@@ -2610,9 +2753,44 @@ async function auditMutation(req: express.Request, action: string, resource: str
   // not enumerate other tenants. Callers without an org (machine tokens) get [].
   app.get('/v1/orgs', async (req, res) => {
     const org = await resolveCallerOrg(req, TRUST_STAMPED);
-    const all = await listOrganizations();
-    res.json(org ? all.filter((o) => o.id === org) : []);
+    const query = pageQuery(req, ['slug', 'display_name', 'status', 'created_at'], 'slug');
+    if (!query) return res.status(400).json({ error: 'invalid_page', message: 'invalid limit/offset/sort/order' });
+    const status = typeof req.query.status === 'string' && req.query.status ? req.query.status.toLowerCase() : '';
+    if (status && !['active', 'suspended'].includes(status)) return res.status(400).json({ error: 'invalid_status' });
+    const all = org ? (await listOrganizations()).filter((o) => o.id === org) : [];
+    const filtered = filterByQuery(all, query.q, (o) => `${o.slug} ${o.display_name || ''}`)
+      .filter((o) => !status || (o.status || 'active') === status);
+    const sorted = sortRows(filtered, query, {
+      slug: (o) => o.slug,
+      display_name: (o) => o.display_name || '',
+      status: (o) => o.status || 'active',
+      created_at: (o) => o.created_at || '',
+    }, (o) => o.id);
+    const page = sorted.slice(query.offset, query.offset + query.limit);
+    res.json(pagePayload(query, sorted.length, page));
   });
+  app.patch('/v1/orgs/:orgId', async (req, res) => {
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id', message: 'orgId must be a UUID' });
+    const org = await getOrgById(req.params.orgId);
+    if (!org) return res.status(404).json({ error: 'org_not_found' });
+    if (org.kind === 'platform') {
+      return res.status(403).json({ error: 'platform_org_protected', message: 'the platform organization is managed by the platform control plane' });
+    }
+    if (!(await callerIsOrgAdmin(req, TRUST_STAMPED, org.id))) {
+      return res.status(403).json({ error: 'org_admin_required', message: 'only an organization administrator can update the organization' });
+    }
+    const raw = (req.body || {}).displayName;
+    if (typeof raw !== 'string') return res.status(400).json({ error: 'invalid_body', message: 'displayName is required' });
+    const displayName = sanitizeName(raw);
+    if (displayName.length < 2) return res.status(400).json({ error: 'invalid_display_name', message: 'displayName must be at least 2 characters' });
+    const updated = await withTransaction(async () => {
+      const value = await updateOrganization(org.id, { displayName });
+      await auditMutation(req, 'iam:org:update', `org:${org.id}`, { displayName });
+      return value;
+    });
+    res.json(updated);
+  });
+
   app.post('/v1/orgs', async (req, res) => {
     try {
       const schema = z.object({
@@ -2653,7 +2831,19 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!(await canActForOrg(req, TRUST_STAMPED, req.params.orgId))) {
       return res.status(403).json({ error: 'forbidden', message: 'organization belongs to another tenant' });
     }
-    res.json(await listAccounts(req.params.orgId));
+    const query = pageQuery(req, ['slug', 'display_name', 'status'], 'slug');
+    if (!query) return res.status(400).json({ error: 'invalid_page', message: 'invalid limit/offset/sort/order' });
+    const status = typeof req.query.status === 'string' && req.query.status ? req.query.status.toLowerCase() : '';
+    if (status && !['active', 'retired'].includes(status)) return res.status(400).json({ error: 'invalid_status' });
+    const filtered = filterByQuery(await listAccounts(req.params.orgId), query.q, (a) => `${a.slug} ${a.display_name || ''}`)
+      .filter((a) => !status || (a.status || 'active') === status);
+    const sorted = sortRows(filtered, query, {
+      slug: (a) => a.slug,
+      display_name: (a) => a.display_name || '',
+      status: (a) => a.status || 'active',
+    }, (a) => a.id);
+    const page = sorted.slice(query.offset, query.offset + query.limit);
+    res.json(pagePayload(query, sorted.length, page));
   });
   app.post('/v1/orgs/:orgId/accounts', async (req, res) => {
     if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id', message: 'orgId must be a UUID' });
@@ -2683,6 +2873,90 @@ async function auditMutation(req: express.Request, action: string, resource: str
     }
   });
 
+  app.get('/v1/accounts/:accountId', async (req, res) => {
+    if (!isUuid(req.params.accountId)) return res.status(400).json({ error: 'invalid_id' });
+    const account = await getAccountById(req.params.accountId);
+    if (!account) return res.status(404).json({ error: 'account_not_found' });
+    if (
+      !(await canActForAccount(req, TRUST_STAMPED, account.id))
+      && !(await callerIsOrgAdmin(req, TRUST_STAMPED, account.org_id))
+    ) {
+      return res.status(403).json({ error: 'forbidden', message: 'account belongs to another tenant' });
+    }
+    const [keys, serviceAccounts] = await Promise.all([
+      listApiKeys(account.id),
+      listServiceAccounts(account.id),
+    ]);
+    res.json({
+      account,
+      apiKeys: keys.length,
+      activeApiKeys: keys.filter((key) => !key.revoked_at).length,
+      serviceAccounts: serviceAccounts.length,
+      activeServiceAccounts: serviceAccounts.filter((sa) => !sa.revoked_at).length,
+    });
+  });
+
+  app.patch('/v1/accounts/:accountId', async (req, res) => {
+    if (!isUuid(req.params.accountId)) return res.status(400).json({ error: 'invalid_id', message: 'accountId must be a UUID' });
+    const account = await getAccountById(req.params.accountId);
+    if (!account) return res.status(404).json({ error: 'account_not_found' });
+    if (!(await callerIsOrgAdmin(req, TRUST_STAMPED, account.org_id))) {
+      return res.status(403).json({ error: 'org_admin_required', message: 'only an organization administrator can update an account' });
+    }
+    const raw = (req.body || {}).displayName;
+    if (typeof raw !== 'string') return res.status(400).json({ error: 'invalid_body', message: 'displayName is required' });
+    const displayName = sanitizeName(raw);
+    if (displayName.length < 2) return res.status(400).json({ error: 'invalid_display_name', message: 'displayName must be at least 2 characters' });
+    const updated = await withTransaction(async () => {
+      const value = await updateAccount(account.id, { displayName });
+      await auditMutation(req, 'iam:account:update', `account:${account.id}`, { displayName });
+      return value;
+    });
+    res.json(updated);
+  });
+
+  app.post('/v1/accounts/:accountId/retire', async (req, res) => {
+    if (!isUuid(req.params.accountId)) return res.status(400).json({ error: 'invalid_id' });
+    const account = await getAccountById(req.params.accountId);
+    if (!account) return res.status(404).json({ error: 'account_not_found' });
+    if (!(await callerIsOrgAdmin(req, TRUST_STAMPED, account.org_id))) {
+      return res.status(403).json({ error: 'org_admin_required', message: 'only an organization administrator can retire an account' });
+    }
+    const reason = typeof (req.body || {}).reason === 'string' ? String((req.body || {}).reason).trim().slice(0, 500) : '';
+    if (reason.length < 3) return res.status(400).json({ error: 'reason_required', message: 'A retirement reason is required.' });
+    const result = await withTransaction(async () => {
+      const updated = await setAccountStatus(account.id, 'retired', String((await resolveCallerUser(req, TRUST_STAMPED)) || ''), reason);
+      let revokedKeys = 0;
+      for (const key of await listApiKeys(account.id)) {
+        if (!key.revoked_at && await revokeApiKey(key.id)) revokedKeys += 1;
+      }
+      let revokedServiceAccounts = 0;
+      for (const sa of await listServiceAccounts(account.id)) {
+        if (!sa.revoked_at && await revokeServiceAccount(sa.id)) revokedServiceAccounts += 1;
+      }
+      await auditMutation(req, 'iam:account:retire', `account:${account.id}`, {
+        org: account.org_id, reason, revokedKeys, revokedServiceAccounts,
+      });
+      return { account: updated, revokedKeys, revokedServiceAccounts };
+    });
+    res.json({ ok: true, ...result });
+  });
+
+  app.post('/v1/accounts/:accountId/reactivate', async (req, res) => {
+    if (!isUuid(req.params.accountId)) return res.status(400).json({ error: 'invalid_id' });
+    const account = await getAccountById(req.params.accountId);
+    if (!account) return res.status(404).json({ error: 'account_not_found' });
+    if (!(await callerIsOrgAdmin(req, TRUST_STAMPED, account.org_id))) {
+      return res.status(403).json({ error: 'org_admin_required', message: 'only an organization administrator can reactivate an account' });
+    }
+    const updated = await withTransaction(async () => {
+      const row = await setAccountStatus(account.id, 'active', String((await resolveCallerUser(req, TRUST_STAMPED)) || ''), '');
+      await auditMutation(req, 'iam:account:reactivate', `account:${account.id}`, { org: account.org_id });
+      return row;
+    });
+    res.json({ ok: true, account: updated, note: 'revoked credentials are not restored' });
+  });
+
   // ---------- Users ----------
   app.post('/v1/orgs/:orgId/users', async (req, res) => {
     if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id', message: 'orgId must be a UUID' });
@@ -2706,6 +2980,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       await auditMutation(req, 'iam:user:create', `user:${created.id}`, { org: req.params.orgId, email, inviteIssued: !!inviteToken });
       return { created, inviteToken };
     });
+    noStore(res);
     res.status(201).json({ ...publicUser(result.created), inviteToken: result.inviteToken });
   });
 
@@ -2716,7 +2991,29 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!(await canActForOrg(req, TRUST_STAMPED, req.params.orgId))) {
       return res.status(403).json({ error: 'forbidden', message: 'organization belongs to another tenant' });
     }
-    res.json(await listUsers(req.params.orgId));
+    const query = pageQuery(req, ['email', 'display_name', 'active', 'is_org_admin'], 'email');
+    if (!query) return res.status(400).json({ error: 'invalid_page', message: 'invalid limit/offset/sort/order' });
+    const activeRaw = req.query.active;
+    const active = activeRaw === undefined ? undefined : String(activeRaw) === 'true';
+    if (activeRaw !== undefined && !['true', 'false'].includes(String(activeRaw).toLowerCase())) {
+      return res.status(400).json({ error: 'invalid_active' });
+    }
+    const adminRaw = req.query.isOrgAdmin;
+    const isOrgAdmin = adminRaw === undefined ? undefined : String(adminRaw) === 'true';
+    if (adminRaw !== undefined && !['true', 'false'].includes(String(adminRaw).toLowerCase())) {
+      return res.status(400).json({ error: 'invalid_isOrgAdmin' });
+    }
+    const filtered = filterByQuery(await listUsers(req.params.orgId), query.q, (u) => `${u.email} ${u.display_name || ''}`)
+      .filter((u) => active === undefined || (u.active !== false) === active)
+      .filter((u) => isOrgAdmin === undefined || !!u.is_org_admin === isOrgAdmin);
+    const sorted = sortRows(filtered, query, {
+      email: (u) => u.email,
+      display_name: (u) => u.display_name || '',
+      active: (u) => u.active !== false,
+      is_org_admin: (u) => !!u.is_org_admin,
+    }, (u) => u.id);
+    const page = sorted.slice(query.offset, query.offset + query.limit).map(publicUser);
+    res.json(pagePayload(query, sorted.length, page));
   });
 
   // ---------- Roles & Policies (AWS-style) ----------
@@ -2752,7 +3049,15 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!(await canActForAccount(req, TRUST_STAMPED, req.params.accountId))) {
       return res.status(403).json({ error: 'forbidden', message: 'account belongs to another tenant' });
     }
-    res.json(await listRoles(req.params.accountId));
+    const query = pageQuery(req, ['slug', 'description'], 'slug');
+    if (!query) return res.status(400).json({ error: 'invalid_page', message: 'invalid limit/offset/sort/order' });
+    const filtered = filterByQuery(await listRoles(req.params.accountId), query.q, (r) => `${r.slug} ${r.description || ''}`);
+    const sorted = sortRows(filtered, query, {
+      slug: (r) => r.slug,
+      description: (r) => r.description || '',
+    }, (r) => r.id);
+    const page = sorted.slice(query.offset, query.offset + query.limit);
+    res.json(pagePayload(query, sorted.length, page));
   });
 
   // Policies attached to one role (management UI + attach verification).
@@ -2765,6 +3070,27 @@ async function auditMutation(req: express.Request, action: string, resource: str
       return res.status(403).json({ error: 'forbidden', message: 'role belongs to another tenant' });
     }
     res.json(await policiesForRole(req.params.roleId));
+  });
+
+  app.patch('/v1/roles/:roleId', async (req, res) => {
+    if (!isUuid(req.params.roleId)) return res.status(400).json({ error: 'invalid_id', message: 'roleId must be a UUID' });
+    const role = await getRoleById(req.params.roleId);
+    if (!role) return res.status(404).json({ error: 'role_not_found' });
+    if (!(await canActForAccount(req, TRUST_STAMPED, role.account_id))) {
+      return res.status(403).json({ error: 'forbidden', message: 'role belongs to another tenant' });
+    }
+    if (typeof (req.body || {}).description !== 'string') {
+      return res.status(400).json({ error: 'invalid_body', message: 'description is required' });
+    }
+    const description = sanitizeName(String((req.body || {}).description), 500);
+    const orgId = await orgForAccount(role.account_id);
+    if (!orgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, orgId, 'iam:role:update'))) return;
+    const updated = await withTransaction(async () => {
+      const value = await updateRole(role.id, { description });
+      await auditMutation(req, 'iam:role:update', `role:${role.id}`, { account: role.account_id });
+      return value;
+    });
+    res.json(updated);
   });
 
   app.delete('/v1/roles/:roleId', async (req, res) => {    if (!isUuid(req.params.roleId)) return res.status(400).json({ error: 'invalid_id', message: 'roleId must be a UUID' });
@@ -2825,7 +3151,47 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!(await canActForAccount(req, TRUST_STAMPED, req.params.accountId))) {
       return res.status(403).json({ error: 'forbidden', message: 'account belongs to another tenant' });
     }
-    res.json(await listPolicies(req.params.accountId));
+    const query = pageQuery(req, ['slug', 'description'], 'slug');
+    if (!query) return res.status(400).json({ error: 'invalid_page', message: 'invalid limit/offset/sort/order' });
+    const filtered = filterByQuery(await listPolicies(req.params.accountId), query.q, (p) => `${p.slug} ${p.description || ''}`);
+    const sorted = sortRows(filtered, query, {
+      slug: (p) => p.slug,
+      description: (p) => p.description || '',
+    }, (p) => p.id);
+    const page = sorted.slice(query.offset, query.offset + query.limit);
+    res.json(pagePayload(query, sorted.length, page));
+  });
+
+  app.patch('/v1/policies/:policyId', async (req, res) => {
+    if (!isUuid(req.params.policyId)) return res.status(400).json({ error: 'invalid_id', message: 'policyId must be a UUID' });
+    const policy = await getPolicyById(req.params.policyId);
+    if (!policy) return res.status(404).json({ error: 'policy_not_found' });
+    if (!(await canActForAccount(req, TRUST_STAMPED, policy.account_id))) {
+      return res.status(403).json({ error: 'forbidden', message: 'policy belongs to another tenant' });
+    }
+    const body = (req.body || {}) as any;
+    const patch: { description?: string; document?: any } = {};
+    if (body.description !== undefined) {
+      if (typeof body.description !== 'string') return res.status(400).json({ error: 'invalid_body', message: 'description must be a string' });
+      patch.description = sanitizeName(body.description, 500);
+    }
+    if (body.document !== undefined) {
+      const docErr = validatePolicyDocument(body.document);
+      if (docErr) return res.status(400).json({ error: 'invalid_document', message: docErr });
+      patch.document = body.document;
+    }
+    if (!Object.keys(patch).length) return res.status(400).json({ error: 'invalid_body', message: 'send description and/or document' });
+    const orgId = await orgForAccount(policy.account_id);
+    if (!orgId || !(await requireSensitiveMutation(req, res, TRUST_STAMPED, orgId, 'iam:policy:update'))) return;
+    const updated = await withTransaction(async () => {
+      const value = await updatePolicy(policy.id, patch);
+      await auditMutation(req, 'iam:policy:update', `policy:${policy.id}`, {
+        account: policy.account_id,
+        ...(patch.document !== undefined ? { documentUpdated: true } : {}),
+      });
+      return value;
+    });
+    res.json(updated);
   });
 
   app.delete('/v1/policies/:policyId', async (req, res) => {
@@ -3119,7 +3485,15 @@ async function auditMutation(req: express.Request, action: string, resource: str
       return res.status(403).json({ error: 'org_admin_required', message: 'audit access requires an organization administrator' });
     }
     noStore(res);
-    res.json(await queryAudit({ limit, offset, actor, allowed, orgId: org, action, resource, from, to }));
+    const filter = { actor, allowed, orgId: org, action, resource, from, to };
+    const items = await queryAudit({ limit, offset, ...filter });
+    const paged = ['1', 'true', 'yes'].includes(String(req.query.paged ?? '').toLowerCase());
+    if (!paged) return res.json(items);
+    const total = await countAudit(filter);
+    res.json({
+      items, total, limit, offset,
+      nextOffset: offset + items.length < total ? offset + items.length : null,
+    });
   });
 
   // ---------- API keys ----------
@@ -3196,7 +3570,34 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!(await canActForAccount(req, TRUST_STAMPED, req.params.accountId))) {
       return res.status(403).json({ error: 'forbidden', message: 'account belongs to another tenant' });
     }
-    res.json(await listApiKeys(req.params.accountId));
+    const query = pageQuery(req, ['name', 'prefix', 'user_id', 'created_at', 'last_used_at'], 'created_at');
+    if (!query) return res.status(400).json({ error: 'invalid_page', message: 'invalid limit/offset/sort/order' });
+    const status = typeof req.query.status === 'string' && req.query.status ? req.query.status.toLowerCase() : '';
+    if (status && !['active', 'revoked', 'expired'].includes(status)) return res.status(400).json({ error: 'invalid_status' });
+    const now = Date.now();
+    const keyStatus = (k: any) => k.revoked_at ? 'revoked' : (k.expires_at && Date.parse(k.expires_at) <= now ? 'expired' : 'active');
+    const filtered = filterByQuery(await listApiKeys(req.params.accountId), query.q, (k) => `${k.name || ''} ${k.prefix || ''} ${k.user_id || ''}`)
+      .filter((k) => !status || keyStatus(k) === status);
+    const sorted = sortRows(filtered, query, {
+      name: (k) => k.name || '',
+      prefix: (k) => k.prefix || '',
+      user_id: (k) => k.user_id || '',
+      created_at: (k) => k.created_at || '',
+      last_used_at: (k) => k.last_used_at || '',
+    }, (k) => k.id);
+    const page = sorted.slice(query.offset, query.offset + query.limit);
+    res.json(pagePayload(query, sorted.length, page));
+  });
+
+  app.get('/v1/keys/:id', async (req, res) => {
+    if (!isUuid(req.params.id)) return res.status(400).json({ error: 'invalid_id', message: 'key id must be a UUID' });
+    const record = await findApiKeyById(req.params.id);
+    if (!record) return res.status(404).json({ error: 'key_not_found' });
+    if (!(await canActForAccount(req, TRUST_STAMPED, record.account_id))) {
+      return res.status(403).json({ error: 'forbidden', message: 'key belongs to another tenant' });
+    }
+    const view = (await listApiKeys(record.account_id)).find((key) => key.id === req.params.id);
+    res.json(view || { id: req.params.id, account_id: record.account_id, name: record.name, scopes: record.scopes, expires_at: record.expires_at, revoked_at: record.revoked_at });
   });
 
   app.post('/v1/keys/verify', async (req, res) => {
@@ -3209,6 +3610,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
       // Include the owning org: the gateway uses this for usage attribution (#28).
       const acc = rec.account_id ? await getAccountById(rec.account_id) : null;
       const keyOrg = acc ? await getOrgById(acc.org_id) : null;
+      if (acc && (acc.status || 'active') === 'retired') {
+        return res.status(403).json({ valid: false, error: 'account_retired' });
+      }
       if (!acc || !keyOrg || keyOrg.status === 'suspended') {
         return res.status(403).json({ valid: false, error: 'org_suspended' });
       }
@@ -3305,7 +3709,30 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!(await canActForAccount(req, TRUST_STAMPED, req.params.accountId))) {
       return res.status(403).json({ error: 'forbidden', message: 'account belongs to another tenant' });
     }
-    res.json(await listServiceAccounts(req.params.accountId));
+    const query = pageQuery(req, ['slug', 'description', 'status'], 'slug');
+    if (!query) return res.status(400).json({ error: 'invalid_page', message: 'invalid limit/offset/sort/order' });
+    const status = typeof req.query.status === 'string' && req.query.status ? req.query.status.toLowerCase() : '';
+    if (status && !['active', 'revoked'].includes(status)) return res.status(400).json({ error: 'invalid_status' });
+    const filtered = filterByQuery(await listServiceAccounts(req.params.accountId), query.q, (s) => `${s.slug} ${s.description || ''}`)
+      .filter((s) => !status || (s.revoked_at ? 'revoked' : 'active') === status);
+    const sorted = sortRows(filtered, query, {
+      slug: (s) => s.slug,
+      description: (s) => s.description || '',
+      status: (s) => s.revoked_at ? 'revoked' : 'active',
+    }, (s) => s.id);
+    const page = sorted.slice(query.offset, query.offset + query.limit);
+    res.json(pagePayload(query, sorted.length, page));
+  });
+
+  app.get('/v1/service-accounts/:id', async (req, res) => {
+    if (!isUuid(req.params.id)) return res.status(400).json({ error: 'invalid_id', message: 'service account id must be a UUID' });
+    const sa = await getServiceAccount(req.params.id);
+    if (!sa) return res.status(404).json({ error: 'service_account_not_found' });
+    if (!(await canActForAccount(req, TRUST_STAMPED, sa.account_id))) {
+      return res.status(403).json({ error: 'forbidden', message: 'service account belongs to another tenant' });
+    }
+    const roles = await rolesForServiceAccount(sa.id);
+    res.json({ ...sa, roles });
   });
 
   // Cấp JWT cho service account (kind=service-account, mang account scope).
@@ -3420,6 +3847,27 @@ async function auditMutation(req: express.Request, action: string, resource: str
     });
     if (!ok) return res.status(404).json({ error: 'assignment_not_found' });
     res.json({ ok: true });
+  });
+
+  app.patch('/v1/users/:userId', async (req, res) => {
+    if (!isUuid(req.params.userId)) return res.status(400).json({ error: 'invalid_id', message: 'userId must be a UUID' });
+    const user = await getUserById(req.params.userId);
+    if (!user) return res.status(404).json({ error: 'user_not_found' });
+    const caller = await resolveCallerUser(req, TRUST_STAMPED);
+    const self = caller === user.id;
+    if (!self && !(await callerIsOrgAdmin(req, TRUST_STAMPED, user.org_id))) {
+      return res.status(403).json({ error: 'forbidden', message: 'only the user or an organization administrator can update this profile' });
+    }
+    const raw = (req.body || {}).displayName;
+    if (typeof raw !== 'string') return res.status(400).json({ error: 'invalid_body', message: 'displayName is required' });
+    const displayName = sanitizeName(raw);
+    if (displayName.length < 2) return res.status(400).json({ error: 'invalid_display_name', message: 'displayName must be at least 2 characters' });
+    const updated = await withTransaction(async () => {
+      await updateUserProfile(user.id, { displayName });
+      await auditMutation(req, 'iam:user:update', `user:${user.id}`, { displayName, self });
+      return getUserById(user.id);
+    });
+    res.json(updated ? publicUser(updated) : { ok: true });
   });
 
   // Org administrators: only an existing admin of the same org may grant or
@@ -3702,6 +4150,10 @@ async function auditMutation(req: express.Request, action: string, resource: str
       await auditPlatformDenied(req, String(claims.sub || ''), user?.org_id || null, 'platform:session:exchange', 'account_inactive');
       return res.status(403).json({ error: 'platform_admin_inactive' });
     }
+    if (Number(claims.ver || 0) !== Number(user.auth_version || 0)) {
+      await auditPlatformDenied(req, user.id, user.org_id, 'platform:session:exchange', 'session_revoked');
+      return res.status(401).json({ error: 'token_revoked', message: 'This session was revoked. Sign in again.' });
+    }
     // Platform privileges are bound to the caller's own user row. A tenant row
     // that merely shares the platform account's email can never exchange into
     // the platform organization.
@@ -3893,7 +4345,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
     res.status(201).json({
       organization: result.created,
       admin: publicUser(result.admin),
-      ...(result.inviteToken && exposesLifecycleTokens() ? { inviteToken: result.inviteToken } : {}),
+      ...(result.inviteToken ? { inviteToken: result.inviteToken } : {}),
     });
   });
 
@@ -4168,6 +4620,17 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!targetOrg || (targetOrg.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'user_not_found' });
     if (target.active === false) return res.status(409).json({ error: 'account_deactivated' });
     if (target.password_hash) return res.status(409).json({ error: 'password_already_set' });
+    // A platform operator must not mint and then redeem a tenant activation
+    // code: at accept time the code is bearer-only, so that would let an
+    // operator take over a tenant account. Only a platform owner (or an
+    // explicitly opted-in development deployment) may see tenant codes.
+    if (ctx.admin.role !== 'owner' && !exposesLifecycleTokens()) {
+      await auditPlatformDenied(req, ctx.user.id, target.org_id, 'platform:user:invite', 'platform_owner_required');
+      return res.status(403).json({
+        error: 'platform_owner_required',
+        message: 'tenant activation codes may only be issued by a platform owner',
+      });
+    }
     if (!(await requirePlatformStepUp(req, res, ctx, 'user:invite'))) return;
     const inviteToken = await withTransaction(async () => {
       const token = await issueInvite(target);
@@ -4175,7 +4638,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       return token;
     });
     noStore(res);
-    res.json({ ok: true, ...(inviteToken && exposesLifecycleTokens() ? { inviteToken } : {}) });
+    res.json({ ok: true, ...(inviteToken ? { inviteToken } : {}) });
   });
 
   app.put('/v1/platform/users/:userId/org-admin', async (req, res) => {
@@ -4362,13 +4825,25 @@ async function auditMutation(req: express.Request, action: string, resource: str
   app.get('/v1/platform/admins', async (req, res) => {
     const ctx = await currentPlatformAdmin(req, res, 'owner');
     if (!ctx) return;
+    const query = pageQuery(req, ['email', 'display_name', 'role'], 'email');
+    if (!query) return res.status(400).json({ error: 'invalid_page' });
+    const role = typeof req.query.role === 'string' && req.query.role ? req.query.role.toLowerCase() : '';
+    if (role && !['owner', 'operator', 'auditor'].includes(role)) return res.status(400).json({ error: 'invalid_role' });
     const rows = await listPlatformAdmins();
-    const items = await Promise.all(rows.map(async (a) => {
+    const enriched = await Promise.all(rows.map(async (a) => {
       const u = await getUserById(a.user_id);
       return { ...a, email: u?.email || '', display_name: u?.display_name || '', active: u?.active !== false };
     }));
+    const filtered = filterByQuery(enriched, query.q, (a) => `${a.email} ${a.display_name} ${a.role}`)
+      .filter((a) => !role || a.role === role);
+    const sorted = sortRows(filtered, query, {
+      email: (a) => a.email,
+      display_name: (a) => a.display_name,
+      role: (a) => a.role,
+    }, (a) => a.user_id);
+    const page = sorted.slice(query.offset, query.offset + query.limit);
     noStore(res);
-    res.json({ items });
+    res.json({ items: page, total: sorted.length, limit: query.limit, offset: query.offset, nextOffset: query.offset + page.length < sorted.length ? query.offset + page.length : null });
   });
 
   app.post('/v1/platform/admins', async (req, res) => {
@@ -4411,12 +4886,15 @@ async function auditMutation(req: express.Request, action: string, resource: str
     }
     const reason = typeof (req.body || {}).reason === 'string' ? String((req.body || {}).reason).slice(0, 500) : '';
     const result = await withTransaction(async () => {
-      const admin = await grantPlatformAdmin({
+      // Re-check and mutate under the platform-owner advisory lock. The outer
+      // transaction keeps the role change and its audit record atomic.
+      const guarded = await grantPlatformAdminGuarded({
         userId: target.id,
         role: role as PlatformAdmin['role'],
         grantedBy: ctx.user.id,
         reason,
       });
+      if (!guarded.ok) return { guardError: guarded.reason } as const;
       const inviteToken = await issueInvite(target);
       await auditPlatformAction(req, ctx.user.id, 'platform:admin:grant', target.org_id, {
         targetUserId: target.id,
@@ -4425,13 +4903,24 @@ async function auditMutation(req: express.Request, action: string, resource: str
         inviteIssued: !!inviteToken,
         ...(reason ? { reason } : {}),
       });
-      return { admin, inviteToken };
+      return { admin: guarded.admin, inviteToken } as const;
     });
+    if ('guardError' in result) {
+      const guardError = String((result as any).guardError);
+      await auditPlatformDenied(req, ctx.user.id, target.org_id, 'admin:grant', guardError);
+      return res.status(409).json({
+        error: guardError === 'last_owner' ? 'last_owner' : 'platform_admin_not_found',
+        message: guardError === 'last_owner'
+          ? 'at least one platform owner must remain'
+          : 'platform administrator not found',
+      });
+    }
+    noStore(res);
     res.status(201).json({
       ...result.admin,
       email: target.email,
       display_name: target.display_name || '',
-      ...(result.inviteToken && exposesLifecycleTokens() ? { inviteToken: result.inviteToken } : {}),
+      ...(result.inviteToken ? { inviteToken: result.inviteToken } : {}),
     });
   });
 
@@ -4452,13 +4941,12 @@ async function auditMutation(req: express.Request, action: string, resource: str
       await auditPlatformDenied(req, ctx.user.id, target.org_id, 'admin:revoke', 'last_owner');
       return res.status(409).json({ error: 'last_owner', message: 'at least one platform owner must remain' });
     }
-    const ok = await revokePlatformAdmin(target.id);
-    if (!ok) {
-      await auditPlatformDenied(req, ctx.user.id, target.org_id, 'admin:revoke', 'revoke_failed');
-      return res.status(404).json({ error: 'platform_admin_not_found' });
-    }
     const reason = typeof (req.body || {}).reason === 'string' ? String((req.body || {}).reason).slice(0, 500) : '';
     const result = await withTransaction(async () => {
+      // Re-check and revoke under the platform-owner advisory lock, so two
+      // concurrent revocations cannot both see two owners.
+      const guarded = await revokePlatformAdminGuarded(target.id);
+      if (!guarded.ok) return { guardedError: guarded.reason } as const;
       const revoked = await revokeAllRefresh(target.id);
       const revokedKeys = await revokeApiKeysForUser(target.id);
       await auditPlatformAction(req, ctx.user.id, 'platform:admin:revoke', target.org_id, {
@@ -4470,6 +4958,16 @@ async function auditMutation(req: express.Request, action: string, resource: str
       });
       return { revoked, revokedKeys };
     });
+    if ('guardedError' in result) {
+      const guardedError = String((result as any).guardedError);
+      await auditPlatformDenied(req, ctx.user.id, target.org_id, 'admin:revoke', guardedError);
+      return res.status(guardedError === 'last_owner' ? 409 : 404).json({
+        error: guardedError === 'last_owner' ? 'last_owner' : 'platform_admin_not_found',
+        message: guardedError === 'last_owner'
+          ? 'at least one platform owner must remain'
+          : 'platform administrator not found',
+      });
+    }
     res.json({ ok: true, ...result });
   });
 
@@ -4718,6 +5216,23 @@ async function auditMutation(req: express.Request, action: string, resource: str
     res.json({ ok: true, revoked, ...parsed.data });
   });
 
+  // Internal tenant-status lookup for asynchronous triggers (webhook/cron/
+  // queue workers) that have no user credential to verify. The internal gate
+  // only admits the shared service secret.
+  app.get('/internal/orgs/:orgId/status', async (req, res) => {
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id' });
+    const org = await getOrgById(req.params.orgId);
+    if (!org) return res.status(404).json({ error: 'org_not_found' });
+    res.json({ id: org.id, slug: org.slug, kind: org.kind || 'tenant', status: org.status || 'active' });
+  });
+
+  app.get('/internal/accounts/:accountId/status', async (req, res) => {
+    if (!isUuid(req.params.accountId)) return res.status(400).json({ error: 'invalid_id' });
+    const account = await getAccountById(req.params.accountId);
+    if (!account) return res.status(404).json({ error: 'account_not_found' });
+    res.json({ id: account.id, org_id: account.org_id, slug: account.slug, status: account.status || 'active' });
+  });
+
   app.post('/internal/platform/bootstrap', async (req, res) => {
     const secret = process.env.PLATFORM_BOOTSTRAP_SECRET || '';
     if (!secret) return res.status(503).json({ error: 'bootstrap_disabled' });
@@ -4770,6 +5285,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (parsed.data.action === 'reset-mfa') {
       result.removed = await removeMfa(user.id);
       await clearLoginFailures(user.id);
+      // A break-glass reset must not leave an attacker's existing session
+      // alive. Bump auth_version and revoke every refresh token as well.
+      result.revoked = await revokeAllRefresh(user.id);
     } else {
       result.revoked = await revokeAllRefresh(user.id);
     }

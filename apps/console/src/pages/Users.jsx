@@ -7,7 +7,7 @@
 import React, { useEffect, useState } from 'react';
 import { useAuth } from '../lib/auth.jsx';
 import { api } from '../lib/api.js';
-import { Badge, Btn, Card, Empty, Err, Field, InlineLoader, Input, Modal, PageTitle, Table, TableSkeleton } from '../components/ui.jsx';
+import { Badge, Btn, Card, Empty, Err, Field, InlineLoader, Input, Modal, PageTitle, Pager, SearchBox, Table, TableSkeleton } from '../components/ui.jsx';
 import { ScopeBar, useScope } from '../components/Scope.jsx';
 
 export default function Users() {
@@ -28,16 +28,30 @@ export default function Users() {
   const [assignRole, setAssignRole] = useState('');
   // Bumped after each assign so every expanded row refetches roles + counts.
   const [tick, setTick] = useState(0);
+  const [q, setQ] = useState('');
+  const [activeFilter, setActiveFilter] = useState('');
+  const [offset, setOffset] = useState(0);
+  const [total, setTotal] = useState(0);
+  const limit = 20;
 
-  useEffect(() => {
+  const loadUsers = () => {
     if (!scope.orgId) {
       setRows([]);
+      setTotal(0);
       setLoaded(true);
       return;
     }
     setErr(null);
-    api.users(scope.orgId, headers).then((v) => setRows(Array.isArray(v) ? v : [])).catch(setErr).finally(() => setLoaded(true));
-  }, [scope.orgId, headers]);
+    api.usersPaged(scope.orgId, { limit, offset, q, active: activeFilter }, headers)
+      .then((v) => { setRows(Array.isArray(v?.items) ? v.items : []); setTotal(Number(v?.total) || 0); })
+      .catch(setErr)
+      .finally(() => setLoaded(true));
+  };
+  useEffect(() => {
+    const t = setTimeout(loadUsers, 250);
+    return () => clearTimeout(t);
+  }, [scope.orgId, headers, offset, q, activeFilter]);
+  useEffect(() => { setOffset(0); }, [q, activeFilter]);
 
   useEffect(() => {
     if (!scope.accountId) {
@@ -47,6 +61,8 @@ export default function Users() {
     setAssignRole('');
     api.roles(scope.accountId, headers).then((v) => setRoles(Array.isArray(v) ? v : [])).catch(() => setRoles([]));
   }, [scope.accountId, headers]);
+
+  const reloadUsers = () => loadUsers();
 
   const create = async (e) => {
     e.preventDefault();
@@ -101,6 +117,14 @@ export default function Users() {
       <PageTitle title="Users" sub="Shadow users federated from Authentik/Keycloak (email + OIDC sub)" right={canAdmin ? <Btn onClick={() => { setFormErr(null); setOpen(true); }}>+ New</Btn> : undefined} />
       <Err e={err} />
       <ScopeBar scope={scope} showAccount={false} />
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="flex-1 min-w-[240px]"><SearchBox value={q} onChange={setQ} placeholder="Search users by email or name…" /></div>
+        <select value={activeFilter} onChange={(e) => setActiveFilter(e.target.value)} className="mb-3 px-3 py-2 rounded-2xl border border-slate-200 text-sm bg-white">
+          <option value="">All users</option>
+          <option value="true">Active</option>
+          <option value="false">Disabled</option>
+        </select>
+      </div>
       {canAdmin && scope.accountId && rows.length > 0 && roles.length > 0 && (
         <Card className="mb-4">
           <form onSubmit={doAssign} className="flex flex-wrap items-end gap-2 [&>label]:mb-0">
@@ -130,13 +154,14 @@ export default function Users() {
         ) : rows.length ? (
           <Table head={['Email', 'Name', 'OIDC sub', 'Roles']}>
             {rows.map((u) => (
-              <Row key={u.id} u={u} headers={headers} onUnassign={doUnassign} tick={tick} canAdmin={canAdmin} />
+              <Row key={u.id} u={u} headers={headers} onUnassign={doUnassign} tick={tick} canAdmin={canAdmin} onChanged={reloadUsers} />
             ))}
           </Table>
         ) : (
           <Empty text={scope.orgId ? 'No users yet' : 'Pick an organization to see its users'} />
         )}
       </Card>
+      <Pager total={total} limit={limit} offset={offset} onChange={setOffset} loading={!loaded} />
       {invite && (
         <Modal title="User invited" onClose={() => setInvite(null)}>
           <p className="text-sm text-normal-text">
@@ -167,7 +192,7 @@ export default function Users() {
   );
 }
 
-function Row({ u, headers, onUnassign, tick, canAdmin }) {
+function Row({ u, headers, onUnassign, tick, canAdmin, onChanged }) {
   const [n, setN] = useState(null);
   const [expanded, setExpanded] = useState(false);
   const [assigned, setAssigned] = useState(null);
@@ -199,16 +224,37 @@ function Row({ u, headers, onUnassign, tick, canAdmin }) {
 
   // Org admins: lost authenticator / locked-out user.
   const security = async (kind) => {
+    if (kind === 'mfa' && !window.confirm('Reset MFA for this user? This also revokes all of their sessions and API keys.')) return;
     setSecBusy(kind);
     setSecMsg(null);
     try {
       if (kind === 'mfa') {
         const r = await api.resetUserMfa(u.id, headers);
         setSecMsg(r.removed ? 'MFA removed, the user can enrol again.' : 'This user had no MFA.');
+      } else if (kind === 'orgadmin') {
+        const next = !u.is_org_admin;
+        await api.setOrgAdmin(u.id, next, headers);
+        setSecMsg(next ? 'Organization administrator granted.' : 'Organization administrator removed.');
+        if (onChanged) onChanged();
       } else {
         await api.unlockUser(u.id, headers);
         setSecMsg('Sign-in lockout cleared.');
       }
+    } catch (e) {
+      setSecMsg(e?.body?.message || e?.message || 'Request failed');
+    } finally {
+      setSecBusy(null);
+    }
+  };
+
+  const rename = async () => {
+    const value = window.prompt('Display name', u.display_name || '');
+    if (value === null) return;
+    setSecBusy('rename');
+    setSecMsg(null);
+    try {
+      await api.updateUser(u.id, value, headers);
+      if (onChanged) onChanged();
     } catch (e) {
       setSecMsg(e?.body?.message || e?.message || 'Request failed');
     } finally {
@@ -257,11 +303,24 @@ function Row({ u, headers, onUnassign, tick, canAdmin }) {
               <p className="text-xs text-normal-text">No roles assigned</p>
             )}
             {canAdmin && <div className="mt-2 flex flex-wrap items-center gap-3 text-xs">
+              <button onClick={rename} disabled={!!secBusy} className="text-main-blue disabled:opacity-50">
+                {secBusy === 'rename' ? 'Saving…' : 'Rename'}
+              </button>
               <button onClick={() => security('mfa')} disabled={!!secBusy} className="text-main-blue disabled:opacity-50">
                 {secBusy === 'mfa' ? 'Resetting…' : 'Reset MFA'}
               </button>
               <button onClick={() => security('unlock')} disabled={!!secBusy} className="text-main-blue disabled:opacity-50">
                 {secBusy === 'unlock' ? 'Unlocking…' : 'Unlock sign-in'}
+              </button>
+              <button
+                onClick={() => {
+                  if (!window.confirm(`${u.is_org_admin ? 'Remove' : 'Grant'} organization administrator for this user?`)) return;
+                  security('orgadmin');
+                }}
+                disabled={!!secBusy}
+                className="text-main-blue disabled:opacity-50"
+              >
+                {secBusy === 'orgadmin' ? 'Saving…' : u.is_org_admin ? 'Remove org admin' : 'Make org admin'}
               </button>
               {secMsg && <span className="text-normal-text">{secMsg}</span>}
             </div>}

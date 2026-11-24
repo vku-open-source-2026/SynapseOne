@@ -10,7 +10,7 @@ import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import { createApp } from './index';
-import { createOrganization, grantPlatformAdmin, upsertUser } from './db';
+import { createOrganization, grantPlatformAdmin, setOrganizationStatus, upsertUser } from './db';
 import { signPlatformAccess, verifyAccess } from './tokens';
 
 const INTERNAL = 'platform-runner-iam-test-secret';
@@ -154,6 +154,15 @@ describe('platform runner credentials', () => {
     });
     assert.equal(before.status, 200, JSON.stringify(before.json));
     assert.equal(before.json.valid, true);
+
+    await setOrganizationStatus(tenantOrg.id, 'suspended', 'test-operator', 'runner suspension');
+    const suspended = await call('GET', '/v1/auth/verify', undefined, {
+      Authorization: `Bearer ${out.json.accessToken}`,
+      'x-synapseone-internal': INTERNAL,
+    });
+    assert.equal(suspended.status, 403, JSON.stringify(suspended.json));
+    assert.equal(suspended.json.error, 'org_suspended');
+    await setOrganizationStatus(tenantOrg.id, 'active', 'test-operator', '');
 
     const revoked = await call('POST', '/internal/platform-runners/delegations/revoke', {
       executionId: 'exec-123',

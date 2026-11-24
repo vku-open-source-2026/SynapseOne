@@ -74,7 +74,7 @@ let templates = client.workflow().list_templates().await?;
 | `ai()` | API-docs assistant |
 | `inference()` | chat, embeddings, decision, route |
 | `ocs()` / `storage()` | buckets, objects, presign, multipart |
-| `warehouse()` | OLAP datasets, SQL, ETL, reports, dashboards |
+| `warehouse()` | OLAP datasets, SQL, ETL jobs and pipeline status |
 | `health()` | `/health`, `/ready`, projected status |
 
 Methods that are not wrapped yet can use the raw escape hatch:

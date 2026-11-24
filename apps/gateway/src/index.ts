@@ -615,6 +615,8 @@ export function propagatePrincipal(req: express.Request): void {
   delete h['x-synapseone-scopes'];
   delete h['x-synapseone-kind'];
   delete h['x-synapseone-runner'];
+  delete h['x-synapseone-org-admin'];
+  delete h['x-synapseone-roles'];
   delete h['x-synapseone-internal'];
   delete h['x-synapseone-anon'];
   // Never let a client smuggle the legacy prefix past the new canonical names.

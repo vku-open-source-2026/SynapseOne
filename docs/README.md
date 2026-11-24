@@ -4,6 +4,7 @@
 |---|---|
 | [quickstart.md](quickstart.md) | 3 commands to run, first flow, Authentik/S3/workflow setup |
 | [architecture.md](architecture.md) | Tier-1 PaaS architecture + technical decisions |
+| [business-flows.md](business-flows.md) | Canonical actors, lifecycle, BF-01..BF-22 business rules and traceability |
 | [iam-model.md](iam-model.md) | Organization/Account/Role/Policy model + tokens + OIDC |
 | [api.md](api.md) | Full API reference via the gateway |
 | [synapsebase.md](synapsebase.md) | SynapseBase — documents, object↔data mapping, queries, changes |
@@ -12,7 +13,9 @@
 | [workflow-runners.md](workflow-runners.md) | Runner Engine: workflow/inference/hybrid connectors, network hardening |
 | [configuration.md](configuration.md) | Environment table for the whole stack |
 | [object-storage.md](object-storage.md) | SynapseOCS bucket/object API, SeaweedFS backend, object backups |
-| [notifications.md](notifications.md) | SynapseNotifications — outbox, templates, preferences, delivery, retries |
+| [notifications.md](notifications.md) | SynapseNotifications — outbox, inline variables, preferences, delivery, retries |
+| [capability-matrix.md](capability-matrix.md) | Resource-by-resource operation coverage, interfaces and supported limitations |
+| [lakehouse.md](lakehouse.md) | Apache Iceberg Lakehouse, snapshots, schema evolution and ETL paths |
 | [troubleshooting.md](troubleshooting.md) | Busy ports, Windows curl, gateway 404s, backup/restore, OIDC errors |
 | [console.md](console.md) | Management UI (run, configure, SSO, frontend dev) |
 | [platform-superadmin.md](platform-superadmin.md) | Platform Super Admin dashboard: bootstrap, MFA, platform admins, rollback |
@@ -26,7 +29,10 @@
 | [sdk-python.md](sdk-python.md) | Python SDK — install, auth, full API reference |
 | [sdk-go.md](sdk-go.md) | Go SDK — install, auth, full API reference |
 | [cli.md](cli.md) | CLI — install, configuration, all commands |
-| [migration-synapseone.md](migration-synapseone.md) | Upgrade an existing SynapseDX deployment to SynapseOne 0.7.0 |
+| [adr/](adr/) | Architecture decisions (Lakehouse, search, runtime parity, workflow security) |
+| [production-readiness.md](production-readiness.md) | Current verification matrix, release blockers and operator prerequisites |
+| [migration-0.9.0-hardening.md](migration-0.9.0-hardening.md) | Deployment order, migration compatibility and rollback for the hardening pass |
+| [migration-synapseone.md](migration-synapseone.md) | Upgrade an existing SynapseDX deployment to SynapseOne 0.9.0 |
 
 Start at [../README.md](../README.md) → [quickstart.md](quickstart.md).
 Contributing: [../CONTRIBUTING.md](../CONTRIBUTING.md). K8s operations: [../infra/k8s/README.md](../infra/k8s/README.md).

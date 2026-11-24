@@ -15,6 +15,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde_json::{json, Map, Value};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
@@ -693,10 +694,33 @@ async fn metrics(State(state): State<AppState>) -> Response {
             collections.len()
         ));
     }
-    if let Ok((pending, _)) = state.store.outbox_stats().await {
-        lines.push("# HELP synapseone_base_outbox_pending Unpublished change events.".into());
+    if let Ok(stats) = state.store.outbox_stats().await {
+        lines.push("# HELP synapseone_base_outbox_pending Deliverable change events.".into());
         lines.push("# TYPE synapseone_base_outbox_pending gauge".into());
-        lines.push(format!("synapseone_base_outbox_pending {pending}"));
+        lines.push(format!("synapseone_base_outbox_pending {}", stats.pending));
+        lines.push(
+            "# HELP synapseone_base_outbox_dead_lettered Quarantined change events.".into(),
+        );
+        lines.push("# TYPE synapseone_base_outbox_dead_lettered gauge".into());
+        lines.push(format!(
+            "synapseone_base_outbox_dead_lettered {}",
+            stats.dead_lettered
+        ));
+        if let Some(oldest) = stats.oldest.as_deref() {
+            if let Ok(parsed) = DateTime::parse_from_rfc3339(oldest) {
+                let age = (Utc::now() - parsed.with_timezone(&Utc))
+                    .num_seconds()
+                    .max(0);
+                lines.push(
+                    "# HELP synapseone_base_outbox_oldest_age_seconds Age of the oldest deliverable event."
+                        .into(),
+                );
+                lines.push("# TYPE synapseone_base_outbox_oldest_age_seconds gauge".into());
+                lines.push(format!(
+                    "synapseone_base_outbox_oldest_age_seconds {age}"
+                ));
+            }
+        }
     }
     let cache = state.cache.metrics();
     lines.push(
@@ -2654,6 +2678,16 @@ async fn list_documents(
             "limit 1..1000 and offset >= 0 required",
         ));
     }
+    let view = match params.get("as") {
+        None => AsView::Data,
+        Some(value) => AsView::parse(value).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_view",
+                "as must be 'data' or 'object'",
+            )
+        })?,
+    };
     let page = state
         .store
         .list_documents_page(&collection.id, limit as i64, offset as i64)
@@ -2661,7 +2695,7 @@ async fn list_documents(
         .map_err(|error| ApiError::from(crate::error::InternalError(error.message)))?;
     let items: Vec<Value> = page
         .iter()
-        .map(|document| to_api_document(document, AsView::Data, Some(&collection.mapping)))
+        .map(|document| to_api_document(document, view, Some(&collection.mapping)))
         .collect();
     let total = state
         .store
@@ -3413,6 +3447,121 @@ async fn not_found() -> Response {
     json_response(StatusCode::NOT_FOUND, json!({"error": "not_found"}))
 }
 
+// ---------- outbox operations ----------
+
+fn outbox_limit(query: &HashMap<String, String>) -> i64 {
+    query
+        .get("limit")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(50)
+        .clamp(1, 200)
+}
+
+async fn outbox_dead_letters(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    let caller = resolve_caller(&headers);
+    let (org_id, account_id, global) = match &caller {
+        Caller::Platform => (None, None, true),
+        Caller::Principal(principal) if principal.org.is_some() => {
+            (principal.org.clone(), None, false)
+        }
+        Caller::Principal(principal) if principal.account.is_some() => {
+            (None, principal.account.clone(), false)
+        }
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "outbox visibility requires a tenant or platform caller",
+            ))
+        }
+    };
+    let items = state
+        .store
+        .list_dead_lettered(
+            outbox_limit(&query),
+            org_id.as_deref(),
+            account_id.as_deref(),
+            global,
+        )
+        .await
+        .map_err(store_error)?;
+    let data: Vec<Value> = items
+        .into_iter()
+        .map(|event| {
+            json!({
+                "eventId": event.event_id,
+                "orgId": event.org_id,
+                "accountId": event.account_id,
+                "collectionId": event.collection_id,
+                "documentId": event.document_id,
+                "operation": event.operation,
+                "attempts": event.attempts,
+                "lastError": event.last_error,
+                "occurredAt": event.occurred_at,
+                "deadLetteredAt": event.dead_lettered_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({"items": data, "count": data.len()})))
+}
+
+async fn internal_outbox(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    let stats = state.store.outbox_stats().await.map_err(store_error)?;
+    let items = state
+        .store
+        .list_dead_lettered(outbox_limit(&query), None, None, true)
+        .await
+        .map_err(store_error)?;
+    let data: Vec<Value> = items
+        .into_iter()
+        .map(|event| {
+            json!({
+                "eventId": event.event_id,
+                "orgId": event.org_id,
+                "accountId": event.account_id,
+                "collectionId": event.collection_id,
+                "documentId": event.document_id,
+                "operation": event.operation,
+                "attempts": event.attempts,
+                "lastError": event.last_error,
+                "occurredAt": event.occurred_at,
+                "deadLetteredAt": event.dead_lettered_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "stats": {
+            "pending": stats.pending,
+            "deadLettered": stats.dead_lettered,
+            "oldest": stats.oldest,
+        },
+        "items": data,
+        "count": data.len(),
+    })))
+}
+
+async fn internal_replay_outbox(
+    State(state): State<AppState>,
+    Path(event_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let requeued = state
+        .store
+        .requeue_dead_letter(&event_id)
+        .await
+        .map_err(store_error)?;
+    if !requeued {
+        return Err(ApiError::not_found("dead-lettered outbox event not found"));
+    }
+    Ok(Json(json!({"ok": true, "eventId": event_id, "requeued": true})))
+}
+
 // ---------- router ----------
 
 fn cors_layer(config: &Config) -> CorsLayer {
@@ -3518,14 +3667,21 @@ pub fn build_app(state: AppState) -> Router {
                 .delete(delete_database),
         )
         .route("/v1/base/databases/{database}/stats", get(database_stats))
+        .route("/v1/base/outbox", get(outbox_dead_letters))
         .route("/v1/search", get(search_get).post(search_post))
         .route("/v1/search/reindex", post(search_reindex))
         .route("/v1/search/status", get(search_status));
 
-    let internal = Router::new().route(
-        "/internal/base/collections/{collection}/backfill",
-        post(backfill),
-    );
+    let internal = Router::new()
+        .route(
+            "/internal/base/collections/{collection}/backfill",
+            post(backfill),
+        )
+        .route("/internal/base/outbox", get(internal_outbox))
+        .route(
+            "/internal/base/outbox/{event_id}/replay",
+            post(internal_replay_outbox),
+        );
 
     let cors = cors_layer(&state.config);
     Router::new()

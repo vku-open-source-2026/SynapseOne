@@ -41,11 +41,15 @@ const MAX_LIKE_PATTERN_LEN = 256;
 const MAX_LIKE_PATTERNS_PER_KEY = 100;
 
 export function matchCondition(cond: any, ctx: ConditionContext): boolean {
-  if (!cond || typeof cond !== 'object') return true;
+  // An absent Condition is unconditional; a malformed one is not. Failing
+  // open here turned a typo into an unconditional Allow/Deny.
+  if (cond === undefined) return true;
+  if (cond === null || typeof cond !== 'object' || Array.isArray(cond)) return false;
   for (const [opRaw, kv] of Object.entries(cond)) {
     const ifExists = opRaw.endsWith('IfExists');
     const op = ifExists ? opRaw.slice(0, -'IfExists'.length) : opRaw;
-    if (typeof kv !== 'object' || kv === null) return false;
+    if (op !== 'StringEquals' && op !== 'StringLike') return false;
+    if (typeof kv !== 'object' || kv === null || Array.isArray(kv)) return false;
     for (const [k, v] of Object.entries(kv as Record<string, any>)) {
       const actual = ctx[k];
       if (actual === undefined) {
@@ -124,6 +128,39 @@ const MAX_STATEMENTS = 100;
 const MAX_PATTERN_LEN = 512;
 const MAX_CONDITION_BYTES = 8192;
 
+function validateCondition(cond: any, statementIndex: number): string | null {
+  const where = `Statement[${statementIndex}].Condition`;
+  if (!cond || typeof cond !== 'object' || Array.isArray(cond)) return `${where} must be an object`;
+  const operators = Object.keys(cond);
+  if (operators.length === 0) return `${where} must not be empty`;
+  for (const opRaw of operators) {
+    const op = opRaw.endsWith('IfExists') ? opRaw.slice(0, -'IfExists'.length) : opRaw;
+    if (op !== 'StringEquals' && op !== 'StringLike') return `${where}.${opRaw} is not a supported operator`;
+    const kv = (cond as any)[opRaw];
+    if (!kv || typeof kv !== 'object' || Array.isArray(kv)) return `${where}.${opRaw} must be an object`;
+    const entries = Object.entries(kv as Record<string, any>);
+    if (entries.length === 0 || entries.length > MAX_LIKE_PATTERNS_PER_KEY) {
+      return `${where}.${opRaw} must have 1..${MAX_LIKE_PATTERNS_PER_KEY} keys`;
+    }
+    for (const [key, value] of entries) {
+      if (!key || key.length > 128) return `${where}.${opRaw} has an invalid key`;
+      const values = Array.isArray(value) ? value : [value];
+      if (values.length === 0 || values.length > MAX_LIKE_PATTERNS_PER_KEY) {
+        return `${where}.${opRaw}.${key} must have 1..${MAX_LIKE_PATTERNS_PER_KEY} values`;
+      }
+      for (const item of values) {
+        if (!['string', 'number', 'boolean'].includes(typeof item)) {
+          return `${where}.${opRaw}.${key} values must be strings, numbers or booleans`;
+        }
+        if (String(item).length > MAX_LIKE_PATTERN_LEN) {
+          return `${where}.${opRaw}.${key} value exceeds ${MAX_LIKE_PATTERN_LEN} chars`;
+        }
+      }
+    }
+  }
+  return null;
+}
+
 export function validatePolicyDocument(doc: any): string | null {
   if (!doc || typeof doc !== 'object') return 'document must be an object';
   if (!Array.isArray((doc as any).Statement)) return 'document.Statement required (AWS IAM style)';
@@ -150,6 +187,8 @@ export function validatePolicyDocument(doc: any): string | null {
         return `Statement[${i}].Condition is not JSON-serializable`;
       }
       if (bytes > MAX_CONDITION_BYTES) return `Statement[${i}].Condition exceeds ${MAX_CONDITION_BYTES} bytes`;
+      const condErr = validateCondition(st.Condition, i);
+      if (condErr) return condErr;
     }
   }
   return null;

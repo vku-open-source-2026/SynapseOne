@@ -73,7 +73,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "http://stream:4009".into());
-    let runtime = StreamRuntime::new(store.clone(), stream_base, config.internal_secret.clone());
+    let lakehouse_base = std::env::var("LAKEHOUSE_SERVICE_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "http://lakehouse:4013".into());
+    let runtime = StreamRuntime::new(
+        store.clone(),
+        stream_base,
+        lakehouse_base,
+        config.internal_secret.clone(),
+    );
     let state = AppState {
         store,
         config: config.clone(),

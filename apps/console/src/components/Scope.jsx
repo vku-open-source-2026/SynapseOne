@@ -82,7 +82,7 @@ export function ScopeProvider({ children }) {
     api
       .accounts(orgId, headers)
       .then((v) => {
-        if (live && seq.current === my) { setAccounts(Array.isArray(v) ? v : []); setScopeErr(null); }
+        if (live && seq.current === my) { setAccounts((Array.isArray(v) ? v : []).filter((a) => (a.status || 'active') === 'active')); setScopeErr(null); }
       })
       .catch((e) => {
         if (live && seq.current === my) {

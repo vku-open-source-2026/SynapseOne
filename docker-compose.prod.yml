@@ -93,6 +93,28 @@ services:
       SYNAPSEONE_INTERNAL_SECRET: ${SYNAPSEONE_INTERNAL_SECRET:?SYNAPSEONE_INTERNAL_SECRET must be set in production}
     ports: !reset []
 
+  warehouse:
+    environment:
+      NODE_ENV: production
+      WAREHOUSE_DATA_DIR: ${WAREHOUSE_DATA_DIR:-/data/warehouse}
+      CORS_ORIGIN: ${CORS_ORIGIN:?CORS_ORIGIN must be set in production}
+      SYNAPSEONE_INTERNAL_SECRET: ${SYNAPSEONE_INTERNAL_SECRET:?SYNAPSEONE_INTERNAL_SECRET must be set in production}
+    # Warehouse is loopback-bound in the base file; production is gateway-only.
+    ports: !reset []
+
+  lakehouse:
+    environment:
+      NODE_ENV: production
+      LAKEHOUSE_CATALOG_URI: postgresql+pg8000://${POSTGRES_USER:-synapseone}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in production}@postgres:5432/${POSTGRES_DB:-synapseone}
+      LAKEHOUSE_WAREHOUSE: s3://${STORAGE_S3_BUCKET:?STORAGE_S3_BUCKET must be set in production}/lakehouse
+      LAKEHOUSE_S3_ENDPOINT: ${STORAGE_S3_ENDPOINT:-http://s3:9090}
+      LAKEHOUSE_S3_ACCESS_KEY: ${STORAGE_S3_ACCESS_KEY:?STORAGE_S3_ACCESS_KEY must be set in production}
+      LAKEHOUSE_S3_SECRET_KEY: ${STORAGE_S3_SECRET_KEY:?STORAGE_S3_SECRET_KEY must be set in production}
+      SYNAPSEONE_INTERNAL_SECRET: ${SYNAPSEONE_INTERNAL_SECRET:?SYNAPSEONE_INTERNAL_SECRET must be set in production}
+      LAKEHOUSE_MAX_BYTES: ${LAKEHOUSE_MAX_BYTES:-1073741824}
+    # Gateway-only in production.
+    ports: !reset []
+
   notifications:
     environment:
       NODE_ENV: production

@@ -141,7 +141,17 @@ export class IamService {
   createOrg(slug: string, displayName: string) {
     return this.http.req('/v1/orgs', { method: 'POST', body: JSON.stringify({ slug, displayName }) });
   }
+  updateOrg(orgId: string, displayName: string) {
+    return this.http.req(`/v1/orgs/${encodeURIComponent(orgId)}`, { method: 'PATCH', body: JSON.stringify({ displayName }) });
+  }
   listAccounts(orgId: string) { return this.http.req(`/v1/orgs/${encodeURIComponent(orgId)}/accounts`); }
+  getAccount(accountId: string) { return this.http.req(`/v1/accounts/${encodeURIComponent(accountId)}`); }
+  updateAccount(accountId: string, displayName: string) {
+    return this.http.req(`/v1/accounts/${encodeURIComponent(accountId)}`, { method: 'PATCH', body: JSON.stringify({ displayName }) });
+  }
+  updateUser(userId: string, displayName: string) {
+    return this.http.req(`/v1/users/${encodeURIComponent(userId)}`, { method: 'PATCH', body: JSON.stringify({ displayName }) });
+  }
   listUsers(orgId: string) { return this.http.req(`/v1/orgs/${encodeURIComponent(orgId)}/users`); }
   createUser(orgId: string, email: string, displayName?: string) {
     return this.http.req(`/v1/orgs/${encodeURIComponent(orgId)}/users`, { method: 'POST', body: JSON.stringify({ email, displayName }) });
@@ -163,8 +173,14 @@ export class IamService {
     return this.http.req(`/v1/accounts/${encodeURIComponent(accountId)}/roles`, { method: 'POST', body: JSON.stringify({ slug, description }) });
   }
   listRoles(accountId: string) { return this.http.req(`/v1/accounts/${encodeURIComponent(accountId)}/roles`); }
+  updateRole(roleId: string, description: string) {
+    return this.http.req(`/v1/roles/${encodeURIComponent(roleId)}`, { method: 'PATCH', body: JSON.stringify({ description }) });
+  }
   deleteRole(roleId: string) { return this.http.req(`/v1/roles/${encodeURIComponent(roleId)}`, { method: 'DELETE' }); }
   listPolicies(accountId: string) { return this.http.req(`/v1/accounts/${encodeURIComponent(accountId)}/policies`); }
+  updatePolicy(policyId: string, patch: { description?: string; document?: any }) {
+    return this.http.req(`/v1/policies/${encodeURIComponent(policyId)}`, { method: 'PATCH', body: JSON.stringify(patch) });
+  }
   deletePolicy(policyId: string) { return this.http.req(`/v1/policies/${encodeURIComponent(policyId)}`, { method: 'DELETE' }); }
   createPolicy(accountId: string, slug: string, document: any, description = '') {
     return this.http.req(`/v1/accounts/${encodeURIComponent(accountId)}/policies`, { method: 'POST', body: JSON.stringify({ slug, document, description }) });
@@ -311,6 +327,8 @@ export class IamService {
     return this.http.req(`/v1/accounts/${encodeURIComponent(accountId)}/service-accounts`, { method: 'POST', body: JSON.stringify({ slug, description }) });
   }
   listServiceAccounts(accountId: string) { return this.http.req(`/v1/accounts/${encodeURIComponent(accountId)}/service-accounts`); }
+  getServiceAccount(id: string) { return this.http.req(`/v1/service-accounts/${encodeURIComponent(id)}`); }
+  getApiKey(id: string) { return this.http.req(`/v1/keys/${encodeURIComponent(id)}`); }
   // scopes omitted -> the server delegates the caller's own scopes (never
   // widens to '*'). Pass an explicit list to narrow the minted token.
   serviceAccountToken(saId: string, scopes?: string[]) {

@@ -252,6 +252,19 @@ export default function SynapseStream() {
     }
   };
 
+  const handleDeleteGroup = async () => {
+    if (!selectedTopic || !selectedGroup) return;
+    if (!window.confirm(`Delete consumer group "${selectedGroup}"? Pending entries stop being tracked.`)) return;
+    try {
+      await api.streamGroupDelete(selectedTopic, selectedGroup, headers);
+      setSelectedGroup('');
+      setGroups((rows) => rows.filter((g) => g.name !== selectedGroup));
+      await loadStats(selectedTopic);
+    } catch (err) {
+      alert(`Delete group failed: ${err.message || err}`);
+    }
+  };
+
   const handleGroupRead = async () => {
     if (!selectedTopic || !selectedGroup) return;
     setGroupReading(true);
@@ -626,6 +639,12 @@ export default function SynapseStream() {
                           </div>
                         ))}
                       </div>
+
+                      {selectedGroup && (
+                        <button type="button" className="text-xs text-red-500 hover:underline mt-2" onClick={handleDeleteGroup}>
+                          Delete consumer group
+                        </button>
+                      )}
 
                       {/* Worker Simulation */}
                       {selectedGroup && (

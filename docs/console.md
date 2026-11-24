@@ -57,8 +57,15 @@ feature, path); **System & Health** — inventory: orgs/accounts/users/workflows
 recent executions, current context + shared org/account picker, gateway +
 IAM/workflow/AI health from aggregate /ready, recent activity with
 skeletons/empty/error states) ·
-Organizations · Accounts · Users (+create) · Roles · Policies (JSON editor +
-dry-run) · API Keys · Service Accounts · Workflows (built-in engine: templates + blank +
+Organizations · Accounts · Users (create, rename, retire/reactivate) · Roles ·
+Policies (JSON editor + dry-run) · API Keys · Service Accounts (mint token and
+role assignment) · Search (`/search`: full-text, semantic and
+hybrid modes, collection/limit filters, relevance results, facets, index status and
+reindex) · Synapse Warehouse (`/warehouse`: datasets, SQL runner, ETL jobs) ·
+Lakehouse (`/lakehouse`: namespaces, Iceberg tables, append, snapshots/time
+travel, schema evolution, quotas, namespace delete) · Notifications (queue, inspect,
+cancel, retry failed/dead, recipient preferences) · SynapseBase outbox visibility and
+collection stats · Workflows (built-in engine: templates + blank +
 duplicate with fresh webhook path + visual drag-and-drop editor grouped by
 Triggers/Actions/Logic/Utils with per-type forms (highlighted code editor,
 credential picker, webhook auth/rate/idempotency, cron timezone, retry/timeout,
@@ -66,11 +73,15 @@ disable toggle), undo/redo, live cycle/self-loop/
 dangling/duplicate validation blocking Save, true/false edge labels, test-run with
 sample input + per-node status/input/output + history, activate/deactivate/execute +
 webhook URL + next-run display + executions with status filter and per-node I/O +
-import/export + delete) · Authorize (simulator + live authorize) · Audit Log.
-**Security** (`/security`): turn on two-factor authentication (shows the TOTP secret
+cancel queued/paused runs + pending human-task approve/reject + import/export +
+delete) · Warehouse ETL supports batch/stream/Base→Lakehouse and authorized
+OCS CSV/JSONL/Parquet preview/import · Authorize (simulator + live authorize) · Audit Log.
+**Accounts** rows show active/retired status and offer org-admin
+retire/reactivate. **Security** (`/security`): turn on two-factor authentication (shows the TOTP secret
 and `otpauth://` link, confirms with a code, then shows 10 recovery codes once),
 replace recovery codes or turn MFA off. **Users** rows also offer *Reset MFA* and
-*Unlock sign-in* for org administrators. When an account has MFA, the Login page asks
+*Unlock sign-in*, make/remove org administrator and password-safe activation codes
+for org administrators. When an account has MFA, the Login page asks
 for the authenticator code (or a recovery code) after the email step.
 Public pages: Landing (`/`, install instructions), API Docs (try-it explorer +
 auth-gated AI chatbot bubble), Docs (SDK/CLI snippets), Login, OIDC callback.

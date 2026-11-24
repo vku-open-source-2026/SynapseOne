@@ -76,6 +76,22 @@ describe('SynapseOneClient', () => {
     assert.equal(lastPath, '/v1/orgs');
   });
 
+  it('exposes lakehouse namespace and table operations', async () => {
+    const c = new SynapseOneClient({ baseUrl: base });
+    await c.lakehouse.createNamespace('analytics');
+    assert.equal(lastMethod, 'POST');
+    assert.equal(lastPath, '/v1/lakehouse/namespaces');
+    assert.deepEqual(JSON.parse(lastBody), { name: 'analytics' });
+
+    await c.lakehouse.query('analytics', 'events', { limit: 10, snapshotId: '123' });
+    assert.equal(lastPath, '/v1/lakehouse/namespaces/analytics/tables/events/query');
+    assert.deepEqual(JSON.parse(lastBody), { limit: 10, snapshotId: '123' });
+
+    await c.lakehouse.append('analytics', 'events', [{ id: 'a' }], 'batch-1');
+    assert.equal(lastPath, '/v1/lakehouse/namespaces/analytics/tables/events/rows');
+    assert.deepEqual(JSON.parse(lastBody), { rows: [{ id: 'a' }], idempotencyKey: 'batch-1' });
+  });
+
   it('sends X-API-Key', async () => {
     const c = new SynapseOneClient({ baseUrl: base, apiKey: 'k1' });
     await c.listTemplates();

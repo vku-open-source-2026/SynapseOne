@@ -53,6 +53,8 @@ jobs:
       # Failures block merge like every other workspace.
       - run: pip install -r apps/inference-service/requirements.txt
       - run: pytest apps/inference-service/tests -q
+      - run: pip install -r apps/lakehouse-service/requirements.txt -r apps/lakehouse-service/requirements-dev.txt
+      - run: pytest apps/lakehouse-service -q
       - run: ruff check sdks/sdk-python apps/inference-service && ruff format --check sdks/sdk-python apps/inference-service
       - name: Edge nginx config guard
         run: |
@@ -67,13 +69,34 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [ai-service, base-service, queue-service, gateway, ocs-service, faststore-service, stream-service, lds-service, notifications-service, warehouse-service]
+        service: [ai-service, base-service, queue-service, gateway, ocs-service, faststore-service, stream-service, lds-service, notifications-service]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: cargo test
         run: cargo test --locked
         working-directory: apps/${{ matrix.service }}
+
+  warehouse-rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Link the official DuckDB 2.0.0 shared library instead of compiling the
+      # bundled C++ engine; the URL and checksum are pinned in the Dockerfile.
+      - name: Fetch pinned DuckDB 2.0.0
+        run: |
+          curl -fsSL -o /tmp/duckdb.tar.gz \
+            https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-shared-libs-linux-amd64.tar.gz
+          echo "993ad89e7dfca66cd6da994c2cad090c2fc160ddf9f550498a098ab4bb13cfb1  /tmp/duckdb.tar.gz" | sha256sum -c -
+          mkdir -p /opt/duckdb && tar -xzf /tmp/duckdb.tar.gz -C /opt/duckdb
+      - name: cargo test (dynamic DuckDB)
+        run: cargo test --locked --no-default-features
+        working-directory: apps/warehouse-service
+        env:
+          DUCKDB_LIB_DIR: /opt/duckdb
+          LD_LIBRARY_PATH: /opt/duckdb
 
   docker:
     runs-on: ubuntu-latest
@@ -85,7 +108,7 @@ jobs:
       # Build the control/data services that carry the release contract.
       # Inference/model images are built and published by their own release
       # pipeline; rebuilding the multi-GB model stack on every PR is not a gate.
-      - run: docker compose build iam workflow queue base gateway console
+      - run: docker compose build iam workflow queue base gateway console warehouse lakehouse stream ocs lds notifications
       - name: Build self-hosted workflow runner image (CI fallback model stage)
         run: |
           docker build -f apps/workflow-runner/Dockerfile \

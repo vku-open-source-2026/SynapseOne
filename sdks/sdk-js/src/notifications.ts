@@ -29,8 +29,11 @@ export interface SendNotificationInput {
   channels?: NotificationChannel[];
   recipient: NotificationRecipient;
   subject?: string;
-  /** Template with `{{var}}` placeholders filled from `data`. */
-  body: string;
+  /** Inline body with `{{var}}` placeholders filled from `data`. */
+  body?: string;
+  /** Stored template id or slug; mutually exclusive with `body`. */
+  templateId?: string;
+  templateSlug?: string;
   data?: Record<string, unknown>;
   idempotencyKey?: string;
 }
@@ -50,6 +53,22 @@ export interface NotificationRecord {
   updatedAt: string;
   nextAttemptAt: string;
   deadReason: string | null;
+  templateId?: string | null;
+  templateVersion?: number | null;
+}
+
+export interface NotificationTemplate {
+  id: string;
+  tenant: string;
+  slug: string;
+  name: string;
+  subject: string;
+  body: string;
+  variables: string[];
+  version: number;
+  archivedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface NotificationPreference {
@@ -85,6 +104,47 @@ export class NotificationsService {
 
   cancel(id: string): Promise<NotificationRecord> {
     return this.http.req(`${P}/${encodeURIComponent(id)}/cancel`, { method: 'POST', body: '{}' });
+  }
+
+  createTemplate(input: {
+    slug: string;
+    name: string;
+    subject?: string;
+    body: string;
+  }): Promise<NotificationTemplate> {
+    return this.http.req(`${P}/templates`, { method: 'POST', body: JSON.stringify(input) });
+  }
+
+  listTemplates(opts: { q?: string; includeArchived?: boolean; limit?: number; offset?: number } = {}) {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(opts)) {
+      if (v !== undefined && v !== null && String(v) !== '') qs.set(k, String(v));
+    }
+    const s = qs.toString();
+    return this.http.req<{ items: NotificationTemplate[]; total: number }>(`${P}/templates${s ? `?${s}` : ''}`);
+  }
+
+  getTemplate(id: string): Promise<NotificationTemplate> {
+    return this.http.req(`${P}/templates/${encodeURIComponent(id)}`);
+  }
+
+  updateTemplate(id: string, patch: { name?: string; subject?: string; body?: string }): Promise<NotificationTemplate> {
+    return this.http.req(`${P}/templates/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(patch) });
+  }
+
+  deleteTemplate(id: string): Promise<{ ok: boolean; archived: boolean }> {
+    return this.http.req(`${P}/templates/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  }
+
+  previewTemplate(id: string, data: Record<string, unknown> = {}) {
+    return this.http.req<{ subject: string; body: string; variables: string[]; missing: string[]; version: number }>(
+      `${P}/templates/${encodeURIComponent(id)}/preview`,
+      { method: 'POST', body: JSON.stringify({ data }) },
+    );
+  }
+
+  retry(id: string): Promise<NotificationRecord> {
+    return this.http.req(`${P}/${encodeURIComponent(id)}/retry`, { method: 'POST', body: '{}' });
   }
 
   getPreference(recipient: string): Promise<NotificationPreference> {

@@ -121,6 +121,13 @@ const del = (path, auth) => req(path, { method: 'DELETE', ...auth });
 // Generic call through the session-aware client (silent refresh on 401).
 // Pages that fetch() directly bypass token rotation — use this instead.
 const call = (method, path, body, auth) => req(path, { method, body, ...auth });
+const pageQs = (params = {}) => {
+  const q = new URLSearchParams({ paged: '1' });
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && String(v) !== '') q.set(k, String(v));
+  }
+  return `?${q.toString()}`;
+};
 
 async function uploadBinary(path, body, contentType, auth) {
   const headers = { 'Content-Type': contentType || 'application/octet-stream' };
@@ -183,17 +190,30 @@ export const api = {
   authContexts: (a) => get('/v1/auth/contexts', a),
   switchContext: (orgId, password, a) => post('/v1/auth/contexts/switch', { orgId, password }, a),
   orgs: (a) => get('/v1/orgs', a),
+  orgsPaged: (params, a) => get(`/v1/orgs${pageQs(params)}`, a),
   createOrg: (slug, displayName, a) => post('/v1/orgs', { slug, displayName }, a),
+  updateOrg: (orgId, displayName, a) => patch(`/v1/orgs/${encodeURIComponent(orgId)}`, { displayName }, a),
   accounts: (orgId, a) => get(`/v1/orgs/${encodeURIComponent(orgId)}/accounts`, a),
+  accountsPaged: (orgId, params, a) => get(`/v1/orgs/${encodeURIComponent(orgId)}/accounts${pageQs(params)}`, a),
   createAccount: (orgId, slug, displayName, a) =>
     post(`/v1/orgs/${encodeURIComponent(orgId)}/accounts`, { slug, displayName }, a),
+  account: (accountId, a) => get(`/v1/accounts/${encodeURIComponent(accountId)}`, a),
+  updateAccount: (accountId, displayName, a) => patch(`/v1/accounts/${encodeURIComponent(accountId)}`, { displayName }, a),
+  retireAccount: (accountId, reason, a) =>
+    post(`/v1/accounts/${encodeURIComponent(accountId)}/retire`, { reason }, a),
+  reactivateAccount: (accountId, a) =>
+    post(`/v1/accounts/${encodeURIComponent(accountId)}/reactivate`, {}, a),
   users: (orgId, a) => get(`/v1/orgs/${encodeURIComponent(orgId)}/users`, a),
+  usersPaged: (orgId, params, a) => get(`/v1/orgs/${encodeURIComponent(orgId)}/users${pageQs(params)}`, a),
   createUser: (orgId, email, displayName, a) =>
     post(`/v1/orgs/${encodeURIComponent(orgId)}/users`, displayName ? { email, displayName } : { email }, a),
+  updateUser: (userId, displayName, a) => patch(`/v1/users/${encodeURIComponent(userId)}`, { displayName }, a),
   roles: (accountId, a) => get(`/v1/accounts/${encodeURIComponent(accountId)}/roles`, a),
+  rolesPaged: (accountId, params, a) => get(`/v1/accounts/${encodeURIComponent(accountId)}/roles${pageQs(params)}`, a),
   createRole: (accountId, slug, a) => post(`/v1/accounts/${encodeURIComponent(accountId)}/roles`, { slug }, a),
   deleteRole: (roleId, a) => del(`/v1/roles/${encodeURIComponent(roleId)}`, a),
   policies: (accountId, a) => get(`/v1/accounts/${encodeURIComponent(accountId)}/policies`, a),
+  policiesPaged: (accountId, params, a) => get(`/v1/accounts/${encodeURIComponent(accountId)}/policies${pageQs(params)}`, a),
   createPolicy: (accountId, slug, document, a) =>
     post(`/v1/accounts/${encodeURIComponent(accountId)}/policies`, { slug, document }, a),
   deletePolicy: (policyId, a) => del(`/v1/policies/${encodeURIComponent(policyId)}`, a),
@@ -221,14 +241,14 @@ export const api = {
   sessions: (a) => get('/v1/auth/sessions', a),
   revokeSession: (id, a) => del(`/v1/auth/sessions/${encodeURIComponent(id)}`, a),
   managedPolicies: (a) => get('/v1/managed-policies', a),
-  createManagedPolicy: (accountId, slug, managed, a) =>
-    post(`/v1/accounts/${encodeURIComponent(accountId)}/policies`, { slug, managed }, a),
   setOrgAdmin: (userId, isOrgAdmin, a) => put(`/v1/users/${encodeURIComponent(userId)}/org-admin`, { isOrgAdmin }, a),
   saRoles: (id, a) => get(`/v1/service-accounts/${encodeURIComponent(id)}/roles`, a),
   saGrantRole: (id, roleId, a) => post(`/v1/service-accounts/${encodeURIComponent(id)}/roles`, { roleId }, a),
   saRevokeRole: (id, roleId, a) => del(`/v1/service-accounts/${encodeURIComponent(id)}/roles/${encodeURIComponent(roleId)}`, a),
   listKeys: (accountId, a) => get(`/v1/accounts/${encodeURIComponent(accountId)}/keys`, a),
+  keysPaged: (accountId, params, a) => get(`/v1/accounts/${encodeURIComponent(accountId)}/keys${pageQs(params)}`, a),
   serviceAccounts: (accountId, a) => get(`/v1/accounts/${encodeURIComponent(accountId)}/service-accounts`, a),
+  serviceAccountsPaged: (accountId, params, a) => get(`/v1/accounts/${encodeURIComponent(accountId)}/service-accounts${pageQs(params)}`, a),
   createSA: (accountId, slug, a) => post(`/v1/accounts/${encodeURIComponent(accountId)}/service-accounts`, { slug }, a),
   saToken: (id, a) => post(`/v1/service-accounts/${encodeURIComponent(id)}/token`, {}, a),
   templates: (a) => get('/v1/templates', a),
@@ -262,15 +282,50 @@ export const api = {
   },
   execution: (id, a) => get(`/v1/executions/${encodeURIComponent(id)}`, a),
   executionWithData: (id, a) => get(`/v1/executions/${encodeURIComponent(id)}?includeData=true`, a),
+  cancelExecution: (id, reason, a) => post(`/v1/executions/${encodeURIComponent(id)}/cancel`, { reason }, a),
+  humanTasks: (params, a) => {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(params || {})) {
+      if (v !== undefined && v !== null && String(v) !== '') qs.set(k, String(v));
+    }
+    const s = qs.toString();
+    return get(`/v1/human-tasks${s ? `?${s}` : ''}`, a);
+  },
+  completeHumanTask: (id, decision, note, a) =>
+    post(`/v1/human-tasks/${encodeURIComponent(id)}/complete`, { decision, ...(note ? { note } : {}) }, a),
+  rejectHumanTask: (id, note, a) =>
+    post(`/v1/human-tasks/${encodeURIComponent(id)}/reject`, { note }, a),
   credentials: (accountId, a) => get(`/v1/credentials${accountId ? `?accountId=${encodeURIComponent(accountId)}` : ''}`, a),
   createCredential: (accountId, name, kind, secret, a) => post('/v1/credentials', { accountId, name, kind, secret }, a),
   deleteCredential: (id, a) => del(`/v1/credentials/${encodeURIComponent(id)}`, a),
   agent: (question, history, a) => post('/v1/ai/agent', { question, history }, a),
+  notifications: (params, a) => {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(params || {})) {
+      if (v !== undefined && v !== null && String(v) !== '') qs.set(k, String(v));
+    }
+    const s = qs.toString();
+    return get(`/v1/notifications${s ? `?${s}` : ''}`, a);
+  },
+  notification: (id, a) => get(`/v1/notifications/${encodeURIComponent(id)}`, a),
+  sendNotification: (body, a) => post('/v1/notifications', body, a),
+  cancelNotification: (id, a) => post(`/v1/notifications/${encodeURIComponent(id)}/cancel`, {}, a),
+  retryNotification: (id, a) => post(`/v1/notifications/${encodeURIComponent(id)}/retry`, {}, a),
+  notificationTemplates: (params, a) => {
+    const q = new URLSearchParams();
+    for (const [k, v] of Object.entries(params || {})) if (v !== undefined && v !== null && String(v) !== '') q.set(k, String(v));
+    return get(`/v1/notifications/templates${q.toString() ? `?${q}` : ''}`, a);
+  },
+  createNotificationTemplate: (body, a) => post('/v1/notifications/templates', body, a),
+  updateNotificationTemplate: (id, body, a) => patch(`/v1/notifications/templates/${encodeURIComponent(id)}`, body, a),
+  deleteNotificationTemplate: (id, a) => del(`/v1/notifications/templates/${encodeURIComponent(id)}`, a),
+  previewNotificationTemplate: (id, data, a) => post(`/v1/notifications/templates/${encodeURIComponent(id)}/preview`, { data }, a),
+  notificationPreferences: (recipient, a) => get(`/v1/notifications/preferences/${encodeURIComponent(recipient)}`, a),
+  setNotificationPreferences: (recipient, body, a) => put(`/v1/notifications/preferences/${encodeURIComponent(recipient)}`, body, a),
   // ---- SynapseOCS (object cloud storage) ----
   ocsBuckets: (a) => get('/v1/ocs/buckets?withStats=1', a),
   ocsCreateBucket: (name, quotaBytes, a) =>
     post('/v1/ocs/buckets', { name, ...(quotaBytes ? { quotaBytes: Number(quotaBytes) } : {}) }, a),
-  ocsBucket: (name, a) => get(`/v1/ocs/buckets/${encodeURIComponent(name)}`, a),
   ocsDeleteBucket: (name, force, a) =>
     del(`/v1/ocs/buckets/${encodeURIComponent(name)}${force ? '?force=true' : ''}`, a),
   ocsObjects: (bucket, params, a) => {
@@ -293,7 +348,6 @@ export const api = {
   ldsDatasource: (id, a) => get(`/v1/lds/datasources/${encodeURIComponent(id)}`, a),
   ldsUpdateDatasource: (id, body, a) => patch(`/v1/lds/datasources/${encodeURIComponent(id)}`, body, a),
   ldsDeleteDatasource: (id, a) => del(`/v1/lds/datasources/${encodeURIComponent(id)}`, a),
-  ldsAttributes: (id, a) => get(`/v1/lds/datasources/${encodeURIComponent(id)}/attributes`, a),
   ldsSetAttributes: (id, attributes, a) => put(`/v1/lds/datasources/${encodeURIComponent(id)}/attributes`, { attributes }, a),
   ldsIngest: (id, payload, a) => post(`/v1/lds/datasources/${encodeURIComponent(id)}/records`, payload, a),
   ldsEntities: (id, params, a) => {
@@ -304,19 +358,19 @@ export const api = {
     const s = qs.toString();
     return get(`/v1/lds/datasources/${encodeURIComponent(id)}/entities${s ? `?${s}` : ''}`, a);
   },
-  ldsEntity: (id, entityId, a) => get(`/v1/lds/datasources/${encodeURIComponent(id)}/entities/${encodeURIComponent(entityId)}`, a),
-  ldsStats: (id, a) => get(`/v1/lds/datasources/${encodeURIComponent(id)}/stats`, a),
+  // ---- Search (SynapseBase index) ----
+  search: (body, a) => post('/v1/search', body, a),
+  searchStatus: (a) => get('/v1/search/status', a),
+  searchReindex: (body, a) => post('/v1/search/reindex', body || {}, a),
   // ---- SynapseBase (document database) ----
   baseDatabases: (a) => get('/v1/base/databases', a),
   baseCreateDatabase: (body, a) => post('/v1/base/databases', body, a),
-  baseDatabase: (db, a) => get(`/v1/base/databases/${encodeURIComponent(db)}`, a),
   baseUpdateDatabase: (db, body, a) =>
     patch(`/v1/base/databases/${encodeURIComponent(db)}`, body, a),
   baseDeleteDatabase: (db, a) =>
     del(`/v1/base/databases/${encodeURIComponent(db)}?cascade=true`, a),
   baseCollections: (a, db) => get(baseCollectionsPath(db), a),
   baseCreateCollection: (body, a, db) => post(baseCollectionsPath(db), body, a),
-  baseCollection: (col, a, db) => get(baseCollectionPath(col, db), a),
   baseUpdateCollection: (col, body, a, db) => patch(baseCollectionPath(col, db), body, a),
   baseDeleteCollection: (col, a, db) => del(baseCollectionPath(col, db), a),
   baseCollectionStats: (col, a, db) => get(`${baseCollectionPath(col, db)}/stats`, a),
@@ -329,14 +383,10 @@ export const api = {
     const s = qs.toString();
     return get(`${baseCollectionPath(col, db)}/documents${s ? `?${s}` : ''}`, a);
   },
-  baseDocument: (col, id, as, a, db) =>
-    get(`${baseCollectionPath(col, db)}/documents/${encodeURIComponent(id)}${as ? `?as=${encodeURIComponent(as)}` : ''}`, a),
   baseCreateDocument: (col, body, a, db) =>
     post(`${baseCollectionPath(col, db)}/documents`, body, a),
   baseUpdateDocument: (col, id, body, a, db) =>
     put(`${baseCollectionPath(col, db)}/documents/${encodeURIComponent(id)}`, body, a),
-  basePatchDocument: (col, id, body, a, db) =>
-    patch(`${baseCollectionPath(col, db)}/documents/${encodeURIComponent(id)}`, body, a),
   baseDeleteDocument: (col, id, a, db) =>
     del(`${baseCollectionPath(col, db)}/documents/${encodeURIComponent(id)}`, a),
   baseQuery: (col, body, a, db) =>
@@ -351,10 +401,17 @@ export const api = {
     const s = qs.toString();
     return get(`${baseCollectionPath(col, db)}/changes${s ? `?${s}` : ''}`, a);
   },
+  baseOutbox: (params, a) => {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(params || {})) {
+      if (v !== undefined && v !== null && String(v) !== '') qs.set(k, String(v));
+    }
+    const s = qs.toString();
+    return get(`/v1/base/outbox${s ? `?${s}` : ''}`, a);
+  },
   // ---- SynapseQueue (messaging) ----
   queueList: (a) => get('/v1/queue/queues', a),
   queueCreate: (name, body, a) => put(`/v1/queue/queues/${encodeURIComponent(name)}`, body, a),
-  queueGet: (name, a) => get(`/v1/queue/queues/${encodeURIComponent(name)}`, a),
   queueDelete: (name, a) => del(`/v1/queue/queues/${encodeURIComponent(name)}`, a),
   queuePurge: (name, a) => post(`/v1/queue/queues/${encodeURIComponent(name)}/purge`, {}, a),
   queueStats: (name, a) => get(`/v1/queue/queues/${encodeURIComponent(name)}/stats`, a),
@@ -386,11 +443,9 @@ export const api = {
   // ---- SynapseStream (event streaming log) ----
   streamTopicList: (a) => get('/v1/stream/topics', a),
   streamTopicCreate: (name, body, a) => put(`/v1/stream/topics/${encodeURIComponent(name)}`, body, a),
-  streamTopicGet: (name, a) => get(`/v1/stream/topics/${encodeURIComponent(name)}`, a),
   streamTopicDelete: (name, a) => del(`/v1/stream/topics/${encodeURIComponent(name)}`, a),
   streamTopicStats: (name, a) => get(`/v1/stream/topics/${encodeURIComponent(name)}/stats`, a),
   streamPublish: (name, body, a) => post(`/v1/stream/topics/${encodeURIComponent(name)}/events`, body, a),
-  streamPublishBatch: (name, body, a) => post(`/v1/stream/topics/${encodeURIComponent(name)}/events:batch`, body, a),
   streamRead: (name, body, a) => post(`/v1/stream/topics/${encodeURIComponent(name)}/read`, body, a),
   streamRange: (name, params, a) => {
     const qs = new URLSearchParams();
@@ -409,18 +464,36 @@ export const api = {
   streamGroupAck: (name, group, body, a) =>
     post(`/v1/stream/topics/${encodeURIComponent(name)}/groups/${encodeURIComponent(group)}/ack`, body, a),
   // ---- Synapse Warehouse (OLAP + ETL) ----
-  warehouseDatasets: (a) => get('/v1/warehouse/datasets', a),
-  warehouseDataset: (id, a) => get(`/v1/warehouse/datasets/${encodeURIComponent(id)}`, a),
+  warehouseDatasets: (params = {}, a) => get(`/v1/warehouse/datasets${pageQs(params)}`, a),
   warehouseCreateDataset: (body, a) => post('/v1/warehouse/datasets', body, a),
+  warehouseUpdateDataset: (id, body, a) => patch(`/v1/warehouse/datasets/${encodeURIComponent(id)}`, body, a),
   warehouseDeleteDataset: (id, a) => del(`/v1/warehouse/datasets/${encodeURIComponent(id)}`, a),
-  warehouseIngest: (id, rows, a) => post(`/v1/warehouse/datasets/${encodeURIComponent(id)}/rows`, { rows }, a),
   warehouseQuery: (sql, limit, a) => post('/v1/warehouse/query', { sql, limit }, a),
   warehouseTemplates: (a) => get('/v1/warehouse/templates', a),
-  warehouseJobs: (a) => get('/v1/warehouse/jobs', a),
+  warehouseJobs: (params = {}, a) => get(`/v1/warehouse/jobs${pageQs(params)}`, a),
   warehouseCreateJob: (body, a) => post('/v1/warehouse/jobs', body, a),
+  warehouseEtlBase: (body, a) => post('/v1/warehouse/etl/base', body, a),
+  warehouseEtlBaseLakehouse: (body, a) => post('/v1/warehouse/etl/base-lakehouse', body, a),
+  warehouseOcsPreview: (body, a) => post('/v1/warehouse/etl/ocs/preview', body, a),
+  warehouseEtlOcs: (body, a) => post('/v1/warehouse/etl/ocs', body, a),
+  warehouseEtlLakehouse: (body, a) => post('/v1/warehouse/etl/lakehouse', body, a),
+  lakehouseUsage: (a) => get('/v1/lakehouse/usage', a),
+  lakehouseNamespaces: (a) => get('/v1/lakehouse/namespaces', a),
+  lakehouseCreateNamespace: (name, a) => post('/v1/lakehouse/namespaces', { name }, a),
+  lakehouseDeleteNamespace: (ns, a) => del(`/v1/lakehouse/namespaces/${encodeURIComponent(ns)}`, a),
+  lakehouseTables: (ns, a) => get(`/v1/lakehouse/namespaces/${encodeURIComponent(ns)}/tables`, a),
+  lakehouseTable: (ns, table, a) => get(`/v1/lakehouse/namespaces/${encodeURIComponent(ns)}/tables/${encodeURIComponent(table)}`, a),
+  lakehouseCreateTable: (ns, body, a) => post(`/v1/lakehouse/namespaces/${encodeURIComponent(ns)}/tables`, body, a),
+  lakehouseDeleteTable: (ns, table, a) => del(`/v1/lakehouse/namespaces/${encodeURIComponent(ns)}/tables/${encodeURIComponent(table)}`, a),
+  lakehouseAppend: (ns, table, body, a) => post(`/v1/lakehouse/namespaces/${encodeURIComponent(ns)}/tables/${encodeURIComponent(table)}/rows`, body, a),
+  lakehouseQuery: (ns, table, body, a) => post(`/v1/lakehouse/namespaces/${encodeURIComponent(ns)}/tables/${encodeURIComponent(table)}/query`, body, a),
+  lakehouseSnapshots: (ns, table, a) => get(`/v1/lakehouse/namespaces/${encodeURIComponent(ns)}/tables/${encodeURIComponent(table)}/snapshots`, a),
+  lakehouseMaintenance: (ns, table, a) => get(`/v1/lakehouse/namespaces/${encodeURIComponent(ns)}/tables/${encodeURIComponent(table)}/maintenance`, a),
+  lakehouseEvolve: (ns, table, body, a) => post(`/v1/lakehouse/namespaces/${encodeURIComponent(ns)}/tables/${encodeURIComponent(table)}/schema`, body, a),
   warehouseRunJob: (id, a) => post(`/v1/warehouse/jobs/${encodeURIComponent(id)}/run`, {}, a),
   warehousePauseJob: (id, a) => post(`/v1/warehouse/jobs/${encodeURIComponent(id)}/pause`, {}, a),
   warehouseResumeJob: (id, a) => post(`/v1/warehouse/jobs/${encodeURIComponent(id)}/resume`, {}, a),
+  warehouseUpdateJob: (id, body, a) => patch(`/v1/warehouse/jobs/${encodeURIComponent(id)}`, body, a),
   warehouseDeleteJob: (id, a) => del(`/v1/warehouse/jobs/${encodeURIComponent(id)}`, a),
   // ---- Synapse Faststore (cache / KV) ----
   faststoreStats: (a) => get('/v1/faststore/stats', a),
@@ -440,7 +513,6 @@ export const api = {
   faststoreIncr: (key, body, a) => post(`/v1/faststore/keys/${encodeURIComponent(key)}/incr`, body, a),
   faststoreHashGet: (key, a) => get(`/v1/faststore/hashes/${encodeURIComponent(key)}`, a),
   faststoreHashSet: (key, body, a) => put(`/v1/faststore/hashes/${encodeURIComponent(key)}`, body, a),
-  faststoreHashDelete: (key, a) => del(`/v1/faststore/hashes/${encodeURIComponent(key)}`, a),
   faststoreListGet: (key, params, a) => {
     const qs = new URLSearchParams();
     for (const [k, v] of Object.entries(params || {})) {
@@ -450,10 +522,8 @@ export const api = {
     return get(`/v1/faststore/lists/${encodeURIComponent(key)}${s ? `?${s}` : ''}`, a);
   },
   faststoreListPush: (key, body, a) => post(`/v1/faststore/lists/${encodeURIComponent(key)}/push`, body, a),
-  faststoreListDelete: (key, a) => del(`/v1/faststore/lists/${encodeURIComponent(key)}`, a),
   faststoreSetGet: (key, a) => get(`/v1/faststore/sets/${encodeURIComponent(key)}`, a),
   faststoreSetAdd: (key, body, a) => post(`/v1/faststore/sets/${encodeURIComponent(key)}/add`, body, a),
-  faststoreSetDelete: (key, a) => del(`/v1/faststore/sets/${encodeURIComponent(key)}`, a),
   faststoreZsetGet: (key, params, a) => {
     const qs = new URLSearchParams();
     for (const [k, v] of Object.entries(params || {})) {
@@ -463,7 +533,6 @@ export const api = {
     return get(`/v1/faststore/zsets/${encodeURIComponent(key)}${s ? `?${s}` : ''}`, a);
   },
   faststoreZsetAdd: (key, body, a) => post(`/v1/faststore/zsets/${encodeURIComponent(key)}/add`, body, a),
-  faststoreZsetDelete: (key, a) => del(`/v1/faststore/zsets/${encodeURIComponent(key)}`, a),
   faststoreLockAcquire: (name, body, a) => post(`/v1/faststore/locks/${encodeURIComponent(name)}/acquire`, body, a),
   faststoreLockRelease: (name, body, a) => post(`/v1/faststore/locks/${encodeURIComponent(name)}/release`, body, a),
   usageSummary: (params, a) => {

@@ -59,6 +59,24 @@ make license-check
 
 - **Build before test.** Each service's `test` script is
   `node --test dist/*.test.js`; `make test` alone fails on a clean checkout.
+- **`make test` exercises the TypeScript reference, not the shipped Rust
+  binaries.** Run the Rust unit tests in the service directory
+  (`cargo test --locked`) or the CI `rust-services` job before calling a
+  data-plane change verified. Do not cite a green `make test` as Rust
+  verification. If `cargo` is installed under `~/.cargo/bin`, add that to
+  `PATH` (the login shell may not).
+- Warehouse's Docker image and CI link the pinned official DuckDB 2.0.0 shared
+  library. For a local test build, download/extract the shared libs once, then:
+
+```bash
+# download/extract the official v2.0.0 shared libs once, then:
+cd apps/warehouse-service
+DUCKDB_LIB_DIR=/path/to/libduckdb \
+LD_LIBRARY_PATH=/path/to/libduckdb \
+cargo test --no-default-features --locked
+```
+
+  The Dockerfile uses the same pinned shared library for the release image.
 - Unit suites use in-memory backends. They do not exercise Postgres SQL,
   migrations, Valkey Lua, or header trust in production mode.
 - To exercise real backends and the full gateway path:
@@ -79,8 +97,9 @@ SYNAPSEONE_BASE_URL=http://localhost:8080 node tests/e2e/inference-check.js
   when needed, then runs pytest). CI installs the same requirements and runs
   `pytest apps/inference-service/tests`.
 - Go SDK: `go vet ./... && go test ./...` in `sdks/sdk-go`.
-- New services in 0.7.0: `storage` (:4010) and `notifications` (:4011); both have
-  fail-closed production guards and are in Compose/K8s/`/ready`.
+- Current data-plane services: `stream` (:4009), `storage`/OCS (:4010),
+  `notifications` (:4011), and `warehouse` (:4012); all have fail-closed
+  production guards and are in Compose/K8s/`/ready`.
 - CI also runs `node tools/catalog-check.mjs`, which asserts the Console
   endpoint list, AI catalog, and `docs/api.md` stay in sync. Update all three
   when adding a public endpoint.

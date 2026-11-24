@@ -44,6 +44,11 @@ export const accounts = pgTable(
     orgId: uuid('org_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
     slug: text('slug').notNull(),
     displayName: text('display_name').notNull(),
+    /** active | retired. Retired accounts keep resources but reject access. */
+    status: text('status').notNull().default('active'),
+    retiredAt: timestamp('retired_at', { withTimezone: true }),
+    retiredBy: text('retired_by'),
+    retireReason: text('retire_reason'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
@@ -268,6 +273,10 @@ export const refreshTokens = pgTable(
     tokenHash: text('token_hash').notNull(),
     expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
     revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    /** Set only when rotation consumed the token. Explicit logout revocation
+     *  leaves this null, so reuse detection can distinguish theft from a
+     *  deliberately revoked session. */
+    consumedAt: timestamp('consumed_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [

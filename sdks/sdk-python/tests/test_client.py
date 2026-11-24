@@ -555,6 +555,31 @@ def test_credential_lifecycle_and_delegated_exchange_paths():
         srv.shutdown()
 
 
+def test_lakehouse_namespace_table_and_snapshot_routes():
+    srv = _server()
+    try:
+        base = f"http://127.0.0.1:{srv.server_port}"
+        c = SynapseOneClient(base)
+        assert c.lakehouse.create_namespace("analytics") == {"ok": True}
+        assert _seen["method"] == "POST"
+        assert _seen["path"] == "/v1/lakehouse/namespaces"
+        assert json.loads(_seen["body"]) == {"name": "analytics"}
+
+        c.lakehouse.append("analytics", "events", [{"id": "a"}], idempotency_key="batch-1")
+        assert _seen["path"] == "/v1/lakehouse/namespaces/analytics/tables/events/rows"
+        assert json.loads(_seen["body"]) == {
+            "rows": [{"id": "a"}],
+            "idempotencyKey": "batch-1",
+        }
+
+        c.lakehouse.query("analytics", "events", limit=10, snapshot_id="123")
+        assert _seen["path"] == "/v1/lakehouse/namespaces/analytics/tables/events/query"
+        assert json.loads(_seen["body"]) == {"limit": 10, "snapshotId": "123"}
+        assert c.lakehouse.snapshots("analytics", "events") == {"ok": True}
+    finally:
+        srv.shutdown()
+
+
 def test_ocs_namespace_routes_bucket_and_object_calls():
     srv = _server()
     try:

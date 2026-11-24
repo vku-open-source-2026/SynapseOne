@@ -335,7 +335,7 @@ export default function Dashboard() {
       const items = asList(await api.executions({ limit: EXEC_WINDOW }, headers)) || [];
       const success = items.filter((x) => execStatus(x) === 'success').length;
       const error = items.filter((x) => execStatus(x) === 'error').length;
-      const waiting = items.filter((x) => execStatus(x) === 'waiting').length;
+      const waiting = items.filter((x) => execStatus(x) === 'queued').length;
       setRuns({ total: items.length, success, error, waiting, items: items.slice(0, 5) });
     } catch (e) {
       setRuns({ total: null, success: 0, error: 0, waiting: 0, items: [] });
@@ -1350,7 +1350,7 @@ export default function Dashboard() {
                       {' · '}
                       <span className="text-red-500 font-medium">{runs.error} failed</span>
                       {' · '}
-                      {runs.waiting} waiting
+                      {runs.waiting} queued
                     </p>
                   </div>
                 </>

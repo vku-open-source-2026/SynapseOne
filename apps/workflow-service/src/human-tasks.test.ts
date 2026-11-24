@@ -7,8 +7,8 @@
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
-import { createApp } from './index';
-import { __clearMem } from './store';
+import { createApp, reclaimWorkflowStateOnce } from './index';
+import { __clearMem, createExecutionRec, createHumanTaskRec, transitionHumanTaskRec } from './store';
 
 const INTERNAL = 'test-secret-123';
 const USER = {
@@ -69,10 +69,10 @@ describe('durable human tasks (#44)', () => {
     return new Promise<void>((resolve) => (server ? server.close(() => resolve()) : resolve()));
   });
 
-  async function createPaused(): Promise<{ executionId: string; taskId: string }> {
+  async function createPaused(override?: any): Promise<{ executionId: string; taskId: string; workflowId: string }> {
     const created = await fetch(`${base}/v1/workflows`, {
       method: 'POST', headers: USER,
-      body: JSON.stringify({ name: `human-${Math.random().toString(36).slice(2)}`, definition: definition() }),
+      body: JSON.stringify({ name: `human-${Math.random().toString(36).slice(2)}`, definition: override ?? definition() }),
     });
     assert.equal(created.status, 201);
     const wf: any = await created.json();
@@ -84,7 +84,7 @@ describe('durable human tasks (#44)', () => {
     assert.equal(paused.status, 'paused');
     assert.equal(paused.paused, true);
     assert.ok(paused.taskId);
-    return { executionId: paused.executionId, taskId: paused.taskId };
+    return { executionId: paused.executionId, taskId: paused.taskId, workflowId: wf.id };
   }
 
   it('pauses at a human task without running downstream nodes', async () => {
@@ -132,6 +132,59 @@ describe('durable human tasks (#44)', () => {
     assert.equal((await again.json()).error, 'already_decided');
   });
 
+  it('fails closed for legacy paused runs without a checkpoint binding', async () => {
+    const execution = await createExecutionRec({
+      workflow_id: 'legacy-unbound',
+      workflow_name: 'legacy-unbound',
+      status: 'paused',
+      input: {},
+      output: { humanTask: { id: 'synthetic' } },
+      node_runs: [],
+      triggered_by: 'manual',
+      principal: { sub: 'operator@example.com', org: 'org-a', account: 'acct-a', kind: 'user' },
+      startedAt: new Date().toISOString(),
+    });
+    const task = await createHumanTaskRec({
+      execution_id: execution.id,
+      workflow_id: null,
+      node_name: 'Apply',
+      title: 'Legacy approval',
+      assignee: 'operator@example.com',
+      org_id: 'org-a',
+      account_id: 'acct-a',
+    });
+    const denied = await fetch(`${base}/v1/human-tasks/${task.id}/complete`, {
+      method: 'POST', headers: USER, body: JSON.stringify({ decision: { approved: true } }),
+    });
+    assert.equal(denied.status, 409);
+    assert.equal((await denied.json()).error, 'not_pause_checkpoint');
+    const after = await fetch(`${base}/v1/executions/${execution.id}`, { headers: USER });
+    assert.equal((await after.json()).status, 'paused');
+  });
+
+  it('refuses to fabricate a second approval for a paused execution', async () => {
+    const { executionId, taskId } = await createPaused();
+    const forged = await fetch(`${base}/v1/human-tasks`, {
+      method: 'POST', headers: USER,
+      body: JSON.stringify({
+        executionId,
+        node: 'Apply',
+        title: 'Bypass approval',
+        assignee: 'operator@example.com',
+        decision: { approved: true },
+      }),
+    });
+    assert.equal(forged.status, 409);
+    assert.equal((await forged.json()).error, 'pause_checkpoint_exists');
+
+    // The original checkpoint remains the only way to resume the execution.
+    const done = await fetch(`${base}/v1/human-tasks/${taskId}/complete`, {
+      method: 'POST', headers: USER, body: JSON.stringify({ decision: { approved: true } }),
+    });
+    assert.equal(done.status, 200);
+    assert.equal((await done.json()).resumed.status, 'success');
+  });
+
   it('rejects with a required note and resumes the rejection branch', async () => {
     const { executionId, taskId } = await createPaused();
     const missing = await fetch(`${base}/v1/human-tasks/${taskId}/reject`, {
@@ -164,6 +217,49 @@ describe('durable human tasks (#44)', () => {
       method: 'POST', headers: USER, body: JSON.stringify({ decision: { approved: true } }),
     });
     assert.equal(allowed.status, 200);
+  });
+
+  it('binds a second pause to its own task and node', async () => {
+    const twoStep = {
+      nodes: [
+        { name: 'Start', type: 'manualTrigger', parameters: {} },
+        { name: 'First approval', type: 'humanTask', parameters: { title: 'First approval', candidateRoles: ['duty-manager'] } },
+        { name: 'Second approval', type: 'humanTask', parameters: { title: 'Second approval', candidateRoles: ['duty-manager'] } },
+        { name: 'Apply', type: 'set', parameters: { values: { done: true } } },
+      ],
+      connections: {
+        Start: { main: [[{ node: 'First approval' }]] },
+        'First approval': { main: [[{ node: 'Second approval' }]] },
+        'Second approval': { main: [[{ node: 'Apply' }]] },
+      },
+    };
+    const created = await fetch(`${base}/v1/workflows`, {
+      method: 'POST', headers: USER,
+      body: JSON.stringify({ name: `bind-${Date.now().toString(36)}`, definition: twoStep }),
+    });
+    assert.equal(created.status, 201);
+    const wf: any = await created.json();
+    const run: any = await (await fetch(`${base}/v1/workflows/${wf.id}/execute`, {
+      method: 'POST', headers: USER, body: JSON.stringify({ incident: 'INC-3' }),
+    })).json();
+    assert.equal(run.status, 'paused');
+    const first: any = await (await fetch(`${base}/v1/human-tasks/${run.taskId}/complete`, {
+      method: 'POST', headers: USER, body: JSON.stringify({ decision: { approved: true } }),
+    })).json();
+    assert.equal(first.resumed.status, 'paused');
+    assert.ok(first.resumed.taskId);
+
+    // The old (first) task may not be replayed against the second pause.
+    const replay = await fetch(`${base}/v1/human-tasks/${run.taskId}/complete`, {
+      method: 'POST', headers: USER, body: JSON.stringify({ decision: { approved: true } }),
+    });
+    assert.equal(replay.status, 409);
+
+    const second: any = await (await fetch(`${base}/v1/human-tasks/${first.resumed.taskId}/complete`, {
+      method: 'POST', headers: USER, body: JSON.stringify({ decision: { approved: true } }),
+    })).json();
+    assert.equal(second.resumed.status, 'success');
+    assert.equal(second.resumed.output.done, true);
   });
 
   it('keeps a second human-task step durable after an inline resume', async () => {
@@ -211,6 +307,21 @@ describe('durable human tasks (#44)', () => {
     const exec: any = await (await fetch(`${base}/v1/executions/${run.executionId}?includeData=true`, { headers: USER })).json();
     assert.equal(exec.status, 'success');
     assert.equal(exec.nodeRuns.filter((n: any) => n.node === 'Apply').length, 1);
+  });
+
+  it('cancels a paused execution and closes its checkpoint task', async () => {
+    const { executionId, taskId } = await createPaused();
+    const cancelled = await fetch(`${base}/v1/executions/${executionId}/cancel`, {
+      method: 'POST', headers: USER, body: JSON.stringify({ reason: 'operator cancelled' }),
+    });
+    assert.equal(cancelled.status, 200);
+    assert.equal((await cancelled.json()).status, 'cancelled');
+    const task: any = await (await fetch(`${base}/v1/human-tasks/${taskId}`, { headers: USER })).json();
+    assert.equal(task.task.status, 'cancelled');
+    const approve = await fetch(`${base}/v1/human-tasks/${taskId}/complete`, {
+      method: 'POST', headers: USER, body: JSON.stringify({ decision: { approved: true } }),
+    });
+    assert.equal(approve.status, 409);
   });
 
   it('expires an overdue task and terminates its paused execution', async () => {
@@ -271,4 +382,68 @@ describe('durable human tasks (#44)', () => {
     const adminRead = await fetch(`${base}/v1/human-tasks/${taskId}`, { headers: ADMIN });
     assert.equal(adminRead.status, 200);
   });
+  it('reconciles a decision stuck between reservation and dispatch', async () => {
+    const { executionId, taskId } = await createPaused();
+    const reserved = await transitionHumanTaskRec(taskId, ['pending'], {
+      status: 'resuming',
+      decision: { approved: true },
+    });
+    assert.ok(reserved);
+    await new Promise((r) => setTimeout(r, 5));
+    const reconciled = await reclaimWorkflowStateOnce({ resumeStaleMs: 0 });
+    assert.ok(reconciled.reconciledTasks >= 1, JSON.stringify(reconciled));
+    const task: any = await (await fetch(`${base}/v1/human-tasks/${taskId}`, { headers: USER })).json();
+    assert.equal(task.task.status, 'pending');
+    const approved = await fetch(`${base}/v1/human-tasks/${taskId}/complete`, {
+      method: 'POST', headers: USER, body: JSON.stringify({ decision: { approved: true } }),
+    });
+    assert.equal(approved.status, 200, await approved.text());
+    const exec: any = await (await fetch(`${base}/v1/executions/${executionId}?includeData=true`, { headers: USER })).json();
+    assert.equal(exec.status, 'success');
+  });
+
+  it('refuses an inline resume after the workflow revision changed', async () => {
+    const { executionId, taskId, workflowId } = await createPaused();
+    const changed = definition();
+    (changed.nodes[2] as any).parameters.values.dispatched = '={{ $json.approved }}-v2';
+    const edited = await fetch(`${base}/v1/workflows/${workflowId}`, {
+      method: 'PUT', headers: USER,
+      body: JSON.stringify({ definition: changed }),
+    });
+    assert.equal(edited.status, 200, await edited.text());
+    const approved = await fetch(`${base}/v1/human-tasks/${taskId}/complete`, {
+      method: 'POST', headers: USER, body: JSON.stringify({ decision: { approved: true } }),
+    });
+    const revisionText = await approved.text();
+    assert.equal(approved.status, 409, revisionText);
+    assert.equal(JSON.parse(revisionText).error, 'workflow_revision_conflict');
+    const exec: any = await (await fetch(`${base}/v1/executions/${executionId}?includeData=true`, { headers: USER })).json();
+    assert.equal(exec.status, 'paused');
+  });
+
+  it('terminates a paused execution when a late approval hits its deadline', async () => {
+    const late = definition();
+    const taskNode: any = late.nodes.find((node: any) => node.type === 'humanTask');
+    delete taskNode.parameters.deadlineMinutes;
+    taskNode.parameters.deadlineAt = new Date(Date.now() - 60_000).toISOString();
+    const { executionId, taskId } = await createPaused(late);
+    const approved = await fetch(`${base}/v1/human-tasks/${taskId}/complete`, {
+      method: 'POST', headers: USER, body: JSON.stringify({ decision: { approved: true } }),
+    });
+    const lateText = await approved.text();
+    assert.equal(approved.status, 409, lateText);
+    assert.equal(JSON.parse(lateText).error, 'task_expired');
+    const exec: any = await (await fetch(`${base}/v1/executions/${executionId}?includeData=true`, { headers: USER })).json();
+    assert.equal(exec.status, 'error');
+    assert.match(exec.error, /expired/);
+  });
+
+  it('refuses to delete a workflow with an active execution', async () => {
+    const { workflowId } = await createPaused();
+    const deleted = await fetch(`${base}/v1/workflows/${workflowId}`, { method: 'DELETE', headers: USER });
+    const deletedText = await deleted.text();
+    assert.equal(deleted.status, 409, deletedText);
+    assert.equal(JSON.parse(deletedText).error, 'workflow_has_active_executions');
+  });
+
 });

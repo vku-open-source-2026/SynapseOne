@@ -352,6 +352,23 @@ func truncate(s string, n int) string {
 
 func pathEscape(s string) string { return url.PathEscape(s) }
 
+// queryString encodes non-empty management-list parameters.
+func queryString(params map[string]string) string {
+	if len(params) == 0 {
+		return ""
+	}
+	values := url.Values{}
+	for key, value := range params {
+		if value != "" {
+			values.Set(key, value)
+		}
+	}
+	if len(values) == 0 {
+		return ""
+	}
+	return "?" + values.Encode()
+}
+
 // ---------- auth ----------
 
 // Login issues tokens via dev login (IAM_ALLOW_DEV_LOGIN=true) or test seed.
@@ -664,6 +681,58 @@ func (c *Client) ListAccounts(orgID string) ([]any, error) {
 	return out, nil
 }
 
+// UpdateOrg renames an organization (display metadata only).
+func (c *Client) UpdateOrg(orgID, displayName string) (map[string]any, error) {
+	b, err := c.do("PATCH", "/v1/orgs/"+pathEscape(orgID), map[string]any{"displayName": displayName})
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetAccount reads one account and its credential counts.
+func (c *Client) GetAccount(accountID string) (map[string]any, error) {
+	b, err := c.do("GET", "/v1/accounts/"+pathEscape(accountID), nil)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// UpdateAccount renames an account (display metadata only).
+func (c *Client) UpdateAccount(accountID, displayName string) (map[string]any, error) {
+	b, err := c.do("PATCH", "/v1/accounts/"+pathEscape(accountID), map[string]any{"displayName": displayName})
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// UpdateUser updates a user's display name.
+func (c *Client) UpdateUser(userID, displayName string) (map[string]any, error) {
+	b, err := c.do("PATCH", "/v1/users/"+pathEscape(userID), map[string]any{"displayName": displayName})
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // CreateAccount creates an account under an org.
 func (c *Client) CreateAccount(orgID, slug, displayName string) (map[string]any, error) {
 	if displayName == "" {
@@ -739,6 +808,32 @@ func (c *Client) ListRoles(accountID string) ([]any, error) {
 		return nil, err
 	}
 	var out []any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// UpdateRole updates a role description.
+func (c *Client) UpdateRole(roleID, description string) (map[string]any, error) {
+	b, err := c.do("PATCH", "/v1/roles/"+pathEscape(roleID), map[string]any{"description": description})
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// UpdatePolicy updates a policy description and/or document.
+func (c *Client) UpdatePolicy(policyID string, patch map[string]any) (map[string]any, error) {
+	b, err := c.do("PATCH", "/v1/policies/"+pathEscape(policyID), patch)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
 	if err := unmarshal(b, &out); err != nil {
 		return nil, err
 	}
@@ -925,6 +1020,19 @@ func (c *Client) CreateAPIKey(accountID, name string, scopes []string) (map[stri
 	return out, nil
 }
 
+// GetAPIKey reads API-key metadata by id (never the secret).
+func (c *Client) GetAPIKey(keyID string) (map[string]any, error) {
+	b, err := c.do("GET", "/v1/keys/"+pathEscape(keyID), nil)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *Client) RevokeAPIKey(keyID string) error {
 	_, err := c.do("DELETE", "/v1/keys/"+pathEscape(keyID), nil)
 	return err
@@ -960,6 +1068,19 @@ func (c *Client) VerifyAPIKey(apiKey string) (map[string]any, error) {
 
 func (c *Client) CreateServiceAccount(accountID, slug, description string) (map[string]any, error) {
 	b, err := c.do("POST", "/v1/accounts/"+pathEscape(accountID)+"/service-accounts", map[string]any{"slug": slug, "description": description})
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetServiceAccount reads one service account and its roles.
+func (c *Client) GetServiceAccount(saID string) (map[string]any, error) {
+	b, err := c.do("GET", "/v1/service-accounts/"+pathEscape(saID), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1666,6 +1787,99 @@ func (c *Client) GetExecutionWithData(id string, includeData bool) (map[string]a
 		p += "?includeData=true"
 	}
 	b, err := c.do("GET", p, nil)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// CancelExecution cancels a queued or human-paused execution. Running
+// executions return 409 because their worker/runner owns the lease.
+func (c *Client) CancelExecution(id, reason string) (map[string]any, error) {
+	body := map[string]any{}
+	if reason != "" {
+		body["reason"] = reason
+	}
+	b, err := c.do("POST", "/v1/executions/"+pathEscape(id)+"/cancel", body)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// LakehouseNamespaces lists tenant-scoped Iceberg namespaces.
+func (c *Client) LakehouseNamespaces() (map[string]any, error) {
+	return c.getJSON("/v1/lakehouse/namespaces")
+}
+
+// LakehouseCreateNamespace creates an Iceberg namespace.
+func (c *Client) LakehouseCreateNamespace(name string) (map[string]any, error) {
+	return c.postJSON("/v1/lakehouse/namespaces", map[string]any{"name": name})
+}
+
+// LakehouseTables lists tables in one namespace.
+func (c *Client) LakehouseTables(namespace string) (map[string]any, error) {
+	return c.getJSON("/v1/lakehouse/namespaces/" + pathEscape(namespace) + "/tables")
+}
+
+// LakehouseAppend appends rows to an Iceberg table. idempotencyKey may be empty.
+func (c *Client) LakehouseAppend(namespace, table string, rows []map[string]any, idempotencyKey string) (map[string]any, error) {
+	body := map[string]any{"rows": rows}
+	if idempotencyKey != "" {
+		body["idempotencyKey"] = idempotencyKey
+	}
+	return c.postJSON("/v1/lakehouse/namespaces/"+pathEscape(namespace)+"/tables/"+pathEscape(table)+"/rows", body)
+}
+
+// LakehouseQuery scans a table, optionally at a historical snapshot.
+func (c *Client) LakehouseQuery(namespace, table string, limit int, snapshotID string) (map[string]any, error) {
+	body := map[string]any{}
+	if limit > 0 {
+		body["limit"] = limit
+	}
+	if snapshotID != "" {
+		body["snapshotId"] = snapshotID
+	}
+	return c.postJSON("/v1/lakehouse/namespaces/"+pathEscape(namespace)+"/tables/"+pathEscape(table)+"/query", body)
+}
+
+// WarehouseBaseToLakehouse creates a durable Base→Stream→Iceberg change-log job.
+func (c *Client) WarehouseBaseToLakehouse(input map[string]any) (map[string]any, error) {
+	return c.postJSON("/v1/warehouse/etl/base-lakehouse", input)
+}
+
+// WarehousePreviewOCS infers schema/rows for an authorized OCS CSV/JSONL/Parquet object.
+func (c *Client) WarehousePreviewOCS(input map[string]any) (map[string]any, error) {
+	return c.postJSON("/v1/warehouse/etl/ocs/preview", input)
+}
+
+// WarehouseImportOCS imports an authorized OCS CSV/JSONL/Parquet object into a dataset.
+func (c *Client) WarehouseImportOCS(input map[string]any) (map[string]any, error) {
+	return c.postJSON("/v1/warehouse/etl/ocs", input)
+}
+
+func (c *Client) getJSON(path string) (map[string]any, error) {
+	b, err := c.do("GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *Client) postJSON(path string, body any) (map[string]any, error) {
+	b, err := c.do("POST", path, body)
 	if err != nil {
 		return nil, err
 	}

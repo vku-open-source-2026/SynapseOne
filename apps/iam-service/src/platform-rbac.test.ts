@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import { createApp } from './index';
 import { base32Decode, totp } from './mfa';
-import { getOrgBySlug, grantPlatformAdmin, revokePlatformAdmin, upsertUser } from './db';
+import { createOrganization, getOrgBySlug, grantPlatformAdmin, revokePlatformAdmin, upsertUser } from './db';
 import { signPlatformAccess } from './tokens';
 
 const BOOTSTRAP = 'rbac-bootstrap-secret';
@@ -133,6 +133,14 @@ describe('platform RBAC matrix', () => {
     }, auditorToken);
     assert.equal(denied.status, 403);
     assert.equal(denied.json.error, 'platform_role_required');
+  });
+
+  it('operator cannot mint a tenant activation code', async () => {
+    const tenant = await createOrganization(`rbac-tenant-${Date.now()}`, 'RBAC Tenant');
+    const target = await upsertUser(tenant.id, `rbac-target-${Date.now()}@test.local`, 'RBAC Target');
+    const denied = await call('POST', `/v1/platform/users/${target.id}/invite`, {}, operatorToken);
+    assert.equal(denied.status, 403, JSON.stringify(denied.json));
+    assert.equal(denied.json.error, 'platform_owner_required');
   });
 
   it('operator can operate but cannot manage platform administrators or create tenants', async () => {

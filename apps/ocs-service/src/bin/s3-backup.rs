@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use synapseone_ocs::s3::{ListedObject, S3Client, S3Config};
 
@@ -47,6 +48,8 @@ struct Config {
     dir: PathBuf,
     retention_days: i64,
     interval_seconds: u64,
+    retry_seconds: u64,
+    max_retry_seconds: u64,
     bucket: String,
     s3: S3Config,
 }
@@ -63,6 +66,14 @@ impl Config {
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(86_400)
             .max(60);
+        let retry_seconds = env("BACKUP_RETRY_SECONDS")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(300)
+            .max(15);
+        let max_retry_seconds = env("BACKUP_MAX_RETRY_SECONDS")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(3600)
+            .max(retry_seconds);
         let bucket = env("STORAGE_S3_BUCKET").unwrap_or_else(|| "synapseone-core".into());
         let path_style = env("STORAGE_S3_PATH_STYLE")
             .map(|value| value != "false")
@@ -71,6 +82,8 @@ impl Config {
             dir: PathBuf::from(dir),
             retention_days,
             interval_seconds,
+            retry_seconds,
+            max_retry_seconds,
             bucket: bucket.clone(),
             s3: S3Config {
                 endpoint: env("STORAGE_S3_ENDPOINT").unwrap_or_else(|| "http://s3:9090".into()),
@@ -102,6 +115,21 @@ fn log(message: &str) {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+/// Machine-readable liveness marker for monitoring. Must never make a backup
+/// fail just because the status file could not be written.
+fn write_status(cfg: &Config, ok: bool, detail: &str) {
+    let path = cfg.dir.join(".last-status.json");
+    if ensure_dir(&cfg.dir).is_err() {
+        return;
+    }
+    let body = json!({
+        "ok": ok,
+        "at": iso_now(),
+        "detail": detail.chars().take(300).collect::<String>(),
+    });
+    let _ = fs::write(path, body.to_string());
 }
 
 fn iso_now() -> String {
@@ -395,20 +423,40 @@ async fn run(cfg: &Config, command: &str, args: &[String]) -> Result<(), String>
     let client = S3Client::new(cfg.s3.clone()).map_err(|error| format!("s3 client: {error}"))?;
     match command {
         "once" => {
-            take_snapshot(cfg, &client).await?;
+            match take_snapshot(cfg, &client).await {
+                Ok(_) => write_status(cfg, true, "ok"),
+                Err(error) => {
+                    write_status(cfg, false, &error);
+                    return Err(error);
+                }
+            }
         }
         "list" => list_snapshots(cfg).await?,
         "restore" => restore(cfg, &client, args).await?,
         "loop" => {
             log(&format!(
-                "every {}s, keep {} days, bucket {}",
-                cfg.interval_seconds, cfg.retention_days, cfg.bucket
+                "every {}s, retry {}s (max {}s), keep {} days, bucket {}",
+                cfg.interval_seconds,
+                cfg.retry_seconds,
+                cfg.max_retry_seconds,
+                cfg.retention_days,
+                cfg.bucket
             ));
+            let mut retry = cfg.retry_seconds;
             loop {
-                if let Err(error) = take_snapshot(cfg, &client).await {
-                    eprintln!("[s3-backup] snapshot failed: {error}");
+                match take_snapshot(cfg, &client).await {
+                    Ok(_) => {
+                        write_status(cfg, true, "ok");
+                        retry = cfg.retry_seconds;
+                        tokio::time::sleep(Duration::from_secs(cfg.interval_seconds)).await;
+                    }
+                    Err(error) => {
+                        eprintln!("[s3-backup] snapshot failed: {error}");
+                        write_status(cfg, false, &error);
+                        tokio::time::sleep(Duration::from_secs(retry)).await;
+                        retry = retry.saturating_mul(2).min(cfg.max_retry_seconds);
+                    }
                 }
-                tokio::time::sleep(Duration::from_secs(cfg.interval_seconds)).await;
             }
         }
         other => {

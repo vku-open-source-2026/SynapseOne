@@ -38,12 +38,15 @@ const ServiceAccounts = React.lazy(() => import('./pages/ServiceAccounts.jsx'));
 const Workflows = React.lazy(() => import('./pages/Workflows.jsx'));
 const WorkflowRunners = React.lazy(() => import('./pages/WorkflowRunners.jsx'));
 const SynapseBase = React.lazy(() => import('./pages/SynapseBase.jsx'));
+const Search = React.lazy(() => import('./pages/Search.jsx'));
 const SynapseQueue = React.lazy(() => import('./pages/SynapseQueue.jsx'));
 const SynapseStream = React.lazy(() => import('./pages/SynapseStream.jsx'));
 const SynapseWarehouse = React.lazy(() => import('./pages/SynapseWarehouse.jsx'));
+const Lakehouse = React.lazy(() => import('./pages/Lakehouse.jsx'));
 const SynapseFaststore = React.lazy(() => import('./pages/SynapseFaststore.jsx'));
 const SynapseOCS = React.lazy(() => import('./pages/SynapseOCS.jsx'));
 const SynapseInference = React.lazy(() => import('./pages/SynapseInference.jsx'));
+const Notifications = React.lazy(() => import('./pages/Notifications.jsx'));
 const LinkedData = React.lazy(() => import('./pages/LinkedData.jsx'));
 const Authorize = React.lazy(() => import('./pages/Authorize.jsx'));
 const Audit = React.lazy(() => import('./pages/Audit.jsx'));
@@ -190,12 +193,15 @@ function AppRoutes() {
           <Route path="/runner-engine" element={<Guard><ConsoleLayout><WorkflowRunners /></ConsoleLayout></Guard>} />
           <Route path="/workflow-runners" element={<Guard><ConsoleLayout><WorkflowRunners /></ConsoleLayout></Guard>} />
           <Route path="/base" element={<Guard><ConsoleLayout><SynapseBase /></ConsoleLayout></Guard>} />
+          <Route path="/search" element={<Guard><ConsoleLayout><Search /></ConsoleLayout></Guard>} />
           <Route path="/queue" element={<Guard><ConsoleLayout><SynapseQueue /></ConsoleLayout></Guard>} />
           <Route path="/stream" element={<Guard><ConsoleLayout><SynapseStream /></ConsoleLayout></Guard>} />
           <Route path="/warehouse" element={<Guard><ConsoleLayout><SynapseWarehouse /></ConsoleLayout></Guard>} />
+          <Route path="/lakehouse" element={<Guard><ConsoleLayout><Lakehouse /></ConsoleLayout></Guard>} />
           <Route path="/faststore" element={<Guard><ConsoleLayout><SynapseFaststore /></ConsoleLayout></Guard>} />
           <Route path="/ocs" element={<Guard><ConsoleLayout><SynapseOCS /></ConsoleLayout></Guard>} />
           <Route path="/inference" element={<Guard><ConsoleLayout><SynapseInference /></ConsoleLayout></Guard>} />
+          <Route path="/notifications" element={<Guard><ConsoleLayout><Notifications /></ConsoleLayout></Guard>} />
           <Route path="/lds" element={<Guard><ConsoleLayout><LinkedData /></ConsoleLayout></Guard>} />
           <Route path="/authorize" element={<Guard><ConsoleLayout><Authorize /></ConsoleLayout></Guard>} />
           <Route path="/audit" element={<Guard><ConsoleLayout><Audit /></ConsoleLayout></Guard>} />

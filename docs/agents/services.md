@@ -5,9 +5,11 @@ Ports assume Compose defaults. Apart from explicit public gateway routes
 (`/v1/auth/*`, LDS public reads, `/webhook/*`), services are internal in
 production and require `x-synapseone-internal` when the shared secret is set.
 
-Implementation: `ai`, `stream`, `lds` and `notifications` are Rust/Axum
-services (`apps/*/Cargo.toml`). This document describes their HTTP contract,
-which is unchanged; the TypeScript sources remain as a behavioural reference.
+Implementation: gateway, base, faststore, queue, stream, lds, ocs,
+notifications, warehouse and ai are Rust/Axum services. IAM and Workflow are
+Node/TypeScript; inference and Lakehouse are Python/FastAPI (Lakehouse uses
+PyIceberg). This document describes the HTTP contract, which is shared with the
+reference sources where they still exist.
 
 ---
 
@@ -23,7 +25,8 @@ stamping, edge hardening, telemetry, aggregate readiness.
 upstreams. `routes.yaml` covers `/v1/auth`, IAM resources, `/v1/workflows`,
 `/v1/templates`, `/v1/executions`, `/v1/credentials`, public `/webhook`,
 `/v1/ai`, `/v1/inference`, LDS public + management, `/v1/base`,
-`/v1/faststore`, `/v1/queue`, `/v1/stream`, `/v1/ocs` (legacy `/v1/storage`), `/v1/notifications`.
+`/v1/faststore`, `/v1/queue`, `/v1/stream`, `/v1/ocs` (legacy `/v1/storage`), `/v1/notifications`,
+`/v1/warehouse`, `/v1/lakehouse`.
 
 **Rules:**
 - Auth modes per route: `none|jwt|apikey|either`; route specificity by literal
@@ -93,7 +96,8 @@ accessors + seed), `src/tokens.ts` (JWT/refresh/API keys), `src/policy.ts`
 
 **Data:** `organizations`, `accounts`, `users`, `roles`, `policies`,
 `role_policies`, `user_roles`, `api_keys`, `service_accounts`,
-`refresh_tokens`, legacy `workflows`, `usage_events`, `audit_log`.
+`refresh_tokens` (hash, expiry, `revoked_at`, `consumed_at` for rotation-replay
+detection), legacy `workflows`, `usage_events`, `audit_log`.
 Migrations seed demo org `acme` and account `prod`; the memory fallback seeds
 `acme` too. Demo users are created on demand (dev login).
 
@@ -135,7 +139,8 @@ Migrations seed demo org `acme` and account `prod`; the memory fallback seeds
   `POST /v1/workflows/:id/execute|activate|deactivate`,
   `POST /v1/workflows/test-run` (`execute` returns 202 queued in queue mode;
   `?wait=1` blocks).
-- `GET /v1/executions`, `GET /v1/executions/:id`.
+- `GET /v1/executions`, `GET /v1/executions/:id`,
+  `POST /v1/executions/:id/cancel` (queued/human-paused only; running keeps its lease).
 - `GET/POST /v1/workflow-runners`, `GET/PATCH/DELETE /v1/workflow-runners/:id`,
   `GET /v1/workflow-runners/options`, `GET .../config|connection`,
   `POST .../heartbeat|command`, `DELETE .../instances/:instanceId`,
@@ -190,8 +195,9 @@ never embedded in queue messages. See `docs/workflow-runners.md`.
 
 **Data:** `synapseone_workflows` (nodes/connections/settings/active/tenant/
 run_as/revision), `synapseone_executions` (input/output/node runs/principal/
-trigger + queue/runner/worker/attempt/lease/resume), `synapseone_workflow_runners`
-(kind workflow/inference/hybrid, queues, tenant/API-key metadata),
+trigger + queue/runner/worker/attempt/lease/resume + `pause_task_id`/`pause_node`),
+`synapseone_workflow_runners` (kind workflow/inference/hybrid, queues,
+account/org `audience`, tenant/API-key metadata),
 `synapseone_workflow_runner_instances` (per-connector hostname/version/
 concurrency/last heartbeat), `synapseone_inference_jobs` (queued inference
 chat/embeddings/decision work for inference/hybrid runners),
@@ -448,17 +454,53 @@ tests in `src/tests.rs`.
 (`GET/POST /v1/warehouse/datasets`, `GET/DELETE /v1/warehouse/datasets/:id`,
 `POST .../rows`), read-only SQL (`POST /v1/warehouse/query`), ETL templates
 (`GET /v1/warehouse/templates`) and jobs (`GET/POST /v1/warehouse/jobs`,
-`GET/DELETE .../:id`, `POST .../:id/run|pause|resume`), plus internal usage
+`GET/DELETE .../:id`, `POST .../:id/run|pause|resume`), Base snapshot ETL
+(`POST /v1/warehouse/etl/base`), Lakehouse materialization
+(`POST /v1/warehouse/etl/lakehouse`), plus internal usage
 rollup/watermark/summary.
 
 **Invariants:** one DuckDB file per tenant (`WAREHOUSE_DATA_DIR`); every SQL
 statement is a single read-only `SELECT`/`WITH` with file/DDL functions denied;
 dataset ids are lower-case slugs and physical table names; stream jobs are
 single-writer (`replicas: 1`); deleting a dataset stops its stream workers
-before dropping its jobs/table.
+before dropping its jobs/table. Base document events replace/delete the current
+row (keyed by `document_id`) and stream ingestion records `_ingest_events`
+before ack. Base/Lakehouse connectors call the owning service with the
+gateway-stamped tenant and the internal secret; tenant SQL never gets file or
+network access.
 
 **Env:** `PORT`, `WAREHOUSE_DATA_DIR`, `WAREHOUSE_THREADS`,
-`STREAM_SERVICE_URL`, `SYNAPSEONE_INTERNAL_SECRET`, `CORS_ORIGIN`.
+`WAREHOUSE_QUERY_TIMEOUT_MS`, `STREAM_SERVICE_URL`, `BASE_SERVICE_URL`,
+`LAKEHOUSE_SERVICE_URL`, `SYNAPSEONE_INTERNAL_SECRET`, `CORS_ORIGIN`.
+
+---
+
+## Lakehouse — `apps/lakehouse-service` (:4013, Python/FastAPI + PyIceberg)
+
+**Purpose:** tenant-scoped Apache Iceberg v2 catalog and table API behind the
+gateway's `/v1/lakehouse` route. Real Parquet data files and Iceberg metadata
+live in the shared S3-compatible store; catalog metadata lives in Postgres.
+
+**Files:** `src/main.py` (FastAPI, auth/tenant mapping, catalog operations),
+`tests/test_service.py` (real SQLite catalog + local filesystem round trip);
+`requirements.txt` pins PyIceberg 0.12/PyArrow 26.
+
+**API:** health/readiness/metrics; namespaces, tables, table metadata,
+append, bounded query (current or historical snapshot), snapshots, additive
+schema evolution and usage/quotas. Snapshot ids are serialized as strings.
+
+**Invariants:** namespace/table names are validated; physical namespaces are
+derived from a SHA-256 tenant key; clients cannot choose an object-store
+location; idempotency keys are recorded in snapshot properties and replay
+returns the existing snapshot; table drop removes catalog metadata but retains
+data files; namespace/table/row quotas are enforced; one catalog lock per
+process, with `409 commit_conflict` if a commit still races.
+
+**Env:** `LAKEHOUSE_CATALOG_URI`, `LAKEHOUSE_WAREHOUSE`,
+`LAKEHOUSE_S3_ENDPOINT`, `LAKEHOUSE_S3_ACCESS_KEY`,
+`LAKEHOUSE_S3_SECRET_KEY`, `LAKEHOUSE_S3_REGION`,
+`LAKEHOUSE_MAX_NAMESPACES`, `LAKEHOUSE_MAX_TABLES_PER_NAMESPACE`,
+`LAKEHOUSE_MAX_ROWS_PER_APPEND`, `SYNAPSEONE_INTERNAL_SECRET`.
 
 ---
 

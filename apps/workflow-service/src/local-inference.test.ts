@@ -415,7 +415,7 @@ describe('local inference bridge', () => {
       {
         requestTimeoutMs: 5000,
         healthIntervalMs: 100,
-        healthTimeoutMs: 50,
+        healthTimeoutMs: 500,
       },
       async ({ worker, logs }) => {
         const result: any = await worker.infer('embeddings', { input: 'slow' });

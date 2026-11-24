@@ -5,19 +5,21 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::State as AxumState;
+use axum::extract::{Query, State as AxumState};
 use axum::http::{HeaderMap, Request, StatusCode};
-use axum::routing::{post, put};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use crate::api::{build_app, AppState, Config};
 use crate::store::{StoreOptions, WarehouseStore};
+use crate::types::{NewDataset, WarehouseColumn};
 use crate::stream::StreamRuntime;
 
 struct TempDir(PathBuf);
@@ -36,11 +38,12 @@ impl Drop for TempDir {
     }
 }
 
-fn app_with(
+fn app_with_services(
     data_dir: Option<PathBuf>,
     secret: &str,
     max_body_bytes: usize,
     stream_url: &str,
+    base_url: &str,
 ) -> Router {
     let store = WarehouseStore::new(match data_dir {
         Some(path) => StoreOptions::file(path),
@@ -51,13 +54,30 @@ fn app_with(
         is_prod: false,
         internal_secret: secret.into(),
         max_body_bytes,
+        base_service_url: base_url.into(),
+        lakehouse_service_url: "http://127.0.0.1:9".into(),
     };
-    let stream = StreamRuntime::new(store.clone(), stream_url.into(), secret.into());
+    let stream = StreamRuntime::new(store.clone(), stream_url.into(), "http://127.0.0.1:9".into(), secret.into());
     build_app(AppState {
         store,
         config,
         stream,
     })
+}
+
+fn app_with(
+    data_dir: Option<PathBuf>,
+    secret: &str,
+    max_body_bytes: usize,
+    stream_url: &str,
+) -> Router {
+    app_with_services(
+        data_dir,
+        secret,
+        max_body_bytes,
+        stream_url,
+        "http://127.0.0.1:9",
+    )
 }
 
 fn memory_app() -> Router {
@@ -233,6 +253,38 @@ async fn dataset_lifecycle_and_rows() {
     let (status, fetched) = call(&app, "GET", "/v1/warehouse/datasets/city_incidents", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(fetched["id"], "city_incidents");
+
+    let (status, updated) = call(
+        &app,
+        "PATCH",
+        "/v1/warehouse/datasets/city_incidents",
+        Some(serde_json::json!({ "name": "City incidents (qa)", "description": "updated" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(updated["name"], "City incidents (qa)");
+    assert_eq!(updated["description"], "updated");
+    assert_eq!(updated["id"], "city_incidents");
+
+    let (status, _invalid) = call(
+        &app,
+        "PATCH",
+        "/v1/warehouse/datasets/city_incidents",
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, filtered) = call(
+        &app,
+        "GET",
+        "/v1/warehouse/datasets?name=qa&mode=batch",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(filtered["total"], 1);
+    assert_eq!(filtered["items"][0]["id"], "city_incidents");
 
     let (status, inserted) = call(
         &app,
@@ -501,7 +553,7 @@ async fn templates_and_job_lifecycle() {
     let (status, templates) = call(&app, "GET", "/v1/warehouse/templates", None).await;
     assert_eq!(status, StatusCode::OK);
     let items = templates["items"].as_array().unwrap();
-    assert_eq!(items.len(), 5);
+    assert_eq!(items.len(), 6);
     let modes = items
         .iter()
         .map(|item| item["mode"].as_str().unwrap())
@@ -570,6 +622,26 @@ async fn templates_and_job_lifecycle() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(paused["status"], "paused");
 
+    let (status, renamed) = call(
+        &app,
+        "PATCH",
+        &format!("/v1/warehouse/jobs/{job_id}"),
+        Some(json!({ "name": "Batch ingest (qa)" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(renamed["name"], "Batch ingest (qa)");
+
+    let (status, filtered) = call(
+        &app,
+        "GET",
+        "/v1/warehouse/jobs?status=paused&mode=batch",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(filtered["total"], 1);
+
     let (status, resumed) = call(
         &app,
         "POST",
@@ -579,6 +651,16 @@ async fn templates_and_job_lifecycle() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(resumed["status"], "running");
+
+    let (status, renamed_while_running) = call(
+        &app,
+        "PATCH",
+        &format!("/v1/warehouse/jobs/{job_id}"),
+        Some(json!({ "name": "batch renamed while idle" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(renamed_while_running["name"], "batch renamed while idle");
 
     let (status, stream_job) = call(
         &app,
@@ -597,6 +679,15 @@ async fn templates_and_job_lifecycle() {
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(stream_job["mode"], "stream");
     let stream_job_id = stream_job["id"].as_str().unwrap().to_string();
+    let (status, conflict) = call(
+        &app,
+        "PATCH",
+        &format!("/v1/warehouse/jobs/{stream_job_id}"),
+        Some(json!({ "name": "too late" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(conflict["error"], "job_running");
     let (status, paused) = call(
         &app,
         "POST",
@@ -855,9 +946,12 @@ async fn internal_secret_gate_and_production_fail_closed() {
             is_prod: true,
             internal_secret: String::new(),
             max_body_bytes: 1024,
+            base_service_url: "http://127.0.0.1:9".into(),
+            lakehouse_service_url: "http://127.0.0.1:9".into(),
         },
         stream: StreamRuntime::new(
             WarehouseStore::new(StoreOptions::memory()),
+            "http://127.0.0.1:9".into(),
             "http://127.0.0.1:9".into(),
             String::new(),
         ),
@@ -1061,6 +1155,10 @@ async fn stream_materialization_deduplicates_across_restart() {
     let event = |index: i64| crate::types::StreamEventRows {
         event_id: format!("evt-{index}"),
         rows: vec![json!({"event_id": format!("evt-{index}"), "value": index})],
+        document_id: None,
+        base_operation: None,
+        version: None,
+        created_at: None,
     };
     for index in 1..=25 {
         let (inserted, duplicates) = store
@@ -1179,6 +1277,441 @@ async fn fake_ack(AxumState(fake): AxumState<FakeStream>, Json(body): Json<Value
     assert_eq!(ids, vec![json!("1-0")]);
     fake.acks.fetch_add(1, Ordering::SeqCst);
     Json(json!({"acked": ids.len()}))
+}
+
+#[derive(Clone)]
+struct FakeBase {
+    calls: Arc<AtomicUsize>,
+}
+
+async fn fake_base(
+    AxumState(fake): AxumState<FakeBase>,
+    headers: HeaderMap,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> (StatusCode, Json<Value>) {
+    fake.calls.fetch_add(1, Ordering::SeqCst);
+    if headers
+        .get("x-synapseone-org")
+        .and_then(|value| value.to_str().ok())
+        != Some("tenant-a")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "forbidden"})),
+        );
+    }
+    let offset: usize = query
+        .get("offset")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let limit: usize = query
+        .get("limit")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1000);
+    let documents = vec![
+        json!({"id": "p-1", "data": {"name": "Central Park", "capacity": 120}, "version": 2, "createdAt": "2026-11-01T00:00:00Z", "updatedAt": "2026-11-02T00:00:00Z"}),
+        json!({"id": "p-2", "data": {"name": "Riverside", "capacity": 80}, "version": 1, "createdAt": "2026-11-01T00:00:00Z", "updatedAt": "2026-11-01T00:00:00Z"}),
+        json!({"id": "p-3", "data": {"name": "Hilltop", "capacity": 45}, "version": 3, "createdAt": "2026-11-01T00:00:00Z", "updatedAt": "2026-11-03T00:00:00Z"}),
+    ];
+    let items: Vec<Value> = documents
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect();
+    (
+        StatusCode::OK,
+        Json(json!({"items": items, "total": 3, "limit": limit, "offset": offset})),
+    )
+}
+
+#[derive(Clone)]
+struct FakeLakehouse;
+
+async fn fake_lakehouse(
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    if headers
+        .get("x-synapseone-org")
+        .and_then(|value| value.to_str().ok())
+        != Some("tenant-a")
+    {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "forbidden"})));
+    }
+    assert_eq!(body["limit"], 5000);
+    (
+        StatusCode::OK,
+        Json(json!({
+            "rows": [
+                {"document_id": "l-1", "name": "Lake One", "capacity": 10},
+                {"document_id": "l-2", "name": "Lake Two", "capacity": 20}
+            ],
+            "rowCount": 2,
+            "snapshotId": 42
+        })),
+    )
+}
+
+#[tokio::test]
+async fn lakehouse_etl_materializes_authorized_rows() {
+    let fake_app = Router::new()
+        .fallback(fake_lakehouse)
+        .with_state(FakeLakehouse);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, fake_app).await;
+    });
+    let store = WarehouseStore::new(StoreOptions::memory());
+    let config = Config {
+        port: 0,
+        is_prod: false,
+        internal_secret: String::new(),
+        max_body_bytes: 8 * 1024 * 1024,
+        base_service_url: "http://127.0.0.1:9".into(),
+        lakehouse_service_url: format!("http://127.0.0.1:{}", address.port()),
+    };
+    let stream = StreamRuntime::new(store.clone(), "http://127.0.0.1:9".into(), "http://127.0.0.1:9".into(), String::new());
+    let app = build_app(AppState {
+        store,
+        config,
+        stream,
+    });
+
+    let created = call(
+        &app,
+        "POST",
+        "/v1/warehouse/datasets",
+        Some(json!({
+            "id": "lake_rows",
+            "name": "Lake rows",
+            "mode": "batch",
+            "columns": [
+                {"name": "document_id", "type": "string"},
+                {"name": "name", "type": "string"},
+                {"name": "capacity", "type": "number"}
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+
+    let (status, result) = call(
+        &app,
+        "POST",
+        "/v1/warehouse/etl/lakehouse",
+        Some(json!({
+            "namespace": "analytics",
+            "table": "events",
+            "targetDatasetId": "lake_rows",
+            "writeMode": "replace"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{result}");
+    assert_eq!(result["rows"], 2);
+    assert_eq!(result["snapshotId"], 42);
+
+    let (_, queried) = call(
+        &app,
+        "POST",
+        "/v1/warehouse/query",
+        Some(json!({"sql": "SELECT document_id, capacity FROM lake_rows ORDER BY document_id"})),
+    )
+    .await;
+    assert_eq!(queried["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(queried["rows"][0]["capacity"], 10);
+
+    let (status, _) = call_as(
+        &app,
+        "POST",
+        "/v1/warehouse/etl/lakehouse",
+        Some(json!({"namespace": "analytics", "table": "events", "targetDatasetId": "lake_rows"})),
+        "tenant-b",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    server.abort();
+}
+
+#[tokio::test]
+async fn failed_base_snapshot_preserves_the_existing_dataset() {
+    let fake_app = Router::new().fallback(|| async {
+        (StatusCode::BAD_GATEWAY, Json(json!({"error": "upstream_down"})))
+    });
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, fake_app).await;
+    });
+    let app = app_with_services(
+        None,
+        "",
+        8 * 1024 * 1024,
+        "http://127.0.0.1:9",
+        &format!("http://127.0.0.1:{}", address.port()),
+    );
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/v1/warehouse/datasets",
+        Some(json!({
+            "id": "kept_rows",
+            "name": "Kept rows",
+            "mode": "batch",
+            "columns": [
+                {"name": "document_id", "type": "string"},
+                {"name": "name", "type": "string"},
+                {"name": "capacity", "type": "number"},
+                {"name": "version", "type": "number"}
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/v1/warehouse/datasets/kept_rows/rows",
+        Some(json!({"rows": [{"document_id": "old", "name": "Preserved", "capacity": 1, "version": 1}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/v1/warehouse/etl/base",
+        Some(json!({
+            "collection": "parks",
+            "targetDatasetId": "kept_rows",
+            "writeMode": "replace"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+    let (_, queried) = call(
+        &app,
+        "POST",
+        "/v1/warehouse/query",
+        Some(json!({"sql": "SELECT document_id, name FROM kept_rows"})),
+    )
+    .await;
+    assert_eq!(queried["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(queried["rows"][0]["document_id"], "old");
+    server.abort();
+}
+
+#[tokio::test]
+async fn ocs_file_import_previews_and_replaces_csv_rows() {
+    let dir = TempDir::new();
+    let path = dir.0.join("sensor.csv");
+    std::fs::write(
+        &path,
+        "document_id,name,capacity,active\ns-1,Alpha,10,true\ns-2,Beta,20,false\n",
+    )
+    .unwrap();
+    let store = WarehouseStore::new(StoreOptions::memory());
+    let dataset = store
+        .create_dataset(
+            "org:qa",
+            NewDataset {
+                id: "sensor_rows".into(),
+                name: "Sensor rows".into(),
+                description: String::new(),
+                columns: vec![
+                    WarehouseColumn { name: "document_id".into(), column_type: "string".into() },
+                    WarehouseColumn { name: "name".into(), column_type: "string".into() },
+                    WarehouseColumn { name: "capacity".into(), column_type: "number".into() },
+                    WarehouseColumn { name: "active".into(), column_type: "boolean".into() },
+                ],
+                mode: "batch".into(),
+                stream_topic: None,
+            },
+        )
+        .await
+        .unwrap();
+    let (columns, rows) = store
+        .preview_ocs_file("org:qa", path.to_string_lossy().as_ref(), "csv")
+        .await
+        .unwrap();
+    assert_eq!(columns.len(), 4);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(columns[2]["type"], "number");
+    assert_eq!(columns[3]["type"], "boolean");
+
+    let inserted = store
+        .import_ocs_file("org:qa", &dataset, path.to_string_lossy().as_ref(), "csv", "replace", 1000)
+        .await
+        .unwrap();
+    assert_eq!(inserted, 2);
+    let query = store
+        .query("org:qa", Some(&json!("SELECT document_id, capacity, active FROM sensor_rows ORDER BY document_id")), 10)
+        .await
+        .unwrap();
+    assert_eq!(query.rows.len(), 2);
+    assert_eq!(query.rows[0]["capacity"], 10.0);
+    assert_eq!(query.rows[0]["active"], true);
+
+    // Append is explicitly at-least-once; replace is the idempotent mode.
+    store
+        .import_ocs_file("org:qa", &dataset, path.to_string_lossy().as_ref(), "csv", "append", 1000)
+        .await
+        .unwrap();
+    let query = store
+        .query("org:qa", Some(&json!("SELECT count(*) AS n FROM sensor_rows")), 10)
+        .await
+        .unwrap();
+    assert_eq!(query.rows[0]["n"], 4);
+    store
+        .import_ocs_file("org:qa", &dataset, path.to_string_lossy().as_ref(), "csv", "replace", 1000)
+        .await
+        .unwrap();
+    let query = store
+        .query("org:qa", Some(&json!("SELECT count(*) AS n FROM sensor_rows")), 10)
+        .await
+        .unwrap();
+    assert_eq!(query.rows[0]["n"], 2);
+}
+
+#[tokio::test]
+async fn ocs_preview_supports_jsonl_and_parquet() {
+    let dir = TempDir::new();
+    let jsonl = dir.0.join("rows.jsonl");
+    std::fs::write(&jsonl, "{\"id\":\"j-1\",\"n\":2}\n{\"id\":\"j-2\",\"n\":3}\n").unwrap();
+    let store = WarehouseStore::new(StoreOptions::memory());
+    let (columns, rows) = store
+        .preview_ocs_file("org:qa", jsonl.to_string_lossy().as_ref(), "jsonl")
+        .await
+        .unwrap();
+    assert_eq!(columns.len(), 2);
+    assert_eq!(rows.len(), 2);
+
+    let parquet = dir.0.join("rows.parquet");
+    {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT 'p-1' AS id, 7 AS n) TO '{}' (FORMAT PARQUET)",
+            parquet.to_string_lossy().replace('\'', "''")
+        ))
+        .unwrap();
+    }
+    let (columns, rows) = store
+        .preview_ocs_file("org:qa", parquet.to_string_lossy().as_ref(), "parquet")
+        .await
+        .unwrap();
+    assert_eq!(columns.len(), 2);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["n"], 7);
+}
+
+#[tokio::test]
+async fn base_etl_copies_a_collection_and_replaces_on_rerun() {
+    let fake = FakeBase {
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let fake_app = Router::new()
+        .fallback(fake_base)
+        .with_state(fake.clone());
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, fake_app).await;
+    });
+    let app = app_with_services(
+        None,
+        "",
+        8 * 1024 * 1024,
+        "http://127.0.0.1:9",
+        &format!("http://127.0.0.1:{}", address.port()),
+    );
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/v1/warehouse/datasets",
+        Some(json!({
+            "id": "parks_etl",
+            "name": "Parks ETL",
+            "mode": "batch",
+            "columns": [
+                {"name": "document_id", "type": "string"},
+                {"name": "name", "type": "string"},
+                {"name": "capacity", "type": "number"},
+                {"name": "version", "type": "number"},
+                {"name": "updated_at", "type": "timestamp"}
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let body = json!({
+        "collection": "parks",
+        "targetDatasetId": "parks_etl",
+        "writeMode": "replace",
+        "pageSize": 2
+    });
+    let (status, result) = call(&app, "POST", "/v1/warehouse/etl/base", Some(body.clone())).await;
+    assert_eq!(status, StatusCode::CREATED, "{result}");
+    assert_eq!(result["rows"], 3);
+    assert_eq!(result["pages"], 2);
+    assert_eq!(result["source"], "base");
+
+    let (status, queried) = call(
+        &app,
+        "POST",
+        "/v1/warehouse/query",
+        Some(json!({"sql": "SELECT document_id, name, capacity, version FROM parks_etl ORDER BY document_id"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{queried}");
+    assert_eq!(queried["rows"].as_array().unwrap().len(), 3);
+    assert_eq!(queried["rows"][0]["document_id"], "p-1");
+    assert_eq!(queried["rows"][0]["name"], "Central Park");
+    assert_eq!(queried["rows"][0]["capacity"], 120);
+    assert_eq!(queried["rows"][0]["version"], 2);
+
+    // Rerunning a full snapshot replaces, not duplicates.
+    let (status, _) = call(&app, "POST", "/v1/warehouse/etl/base", Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, counted) = call(
+        &app,
+        "POST",
+        "/v1/warehouse/query",
+        Some(json!({"sql": "SELECT count(*) AS n FROM parks_etl"})),
+    )
+    .await;
+    assert_eq!(counted["rows"][0]["n"], 3);
+
+    // The job is visible as an ETL execution with source mode `base`.
+    let (_, jobs) = call(&app, "GET", "/v1/warehouse/jobs", None).await;
+    assert!(jobs["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|job| job["mode"] == "base" && job["targetDatasetId"] == "parks_etl"));
+
+    // A different organization cannot address the dataset, even before Base
+    // is called.
+    let (status, _) = call_as(
+        &app,
+        "POST",
+        "/v1/warehouse/etl/base",
+        Some(json!({"collection": "parks", "targetDatasetId": "parks_etl"})),
+        "tenant-b",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    server.abort();
 }
 
 #[tokio::test]
@@ -1329,4 +1862,115 @@ async fn mutations_emit_audit_events() {
     assert_eq!(event.result, "allowed");
     assert_eq!(event.status_code, 201);
     assert!(!event.request_id.is_empty());
+}
+
+#[derive(Clone, Default)]
+struct FakeBackfill {
+    calls: Arc<Mutex<Vec<Value>>>,
+}
+
+async fn fake_backfill_metadata() -> Json<Value> {
+    Json(json!({
+        "name": "changes",
+        "schema": [
+            {"name": "event_id", "type": "string"},
+            {"name": "collection", "type": "string"},
+            {"name": "document_id", "type": "string"},
+            {"name": "operation", "type": "string"},
+            {"name": "version", "type": "long"},
+            {"name": "occurred_at", "type": "timestamp"},
+            {"name": "data", "type": "string"},
+            {"name": "deleted", "type": "boolean"}
+        ]
+    }))
+}
+
+async fn fake_backfill_page(
+    AxumState(fake): AxumState<FakeBackfill>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let mut calls = fake.calls.lock().expect("calls");
+    calls.push(body.clone());
+    if body.get("afterId").is_none() {
+        Json(json!({
+            "enqueued": 1000,
+            "scanned": 1000,
+            "nextAfter": "p-1000",
+            "hasMore": true
+        }))
+    } else {
+        Json(json!({
+            "enqueued": 1,
+            "scanned": 1,
+            "nextAfter": "p-1001",
+            "hasMore": false
+        }))
+    }
+}
+
+#[tokio::test]
+async fn base_lakehouse_backfill_walks_every_cursor_page() {
+    let fake = FakeBackfill::default();
+    let fake_app = Router::new()
+        .route(
+            "/v1/lakehouse/namespaces/analytics/tables/changes",
+            get(fake_backfill_metadata),
+        )
+        .route(
+            "/internal/base/collections/parks/backfill",
+            post(fake_backfill_page),
+        )
+        .with_state(fake.clone());
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, fake_app).await;
+    });
+    let base_url = format!("http://127.0.0.1:{}", address.port());
+    let store = WarehouseStore::new(StoreOptions::memory());
+    let config = Config {
+        port: 0,
+        is_prod: false,
+        internal_secret: String::new(),
+        max_body_bytes: 8 * 1024 * 1024,
+        base_service_url: base_url.clone(),
+        lakehouse_service_url: base_url,
+    };
+    let stream = StreamRuntime::new(
+        store.clone(),
+        "http://127.0.0.1:9".into(),
+        "http://127.0.0.1:9".into(),
+        String::new(),
+    );
+    let app = build_app(AppState {
+        store,
+        config,
+        stream,
+    });
+
+    let (status, result) = call(
+        &app,
+        "POST",
+        "/v1/warehouse/etl/base-lakehouse",
+        Some(json!({
+            "collection": "parks",
+            "namespace": "analytics",
+            "table": "changes",
+            "backfill": true
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{result}");
+    assert_eq!(result["backfill"]["pages"], 2);
+    assert_eq!(result["backfill"]["enqueued"], 1001);
+    assert_eq!(result["backfill"]["scanned"], 1001);
+
+    let calls = fake.calls.lock().expect("calls").clone();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["limit"], 1000);
+    assert!(calls[0].get("afterId").is_none());
+    assert_eq!(calls[1]["afterId"], "p-1000");
+    server.abort();
 }

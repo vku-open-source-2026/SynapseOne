@@ -87,7 +87,22 @@ fn read_function_re() -> &'static Regex {
 
 fn internal_table_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r#"(?i)\b(?:from|join)\s+"?_[a-z0-9_]+"?"#).unwrap())
+    // Match `_datasets` and schema-qualified spellings such as `main._datasets`
+    // or `"main"."_datasets"`. Dataset ids cannot start with `_`, so this only
+    // targets service metadata.
+    RE.get_or_init(|| {
+        Regex::new(r#"(?i)\b(?:from|join)\s+(?:(?:"?[a-z0-9_]+"?)\s*\.\s*)?"?_[a-z0-9_]+"?"#)
+            .unwrap()
+    })
+}
+
+fn literal_table_scan_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // DuckDB replacement scans accept a quoted path as a table name:
+    //   SELECT * FROM '/etc/passwd'
+    //   SELECT * FROM 'data/*.parquet'
+    // Reject the shape before literal masking can hide it.
+    RE.get_or_init(|| Regex::new(r#"(?i)\b(?:from|join)\s*'"#).unwrap())
 }
 
 pub fn is_valid_dataset_id(id: &str) -> bool {
@@ -242,6 +257,14 @@ pub fn assert_read_only_sql(raw: Option<&Value>) -> Result<String, String> {
     }
     let without_trailing = sql.trim_end_matches(';').trim_end();
     let without_trailing = without_trailing.to_string();
+    if literal_table_scan_re().is_match(&without_trailing) {
+        return Err("table scans from quoted paths are not allowed".into());
+    }
+    // Double-quoted schema/table spellings are blanked by mask_literals, so
+    // check the raw statement too. This is intentionally conservative.
+    if internal_table_re().is_match(&without_trailing) {
+        return Err("internal warehouse tables are not queryable".into());
+    }
     let masked = mask_literals(&without_trailing);
     if masked.contains(';') {
         return Err("only one SQL statement is allowed".into());
@@ -306,10 +329,14 @@ mod tests {
             "DROP TABLE city_incidents",
             "DELETE FROM city_incidents",
             "SELECT * FROM read_csv('/etc/passwd')",
+            "SELECT * FROM '/etc/passwd'",
+            "SELECT * FROM 'data/events.parquet'",
             "SELECT 1; DELETE FROM city_incidents",
             "-- comment\nSELECT 1",
             "SELECT * FROM _usage_hourly",
             "SELECT * FROM _datasets",
+            "SELECT * FROM main._datasets",
+            "SELECT * FROM \"main\".\"_datasets\"",
             "SELECT * FROM query_table('_usage_hourly')",
             "SELECT * FROM query('SELECT * FROM _datasets')",
             "SELECT * FROM sniff_csv('/etc/passwd')",

@@ -746,9 +746,19 @@ Endpoints: `POST .../geo/features`, `GET .../geo/features?bbox=`,
   (`x-synapseone-internal`, 500 docs/page, deterministic event ids).
 - `BASE_OUTBOX_STREAM_TOPIC` (default `base-changes`) enables the relay to
   SynapseStream when `STREAM_SERVICE_URL` is configured.
+- Delivery is at-least-once. Transient failures (network, timeout, 429, 5xx,
+  auth/route misconfiguration) back off exponentially with deterministic
+  ±20% jitter and are retried. Event-shape failures (400/405/413/415/422) are
+  quarantined immediately; transient failures are quarantined after
+  `BASE_OUTBOX_MAX_ATTEMPTS` (default 20). A quarantined event does not occupy
+  every relay batch.
+- Base outbox ordering is best-effort: a backed-off event may be overtaken by
+  later events. Consumers must use event ids/versions and be idempotent.
+- `GET /v1/base/outbox` lists quarantined events for the caller's tenant;
+  operators use `GET /internal/base/outbox` and
+  `POST /internal/base/outbox/:eventId/replay` to inspect and requeue.
+  Replay resets the retry budget but keeps the event id.
 - `limit` 1..1000 (default 100).
-- Only upserts/updates are emitted. **Deletes are not emitted** — `deleted` is
-  always `false`; consumers must handle removals separately.
 - `hasMore` is true when the page was full; call again immediately with the new
   `nextSince`.
 

@@ -411,7 +411,7 @@ mod tests {
     #[test]
     fn catalog_matches_the_typescript_source() {
         let catalog = catalog();
-        assert_eq!(catalog.len(), 219);
+        assert_eq!(catalog.len(), 275);
         let first = &catalog[0];
         assert_eq!(first.method, "POST");
         assert_eq!(first.path, "/v1/auth/login");

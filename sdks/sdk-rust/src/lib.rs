@@ -43,6 +43,7 @@ pub mod faststore;
 pub mod health;
 pub mod iam;
 pub mod inference;
+pub mod lakehouse;
 pub mod lds;
 pub mod notifications;
 pub mod ocs;
@@ -64,6 +65,7 @@ pub use faststore::FaststoreService;
 pub use health::HealthService;
 pub use iam::IamService;
 pub use inference::InferenceService;
+pub use lakehouse::LakehouseService;
 pub use lds::LdsService;
 pub use notifications::NotificationsService;
 pub use ocs::OcsService;
@@ -136,6 +138,10 @@ impl Client {
     pub fn warehouse(&self) -> WarehouseService {
         WarehouseService::new(self.clone())
     }
+
+    pub fn lakehouse(&self) -> LakehouseService {
+        LakehouseService::new(self.clone())
+    }
 }
 
 /// One client, one HTTP layer, one namespace per platform service.
@@ -158,6 +164,7 @@ pub struct SynapseOneClient {
     storage: StorageService,
     ocs: OcsService,
     warehouse: WarehouseService,
+    lakehouse: LakehouseService,
 }
 
 impl SynapseOneClient {
@@ -193,6 +200,7 @@ impl SynapseOneClient {
             storage: StorageService::new(client.clone()),
             ocs: OcsService::new(client.clone()),
             warehouse: WarehouseService::new(client.clone()),
+            lakehouse: LakehouseService::new(client.clone()),
             client,
         }
     }
@@ -255,6 +263,10 @@ impl SynapseOneClient {
 
     pub fn warehouse(&self) -> &WarehouseService {
         &self.warehouse
+    }
+
+    pub fn lakehouse(&self) -> &LakehouseService {
+        &self.lakehouse
     }
 
     /// Raw gateway request escape hatch.

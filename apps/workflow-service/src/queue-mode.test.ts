@@ -291,6 +291,35 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
     assert.equal(mock.published.length, before + 1);
   });
 
+  it('account runner cannot claim another account execution in the same org', async () => {
+    const created = await fetch(`${base}/v1/workflow-runners`, {
+      method: 'POST', headers: USER, body: JSON.stringify({ name: 'account-runner', mode: 'custom' }),
+    });
+    assert.equal(created.status, 201);
+    const { runner } = await created.json();
+    assert.equal(runner.audience, 'account');
+
+    const foreign = await createExecutionRec({
+      workflow_id: 'wf-foreign-account',
+      workflow_name: 'foreign-account',
+      status: 'queued',
+      input: {},
+      output: null,
+      node_runs: [],
+      triggered_by: 'manual',
+      principal: { sub: 'other@example.com', org: 'org-1', account: 'acc-2', kind: 'user' },
+      queue_name: 'synapseone-wf-custom',
+      runner: 'custom',
+      startedAt: new Date().toISOString(),
+    });
+    const claim = await fetch(`${base}/v1/runner/jobs/${foreign.id}/claim`, {
+      method: 'POST', headers: RUNNER_AUTH,
+      body: JSON.stringify({ runnerId: runner.id, instanceId: 'account-connector', leaseSeconds: 60 }),
+    });
+    assert.equal(claim.status, 403);
+    assert.equal((await claim.json()).error, 'runner_audience');
+  });
+
   it('custom runner never receives a graph changed after enqueue', async () => {
     const wf = await createWorkflow('custom', 'custom-revision-drift');
     const created = await fetch(`${base}/v1/workflow-runners`, {
@@ -366,6 +395,49 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
     assert.equal(hook.status, 202);
     const body: any = await hook.json();
     assert.equal(body.queued, true);
+  });
+
+  it('cancels a queued execution before a runner claims it', async () => {
+    const wf = await createWorkflow('custom', 'cancel-queued');
+    const queued: any = await (await fetch(`${base}/v1/workflows/${wf.id}/execute`, {
+      method: 'POST', headers: USER, body: JSON.stringify({ value: 1 }),
+    })).json();
+    assert.equal(queued.status, 'queued');
+    const cancelled = await fetch(`${base}/v1/executions/${queued.executionId}/cancel`, {
+      method: 'POST', headers: USER, body: JSON.stringify({ reason: 'test cancel' }),
+    });
+    assert.equal(cancelled.status, 200);
+    assert.equal((await cancelled.json()).status, 'cancelled');
+    const again = await fetch(`${base}/v1/executions/${queued.executionId}/cancel`, {
+      method: 'POST', headers: USER, body: '{}',
+    });
+    assert.equal(again.status, 409);
+  });
+
+  it('enforces the webhook declared HTTP method', async () => {
+    const created = await fetch(`${base}/v1/workflows`, {
+      method: 'POST', headers: USER,
+      body: JSON.stringify({
+        name: 'webhook-method-guard',
+        definition: {
+          nodes: [
+            { name: 'Hook', type: 'n8n-nodes-base.webhook', parameters: { path: 'method-hook', httpMethod: 'POST' } },
+            { name: 'Echo', type: 'n8n-nodes-base.noOp', parameters: {} },
+          ],
+          connections: { Hook: { main: [[{ node: 'Echo' }]] } },
+        },
+      }),
+    });
+    assert.equal(created.status, 201);
+    const wf: any = await created.json();
+    assert.equal((await fetch(`${base}/v1/workflows/${wf.id}/activate`, { method: 'POST', headers: USER, body: '{}' })).status, 200);
+    const wrong = await fetch(`${base}/webhook/method-hook`, { method: 'GET' });
+    assert.equal(wrong.status, 405);
+    assert.equal((await wrong.json()).error, 'method_not_allowed');
+    const right = await fetch(`${base}/webhook/method-hook`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    });
+    assert.ok([200, 202].includes(right.status));
   });
 
   it('creates a custom runner with a copy-paste command containing the API key', async () => {

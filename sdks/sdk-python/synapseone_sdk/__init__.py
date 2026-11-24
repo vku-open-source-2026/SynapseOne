@@ -55,6 +55,7 @@ from .faststore import FaststoreService
 from .health import HealthService
 from .iam import IamService
 from .inference import InferenceService
+from .lakehouse import LakehouseService
 from .lds import LdsService
 from .notifications import NotificationsService
 from .ocs import OcsService
@@ -73,6 +74,7 @@ __all__ = [
     "IamService",
     "HealthService",
     "InferenceService",
+    "LakehouseService",
     "LdsService",
     "QueryResult",
     "VectorSearchResult",
@@ -137,6 +139,7 @@ class SynapseOneClient:
         self.ocs = OcsService(self._http)
         self.notifications = NotificationsService(self._http)
         self.warehouse = WarehouseService(self._http)
+        self.lakehouse = LakehouseService(self._http)
 
     # ---- transport knobs (also mirrored by JS setToken/setApiKey and Go) ----
     @property

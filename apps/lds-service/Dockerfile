@@ -3,6 +3,8 @@
 FROM rust:1-bookworm AS builder
 WORKDIR /workspace
 COPY Cargo.toml Cargo.lock ./
+# store.rs includes the Drizzle migration at compile time.
+COPY drizzle ./drizzle
 COPY src ./src
 RUN cargo build --release --locked
 

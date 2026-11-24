@@ -282,9 +282,42 @@ impl IamService {
             .await
     }
 
+    pub async fn update_org(&self, org_id: &str, display_name: &str) -> Result<Value> {
+        self.client
+            .patch(
+                format!("/v1/orgs/{}", segment(org_id)),
+                json!({ "displayName": display_name }),
+            )
+            .await
+    }
+
     pub async fn list_accounts(&self, org_id: &str) -> Result<Value> {
         self.client
             .get(format!("/v1/orgs/{}/accounts", segment(org_id)))
+            .await
+    }
+
+    pub async fn get_account(&self, account_id: &str) -> Result<Value> {
+        self.client
+            .get(format!("/v1/accounts/{}", segment(account_id)))
+            .await
+    }
+
+    pub async fn update_account(&self, account_id: &str, display_name: &str) -> Result<Value> {
+        self.client
+            .patch(
+                format!("/v1/accounts/{}", segment(account_id)),
+                json!({ "displayName": display_name }),
+            )
+            .await
+    }
+
+    pub async fn update_user(&self, user_id: &str, display_name: &str) -> Result<Value> {
+        self.client
+            .patch(
+                format!("/v1/users/{}", segment(user_id)),
+                json!({ "displayName": display_name }),
+            )
             .await
     }
 
@@ -483,6 +516,12 @@ impl IamService {
             .await
     }
 
+    pub async fn get_api_key(&self, key_id: &str) -> Result<Value> {
+        self.client
+            .get(format!("/v1/keys/{}", segment(key_id)))
+            .await
+    }
+
     pub async fn verify_api_key(&self, api_key: &str) -> Result<Value> {
         self.client
             .post("/v1/keys/verify", json!({ "apiKey": api_key }))
@@ -606,9 +645,30 @@ impl IamService {
             .await
     }
 
+    pub async fn get_service_account(&self, sa_id: &str) -> Result<Value> {
+        self.client
+            .get(format!("/v1/service-accounts/{}", segment(sa_id)))
+            .await
+    }
+
     pub async fn list_roles(&self, account_id: &str) -> Result<Value> {
         self.client
             .get(format!("/v1/accounts/{}/roles", segment(account_id)))
+            .await
+    }
+
+    pub async fn update_role(&self, role_id: &str, description: &str) -> Result<Value> {
+        self.client
+            .patch(
+                format!("/v1/roles/{}", segment(role_id)),
+                json!({ "description": description }),
+            )
+            .await
+    }
+
+    pub async fn update_policy(&self, policy_id: &str, patch: Value) -> Result<Value> {
+        self.client
+            .patch(format!("/v1/policies/{}", segment(policy_id)), patch)
             .await
     }
 

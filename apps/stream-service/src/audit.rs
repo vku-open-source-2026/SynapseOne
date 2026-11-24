@@ -247,10 +247,12 @@ pub async fn flush_now() {
     }
 }
 
+#[cfg(test)]
 pub fn events() -> Vec<AuditEvent> {
     buffer().lock().expect("audit buffer").clone()
 }
 
+#[cfg(test)]
 pub fn clear() {
     buffer().lock().expect("audit buffer").clear();
 }

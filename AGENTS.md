@@ -5,7 +5,7 @@ by concern to keep context small.
 
 ## What this is
 
-SynapseOne v0.7.0 — Apache-2.0 "Tier-1 PaaS": one API gateway, AWS-style IAM,
+SynapseOne v0.9.0 — Apache-2.0 "Tier-1 PaaS": one API gateway, AWS-style IAM,
 Postgres/Valkey data plane + tenant-scoped object storage (S3-compatible), built-in
 workflow engine, NGSI-LD linked data (SynapseLDS), document DB (SynapseBase),
 Valkey cache (Synapse Faststore), and at-least-once queue (SynapseQueue).
@@ -35,7 +35,9 @@ and `.notes/` (local credentials — never print, copy, or commit).
   `apps/lds-service`, `apps/notifications-service`, `apps/faststore-service`,
   `apps/queue-service`, `apps/ocs-service`, `apps/base-service`,
   `apps/warehouse-service` and `apps/gateway`. Each has `Cargo.toml`,
-  `Cargo.lock`, a Rust `Dockerfile` and a `--healthcheck` mode. Their TypeScript
+  `Cargo.lock`, a Rust `Dockerfile` and a `--healthcheck` mode. `apps/lakehouse-service`
+  is Python (FastAPI + PyIceberg) and owns the Iceberg catalog/tables; its
+  Dockerfile is the production entry point. Their TypeScript
   sources remain as the behavioural reference; the Rust binary is what ships.
 
 - React 18 + Vite + Tailwind Console (plain JSX, not TypeScript).
@@ -59,6 +61,7 @@ and `.notes/` (local credentials — never print, copy, or commit).
 | `apps/queue-service` | SynapseQueue messaging, leases, retries, DLQ | 4007 | Valkey / memory |
 | `apps/stream-service` | SynapseStream tenant-scoped event log | 4009 | Valkey Streams / memory |
 | `apps/warehouse-service` | Synapse Warehouse OLAP datasets, SQL queries, batch/stream ETL | 4012 | DuckDB files / memory |
+| `apps/lakehouse-service` | Apache Iceberg catalog/tables, snapshots, schema evolution | 4013 | Postgres catalog + S3-compatible Parquet |
 | `apps/ocs-service` | SynapseOCS objects, multipart, presign, quotas | 4010 | S3 / filesystem |
 | `apps/notifications-service` | SynapseNotifications outbox, templates, preferences, delivery | 4011 | Postgres / memory + queue |
 | `apps/inference-service` | Python FastAPI LLM proxy + embeddings + decision | 4008 | local models / OpenRouter |
@@ -120,7 +123,15 @@ Postgres · Valkey · S3-compatible object storage · notification relays
 11. **Identity is first-party by default.** Password registration/login/reset
     work in production; OIDC uses a PUBLIC HTTPS issuer (internal Docker hosts
     are rejected at boot). Tier-2 uses `/v1/auth/exchange` for per-user tokens.
-12. **Keep versions in sync** at `0.7.0` across packages, Compose images, and SDKs.
+12. **Keep the platform release identity in sync** at `0.9.0` across app packages,
+    Cargo manifests, Compose images, the inference `__version__`, and K8s tags.
+    Client SDKs/CLI may carry independent patch versions; document them in the
+    release notes instead of silently changing their published semver.
+13. **Lakehouse owns Iceberg metadata/data; Warehouse only materializes it.**
+    Tenant SQL keeps external access disabled. Clients never choose object-store
+    locations, and catalog drops retain data files until an explicit operator
+    cleanup. One catalog lock per Lakehouse process; concurrent replicas may
+    return `409 commit_conflict`.
 
 ## Commands
 

@@ -43,6 +43,27 @@ for (const entry of fs.readdirSync(path.join(root, 'apps'), { withFileTypes: tru
   }
 }
 
+// Python inference reports its version in health output; keep it on the same
+// release identity as the rest of the stack.
+const inferencePkg = path.join(root, 'apps', 'inference-service', 'src', '__init__.py');
+if (fs.existsSync(inferencePkg)) {
+  const source = fs.readFileSync(inferencePkg, 'utf8');
+  const match = source.match(/^__version__\s*=\s*["']([^"']+)["']/m);
+  if (!match || match[1] !== version) {
+    errors.push(`${path.relative(root, inferencePkg)}: ${match ? match[1] : 'missing __version__'} != ${version}`);
+  }
+}
+
+// Lakehouse is Python too; its health/metrics version must track the platform.
+const lakehouseVersion = path.join(root, 'apps', 'lakehouse-service', 'src', 'main.py');
+if (fs.existsSync(lakehouseVersion)) {
+  const source = fs.readFileSync(lakehouseVersion, 'utf8');
+  const match = source.match(/^VERSION\s*=\s*["']([^"']+)["']/m);
+  if (!match || match[1] !== version) {
+    errors.push(`${path.relative(root, lakehouseVersion)}: ${match ? match[1] : 'missing VERSION'} != ${version}`);
+  }
+}
+
 const k8s = path.join(root, 'infra', 'k8s', 'base', 'all.yaml');
 if (fs.existsSync(k8s)) {
   for (const line of fs.readFileSync(k8s, 'utf8').split('\n')) {

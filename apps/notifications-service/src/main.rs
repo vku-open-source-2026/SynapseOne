@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 VKU.VIC
 //! SynapseNotifications — tenant-scoped notification delivery.
 //!
-//! Outbox + templates + preferences + retries/DLQ. Delivery adapters are HTTP
+//! Outbox + inline variables + preferences + retries/DLQ. Delivery adapters are HTTP
 //! relays (email/SMS/push) plus direct webhooks, so no provider SDK is bundled.
 //! With NOTIFICATIONS_QUEUE_URL set, delivery jobs travel through SynapseQueue
 //! for at-least-once processing across replicas.
@@ -28,7 +28,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
-use db::{NewNotification, NotificationRecord, Store, CHANNELS};
+use db::{NewNotification, NewTemplate, NotificationRecord, Store, CHANNELS};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -853,7 +853,75 @@ async fn create_notification(
             Some(format!("channels must be one of {}", CHANNELS.join(","))),
         );
     }
-    let mut text = js_string(object.get("body").or_else(|| object.get("text")));
+    let data = object
+        .get("data")
+        .filter(|value| value.is_object() || value.is_array())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let template_id_input = object
+        .get("templateId")
+        .map(|value| js_string(Some(value)))
+        .filter(|value| !value.is_empty());
+    let template_slug_input = object
+        .get("templateSlug")
+        .map(|value| js_string(Some(value)))
+        .filter(|value| !value.is_empty());
+    if template_id_input.is_some() && template_slug_input.is_some() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_template",
+            Some("send templateId or templateSlug, not both".into()),
+        );
+    }
+    if (template_id_input.is_some() || template_slug_input.is_some())
+        && object.get("body").or_else(|| object.get("text")).is_some()
+    {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_template",
+            Some("send body or a template, not both".into()),
+        );
+    }
+    let template = if let Some(id) = template_id_input.as_deref() {
+        match state.store.get_template(&tenant, id).await {
+            Ok(Some(t)) => Some(t),
+            Ok(None) => return json_error(StatusCode::NOT_FOUND, "template_not_found", None),
+            Err(error) => {
+                tracing::error!("[notifications] template read failed: {error}");
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", None);
+            }
+        }
+    } else if let Some(slug) = template_slug_input.as_deref() {
+        match state.store.get_template_by_slug(&tenant, slug).await {
+            Ok(Some(t)) => Some(t),
+            Ok(None) => return json_error(StatusCode::NOT_FOUND, "template_not_found", None),
+            Err(error) => {
+                tracing::error!("[notifications] template read failed: {error}");
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", None);
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(t) = &template {
+        if t.archived_at.is_some() {
+            return json_error(StatusCode::CONFLICT, "template_archived", None);
+        }
+        let missing = delivery::missing_variables(&t.variables, &data);
+        if !missing.is_empty() {
+            let mut response = json_error(
+                StatusCode::BAD_REQUEST,
+                "missing_template_variables",
+                Some(format!("missing template variables: {}", missing.join(", "))),
+            );
+            response.headers_mut().insert("x-missing-variables", missing.join(",").parse().unwrap());
+            return response;
+        }
+    }
+    let mut text = match &template {
+        Some(t) => t.body.clone(),
+        None => js_string(object.get("body").or_else(|| object.get("text"))),
+    };
     text.truncate(100_000);
     if text.is_empty() {
         return json_error(
@@ -862,7 +930,10 @@ async fn create_notification(
             Some("body (or template) is required".into()),
         );
     }
-    let mut subject = js_string(object.get("subject"));
+    let mut subject = match &template {
+        Some(t) => t.subject.clone(),
+        None => js_string(object.get("subject")),
+    };
     subject.truncate(500);
     let idempotency_key = object
         .get("idempotencyKey")
@@ -872,12 +943,10 @@ async fn create_notification(
             value.truncate(200);
             value
         });
-    let data = object
-        .get("data")
-        .filter(|value| value.is_object() || value.is_array())
-        .cloned()
-        .unwrap_or_else(|| json!({}));
     let rendered = delivery::render_template(&text, &data);
+    let rendered_subject = delivery::render_template(&subject, &data);
+    let template_id = template.as_ref().map(|t| t.id.clone());
+    let template_version = template.as_ref().map(|t| t.version);
 
     let mut created = Vec::new();
     for channel in channels {
@@ -890,10 +959,12 @@ async fn create_notification(
                 tenant: tenant.clone(),
                 channel,
                 recipient: recipient.clone(),
-                subject: subject.clone(),
+                subject: rendered_subject.clone(),
                 body: rendered.clone(),
                 idempotency_key: key,
                 metadata: data.clone(),
+                template_id: template_id.clone(),
+                template_version,
             })
             .await
         {
@@ -987,6 +1058,259 @@ async fn cancel_notification(
         ),
         Err(error) => {
             tracing::error!("[notifications] cancel failed: {error}");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", None)
+        }
+    }
+}
+
+async fn retry_notification(
+    State(state): State<AppState>,
+    Extension(Tenant(tenant)): Extension<Tenant>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if rate_limited(&state, &tenant).await {
+        let mut response = json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            Some(format!(
+                "limit is {} notifications/minute",
+                state.config.rate_limit
+            )),
+        );
+        response
+            .headers_mut()
+            .insert("retry-after", "60".parse().unwrap());
+        return response;
+    }
+    match state.store.retry(&tenant, &id).await {
+        Ok(Some(record)) => Json(record).into_response(),
+        Ok(None) => json_error(
+            StatusCode::CONFLICT,
+            "not_retryable",
+            Some("notification is not failed/dead or does not exist".into()),
+        ),
+        Err(error) => {
+            tracing::error!("[notifications] retry failed: {error}");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", None)
+        }
+    }
+}
+
+fn template_slug(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+async fn create_template(
+    State(state): State<AppState>,
+    Extension(Tenant(tenant)): Extension<Tenant>,
+    body: Bytes,
+) -> Response {
+    let Ok(body) = serde_json::from_slice::<Value>(&body) else {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_json", None);
+    };
+    let object = body.as_object().cloned().unwrap_or_default();
+    let slug = js_string(object.get("slug"));
+    if !template_slug(&slug) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_slug",
+            Some("slug must match ^[a-z0-9-]{1,64}$".into()),
+        );
+    }
+    let name = js_string(object.get("name"));
+    if name.is_empty() || name.chars().count() > 200 {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_name", Some("name is required (≤200)".into()));
+    }
+    let subject = js_string(object.get("subject"));
+    let body_text = js_string(object.get("body"));
+    if body_text.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "body_required", None);
+    }
+    if subject.chars().count() > 500 || body_text.chars().count() > 100_000 {
+        return json_error(StatusCode::BAD_REQUEST, "template_too_large", None);
+    }
+    for text in [&subject, &body_text] {
+        if let Some(error) = delivery::template_syntax_error(text) {
+            return json_error(StatusCode::BAD_REQUEST, "invalid_template", Some(error));
+        }
+    }
+    let variables = delivery::extract_variables(&format!("{subject}\n{body_text}"));
+    match state
+        .store
+        .create_template(NewTemplate {
+            tenant: tenant.clone(),
+            slug,
+            name,
+            subject,
+            body: body_text,
+            variables,
+        })
+        .await
+    {
+        Ok(record) => (StatusCode::CREATED, Json(record)).into_response(),
+        Err(error) if error.contains("slug exists") => {
+            json_error(StatusCode::CONFLICT, "template_exists", Some(error))
+        }
+        Err(error) => {
+            tracing::error!("[notifications] create template failed: {error}");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", None)
+        }
+    }
+}
+
+async fn list_templates(
+    State(state): State<AppState>,
+    Extension(Tenant(tenant)): Extension<Tenant>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let limit = match query.get("limit") {
+        None => 50,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(value) if (1..=200).contains(&value) => value,
+            _ => return json_error(StatusCode::BAD_REQUEST, "invalid_limit", None),
+        },
+    };
+    let offset = match query.get("offset") {
+        None => 0,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(value) if (0..=100_000).contains(&value) => value,
+            _ => return json_error(StatusCode::BAD_REQUEST, "invalid_offset", None),
+        },
+    };
+    let q = query.get("q").cloned().unwrap_or_default();
+    let include_archived = query.get("includeArchived").map(|v| v == "true").unwrap_or(false);
+    match state
+        .store
+        .list_templates(&tenant, &q, include_archived, limit, offset)
+        .await
+    {
+        Ok((items, total)) => Json(json!({
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "nextOffset": if offset + (items.len() as i64) < total { Some(offset + items.len() as i64) } else { None::<i64> },
+        }))
+        .into_response(),
+        Err(error) => {
+            tracing::error!("[notifications] list templates failed: {error}");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", None)
+        }
+    }
+}
+
+async fn get_template(
+    State(state): State<AppState>,
+    Extension(Tenant(tenant)): Extension<Tenant>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    match state.store.get_template(&tenant, &id).await {
+        Ok(Some(t)) => Json(t).into_response(),
+        Ok(None) => json_error(StatusCode::NOT_FOUND, "template_not_found", None),
+        Err(error) => {
+            tracing::error!("[notifications] get template failed: {error}");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", None)
+        }
+    }
+}
+
+async fn update_template(
+    State(state): State<AppState>,
+    Extension(Tenant(tenant)): Extension<Tenant>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Bytes,
+) -> Response {
+    let Ok(body) = serde_json::from_slice::<Value>(&body) else {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_json", None);
+    };
+    let object = body.as_object().cloned().unwrap_or_default();
+    let Some(existing) = state.store.get_template(&tenant, &id).await.ok().flatten() else {
+        return json_error(StatusCode::NOT_FOUND, "template_not_found", None);
+    };
+    let name = object.get("name").map(|v| js_string(Some(v)));
+    let subject = object.get("subject").map(|v| js_string(Some(v)));
+    let text = object.get("body").map(|v| js_string(Some(v)));
+    if name.is_none() && subject.is_none() && text.is_none() {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_body", Some("send name, subject and/or body".into()));
+    }
+    if let Some(name) = &name {
+        if name.is_empty() || name.chars().count() > 200 {
+            return json_error(StatusCode::BAD_REQUEST, "invalid_name", None);
+        }
+    }
+    let next_subject = subject.clone().unwrap_or_else(|| existing.subject.clone());
+    let next_body = text.clone().unwrap_or_else(|| existing.body.clone());
+    if next_subject.chars().count() > 500 || next_body.chars().count() > 100_000 {
+        return json_error(StatusCode::BAD_REQUEST, "template_too_large", None);
+    }
+    for value in [&next_subject, &next_body] {
+        if let Some(error) = delivery::template_syntax_error(value) {
+            return json_error(StatusCode::BAD_REQUEST, "invalid_template", Some(error));
+        }
+    }
+    let variables = delivery::extract_variables(&format!("{next_subject}\n{next_body}"));
+    match state
+        .store
+        .update_template(&tenant, &id, name, subject, text, Some(variables))
+        .await
+    {
+        Ok(Some(record)) => Json(record).into_response(),
+        Ok(None) => json_error(StatusCode::NOT_FOUND, "template_not_found", None),
+        Err(error) => {
+            tracing::error!("[notifications] update template failed: {error}");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", None)
+        }
+    }
+}
+
+async fn archive_template(
+    State(state): State<AppState>,
+    Extension(Tenant(tenant)): Extension<Tenant>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    match state.store.archive_template(&tenant, &id).await {
+        Ok(true) => Json(json!({ "ok": true, "archived": true })).into_response(),
+        Ok(false) => json_error(StatusCode::NOT_FOUND, "template_not_found_or_archived", None),
+        Err(error) => {
+            tracing::error!("[notifications] archive template failed: {error}");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", None)
+        }
+    }
+}
+
+async fn preview_template(
+    State(state): State<AppState>,
+    Extension(Tenant(tenant)): Extension<Tenant>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Bytes,
+) -> Response {
+    let body = serde_json::from_slice::<Value>(&body).unwrap_or_else(|_| json!({}));
+    let data = body
+        .get("data")
+        .filter(|v| v.is_object() || v.is_array())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    match state.store.get_template(&tenant, &id).await {
+        Ok(Some(t)) if t.archived_at.is_none() => {
+            let missing = delivery::missing_variables(&t.variables, &data);
+            Json(json!({
+                "id": t.id,
+                "version": t.version,
+                "subject": delivery::render_template(&t.subject, &data),
+                "body": delivery::render_template(&t.body, &data),
+                "variables": t.variables,
+                "missing": missing,
+            }))
+            .into_response()
+        }
+        Ok(Some(_)) => json_error(StatusCode::CONFLICT, "template_archived", None),
+        Ok(None) => json_error(StatusCode::NOT_FOUND, "template_not_found", None),
+        Err(error) => {
+            tracing::error!("[notifications] preview template failed: {error}");
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", None)
         }
     }
@@ -1110,8 +1434,18 @@ fn build_app(state: AppState) -> Router {
     };
     let api = Router::new()
         .route("/v1/notifications", post(create_notification).get(list_notifications))
+        .route("/v1/notifications/templates", get(list_templates).post(create_template))
+        .route(
+            "/v1/notifications/templates/{id}",
+            get(get_template).patch(update_template).delete(archive_template),
+        )
+        .route(
+            "/v1/notifications/templates/{id}/preview",
+            post(preview_template),
+        )
         .route("/v1/notifications/{id}", get(get_notification))
         .route("/v1/notifications/{id}/cancel", post(cancel_notification))
+        .route("/v1/notifications/{id}/retry", post(retry_notification))
         .route(
             "/v1/notifications/preferences/{recipient}",
             get(get_preference).put(put_preference),
@@ -1297,6 +1631,8 @@ mod tests {
             body: "one".into(),
             idempotency_key: Some("log:key-1".into()),
             metadata: json!({}),
+            template_id: None,
+            template_version: None,
         };
         let first = store.create(input()).await.unwrap();
         let second = store.create(input()).await.unwrap();
@@ -1308,6 +1644,127 @@ mod tests {
             .unwrap();
         assert_eq!(cancelled.status, "cancelled");
         assert!(store.cancel("org:org-a", &first.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn templates_render_at_enqueue_and_are_tenant_scoped() {
+        let state = test_state().await;
+        let app = build_app(state.clone());
+        let template = state
+            .store
+            .create_template(NewTemplate {
+                tenant: "org:org-a".into(),
+                slug: "flood".into(),
+                name: "Flood alert".into(),
+                subject: "Flood in {{city}}".into(),
+                body: "Level {{level}}m".into(),
+                variables: vec!["city".into(), "level".into()],
+            })
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/notifications")
+                    .header("content-type", "application/json")
+                    .header("x-synapseone-org", "org-a")
+                    .body(Body::from(format!(
+                        r#"{{"channel":"log","recipient":{{"userId":"u1"}},"templateId":"{}","data":{{"city":"Hanoi","level":2.5}}}}"#,
+                        template.id
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["notifications"][0]["body"], "Level 2.5m");
+        assert_eq!(body["notifications"][0]["subject"], "Flood in Hanoi");
+        assert_eq!(body["notifications"][0]["templateVersion"], 1);
+
+        let missing = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/notifications")
+                    .header("content-type", "application/json")
+                    .header("x-synapseone-org", "org-a")
+                    .body(Body::from(format!(
+                        r#"{{"channel":"log","recipient":{{}},"templateId":"{}","data":{{"city":"Hanoi"}}}}"#,
+                        template.id
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+
+        let archived = state
+            .store
+            .archive_template("org:org-a", &template.id)
+            .await
+            .unwrap();
+        assert!(archived);
+        let blocked = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/notifications")
+                    .header("content-type", "application/json")
+                    .header("x-synapseone-org", "org-a")
+                    .body(Body::from(format!(
+                        r#"{{"channel":"log","recipient":{{}},"templateId":"{}","data":{{"city":"Hanoi","level":1}}}}"#,
+                        template.id
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn manual_retry_restarts_a_dead_notification() {
+        let store = Store::connect(None).await.unwrap();
+        let created = store
+            .create(NewNotification {
+                tenant: "org:org-a".into(),
+                channel: "log".into(),
+                recipient: json!({"userId": "u2"}),
+                subject: String::new(),
+                body: "retry me".into(),
+                idempotency_key: None,
+                metadata: json!({}),
+                template_id: None,
+                template_version: None,
+            })
+            .await
+            .unwrap();
+        assert!(store.retry("org:org-a", &created.id).await.unwrap().is_none());
+        store
+            .update(
+                &created.id,
+                Some("dead"),
+                Some(json!([{"at": "2026-01-01T00:00:00Z", "ok": false}])),
+                None,
+                Some("smtp down"),
+            )
+            .await
+            .unwrap();
+        let retried = store
+            .retry("org:org-a", &created.id)
+            .await
+            .unwrap()
+            .expect("dead notification retries");
+        assert_eq!(retried.status, "queued");
+        assert_eq!(retried.attempts, json!([]));
+        assert!(retried.dead_reason.is_none());
+        assert!(retried.published_at.is_none());
+        assert!(store.retry("org:org-b", &created.id).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1372,6 +1829,8 @@ mod tests {
                 body: "hi".into(),
                 idempotency_key: None,
                 metadata: json!({}),
+                template_id: None,
+                template_version: None,
             })
             .await
             .unwrap();
@@ -1476,6 +1935,8 @@ mod tests {
                 body: body.into(),
                 idempotency_key: None,
                 metadata: json!({}),
+                template_id: None,
+                template_version: None,
             })
             .await
             .expect("seed notification")

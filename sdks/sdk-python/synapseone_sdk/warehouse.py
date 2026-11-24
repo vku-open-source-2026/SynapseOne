@@ -30,6 +30,16 @@ class WarehouseService:
     def create_dataset(self, dataset: dict) -> dict:
         return self._req("POST", f"{_P}/datasets", dataset)
 
+    def update_dataset(
+        self, dataset_id: str, name: str | None = None, description: str | None = None
+    ) -> dict:
+        body: dict[str, Any] = {}
+        if name is not None:
+            body["name"] = name
+        if description is not None:
+            body["description"] = description
+        return self._req("PATCH", f"{_P}/datasets/{dataset_id}", body)
+
     def delete_dataset(self, dataset_id: str) -> dict:
         return self._req("DELETE", f"{_P}/datasets/{dataset_id}")
 
@@ -54,11 +64,34 @@ class WarehouseService:
     def create_job(self, job: dict) -> dict:
         return self._req("POST", f"{_P}/jobs", job)
 
+    def update_job(self, job_id: str, name: str) -> dict:
+        return self._req("PATCH", f"{_P}/jobs/{job_id}", {"name": name})
+
     def run_batch(self, job: dict) -> dict:
         return self._req("POST", f"{_P}/etl/batch", job)
 
     def ensure_stream(self, job: dict) -> dict:
         return self._req("POST", f"{_P}/etl/stream", job)
+
+    def base_to_warehouse(self, job: dict) -> dict:
+        """One-shot Base snapshot → Warehouse current-state dataset (Path A)."""
+        return self._req("POST", f"{_P}/etl/base", job)
+
+    def lakehouse_to_warehouse(self, job: dict) -> dict:
+        """Authorized Lakehouse snapshot/table → Warehouse dataset (Path C)."""
+        return self._req("POST", f"{_P}/etl/lakehouse", job)
+
+    def base_to_lakehouse(self, job: dict) -> dict:
+        """Create a durable Base→Stream→Iceberg change-log ETL job."""
+        return self._req("POST", f"{_P}/etl/base-lakehouse", job)
+
+    def preview_ocs(self, job: dict) -> dict:
+        """Preview schema and rows for an authorized OCS CSV/JSONL/Parquet object."""
+        return self._req("POST", f"{_P}/etl/ocs/preview", job)
+
+    def import_ocs(self, job: dict) -> dict:
+        """Import an authorized OCS CSV/JSONL/Parquet object into a dataset."""
+        return self._req("POST", f"{_P}/etl/ocs", job)
 
     def run_job(self, job_id: str) -> dict:
         return self._req("POST", f"{_P}/jobs/{job_id}/run")

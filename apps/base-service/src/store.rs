@@ -65,6 +65,27 @@ pub struct OutboxEvent {
 }
 
 #[derive(Debug, Clone)]
+pub struct OutboxStats {
+    pub pending: i64,
+    pub dead_lettered: i64,
+    pub oldest: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutboxDeadLetter {
+    pub event_id: String,
+    pub org_id: Option<String>,
+    pub account_id: Option<String>,
+    pub collection_id: String,
+    pub document_id: String,
+    pub operation: String,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    pub occurred_at: String,
+    pub dead_lettered_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct StoredSearchRecord {
     pub id: String,
     pub collection_id: String,
@@ -123,6 +144,9 @@ pub struct MemoryOutbox {
     pub payload: Value,
     pub published_at: Option<String>,
     pub attempts: i64,
+    pub next_attempt_at: String,
+    pub last_attempt_at: Option<String>,
+    pub dead_lettered_at: Option<String>,
     pub last_error: Option<String>,
 }
 
@@ -280,6 +304,10 @@ pub(crate) const MIGRATIONS: &[(i64, &str)] = &[
     (
         1_797_000_000_001,
         include_str!("../drizzle/0009_base_multidb_runtime_repair.sql"),
+    ),
+    (
+        1_798_000_000_000,
+        include_str!("../drizzle/0010_misty_pretty_boy.sql"),
     ),
 ];
 
@@ -1185,19 +1213,51 @@ impl Store {
 
     pub async fn delete_collection(&self, id: &str) -> Result<bool, StoreError> {
         if let Some(pool) = self.pool() {
+            let mut transaction = pool
+                .begin()
+                .await
+                .map_err(|error| StoreError::invalid(error.to_string()))?;
+            // A deleted collection must not leave stale current-state rows or
+            // replay a queued create into Warehouse/Lakehouse. Append a delete
+            // tombstone for every document before removing the collection.
+            let rows = sqlx::query(
+                r#"SELECT collection_id, id, data, version, created_at, updated_at
+                   FROM synapseone_base_documents WHERE collection_id = $1"#,
+            )
+            .bind(id)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|error| StoreError::invalid(error.to_string()))?;
+            for row in rows {
+                let document = document_from_row(&row)?;
+                enqueue_outbox_tx(&mut transaction, id, &document, "delete", None).await?;
+            }
             sqlx::query("DELETE FROM synapseone_search_index WHERE collection_id = $1")
                 .bind(id)
-                .execute(pool)
+                .execute(&mut *transaction)
                 .await
                 .map_err(|error| StoreError::invalid(error.to_string()))?;
             let result = sqlx::query("DELETE FROM synapseone_base_collections WHERE id = $1")
                 .bind(id)
-                .execute(pool)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| StoreError::invalid(error.to_string()))?;
+            transaction
+                .commit()
                 .await
                 .map_err(|error| StoreError::invalid(error.to_string()))?;
             return Ok(result.rows_affected() > 0);
         }
         let mut memory = self.memory().await.expect("memory store");
+        let documents: Vec<StoredDocument> = memory
+            .documents
+            .iter()
+            .filter(|((collection_id, _), _)| collection_id == id)
+            .map(|(_, document)| document.clone())
+            .collect();
+        for document in documents {
+            enqueue_outbox_mem(&mut memory, id, &document, "delete", None);
+        }
         memory
             .documents
             .retain(|(collection_id, _), _| collection_id != id);
@@ -2041,8 +2101,8 @@ impl Store {
             let mut inserted = 0usize;
             for document in documents {
                 let event_id = format!(
-                    "backfill:{collection_id}:{}:{}",
-                    document.id, document.version
+                    "backfill:{collection_id}:{}:{}:{}",
+                    document.id, document.created_at, document.version
                 );
                 let payload = outbox_payload(
                     collection.as_ref(),
@@ -2097,8 +2157,8 @@ impl Store {
         let collection = memory.collections.get(collection_id).cloned();
         for document in documents {
             let event_id = format!(
-                "backfill:{collection_id}:{}:{}",
-                document.id, document.version
+                "backfill:{collection_id}:{}:{}:{}",
+                document.id, document.created_at, document.version
             );
             if existing.contains(&event_id) {
                 continue;
@@ -2114,6 +2174,9 @@ impl Store {
                 payload,
                 published_at: None,
                 attempts: 0,
+                next_attempt_at: now_iso(),
+                last_attempt_at: None,
+                dead_lettered_at: None,
                 last_error: None,
             });
             existing.insert(event_id);
@@ -2223,44 +2286,60 @@ impl Store {
         })
     }
 
-    pub async fn outbox_stats(&self) -> Result<(i64, Option<String>), StoreError> {
+    pub async fn outbox_stats(&self) -> Result<OutboxStats, StoreError> {
         if let Some(pool) = self.pool() {
             let row = sqlx::query(
-                r#"SELECT count(*) filter (where published_at is null)::int AS pending,
-                          min(occurred_at) filter (where published_at is null) AS oldest
+                r#"SELECT count(*) filter (where published_at is null and dead_lettered_at is null)::int AS pending,
+                          count(*) filter (where published_at is null and dead_lettered_at is not null)::int AS dead_lettered,
+                          min(occurred_at) filter (where published_at is null and dead_lettered_at is null) AS oldest
                    FROM synapseone_base_outbox"#,
             )
             .fetch_one(pool)
             .await
             .map_err(|error| StoreError::invalid(error.to_string()))?;
             let pending: i32 = row.try_get("pending").unwrap_or(0);
+            let dead_lettered: i32 = row.try_get("dead_lettered").unwrap_or(0);
             let oldest: Option<DateTime<Utc>> = row.try_get("oldest").ok().flatten();
-            return Ok((pending as i64, oldest.map(|value| iso(&value))));
+            return Ok(OutboxStats {
+                pending: pending as i64,
+                dead_lettered: dead_lettered as i64,
+                oldest: oldest.map(|value| iso(&value)),
+            });
         }
         let memory = self.memory().await.expect("memory store");
         let pending: Vec<&MemoryOutbox> = memory
             .outbox
             .iter()
-            .filter(|event| event.published_at.is_none())
+            .filter(|event| event.published_at.is_none() && event.dead_lettered_at.is_none())
             .collect();
-        Ok((
-            pending.len() as i64,
-            pending.first().and_then(|event| {
-                event
-                    .payload
-                    .get("occurred_at")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            }),
-        ))
+        let dead_lettered = memory
+            .outbox
+            .iter()
+            .filter(|event| event.published_at.is_none() && event.dead_lettered_at.is_some())
+            .count() as i64;
+        let oldest = pending
+            .iter()
+            .filter_map(|event| event.payload.get("occurred_at").and_then(Value::as_str))
+            .min()
+            .map(str::to_string);
+        Ok(OutboxStats {
+            pending: pending.len() as i64,
+            dead_lettered,
+            oldest,
+        })
     }
 
+    /// Rows that are due for delivery: unpublished, not quarantined, and past
+    /// their next-attempt time. A poison event therefore cannot occupy every
+    /// relay batch while its backoff is pending.
     pub async fn list_unpublished(&self, limit: i64) -> Result<Vec<OutboxEvent>, StoreError> {
         let limit = limit.clamp(1, 500);
         if let Some(pool) = self.pool() {
             let rows = sqlx::query(
                 r#"SELECT event_id, payload, attempts FROM synapseone_base_outbox
                    WHERE published_at IS NULL
+                     AND dead_lettered_at IS NULL
+                     AND next_attempt_at <= now()
                    ORDER BY occurred_at ASC, event_id ASC LIMIT $1"#,
             )
             .bind(limit)
@@ -2276,11 +2355,16 @@ impl Store {
                 })
                 .collect());
         }
+        let now = now_iso();
         let memory = self.memory().await.expect("memory store");
         Ok(memory
             .outbox
             .iter()
-            .filter(|event| event.published_at.is_none())
+            .filter(|event| {
+                event.published_at.is_none()
+                    && event.dead_lettered_at.is_none()
+                    && event.next_attempt_at <= now
+            })
             .take(limit as usize)
             .map(|event| OutboxEvent {
                 event_id: event.event_id.clone(),
@@ -2297,7 +2381,7 @@ impl Store {
         if let Some(pool) = self.pool() {
             for event_id in event_ids {
                 sqlx::query(
-                    "UPDATE synapseone_base_outbox SET published_at = now(), last_error = NULL WHERE event_id = $1",
+                    "UPDATE synapseone_base_outbox SET published_at = now(), last_error = NULL, dead_lettered_at = NULL WHERE event_id = $1",
                 )
                 .bind(event_id)
                 .execute(pool)
@@ -2310,19 +2394,37 @@ impl Store {
         for event in &mut memory.outbox {
             if event_ids.contains(&event.event_id) {
                 event.published_at = Some(now_iso());
+                event.last_error = None;
+                event.dead_lettered_at = None;
             }
         }
         Ok(())
     }
 
-    pub async fn record_failure(&self, event_id: &str, error: &str) -> Result<(), StoreError> {
+    /// Record one delivery failure. `next_attempt_at` schedules exponential
+    /// backoff; `dead_letter` quarantines immediately for a permanent error.
+    pub async fn record_failure(
+        &self,
+        event_id: &str,
+        error: &str,
+        next_attempt_at: Option<DateTime<Utc>>,
+        dead_letter: bool,
+    ) -> Result<(), StoreError> {
         let message: String = error.chars().take(1000).collect();
         if let Some(pool) = self.pool() {
             sqlx::query(
-                "UPDATE synapseone_base_outbox SET attempts = attempts + 1, last_error = $2 WHERE event_id = $1",
+                r#"UPDATE synapseone_base_outbox SET
+                     attempts = attempts + 1,
+                     last_attempt_at = now(),
+                     last_error = $2,
+                     next_attempt_at = CASE WHEN $4 THEN now() ELSE COALESCE($3, next_attempt_at) END,
+                     dead_lettered_at = CASE WHEN $4 THEN now() ELSE dead_lettered_at END
+                   WHERE event_id = $1 AND published_at IS NULL"#,
             )
             .bind(event_id)
             .bind(message)
+            .bind(next_attempt_at)
+            .bind(dead_letter)
             .execute(pool)
             .await
             .map_err(|error| StoreError::invalid(error.to_string()))?;
@@ -2332,12 +2434,198 @@ impl Store {
         if let Some(event) = memory
             .outbox
             .iter_mut()
-            .find(|event| event.event_id == event_id)
+            .find(|event| event.event_id == event_id && event.published_at.is_none())
         {
             event.attempts += 1;
+            event.last_attempt_at = Some(now_iso());
             event.last_error = Some(message);
+            if dead_letter {
+                event.dead_lettered_at = Some(now_iso());
+                event.next_attempt_at = now_iso();
+            } else if let Some(next) = next_attempt_at {
+                event.next_attempt_at = iso(&next);
+            }
         }
         Ok(())
+    }
+
+    /// Quarantined rows visible to an operator or tenant scope, newest first.
+    pub async fn list_dead_lettered(
+        &self,
+        limit: i64,
+        org_id: Option<&str>,
+        account_id: Option<&str>,
+        global: bool,
+    ) -> Result<Vec<OutboxDeadLetter>, StoreError> {
+        let limit = limit.clamp(1, 500);
+        if let Some(pool) = self.pool() {
+            let filter = if global {
+                ""
+            } else if org_id.is_some() {
+                "AND org_id = $1"
+            } else if account_id.is_some() {
+                "AND org_id IS NULL AND account_id = $1"
+            } else {
+                return Ok(Vec::new());
+            };
+            let sql = if global {
+                format!(
+                    r#"SELECT event_id, org_id, account_id, collection_id, document_id, operation,
+                              attempts, last_error, occurred_at, dead_lettered_at
+                       FROM synapseone_base_outbox
+                       WHERE published_at IS NULL AND dead_lettered_at IS NOT NULL
+                       ORDER BY dead_lettered_at DESC, event_id ASC LIMIT $1"#
+                )
+            } else {
+                format!(
+                    r#"SELECT event_id, org_id, account_id, collection_id, document_id, operation,
+                              attempts, last_error, occurred_at, dead_lettered_at
+                       FROM synapseone_base_outbox
+                       WHERE published_at IS NULL AND dead_lettered_at IS NOT NULL {filter}
+                       ORDER BY dead_lettered_at DESC, event_id ASC LIMIT $2"#
+                )
+            };
+            let mut request = sqlx::query(&sql);
+            if !global {
+                request = request.bind(org_id.or(account_id).unwrap_or_default());
+                request = request.bind(limit);
+            } else {
+                request = request.bind(limit);
+            }
+            let rows = request
+                .fetch_all(pool)
+                .await
+                .map_err(|error| StoreError::invalid(error.to_string()))?;
+            return Ok(rows
+                .iter()
+                .map(|row| OutboxDeadLetter {
+                    event_id: row.try_get("event_id").unwrap_or_default(),
+                    org_id: row.try_get("org_id").ok().flatten(),
+                    account_id: row.try_get("account_id").ok().flatten(),
+                    collection_id: row.try_get("collection_id").unwrap_or_default(),
+                    document_id: row.try_get("document_id").unwrap_or_default(),
+                    operation: row.try_get("operation").unwrap_or_default(),
+                    attempts: row.try_get::<i32, _>("attempts").unwrap_or(0) as i64,
+                    last_error: row.try_get("last_error").ok().flatten(),
+                    occurred_at: row
+                        .try_get::<DateTime<Utc>, _>("occurred_at")
+                        .map(|value| iso(&value))
+                        .unwrap_or_default(),
+                    dead_lettered_at: row
+                        .try_get::<Option<DateTime<Utc>>, _>("dead_lettered_at")
+                        .ok()
+                        .flatten()
+                        .map(|value| iso(&value)),
+                })
+                .collect());
+        }
+        let memory = self.memory().await.expect("memory store");
+        Ok(memory
+            .outbox
+            .iter()
+            .filter(|event| {
+                if event.published_at.is_some() || event.dead_lettered_at.is_none() {
+                    return false;
+                }
+                if global {
+                    return true;
+                }
+                if let Some(org) = org_id {
+                    event
+                        .payload
+                        .get("organization_id")
+                        .and_then(Value::as_str)
+                        == Some(org)
+                } else if let Some(account) = account_id {
+                    event
+                        .payload
+                        .get("organization_id")
+                        .and_then(Value::as_str)
+                        .is_none()
+                        && event
+                            .payload
+                            .get("account_id")
+                            .and_then(Value::as_str)
+                            == Some(account)
+                } else {
+                    false
+                }
+            })
+            .take(limit as usize)
+            .map(|event| OutboxDeadLetter {
+                event_id: event.event_id.clone(),
+                org_id: event
+                    .payload
+                    .get("organization_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                account_id: event
+                    .payload
+                    .get("account_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                collection_id: event
+                    .payload
+                    .get("collection_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                document_id: event
+                    .payload
+                    .get("document_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                operation: event
+                    .payload
+                    .get("operation")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                attempts: event.attempts,
+                last_error: event.last_error.clone(),
+                occurred_at: event
+                    .payload
+                    .get("occurred_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                dead_lettered_at: event.dead_lettered_at.clone(),
+            })
+            .collect())
+    }
+
+    /// Requeue one quarantined row with a fresh retry budget. The row keeps its
+    /// event id, so downstream dedupe and at-least-once semantics still apply.
+    pub async fn requeue_dead_letter(&self, event_id: &str) -> Result<bool, StoreError> {
+        if let Some(pool) = self.pool() {
+            let result = sqlx::query(
+                r#"UPDATE synapseone_base_outbox SET
+                     attempts = 0,
+                     last_error = NULL,
+                     dead_lettered_at = NULL,
+                     next_attempt_at = now()
+                   WHERE event_id = $1 AND published_at IS NULL AND dead_lettered_at IS NOT NULL"#,
+            )
+            .bind(event_id)
+            .execute(pool)
+            .await
+            .map_err(|error| StoreError::invalid(error.to_string()))?;
+            return Ok(result.rows_affected() > 0);
+        }
+        let mut memory = self.memory().await.expect("memory store");
+        if let Some(event) = memory.outbox.iter_mut().find(|event| {
+            event.event_id == event_id
+                && event.published_at.is_none()
+                && event.dead_lettered_at.is_some()
+        }) {
+            event.attempts = 0;
+            event.last_error = None;
+            event.dead_lettered_at = None;
+            event.next_attempt_at = now_iso();
+            return Ok(true);
+        }
+        Ok(false)
     }
 }
 
@@ -2553,6 +2841,10 @@ fn outbox_payload(
                 .unwrap_or_default(),
         ),
     );
+    payload.insert(
+        "created_at".into(),
+        Value::String(document.created_at.clone()),
+    );
     payload.insert("document_id".into(), Value::String(document.id.clone()));
     payload.insert("operation".into(), Value::String(operation.into()));
     payload.insert("version".into(), json!(document.version));
@@ -2585,6 +2877,9 @@ fn enqueue_outbox_mem(
         payload,
         published_at: None,
         attempts: 0,
+        next_attempt_at: now_iso(),
+        last_attempt_at: None,
+        dead_lettered_at: None,
         last_error: None,
     });
 }

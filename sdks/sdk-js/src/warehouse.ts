@@ -106,6 +106,13 @@ export class WarehouseService {
     });
   }
 
+  updateDataset(id: string, input: { name?: string; description?: string }) {
+    return this.http.req<WarehouseDataset>(`${P}/datasets/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(input),
+    });
+  }
+
   deleteDataset(id: string) {
     return this.http.req<{ ok: boolean; deleted: boolean }>(`${P}/datasets/${encodeURIComponent(id)}`, {
       method: 'DELETE',
@@ -142,6 +149,13 @@ export class WarehouseService {
     return this.http.req<WarehouseJob>(`${P}/jobs/${encodeURIComponent(id)}`);
   }
 
+  updateJob(id: string, input: { name: string }) {
+    return this.http.req<WarehouseJob>(`${P}/jobs/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(input),
+    });
+  }
+
   createJob(input: WarehouseBatchJobInput | WarehouseStreamJobInput) {
     return this.http.req<WarehouseJob>(`${P}/jobs`, {
       method: 'POST',
@@ -161,6 +175,57 @@ export class WarehouseService {
       method: 'POST',
       body: JSON.stringify(input),
     });
+  }
+
+  /** One-shot Base snapshot → Warehouse current-state dataset (Path A). */
+  baseToWarehouse(input: Record<string, unknown>) {
+    return this.http.req(`${P}/etl/base`, { method: 'POST', body: JSON.stringify(input) });
+  }
+
+  /** Authorized Lakehouse snapshot/table → Warehouse dataset (Path C). */
+  lakehouseToWarehouse(input: Record<string, unknown>) {
+    return this.http.req(`${P}/etl/lakehouse`, { method: 'POST', body: JSON.stringify(input) });
+  }
+
+  /** Create a durable Base→Stream→Iceberg append-only change-log job. */
+  baseToLakehouse(input: {
+    collection: string;
+    namespace: string;
+    table: string;
+    database?: string;
+    streamTopic?: string;
+    streamGroup?: string;
+    backfill?: boolean;
+    name?: string;
+  }) {
+    return this.http.req<{ ok: boolean; job: WarehouseJob; backfill: unknown }>(
+      `${P}/etl/base-lakehouse`,
+      { method: 'POST', body: JSON.stringify(input) },
+    );
+  }
+
+  /** Preview schema/rows for an authorized OCS CSV/JSONL/Parquet object. */
+  previewOcs(input: { bucket: string; key: string; format?: string }) {
+    return this.http.req<{ ok: boolean; columns: unknown[]; rows: unknown[]; bytes: number }>(
+      `${P}/etl/ocs/preview`,
+      { method: 'POST', body: JSON.stringify(input) },
+    );
+  }
+
+  /** Import an authorized OCS CSV/JSONL/Parquet object into a dataset. */
+  importOcs(input: {
+    bucket: string;
+    key: string;
+    format?: string;
+    targetDatasetId: string;
+    writeMode?: 'replace' | 'append';
+    maxRows?: number;
+    name?: string;
+  }) {
+    return this.http.req<{ ok: boolean; job: WarehouseJob; rows: number; bytes: number }>(
+      `${P}/etl/ocs`,
+      { method: 'POST', body: JSON.stringify(input) },
+    );
   }
 
   runJob(id: string) {

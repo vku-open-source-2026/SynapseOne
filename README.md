@@ -15,8 +15,10 @@
 [![PyPI SDK](https://img.shields.io/pypi/v/synapseone-sdk)](https://pypi.org/project/synapseone-sdk/)
 
 **SynapseOne is an open-source Tier-1 PaaS (Apache-2.0): one API gateway, AWS-style access
-management, a core data cluster (documents, cache and queue), and native workflows —
-operated through a web Console, SDKs in four languages, and a zero-dependency CLI.**
+management, operational data services (documents, search, cache, queue, stream and
+objects), analytical services (Warehouse, ETL and Apache Iceberg Lakehouse), and
+native workflows — operated through a web Console, SDKs in four languages, and a
+zero-dependency CLI.**
 
 No lock-in: Authentik/Keycloak runs as an optional external IdP over
 standard OIDC. Everything else is SynapseOne code, pure Apache-2.0.
@@ -36,8 +38,9 @@ standard OIDC. Everything else is SynapseOne code, pure Apache-2.0.
 | **SynapseBase** | Self-managed document database with tenant → database → collection → document namespaces, object↔data mapping with validation, filters/cursors, optimistic concurrency, atomic counters, batches and a change feed (`/v1/base`) |
 | **Synapse Faststore** | Valkey-backed cache/KV and data structures: TTL strings, counters, hashes, lists, sets, sorted sets, scans, batches and distributed locks (`/v1/faststore`) |
 | **SynapseQueue** | At-least-once messaging: delayed/deduplicated publishing, visibility-timeout leases, ack/nack/heartbeat, retries, dead letters and replay (`/v1/queue`) |
-| **SynapseStream** | Tenant-scoped event log over Valkey/Redis Streams or Kafka with consumer groups, acks and retention (`/v1/stream`) |
-| **Synapse Warehouse** | Tenant-scoped OLAP: DuckDB datasets, read-only SQL, batch SQL transforms and SynapseStream-driven stream ETL, plus workflow templates (`/v1/warehouse`) |
+| **SynapseStream** | Tenant-scoped event log over Valkey/Redis Streams with consumer groups, acks and retention (`/v1/stream`); the Kafka driver is not shipped |
+| **Synapse Warehouse** | Tenant-scoped OLAP: DuckDB datasets, read-only SQL, batch SQL transforms, SynapseStream-driven stream ETL, Base collection snapshots, Lakehouse materialization and workflow templates (`/v1/warehouse`) |
+| **Synapse Lakehouse** | Real Apache Iceberg v2 tables written as Parquet to the shared S3-compatible store, with a SQL catalog, tenant namespaces, snapshots/time travel, additive schema evolution, idempotent appends and quotas (`/v1/lakehouse`) |
 | **SynapseOCS** | Tenant-scoped buckets/objects with direct + multipart upload, presigned URLs, checksums, size/type limits and quotas (`/v1/ocs`, legacy `/v1/storage`) |
 | **SynapseNotifications** | Durable outbox + `{{var}}` templates, per-recipient preferences/unsubscribe, email/SMS/push relays, webhooks, retries and dead letters (`/v1/notifications`) |
 | **Workflows** | Built-in workflow engine (Apache-2.0): queue-backed DAG runner, versioned templates, activate/deactivate/execute (real webhook & cron triggers), sandboxed code execution, execution history, visual graph editor, and self-hosted runner image for hybrid/private execution |
@@ -47,11 +50,14 @@ standard OIDC. Everything else is SynapseOne code, pure Apache-2.0.
 
 ## Try it in 30 seconds
 
-No install needed — point the clients at the live demo:
+The hosted demo disables passwordless dev login. Create an account at
+[cloud.synapseone.space/register](https://cloud.synapseone.space/register), then
+use that email/password (or an API key from **Console → Keys**):
 
 ```bash
 # CLI, straight from the registry (Node 18+)
-npx -y @synapseone/cli@latest --base https://api.synapseone.space login --email demo@acme.local
+npx -y @synapseone/cli@latest --base https://api.synapseone.space \
+  login --email you@example.com --org your-org --password '<your-password>'
 npx -y @synapseone/cli@latest --base https://api.synapseone.space orgs
 ```
 
@@ -63,8 +69,10 @@ pip install synapseone-sdk
 ```python
 from synapseone_sdk import SynapseOneClient
 c = SynapseOneClient("https://api.synapseone.space")
-login = c.iam.login("demo@acme.local")
-c.set_api_key("<your-key>")  # create one in the Console: cloud.synapseone.space → Keys
+login = c.iam.login_with_password(
+    email="you@example.com", password="<your-password>", org_slug="your-org"
+)
+c.set_token(login["accessToken"])
 print(c.iam.list_orgs())
 ```
 
@@ -189,6 +197,7 @@ Production (TLS, edge rate limiting, hardened secrets): `docker-compose.prod.yml
 | Queue | `http://localhost:4007` | Internal — SynapseQueue messaging (behind gateway in prod) |
 | Stream | `http://localhost:4009` | Internal — SynapseStream event log (behind gateway in prod) |
 | Warehouse | `http://localhost:4012` | Internal — Synapse Warehouse OLAP + ETL (behind gateway in prod) |
+| Lakehouse | `http://localhost:4013` | Internal — Apache Iceberg catalog/tables (behind gateway in prod) |
 | OCS | `http://localhost:4010` | Internal — buckets, objects and presigned URLs |
 | Notifications | `http://localhost:4011` | Internal — durable notification outbox |
 | Inference | `http://localhost:4008` | Internal — LLM proxy, embeddings, decision |
@@ -204,6 +213,8 @@ Client → Gateway :8080 ─┬─► IAM :4001           (Org/Account/Role/Poli
                          ├─► Faststore :4006     (cache/KV/data structures)
                          ├─► Queue :4007         (at-least-once messaging)
                          ├─► Stream :4009        (event log / consumer groups)
+                         ├─► Warehouse :4012     (DuckDB datasets, sandboxed SQL, ETL)
+                         ├─► Lakehouse :4013     (Apache Iceberg + Parquet on S3)
                          ├─► Storage :4010       (objects, multipart, presign)
                          └─► Notifications :4011 (outbox + delivery)
                          Postgres :5432 / Valkey :6379 / SeaweedFS (S3) :9090
@@ -226,6 +237,7 @@ apps/faststore-service     Synapse Faststore — cache/KV, data structures, lock
 apps/queue-service         SynapseQueue — publish/consume, leases, retries, DLQ (Rust)
 apps/stream-service        SynapseStream — topics, consumer groups, acks (Rust)
 apps/warehouse-service     Synapse Warehouse — OLAP datasets, SQL, batch/stream ETL (Rust)
+apps/lakehouse-service     Synapse Lakehouse — Apache Iceberg catalog/tables, snapshots, schema (Python/PyIceberg)
 apps/ocs-service           SynapseOCS — objects, multipart, presign, quotas (Rust)
 apps/notifications-service SynapseNotifications — outbox, templates, preferences (Rust)
 apps/ai-service            SynapseOne AI assistant — LLM routing + call generation (Rust)

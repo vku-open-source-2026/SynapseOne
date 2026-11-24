@@ -73,6 +73,20 @@ describe('TOTP primitives', () => {
     assert.deepEqual(openSecret(sealed), raw);
   });
 
+  it('opens secrets sealed before a dedicated MFA key was configured', () => {
+    const previous = process.env.IAM_MFA_ENCRYPTION_KEY;
+    delete process.env.IAM_MFA_ENCRYPTION_KEY;
+    const raw = Buffer.from('legacy-sealed-totp-secret');
+    const sealed = sealSecret(raw);
+    process.env.IAM_MFA_ENCRYPTION_KEY = 'a'.repeat(64);
+    try {
+      assert.deepEqual(openSecret(sealed), raw);
+    } finally {
+      if (previous === undefined) delete process.env.IAM_MFA_ENCRYPTION_KEY;
+      else process.env.IAM_MFA_ENCRYPTION_KEY = previous;
+    }
+  });
+
   it('rejects replayed and out-of-window codes', () => {
     const secret = Buffer.from('12345678901234567890');
     const now = 1_800_000_000_000;

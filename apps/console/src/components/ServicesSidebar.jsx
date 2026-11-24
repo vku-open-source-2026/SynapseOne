@@ -21,6 +21,8 @@ import {
   faCloud,
   faServer,
   faWarehouse,
+  faLayerGroup,
+  faBell,
 } from '@fortawesome/free-solid-svg-icons';
 import { useI18n } from '../lib/i18n-context.js';
 
@@ -62,6 +64,18 @@ export const PLATFORM_SERVICES = [
     keywords: ['base', 'document', 'database', 'json', 'nosql', 'mapping', 'query', 'collections'],
   },
   {
+    to: '/search',
+    label: 'Search',
+    category: 'Document Database',
+    desc: 'Tenant-scoped full-text, semantic & hybrid search',
+    icon: faMagnifyingGlass,
+    iconColor: 'from-indigo-400 to-blue-600',
+    bgGradient: 'linear-gradient(135deg, #818cf8 0%, #2563eb 100%)',
+    shadowColor: 'rgba(99, 102, 241, 0.28)',
+    match: (p) => p.startsWith('/search'),
+    keywords: ['search', 'full-text', 'semantic', 'hybrid', 'facets', 'index', 'reindex', 'base'],
+  },
+  {
     to: '/queue',
     label: 'SynapseQueue',
     category: 'Message Queue',
@@ -98,6 +112,18 @@ export const PLATFORM_SERVICES = [
     keywords: ['warehouse', 'olap', 'duckdb', 'sql', 'dataset', 'etl', 'analytics', 'batch', 'stream', 'aggregate', 'rollup'],
   },
   {
+    to: '/lakehouse',
+    label: 'Synapse Lakehouse',
+    category: 'OLAP & ETL',
+    desc: 'Apache Iceberg tables, snapshots, schema evolution and object storage',
+    icon: faLayerGroup,
+    iconColor: 'from-teal-400 to-cyan-600',
+    bgGradient: 'linear-gradient(135deg, #2dd4bf 0%, #0891b2 100%)',
+    shadowColor: 'rgba(20, 184, 166, 0.28)',
+    match: (p) => p.startsWith('/lakehouse'),
+    keywords: ['lakehouse', 'iceberg', 'parquet', 'snapshot', 'time travel', 'schema evolution', 'catalog', 's3', 'analytics', 'table'],
+  },
+  {
     to: '/ocs',
     label: 'SynapseOCS',
     category: 'Object Cloud Storage',
@@ -132,6 +158,18 @@ export const PLATFORM_SERVICES = [
     shadowColor: 'rgba(139, 92, 246, 0.28)',
     match: (p) => p.startsWith('/lds'),
     keywords: ['lds', 'linked data', 'ngsi-ld', 'datasource', 'license', 'schema', 'entities'],
+  },
+  {
+    to: '/notifications',
+    label: 'SynapseNotifications',
+    category: 'Messaging',
+    desc: 'Tenant notification outbox, preferences, delivery and cancellation',
+    icon: faBell,
+    iconColor: 'from-rose-400 to-pink-600',
+    bgGradient: 'linear-gradient(135deg, #fb7185 0%, #db2777 100%)',
+    shadowColor: 'rgba(244, 63, 94, 0.28)',
+    match: (p) => p.startsWith('/notifications'),
+    keywords: ['notifications', 'email', 'sms', 'push', 'webhook', 'outbox', 'delivery', 'unsubscribe'],
   },
   {
     to: '/inference',

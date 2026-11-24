@@ -17,7 +17,7 @@ import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import * as schema from './schema';
 
 export interface Organization { id: string; slug: string; display_name: string; kind?: string; status?: string; suspended_at?: string; suspended_by?: string; suspend_reason?: string; created_at?: string }
-export interface Account { id: string; org_id: string; slug: string; display_name: string }
+export interface Account { id: string; org_id: string; slug: string; display_name: string; status?: string; retired_at?: string; retired_by?: string; retire_reason?: string }
 export interface User { id: string; org_id: string; email: string; display_name?: string; external_sub?: string; password_hash?: string; email_verified?: boolean; active?: boolean; is_org_admin?: boolean; auth_version?: number }
 export interface Role { id: string; account_id: string; slug: string; description?: string }
 export interface PolicyDoc { Version?: string; Statement: Array<{ Effect: 'Allow'|'Deny'; Action: string|string[]; Resource: string|string[]; Condition?: any }> }
@@ -70,6 +70,10 @@ const db: NodePgDatabase<typeof schema> | null = baseDb
 
 export async function withTransaction<T>(fn: () => Promise<T>): Promise<T> {
   if (!baseDb) return fn();
+  // Join an ambient transaction instead of opening a second connection: a
+  // guarded helper called from an already-transactional route must keep the
+  // same advisory lock, connection and commit boundary.
+  if (txStore.getStore()?.tx) return fn();
   return baseDb.transaction(async (tx) => txStore.run({ tx }, fn));
 }
 
@@ -180,8 +184,17 @@ function orgRow(r: { id: string; slug: string; displayName: string; kind?: strin
     ...(r.createdAt ? { created_at: iso(r.createdAt) } : {}),
   };
 }
-function accountRow(r: { id: string; orgId: string; slug: string; displayName: string }): Account {
-  return { id: r.id, org_id: r.orgId, slug: r.slug, display_name: r.displayName };
+function accountRow(r: { id: string; orgId: string; slug: string; displayName: string; status?: string | null; retiredAt?: Date | null; retiredBy?: string | null; retireReason?: string | null }): Account {
+  return {
+    id: r.id,
+    org_id: r.orgId,
+    slug: r.slug,
+    display_name: r.displayName,
+    status: r.status || 'active',
+    ...(r.retiredAt ? { retired_at: iso(r.retiredAt) } : {}),
+    ...(r.retiredBy ? { retired_by: r.retiredBy } : {}),
+    ...(r.retireReason ? { retire_reason: r.retireReason } : {}),
+  };
 }
 function userRow(r: { id: string; orgId: string; email: string; displayName: string | null; externalSub: string | null; passwordHash?: string | null; emailVerified?: boolean | null; active?: boolean | null; isOrgAdmin?: boolean | null; authVersion?: number | null }): User {
   return {
@@ -369,14 +382,54 @@ export async function createAccount(orgId: string, slug: string, display_name: s
     await ensureTables();
     const rows = await db.insert(schema.accounts)
       .values({ orgId, slug, displayName: display_name })
-      .returning({ id: schema.accounts.id, orgId: schema.accounts.orgId, slug: schema.accounts.slug, displayName: schema.accounts.displayName });
+      .returning({ id: schema.accounts.id, orgId: schema.accounts.orgId, slug: schema.accounts.slug, displayName: schema.accounts.displayName, status: schema.accounts.status, retiredAt: schema.accounts.retiredAt, retiredBy: schema.accounts.retiredBy, retireReason: schema.accounts.retireReason });
     return accountRow(rows[0]);
   }
   const dup = [...mem.accounts.values()].find((a) => a.org_id === orgId && a.slug === slug);
   if (dup) throw Object.assign(new Error('account exists'), { status: 409 });
-  const a: Account = { id: randomUUID(), org_id: orgId, slug, display_name };
+  const a: Account = { id: randomUUID(), org_id: orgId, slug, display_name, status: 'active' };
   mem.accounts.set(a.id, a);
   return a;
+}
+
+export async function setAccountStatus(
+  accountId: string,
+  status: 'active' | 'retired',
+  actorId: string,
+  reason = '',
+): Promise<Account | null> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(schema.accounts).set({
+      status,
+      retiredAt: status === 'retired' ? new Date() : null,
+      retiredBy: status === 'retired' ? actorId : null,
+      retireReason: status === 'retired' ? reason.slice(0, 500) : null,
+    }).where(eq(schema.accounts.id, accountId)).returning({
+      id: schema.accounts.id,
+      orgId: schema.accounts.orgId,
+      slug: schema.accounts.slug,
+      displayName: schema.accounts.displayName,
+      status: schema.accounts.status,
+      retiredAt: schema.accounts.retiredAt,
+      retiredBy: schema.accounts.retiredBy,
+      retireReason: schema.accounts.retireReason,
+    });
+    return rows[0] ? accountRow(rows[0]) : null;
+  }
+  const acc = mem.accounts.get(accountId);
+  if (!acc) return null;
+  acc.status = status;
+  if (status === 'retired') {
+    acc.retired_at = new Date().toISOString();
+    acc.retired_by = actorId;
+    acc.retire_reason = reason.slice(0, 500);
+  } else {
+    delete acc.retired_at;
+    delete acc.retired_by;
+    delete acc.retire_reason;
+  }
+  return acc;
 }
 
 export async function listAccounts(orgId: string): Promise<Account[]> {
@@ -387,6 +440,10 @@ export async function listAccounts(orgId: string): Promise<Account[]> {
       orgId: schema.accounts.orgId,
       slug: schema.accounts.slug,
       displayName: schema.accounts.displayName,
+      status: schema.accounts.status,
+      retiredAt: schema.accounts.retiredAt,
+      retiredBy: schema.accounts.retiredBy,
+      retireReason: schema.accounts.retireReason,
     }).from(schema.accounts).where(eq(schema.accounts.orgId, orgId)).orderBy(asc(schema.accounts.slug));
     return rows.map(accountRow);
   }
@@ -727,6 +784,10 @@ export async function getAccountById(id: string): Promise<Account | null> {
       orgId: schema.accounts.orgId,
       slug: schema.accounts.slug,
       displayName: schema.accounts.displayName,
+      status: schema.accounts.status,
+      retiredAt: schema.accounts.retiredAt,
+      retiredBy: schema.accounts.retiredBy,
+      retireReason: schema.accounts.retireReason,
     }).from(schema.accounts).where(eq(schema.accounts.id, id)).limit(1);
     return rows[0] ? accountRow(rows[0]) : null;
   }
@@ -740,13 +801,14 @@ export async function accountsForUser(userId: string): Promise<string[]> {
     const rows = await db.selectDistinct({ accountId: schema.roles.accountId })
       .from(schema.roles)
       .innerJoin(schema.userRoles, eq(schema.userRoles.roleId, schema.roles.id))
-      .where(eq(schema.userRoles.userId, userId));
+      .innerJoin(schema.accounts, eq(schema.accounts.id, schema.roles.accountId))
+      .where(and(eq(schema.userRoles.userId, userId), eq(schema.accounts.status, 'active')));
     return rows.map((x) => x.accountId);
   }
   const out = new Set<string>();
   for (const rid of mem.userRoles.get(userId) || []) {
     const role = mem.roles.get(rid);
-    if (role) out.add(role.account_id);
+    if (role && (mem.accounts.get(role.account_id)?.status || 'active') === 'active') out.add(role.account_id);
   }
   return [...out];
 }
@@ -875,6 +937,41 @@ export async function queryAudit(q: AuditQuery = {}): Promise<any[]> {
       && at <= toMs;
   });
   return filtered.slice(off, off + lim);
+}
+
+/** Count rows matching the same filters as queryAudit (paged management UI). */
+export async function countAudit(q: AuditQuery = {}): Promise<number> {
+  const dec = q.allowed === undefined ? undefined : !!q.allowed;
+  if (db) {
+    await ensureTables();
+    const conds = [];
+    if (q.actor) conds.push(eq(schema.auditLog.actorId, q.actor));
+    if (dec !== undefined) conds.push(eq(schema.auditLog.decision, dec));
+    if (q.action) conds.push(eq(schema.auditLog.action, q.action));
+    if (q.resource) conds.push(eq(schema.auditLog.resource, q.resource));
+    if (q.from) conds.push(sql`${schema.auditLog.createdAt} >= ${q.from}`);
+    if (q.to) conds.push(sql`${schema.auditLog.createdAt} <= ${q.to}`);
+    if (q.orgId) {
+      const fallback = sql`(${schema.auditLog.context}->>'org' = ${q.orgId} OR ${schema.auditLog.context}->>'callerOrg' = ${q.orgId})`;
+      conds.push(or(eq(schema.auditLog.orgId, q.orgId), and(isNull(schema.auditLog.orgId), fallback))!);
+    }
+    const where = conds.length ? and(...conds) : undefined;
+    const rows = await db.select({ n: sql<number>`count(*)::int` }).from(schema.auditLog).where(where);
+    return Number(rows[0]?.n) || 0;
+  }
+  const all: any[] = (((__mem as any).audit as any[]) || []);
+  const fromMs = q.from ? q.from.getTime() : -Infinity;
+  const toMs = q.to ? q.to.getTime() : Infinity;
+  return all.filter((a) => {
+    const at = Date.parse(String(a.created_at || '')) || 0;
+    return (!q.actor || a.actor_id === q.actor)
+      && (dec === undefined || !!a.decision === dec)
+      && (!q.action || a.action === q.action)
+      && (!q.resource || a.resource === q.resource)
+      && (!q.orgId || a.org_id === q.orgId || a.context?.org === q.orgId || a.context?.callerOrg === q.orgId)
+      && at >= fromMs
+      && at <= toMs;
+  }).length;
 }
 
 export async function listAudit(limit = 50, actorId?: string, allowed?: boolean, orgId?: string): Promise<any[]> {
@@ -1010,6 +1107,119 @@ export async function setUserPassword(userId: string, hash: string): Promise<boo
   if (!u) return false;
   u.password_hash = hash;
   return true;
+}
+
+export async function updateOrganization(
+  id: string,
+  patch: { displayName?: string },
+): Promise<Organization | null> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(schema.organizations)
+      .set({
+        ...(patch.displayName !== undefined ? { displayName: patch.displayName } : {}),
+      })
+      .where(eq(schema.organizations.id, id))
+      .returning({
+        id: schema.organizations.id,
+        slug: schema.organizations.slug,
+        displayName: schema.organizations.displayName,
+        kind: schema.organizations.kind,
+        status: schema.organizations.status,
+        suspendedAt: schema.organizations.suspendedAt,
+        suspendedBy: schema.organizations.suspendedBy,
+        suspendReason: schema.organizations.suspendReason,
+        createdAt: schema.organizations.createdAt,
+      });
+    return rows[0] ? orgRow(rows[0]) : null;
+  }
+  const org = mem.orgs.get(id);
+  if (!org) return null;
+  if (patch.displayName !== undefined) org.display_name = patch.displayName;
+  return org;
+}
+
+export async function updateAccount(
+  id: string,
+  patch: { displayName?: string },
+): Promise<Account | null> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(schema.accounts)
+      .set({
+        ...(patch.displayName !== undefined ? { displayName: patch.displayName } : {}),
+      })
+      .where(eq(schema.accounts.id, id))
+      .returning({
+        id: schema.accounts.id,
+        orgId: schema.accounts.orgId,
+        slug: schema.accounts.slug,
+        displayName: schema.accounts.displayName,
+        status: schema.accounts.status,
+        retiredAt: schema.accounts.retiredAt,
+        retiredBy: schema.accounts.retiredBy,
+        retireReason: schema.accounts.retireReason,
+        createdAt: schema.accounts.createdAt,
+      });
+    return rows[0] ? accountRow(rows[0]) : null;
+  }
+  const account = mem.accounts.get(id);
+  if (!account) return null;
+  if (patch.displayName !== undefined) account.display_name = patch.displayName;
+  return account;
+}
+
+export async function updateRole(
+  id: string,
+  patch: { description?: string },
+): Promise<Role | null> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(schema.roles)
+      .set({
+        ...(patch.description !== undefined ? { description: patch.description } : {}),
+      })
+      .where(eq(schema.roles.id, id))
+      .returning({
+        id: schema.roles.id,
+        accountId: schema.roles.accountId,
+        slug: schema.roles.slug,
+        description: schema.roles.description,
+      });
+    return rows[0] ? roleRow(rows[0]) : null;
+  }
+  const role = mem.roles.get(id);
+  if (!role) return null;
+  if (patch.description !== undefined) role.description = patch.description;
+  return role;
+}
+
+export async function updatePolicy(
+  id: string,
+  patch: { description?: string; document?: PolicyDoc },
+): Promise<Policy | null> {
+  if (db) {
+    await ensureTables();
+    const rows = await db.update(schema.policies)
+      .set({
+        ...(patch.description !== undefined ? { description: patch.description } : {}),
+        ...(patch.document !== undefined ? { document: patch.document } : {}),
+      })
+      .where(eq(schema.policies.id, id))
+      .returning({
+        id: schema.policies.id,
+        accountId: schema.policies.accountId,
+        slug: schema.policies.slug,
+        description: schema.policies.description,
+        document: schema.policies.document,
+      });
+    return rows[0] ? policyRow(rows[0]) : null;
+  }
+  const policy = mem.policies.get(id);
+  if (!policy) return null;
+  if (patch.description !== undefined) policy.description = patch.description;
+  if (patch.document !== undefined) policy.document = patch.document;
+  return policy;
 }
 
 export async function updateUserProfile(userId: string, patch: { displayName?: string; externalSub?: string | null }): Promise<boolean> {
@@ -1364,6 +1574,47 @@ export async function grantPlatformAdmin(input: {
   };
   mem.platformAdmins.set(input.userId, rec);
   return rec;
+}
+
+export type PlatformAdminGuardResult =
+  | { ok: true; admin: PlatformAdmin }
+  | { ok: false; reason: 'last_owner' | 'not_found' };
+
+/** Grant/demote with a transaction-scoped last-owner check. The advisory lock
+ *  (or memory mutex) spans the count and the mutation, so two concurrent
+ *  demotions cannot both observe two owners. */
+export async function grantPlatformAdminGuarded(input: {
+  userId: string;
+  role: PlatformAdmin['role'];
+  grantedBy?: string | null;
+  reason?: string;
+}): Promise<PlatformAdminGuardResult> {
+  return withOrgAdminLock('__platform_owners__', async () => {
+    const role = ['owner', 'operator', 'auditor'].includes(input.role) ? input.role : 'auditor';
+    const previous = await getPlatformAdmin(input.userId);
+    if (previous && !previous.revoked_at && previous.role === 'owner' && role !== 'owner'
+        && (await countActivePlatformOwners()) <= 1) {
+      return { ok: false, reason: 'last_owner' } as const;
+    }
+    return {
+      ok: true,
+      admin: await grantPlatformAdmin({ ...input, role }),
+    } as const;
+  });
+}
+
+/** Revoke with the same last-owner invariant as grant/demote. */
+export async function revokePlatformAdminGuarded(userId: string): Promise<PlatformAdminGuardResult> {
+  return withOrgAdminLock('__platform_owners__', async () => {
+    const current = await getPlatformAdmin(userId);
+    if (!current || current.revoked_at) return { ok: false, reason: 'not_found' } as const;
+    if (current.role === 'owner' && (await countActivePlatformOwners()) <= 1) {
+      return { ok: false, reason: 'last_owner' } as const;
+    }
+    const ok = await revokePlatformAdmin(userId);
+    if (!ok) return { ok: false, reason: 'not_found' } as const;
+    return { ok: true, admin: { ...current, revoked_at: new Date().toISOString() } } as const;
+  });
 }
 
 export async function revokePlatformAdmin(userId: string): Promise<boolean> {
@@ -1730,7 +1981,7 @@ export async function revokeServiceAccount(id: string): Promise<boolean> {
 
 
 export interface PlatformAccountRow {
-  id: string; org_id: string; org_slug: string; org_name: string; slug: string; display_name: string; created_at?: string;
+  id: string; org_id: string; org_slug: string; org_name: string; slug: string; display_name: string; status?: string; created_at?: string;
 }
 
 export async function listPlatformAccounts(opts: { q?: string; orgId?: string; limit?: number; offset?: number } = {}): Promise<{ items: PlatformAccountRow[]; total: number }> {
@@ -1748,11 +1999,11 @@ export async function listPlatformAccounts(opts: { q?: string; orgId?: string; l
     const rows = await db.select({
       id: schema.accounts.id, orgId: schema.accounts.orgId, orgSlug: schema.organizations.slug,
       orgName: schema.organizations.displayName, slug: schema.accounts.slug,
-      displayName: schema.accounts.displayName, createdAt: schema.accounts.createdAt,
+      displayName: schema.accounts.displayName, status: schema.accounts.status, createdAt: schema.accounts.createdAt,
     }).from(schema.accounts).innerJoin(schema.organizations, eq(schema.organizations.id, schema.accounts.orgId))
       .where(where).orderBy(asc(schema.organizations.slug), asc(schema.accounts.slug)).limit(limit).offset(offset);
     return {
-      items: rows.map((r) => ({ id: r.id, org_id: r.orgId, org_slug: r.orgSlug, org_name: r.orgName, slug: r.slug, display_name: r.displayName, created_at: iso(r.createdAt) })),
+      items: rows.map((r) => ({ id: r.id, org_id: r.orgId, org_slug: r.orgSlug, org_name: r.orgName, slug: r.slug, display_name: r.displayName, status: r.status || 'active', created_at: iso(r.createdAt) })),
       total: Number(total[0]?.n) || 0,
     };
   }
@@ -1760,7 +2011,7 @@ export async function listPlatformAccounts(opts: { q?: string; orgId?: string; l
     .filter((a) => (mem.orgs.get(a.org_id)?.kind || 'tenant') === 'tenant')
     .map((a) => {
       const org = mem.orgs.get(a.org_id);
-      return { id: a.id, org_id: a.org_id, org_slug: org?.slug || '', org_name: org?.display_name || '', slug: a.slug, display_name: a.display_name };
+      return { id: a.id, org_id: a.org_id, org_slug: org?.slug || '', org_name: org?.display_name || '', slug: a.slug, display_name: a.display_name, status: a.status || 'active' };
     })
     .filter((a) => (!opts.orgId || a.org_id === opts.orgId) && (!q || a.slug.includes(q) || a.display_name.toLowerCase().includes(q.toLowerCase())));
   return { items: rows.slice(offset, offset + limit), total: rows.length };

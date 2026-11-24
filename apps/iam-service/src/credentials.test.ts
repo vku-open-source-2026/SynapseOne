@@ -77,6 +77,18 @@ describe('first-party credential lifecycle', () => {
     assert.equal(reused.status, 400);
   });
 
+  it('revokes the refresh family when a consumed token is replayed', async () => {
+    const reg = await register('cred-refresh-reuse', 'refreshreuse@cred.local');
+    const first = await call('POST', '/v1/auth/refresh', { refreshToken: reg.refreshToken });
+    assert.equal(first.status, 200, JSON.stringify(first.data));
+    assert.ok(first.data.refreshToken);
+    const replay = await call('POST', '/v1/auth/refresh', { refreshToken: reg.refreshToken });
+    assert.equal(replay.status, 401);
+    assert.equal(replay.data.error, 'invalid_refresh');
+    const winner = await call('POST', '/v1/auth/refresh', { refreshToken: first.data.refreshToken });
+    assert.equal(winner.status, 401, 'reuse must revoke the whole token family');
+  });
+
   it('revokes user-bound API keys on password change and reset', async () => {
     const reg = await register('cred-key-revoke', 'keyrevoke@cred.local');
     const orgs = await call('GET', '/v1/orgs', undefined, reg.accessToken);

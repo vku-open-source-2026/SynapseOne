@@ -170,16 +170,16 @@ export default function SynapseFaststore() {
         await api.faststoreSet(newKey.trim(), { value: parsedValue, ttlSeconds: ttl }, headers);
       } else if (newType === 'hash') {
         const hash = (parsedValue && typeof parsedValue === 'object' && !Array.isArray(parsedValue)) ? parsedValue : { val: parsedValue };
-        await api.faststoreHashSet(newKey.trim(), { values: hash }, headers);
+        await api.faststoreHashSet(newKey.trim(), { values: hash, ttlSeconds: ttl }, headers);
       } else if (newType === 'list') {
         const arr = Array.isArray(parsedValue) ? parsedValue : [parsedValue];
-        await api.faststoreListPush(newKey.trim(), { values: arr, side: 'right' }, headers);
+        await api.faststoreListPush(newKey.trim(), { values: arr, side: 'right', ttlSeconds: ttl }, headers);
       } else if (newType === 'set') {
         const members = Array.isArray(parsedValue) ? parsedValue : [String(parsedValue)];
-        await api.faststoreSetAdd(newKey.trim(), { members }, headers);
+        await api.faststoreSetAdd(newKey.trim(), { members, ttlSeconds: ttl }, headers);
       } else if (newType === 'zset') {
         const members = Array.isArray(parsedValue) ? parsedValue : [{ member: String(parsedValue), score: 1 }];
-        await api.faststoreZsetAdd(newKey.trim(), { members }, headers);
+        await api.faststoreZsetAdd(newKey.trim(), { members, ttlSeconds: ttl }, headers);
       }
 
       setCreateModalOpen(false);
@@ -259,8 +259,12 @@ export default function SynapseFaststore() {
     setLockBusy(true);
     try {
       const res = await api.faststoreLockRelease(lockName.trim(), { token: lockToken.trim() }, headers);
-      setLockResult({ ...res, message: 'Lock released successfully.' });
-      setLockToken('');
+      if (res?.released === false) {
+        setLockResult({ ok: false, error: 'The lock is not held by this token (already expired or owned by another client).' });
+      } else {
+        setLockResult({ ...res, message: 'Lock released successfully.' });
+        setLockToken('');
+      }
     } catch (e) {
       setLockResult({ ok: false, error: e.message || String(e) });
     } finally {

@@ -45,12 +45,13 @@ export default function AdminAccounts() {
         {loading ? <TableSkeleton rows={6} cols={4} /> : err ? (
           <div className="py-6 text-center"><Btn kind="secondary" onClick={() => load()}>Retry</Btn></div>
         ) : data.items?.length ? (
-          <Table head={['Organization', 'Account', 'Display name', 'ID']}>
+          <Table head={['Organization', 'Account', 'Display name', 'Status', 'ID']}>
             {data.items.map((a) => (
               <tr key={a.id} className="border-t border-slate-100">
                 <td className="py-2 pr-4"><Link to={`/admin/orgs/${a.org_id}`} className="text-main-blue hover:underline">{a.org_slug}</Link></td>
                 <td className="py-2 pr-4 font-medium">{a.slug}</td>
                 <td className="py-2 pr-4">{a.display_name}</td>
+                <td className="py-2 pr-4"><Badge tone={(a.status || 'active') === 'active' ? 'green' : 'red'}>{a.status || 'active'}</Badge></td>
                 <td className="py-2 pr-4 text-xs font-mono">{a.id?.slice(0, 8)}…</td>
               </tr>
             ))}

@@ -209,6 +209,16 @@ routes:
       - { method: GET, path: /v1/warehouse/*, action: warehouse:Read }
     timeoutMs: 120000
 
+  # Synapse Lakehouse — Iceberg catalog/tables on tenant-scoped object storage.
+  - path: /v1/lakehouse
+    target: ${LAKEHOUSE_SERVICE_URL:http://lakehouse:4013}
+    auth: either
+    service: lakehouse
+    actions:
+      - { method: POST, path: /v1/lakehouse/namespaces/*/tables/*/query, action: lakehouse:Read }
+      - { method: GET, path: /v1/lakehouse/*, action: lakehouse:Read }
+    timeoutMs: 120000
+
   # SynapseLDS — linked data service (NGSI-LD datasources + licensed exports).
   # SynapseLDS public (anonymous) read surface — spec: public = "anyone reaching
   # the API". LDS enforces GET/HEAD-only + public-only projection for anonymous
@@ -254,7 +264,7 @@ routes:
     auth: either
     service: queue
 
-  # SynapseStream — distributed event streaming log (pluggable Redis Streams / Kafka).
+  # SynapseStream — distributed event streaming log (Valkey/Redis Streams).
   - path: /v1/stream
     target: ${STREAM_SERVICE_URL:http://stream:4009}
     auth: either

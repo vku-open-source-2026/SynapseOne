@@ -430,6 +430,48 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+  name: lakehouse
+  namespace: synapseone
+spec:
+  # One catalog lock per process; scale with care and expect 409 on commit races.
+  replicas: 1
+  selector:
+    matchLabels: { app: lakehouse }
+  template:
+    metadata:
+      labels: { app: lakehouse }
+    spec:
+      containers:
+        - name: lakehouse
+          image: ghcr.io/synapseone/lakehouse:0.9.0
+          ports: [{ containerPort: 4013 }]
+          env:
+            - { name: PORT, value: "4013" }
+            - { name: NODE_ENV, value: "production" }
+            - { name: LAKEHOUSE_CATALOG_URI, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: lakehouse-catalog-uri } } }
+            - { name: LAKEHOUSE_WAREHOUSE, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: lakehouse-warehouse } } }
+            - { name: LAKEHOUSE_S3_ENDPOINT, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: lakehouse-s3-endpoint } } }
+            - { name: LAKEHOUSE_S3_ACCESS_KEY, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: lakehouse-s3-access-key } } }
+            - { name: LAKEHOUSE_S3_SECRET_KEY, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: lakehouse-s3-secret-key } } }
+            - { name: LAKEHOUSE_S3_REGION, value: "us-east-1" }
+            - { name: SYNAPSEONE_INTERNAL_SECRET, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: internal-secret } } }
+          securityContext: { runAsNonRoot: true, runAsUser: 1000, allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } }
+          resources: { requests: { cpu: "200m", memory: "512Mi" }, limits: { cpu: "1000m", memory: "1Gi" } }
+          livenessProbe: { httpGet: { path: /health, port: 4013 }, initialDelaySeconds: 20, periodSeconds: 30 }
+          readinessProbe: { httpGet: { path: /ready, port: 4013 }, initialDelaySeconds: 10, periodSeconds: 10 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lakehouse
+  namespace: synapseone
+spec:
+  selector: { app: lakehouse }
+  ports: [{ port: 4013, targetPort: 4013 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
   name: inference
   namespace: synapseone
 spec:

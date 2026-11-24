@@ -81,6 +81,13 @@ describe('conditions', () => {
     const doc = docWith({ IpAddress: { sourceIp: '10.0.0.0/8' } });
     assert.equal(evaluatePolicies([doc], { action: 'workflow:Execute', resource: '*' }, { sourceIp: '10.1.2.3' }).allowed, false);
   });
+  it('malformed conditions fail closed instead of becoming unconditional', () => {
+    const doc = docWith('StringEquals');
+    assert.equal(evaluatePolicies([doc], { action: 'workflow:Execute', resource: '*' }).allowed, false);
+    const nullCond = docWith(null);
+    assert.equal(evaluatePolicies([nullCond], { action: 'workflow:Execute', resource: '*' }).allowed, false);
+    assert.equal(matchCondition({ StringEquals: 'org' }, { org: 'acme' }), false);
+  });
   it('overlong StringLike pattern never matches (ReDoS guard)', () => {
     const evil = 'a*'.repeat(200); // 400 chars > 256 cap
     assert.equal(matchCondition({ StringLike: { email: evil } }, { email: 'a@acme.local' }), false);
@@ -107,5 +114,19 @@ describe('validatePolicyDocument', () => {
     const many = Array.from({ length: 101 }, () => ({ Effect: 'Allow', Action: '*', Resource: '*' }));
     assert.ok(validatePolicyDocument({ Statement: many }));
     assert.ok(validatePolicyDocument({ Statement: [{ Effect: 'Allow', Action: '*', Resource: '*', Condition: { StringEquals: { k: 'x'.repeat(9000) } } }] }));
+  });
+  it('rejects malformed/unsupported condition shapes', () => {
+    for (const Condition of [
+      'StringEquals',
+      null,
+      [],
+      {},
+      { IpAddress: { sourceIp: '10.0.0.0/8' } },
+      { StringEquals: 'org' },
+      { StringEquals: {} },
+      { StringEquals: { org: { nested: true } } },
+    ]) {
+      assert.ok(validatePolicyDocument({ Statement: [{ Effect: 'Allow', Action: '*', Resource: '*', Condition }] }), JSON.stringify(Condition));
+    }
   });
 });

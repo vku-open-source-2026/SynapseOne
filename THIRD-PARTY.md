@@ -13,7 +13,7 @@ the upstream project's own `LICENSE` file.
 | Authentik (`ghcr.io/goauthentik/server`) | MIT | Container image + OIDC | Optional external IdP (default). |
 | Keycloak | Apache-2.0 | OIDC (alternative IdP) | Supported as alternative upstream IdP; no image pinned in compose. |
 | PostgreSQL (`postgres:16-alpine`) | PostgreSQL Licence (permissive) | Container image + `pg` driver (MIT) | System of record for IAM. |
-| Valkey (`valkey/valkey:8-alpine`) | BSD-3-Clause | Container image + `ioredis` (MIT) | Cache, queue, stream and Authentik backend. Redis-protocol compatible; replaces Redis 7 whose 7.4+ releases moved to RSALv2/SSPL (no copyleft in the shipped stack). |
+| Valkey (`valkey/valkey:8-alpine`) | BSD-3-Clause | Container image + `ioredis` (MIT) | Cache, queue, stream and Authentik backend. Redis-protocol compatible; replaces Redis 7 whose 7.4+ releases moved to RSALv2/SSPL (no copyleft in the shipped stack). **Deployment check:** a host still running `redis:7-alpine` 7.4+ is out of policy; verify with `docker inspect <redis> --format '{{.Config.Env}}'` and migrate to the `valkey` service before release. |
 | SeaweedFS (`chrislusf/seaweedfs:4.48`) | Apache-2.0 | Container image (S3-compatible object storage) | Default S3-compatible backend for SynapseOCS in Compose (dev and prod; data in the `seaweeddata` volume); production may point at MinIO/AWS S3/R2 instead. |
 | Prometheus (`prom/prometheus`) | Apache-2.0 | Container image + scrape API | Metrics store for `infra/monitoring` (scrapes gateway/PG/Valkey). |
 | postgres-exporter (`prometheuscommunity/postgres-exporter`) | Apache-2.0 | Container image | PG metrics for Prometheus. |
@@ -37,18 +37,25 @@ the upstream project's own `LICENSE` file.
 - Python SDK (`sdks/sdk-python`): `requests` — Apache-2.0 (via `urllib3` MIT,
   `idna` BSD-3-Clause, `charset-normalizer` MIT, `certifi` **MPL-2.0** — file-level
   weak copyleft, used unmodified as a CA bundle; no disclosure duty beyond this notice).
+- Lakehouse (`apps/lakehouse-service`): PyIceberg 0.12 — Apache-2.0; PyArrow 26 —
+  Apache-2.0; FastAPI/Starlette — MIT/BSD-3-Clause; Uvicorn — BSD-3-Clause;
+  pg8000 — BSD-3-Clause; SQLAlchemy — MIT; `certifi` — **MPL-2.0** (unmodified CA
+  bundle, same notice as above). A fresh `requirements.txt` install contains no
+  GPL/AGPL/LGPL package.
 - Go SDK (`sdks/sdk-go`): standard library only — BSD-3-Clause (Go itself).
 
-## Verified scan (2026-10-13, `node tools/license-check.cjs`)
+## Verified scan (2026-11-24, `node tools/license-check.cjs`)
 
-290 installed packages (incl. dev): MIT 258, Apache-2.0 9, ISC 15, BSD-3-Clause 4,
-BSD-2-Clause 1, CC-BY-4.0 1 (+1 dual CC-BY-4.0 AND MIT), Python-2.0 1.
+314 installed npm packages (incl. dev): MIT 277, Apache-2.0 12, ISC 16,
+BSD-3-Clause 5, BSD-2-Clause 1, CC-BY-4.0 1 (+1 dual CC-BY-4.0 AND MIT),
+Python-2.0 1.
 **Zero strong copyleft (no GPL/AGPL/CPAL/EUPL), zero weak copyleft, zero
 source-available/ethical/NC licenses (no SSPL/RSAL/BUSL/SUL/Hippocratic/
 Commons-Clause/Elastic/PolyForm/Prosperity) in the npm tree.**
 Scope note: the gate scans the npm tree only. Python (`certifi` MPL-2.0, above),
-Go (stdlib only) and container images (all permissive in the default and prod stacks, above) are
-inventoried manually in this file.
+Lakehouse (PyIceberg/PyArrow/FastAPI/pg8000, above), Go (stdlib only) and container
+images (all permissive in the default and prod stacks, above) are inventoried
+manually in this file.
 CI re-verifies on every push (`license-check.cjs` + SBOM artifact, `pip-licenses
 --fail-on` for Python, `npm audit --audit-level=critical`).
 

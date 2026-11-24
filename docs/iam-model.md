@@ -185,7 +185,22 @@ endpoint, which returns a one-time `inviteToken` (see
 Invited accounts (first tenant admin, additional platform admins, tenant members)
 activate with `POST /v1/auth/invite/accept {token, password}` or the Console
 `/register` page. Email+org registration cannot join an existing organization
-without an invite code.
+without an invite code. The one-time activation code is returned to the
+authorized creator (tenant org admin, or platform owner with step-up; platform operators must ask an owner); this
+is separate from self-service password-reset tokens, which stay suppressed in
+production unless an operator wires a mailer.
+
+## Account retirement
+
+An organization administrator can retire one account without suspending the
+organization or sibling accounts:
+
+- `POST /v1/accounts/:accountId/retire {reason}` sets `status=retired`, revokes
+  every account API key and service account, blocks account-bound credential
+  verification/context use, and audits the action.
+- `POST /v1/accounts/:accountId/reactivate` restores the active state but does
+  not resurrect revoked keys or service accounts.
+- Resources are retained. Hard account deletion is not supported.
 
 ## Privileged IAM mutations
 

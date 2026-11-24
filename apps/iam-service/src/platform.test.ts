@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import { createApp } from './index';
 import { base32Decode, totp } from './mfa';
-import { queryAudit, grantPlatformAdmin, revokePlatformAdmin } from './db';
+import { queryAudit, grantPlatformAdmin, revokePlatformAdmin, revokePlatformAdminGuarded, countActivePlatformOwners, getPlatformAdmin, getOrgBySlug, upsertUser } from './db';
 import { signPlatformAccess } from './tokens';
 
 const BOOTSTRAP = 'bootstrap-test-secret';
@@ -184,9 +184,9 @@ describe('platform super admin', () => {
     tenantOrgId = created.json.organization.id;
     tenantUserId = created.json.admin.id;
     assert.equal(created.json.admin.is_org_admin, true);
-    // Tenant invite tokens are not handed to platform administrators unless
-    // the deployment explicitly opts into lifecycle-token exposure.
-    assert.equal(created.json.inviteToken, undefined);
+    // Platform owners receive the one-time activation code so a production
+    // deployment without a mailer can still onboard the first tenant admin.
+    assert.equal(typeof created.json.inviteToken, 'string');
 
     const orgs = await call('GET', `/v1/platform/orgs?q=${encodeURIComponent(slug)}`, undefined, platformToken);
     assert.equal(orgs.status, 200);
@@ -293,5 +293,68 @@ describe('platform super admin', () => {
     }, platformToken, { 'x-platform-step-up': step.json.stepUpToken });
     assert.equal(demote.status, 409, JSON.stringify(demote.json));
     assert.equal(demote.json.error, 'last_owner');
+  });
+
+  it('serializes concurrent last-owner revocations so one owner always remains', async () => {
+    const step = await call('POST', '/v1/platform/step-up', {
+      recoveryCode: platformRecoveryCodes[6],
+      action: 'admin:grant',
+    }, platformToken);
+    assert.equal(step.status, 200, JSON.stringify(step.json));
+    const created = await call('POST', '/v1/platform/admins', {
+      email: 'platform-owner-2@test.local',
+      role: 'owner',
+      reason: 'concurrency fixture',
+    }, platformToken, { 'x-platform-step-up': step.json.stepUpToken });
+    assert.equal(created.status, 201, JSON.stringify(created.json));
+    const secondId = created.json.user_id;
+    assert.equal(await countActivePlatformOwners(), 2);
+
+    // Two concurrent revocations each see two owners. The advisory lock /
+    // memory mutex must serialize the count+mutation so only one succeeds.
+    const results = await Promise.all([
+      revokePlatformAdminGuarded(platformUserId),
+      revokePlatformAdminGuarded(secondId),
+    ]);
+    assert.equal(results.filter((r) => r.ok).length, 1);
+    const denied = results.find((r) => !r.ok) as { reason: string };
+    assert.equal(denied.reason, 'last_owner');
+    assert.equal(await countActivePlatformOwners(), 1);
+
+    // Restore the session owner for the remainder of the file.
+    await grantPlatformAdmin({ userId: platformUserId, role: 'owner', grantedBy: platformUserId, reason: 'restore' });
+    assert.equal((await getPlatformAdmin(platformUserId))?.role, 'owner');
+  });
+
+  it('keeps auditors read-only for owner/operator mutations', async () => {
+    const previousMfa = process.env.PLATFORM_ADMIN_REQUIRE_MFA;
+    process.env.PLATFORM_ADMIN_REQUIRE_MFA = 'false';
+    try {
+      const platformOrg = await getOrgBySlug(process.env.PLATFORM_ORG_SLUG || 'synapseone-platform');
+      assert.ok(platformOrg);
+      const auditor = await upsertUser(
+        platformOrg.id,
+        `auditor-${Date.now()}@test.local`,
+        'Platform Auditor',
+      );
+      await grantPlatformAdmin({ userId: auditor.id, role: 'auditor', grantedBy: platformUserId });
+      const token = signPlatformAccess({ userId: auditor.id, role: 'auditor' }).token;
+
+      const me = await call('GET', '/v1/platform/me', undefined, token);
+      assert.equal(me.status, 200, JSON.stringify(me.json));
+      assert.equal(me.json.role, 'auditor');
+      assert.equal((await call('GET', '/v1/platform/admins', undefined, token)).status, 403);
+      const orgCreate = await call('POST', '/v1/platform/orgs', {
+        slug: `auditor-denied-${Date.now()}`,
+        displayName: 'Denied',
+        adminEmail: `denied-${Date.now()}@test.local`,
+      }, token);
+      assert.equal(orgCreate.status, 403);
+      const disable = await call('POST', `/v1/platform/users/${tenantUserId}/disable`, {}, token);
+      assert.equal(disable.status, 403);
+    } finally {
+      if (previousMfa === undefined) delete process.env.PLATFORM_ADMIN_REQUIRE_MFA;
+      else process.env.PLATFORM_ADMIN_REQUIRE_MFA = previousMfa;
+    }
   });
 });

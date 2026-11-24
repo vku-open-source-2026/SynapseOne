@@ -255,6 +255,11 @@ class WorkflowService:
         qs = "?includeData=true" if include_data else ""
         return self._req("GET", f"/v1/executions/{quote(exec_id, safe='')}{qs}")
 
+    def cancel_execution(self, exec_id: str, reason: str | None = None) -> Any:
+        """Cancel a queued or human-paused execution (running returns 409)."""
+        body = {"reason": reason} if reason else {}
+        return self._req("POST", f"/v1/executions/{quote(exec_id, safe='')}/cancel", body)
+
     def test_run(
         self,
         definition: dict,

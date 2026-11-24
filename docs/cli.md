@@ -1049,6 +1049,29 @@ synapseone warehouse job create ingest --dataset incidents --mode stream \
   --stream-topic telemetry [--stream-group g] [--batch-size 100] [--interval-ms 1000]
 synapseone warehouse job get|run|pause|resume|delete <id>
 synapseone warehouse etl-batch --dataset incidents --sql '...' [--name N] [--write-mode replace]
+synapseone warehouse etl-base-lakehouse --collection parks --namespace analytics \
+  --table parks_changes [--database db] [--name N] [--backfill false]
+synapseone warehouse ocs-preview --bucket data --key exports/sensors.csv [--format csv]
+synapseone warehouse etl-ocs --bucket data --key exports/sensors.csv --dataset sensors \
+  [--format csv|jsonl|parquet] [--write-mode replace|append] [--max-rows N]
+```
+
+### Synapse Lakehouse (Apache Iceberg)
+
+```bash
+synapseone lakehouse usage
+synapseone lakehouse namespaces [list]
+synapseone lakehouse namespaces create analytics
+synapseone lakehouse namespaces delete analytics
+
+synapseone lakehouse tables analytics
+synapseone lakehouse table analytics events
+synapseone lakehouse create analytics events --schema '[{"name":"id","type":"string"}]'
+synapseone lakehouse append analytics events --rows '[{"id":"a","value":1}]' \
+  [--idempotency-key batch-1]
+synapseone lakehouse query analytics events [--limit 100] [--snapshot <id>]
+synapseone lakehouse snapshots analytics events
+synapseone lakehouse drop analytics events
 ```
 
 ### Human tasks

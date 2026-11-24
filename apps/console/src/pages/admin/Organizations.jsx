@@ -22,7 +22,7 @@ export default function AdminOrganizations() {
   const [created, setCreated] = useState(null);
   const [form, setForm] = useState({ slug: '', displayName: '', adminEmail: '', adminDisplayName: '', reason: '', code: '' });
   const seqRef = useRef(0);
-  const canWrite = platform.role === 'owner' || platform.role === 'operator';
+  const canWrite = platform.role === 'owner';
 
   const load = useCallback(async (nextOffset = offset) => {
     const seq = ++seqRef.current;
@@ -98,7 +98,7 @@ export default function AdminOrganizations() {
       />
       {!canWrite && (
         <div className="mb-4 px-4 py-2.5 rounded-2xl bg-amber-500/10 text-amber-700 text-sm">
-          Auditor role: organization creation is disabled.
+          Only a platform owner can create organizations. Auditors and operators are read-only here.
         </div>
       )}
       <Err e={err} />

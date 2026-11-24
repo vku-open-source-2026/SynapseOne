@@ -2000,7 +2000,12 @@ const PUBLISH_LUA: &str = r#"
   redis.call('HSET', KEYS[2], ARGV[1], ARGV[6])
   if ARGV[7] ~= '' then redis.call('HSET', KEYS[3], ARGV[1], ARGV[7]) end
   redis.call('ZADD', KEYS[5], ARGV[4], ARGV[1])
-  if ARGV[3] ~= '' then redis.call('HSET', KEYS[4], ARGV[3], ARGV[1]) end
+  if ARGV[3] ~= '' then
+    redis.call('HSET', KEYS[4], ARGV[3], ARGV[1])
+    -- Bound dedupe growth. The window is a delivery-dedup hint, not a
+    -- permanent idempotency store; 7 days is longer than any retry horizon.
+    redis.call('EXPIRE', KEYS[4], 604800)
+  end
   redis.call('HINCRBY', KEYS[6], 'published', 1)
   redis.call('SADD', KEYS[7], ARGV[5])
   return {ARGV[1], '0'}

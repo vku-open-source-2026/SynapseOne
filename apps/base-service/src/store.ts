@@ -379,6 +379,7 @@ export interface OutboxEvent {
   operation: 'create' | 'update' | 'delete';
   version: number;
   occurred_at: string;
+  created_at: string;
   data?: Record<string, unknown>;
 }
 
@@ -401,6 +402,7 @@ function outboxPayload(
     operation,
     version: doc.version,
     occurred_at: doc.updated_at,
+    created_at: doc.created_at,
   };
   if (operation !== 'delete') payload.data = doc.data;
   return payload;
@@ -445,7 +447,7 @@ export async function enqueueBackfill(collectionId: string, docs: StoredDocument
   if (db) {
     await ensureTables();
     for (const doc of docs) {
-      const eventId = `backfill:${collectionId}:${doc.id}:${doc.version}`;
+      const eventId = `backfill:${collectionId}:${doc.id}:${doc.created_at}:${doc.version}`;
       const payload = outboxPayload(meta, doc, 'create', eventId);
       const rows = await db.insert(baseOutbox).values({
         eventId,
@@ -465,7 +467,7 @@ export async function enqueueBackfill(collectionId: string, docs: StoredDocument
   }
   const existing = new Set(memOutbox.map((e) => e.event_id));
   for (const doc of docs) {
-    const eventId = `backfill:${collectionId}:${doc.id}:${doc.version}`;
+    const eventId = `backfill:${collectionId}:${doc.id}:${doc.created_at}:${doc.version}`;
     if (existing.has(eventId)) continue;
     const payload = outboxPayload(meta, doc, 'create', eventId);
     memOutbox.push({ ...payload, published_at: null, attempts: 0, last_error: null });

@@ -132,62 +132,66 @@ impl Store {
         let Backend::Postgres(pool) = &self.backend else {
             return Ok(());
         };
-        let statements = [
-            r#"
-            CREATE TABLE IF NOT EXISTS lds_datasources (
-              id text PRIMARY KEY,
-              slug text NOT NULL,
-              name text NOT NULL,
-              entity_type text NOT NULL,
-              license text NOT NULL,
-              license_url text,
-              contexts jsonb NOT NULL DEFAULT '[]'::jsonb,
-              default_visibility text NOT NULL DEFAULT 'internal',
-              description text,
-              org_id text,
-              account_id text,
-              created_by text,
-              created_at timestamptz NOT NULL DEFAULT now(),
-              updated_at timestamptz NOT NULL DEFAULT now()
+        // Apply the Drizzle migration through the same journal the TypeScript
+        // service uses. Hand-written CREATE IF NOT EXISTS DDL silently ignored
+        // every future migration; a shared journal keeps both runtimes honest.
+        // Append new (journal timestamp, SQL) tuples for future migrations.
+        const MIGRATIONS: &[(i64, &str)] =
+            &[(1_792_554_131_564, include_str!("../drizzle/0000_absent_nemesis.sql"))];
+        let mut connection = pool
+            .acquire()
+            .await
+            .map_err(|error| format!("migration connection: {error}"))?;
+        sqlx::raw_sql("SELECT pg_advisory_lock(hashtext('synapseone_lds_migrations'))")
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| format!("migration lock: {error}"))?;
+        let result = async {
+            sqlx::raw_sql(
+                r#"CREATE TABLE IF NOT EXISTS "__drizzle_migrations_lds" (
+                    id SERIAL PRIMARY KEY,
+                    hash text NOT NULL,
+                    created_at bigint
+                )"#,
             )
-            "#,
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_lds_datasources_scope_slug ON lds_datasources (coalesce(org_id, ''), slug)",
-            "CREATE INDEX IF NOT EXISTS idx_lds_datasources_tenant ON lds_datasources (org_id, account_id)",
-            r#"
-            CREATE TABLE IF NOT EXISTS lds_attributes (
-              datasource_id text NOT NULL REFERENCES lds_datasources(id) ON DELETE CASCADE,
-              name text NOT NULL,
-              ngsi_ld_type text NOT NULL DEFAULT 'Property',
-              visibility text NOT NULL DEFAULT 'internal',
-              description text,
-              source_field text,
-              updated_at timestamptz NOT NULL DEFAULT now(),
-              PRIMARY KEY (datasource_id, name)
-            )
-            "#,
-            r#"
-            CREATE TABLE IF NOT EXISTS lds_records (
-              datasource_id text NOT NULL REFERENCES lds_datasources(id) ON DELETE CASCADE,
-              entity_id text NOT NULL,
-              source_record_id text,
-              version integer NOT NULL DEFAULT 1,
-              core jsonb NOT NULL DEFAULT '{}'::jsonb,
-              entity jsonb NOT NULL DEFAULT '{}'::jsonb,
-              attributes jsonb NOT NULL DEFAULT '{}'::jsonb,
-              created_at timestamptz NOT NULL DEFAULT now(),
-              updated_at timestamptz NOT NULL DEFAULT now(),
-              PRIMARY KEY (datasource_id, entity_id)
-            )
-            "#,
-            "CREATE INDEX IF NOT EXISTS idx_lds_records_ds ON lds_records (datasource_id, updated_at DESC)",
-        ];
-        for statement in statements {
-            sqlx::query(statement)
-                .execute(pool)
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| format!("migration bookkeeping: {error}"))?;
+            for (when, sql) in MIGRATIONS {
+                let applied: i64 = sqlx::query_scalar(
+                    r#"SELECT count(*) FROM "__drizzle_migrations_lds" WHERE created_at = $1"#,
+                )
+                .bind(*when)
+                .fetch_one(&mut *connection)
                 .await
-                .map_err(|e| format!("ensure tables: {e}"))?;
+                .map_err(|error| format!("migration bookkeeping check: {error}"))?;
+                if applied > 0 {
+                    continue;
+                }
+                sqlx::raw_sql(sql)
+                    .execute(&mut *connection)
+                    .await
+                    .map_err(|error| format!("migration {when}: {error}"))?;
+                sqlx::query(
+                    r#"INSERT INTO "__drizzle_migrations_lds" (hash, created_at)
+                       SELECT $1, $2
+                       WHERE NOT EXISTS (
+                         SELECT 1 FROM "__drizzle_migrations_lds" WHERE created_at = $2
+                       )"#,
+                )
+                .bind("rust-embedded-0000_absent_nemesis")
+                .bind(*when)
+                .execute(&mut *connection)
+                .await
+                .map_err(|error| format!("migration bookkeeping insert: {error}"))?;
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        let _ = sqlx::raw_sql("SELECT pg_advisory_unlock(hashtext('synapseone_lds_migrations'))")
+            .execute(&mut *connection)
+            .await;
+        result
     }
 
     pub async fn create_datasource(

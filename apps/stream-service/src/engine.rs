@@ -8,12 +8,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use redis::aio::ConnectionManager;
 use redis::streams::{
-    StreamAddOptions, StreamReadOptions, StreamReadReply, StreamTrimStrategy,
-    StreamTrimmingMode,
+    StreamAddOptions, StreamAutoClaimOptions, StreamAutoClaimReply, StreamReadOptions,
+    StreamReadReply, StreamTrimStrategy, StreamTrimmingMode,
 };
-use redis::{AsyncCommands, FromRedisValue};
+use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
@@ -77,6 +77,9 @@ pub struct GroupReadOptions {
     pub count: Option<i64>,
     pub block_ms: Option<i64>,
     pub auto_ack: bool,
+    /// Reclaim unacknowledged entries after this many milliseconds. `None` or
+    /// zero disables reclaim; the API default is 30s.
+    pub claim_idle_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -600,15 +603,58 @@ impl MemoryEngine {
                 format!("Consumer group '{group_name}' not found"),
             ));
         };
+        // A pending entry that is no longer in the stream was trimmed by
+        // maxLen/minId/retention. Surfacing that as a recovery error is safer
+        // than silently skipping the event and letting the consumer believe it
+        // processed the full history.
+        let retained: std::collections::HashSet<&str> =
+            events.iter().map(|event| event.id.as_str()).collect();
+        let mut missing: Vec<String> = group
+            .pending
+            .keys()
+            .filter(|id| !retained.contains(id.as_str()))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            // Drop the unrecoverable ids from the PEL so the group can make
+            // progress after the operator sees the gap (Redis XAUTOCLAIM does
+            // this itself). The error is reported once, not forever.
+            for id in &missing {
+                group.pending.remove(id);
+            }
+            missing.truncate(20);
+            return Err(retention_gap_error(missing));
+        }
         group.consumers.insert(options.consumer.clone());
         let count = options.count.filter(|value| *value > 0).unwrap_or(10) as usize;
+        let now = now_ms();
+        if !options.auto_ack {
+            if let Some(idle_ms) = options.claim_idle_ms.filter(|value| *value > 0) {
+                let mut reclaimed = Vec::new();
+                for event in &events {
+                    if reclaimed.len() >= count {
+                        break;
+                    }
+                    if let Some((_, delivered_at)) = group.pending.get(&event.id) {
+                        if now.saturating_sub(*delivered_at) >= idle_ms {
+                            group
+                                .pending
+                                .insert(event.id.clone(), (options.consumer.clone(), now));
+                            reclaimed.push(event.clone());
+                        }
+                    }
+                }
+                if !reclaimed.is_empty() {
+                    return Ok(reclaimed);
+                }
+            }
+        }
         let last = group.last_delivered_id.clone();
         let eligible: Vec<StreamEvent> = events
             .into_iter()
             .filter(|event| compare_ids(&event.id, &last) > 0)
             .take(count)
             .collect();
-        let now = now_ms();
         for event in &eligible {
             group.last_delivered_id = event.id.clone();
             if !options.auto_ack {
@@ -677,6 +723,19 @@ impl MemoryEngine {
 pub struct RedisEngine {
     client: redis::Client,
     conn: ConnectionManager,
+}
+
+/// Recovery-visible error for pending entries whose payload was trimmed.
+pub fn retention_gap_error(ids: Vec<String>) -> StreamError {
+    StreamError::new(
+        "retention_gap",
+        format!(
+            "{} pending stream entr{} no longer retained (trimmed by maxLen/minId/retention); rebuild or reset the consumer group before continuing: {}",
+            ids.len(),
+            if ids.len() == 1 { "y" } else { "ies" },
+            ids.join(", ")
+        ),
+    )
 }
 
 fn map_error(error: redis::RedisError) -> StreamError {
@@ -1059,6 +1118,47 @@ impl RedisEngine {
         if let Some(block) = options.block_ms.filter(|value| *value > 0) {
             read_options = read_options.block(block as usize);
         }
+        if !options.auto_ack {
+            if let Some(idle_ms) = options.claim_idle_ms.filter(|value| *value > 0) {
+                let mut conn = self.conn.clone();
+                let mut cursor = "0-0".to_string();
+                let mut collected = Vec::new();
+                // XAUTOCLAIM scans a bounded window and returns the next
+                // cursor. Walk it so a PEL larger than one window is not
+                // starved forever (bounded to 10 pages per read).
+                for _ in 0..10 {
+                    let claim_options =
+                        StreamAutoClaimOptions::default().count(count.max(1) as usize);
+                    let claimed: StreamAutoClaimReply = conn
+                        .xautoclaim_options(
+                            &key,
+                            group,
+                            &options.consumer,
+                            idle_ms,
+                            &cursor,
+                            claim_options,
+                        )
+                        .await
+                        .map_err(map_error)?;
+                    if !claimed.deleted_ids.is_empty() {
+                        return Err(retention_gap_error(claimed.deleted_ids));
+                    }
+                    for entry in claimed.claimed {
+                        collected.push(Self::parse_event(entry.id, entry.map));
+                        if collected.len() >= count as usize {
+                            break;
+                        }
+                    }
+                    cursor = claimed.next_stream_id;
+                    if cursor == "0-0" || collected.len() >= count as usize {
+                        break;
+                    }
+                }
+                if !collected.is_empty() {
+                    return Ok(collected);
+                }
+            }
+        }
         let ids = [">"];
         if options.block_ms.filter(|value| *value > 0).is_some() {
             let mut conn = self
@@ -1124,6 +1224,7 @@ impl RedisEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[tokio::test]
     async fn memory_topic_lifecycle_and_group_read() {
@@ -1184,6 +1285,7 @@ mod tests {
                     count: Some(10),
                     block_ms: None,
                     auto_ack: false,
+                    claim_idle_ms: Some(30_000),
                 },
             )
             .await
@@ -1221,5 +1323,156 @@ mod tests {
     fn id_ordering_is_numeric() {
         assert!(compare_ids("10-1", "9-99") > 0);
         assert!(compare_ids("10-2", "10-1") > 0);
+    }
+
+    #[tokio::test]
+    async fn memory_group_reclaims_an_unacked_batch_after_idle_timeout() {
+        let engine = Engine::Memory(MemoryEngine::new());
+        engine
+            .create_topic("tenant-a", "jobs", None, None, None)
+            .await
+            .unwrap();
+        let published = engine
+            .publish(
+                "tenant-a",
+                "jobs",
+                PublishInput {
+                    payload: json!({"job": 1}),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        engine
+            .create_group("tenant-a", "jobs", "workers", "0-0")
+            .await
+            .unwrap();
+        let first = engine
+            .read_group(
+                "tenant-a",
+                "jobs",
+                "workers",
+                GroupReadOptions {
+                    consumer: "worker-a".into(),
+                    count: Some(10),
+                    block_ms: None,
+                    auto_ack: false,
+                    claim_idle_ms: Some(1),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let retried = engine
+            .read_group(
+                "tenant-a",
+                "jobs",
+                "workers",
+                GroupReadOptions {
+                    consumer: "worker-b".into(),
+                    count: Some(10),
+                    block_ms: None,
+                    auto_ack: false,
+                    claim_idle_ms: Some(1),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].id, published.id);
+        let acked = engine
+            .ack("tenant-a", "jobs", "workers", &[published.id])
+            .await
+            .unwrap();
+        assert_eq!(acked, 1);
+    }
+
+    #[tokio::test]
+    async fn memory_reports_a_retention_gap_for_trimmed_pending_entries() {
+        let engine = Engine::Memory(MemoryEngine::new());
+        engine
+            .create_topic("tenant-a", "audit", Some(2), None, None)
+            .await
+            .unwrap();
+        for value in 1..=2 {
+            engine
+                .publish(
+                    "tenant-a",
+                    "audit",
+                    PublishInput {
+                        payload: json!({ "n": value }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        engine
+            .create_group("tenant-a", "audit", "workers", "0-0")
+            .await
+            .unwrap();
+        let delivered = engine
+            .read_group(
+                "tenant-a",
+                "audit",
+                "workers",
+                GroupReadOptions {
+                    consumer: "worker-a".into(),
+                    count: Some(10),
+                    block_ms: None,
+                    auto_ack: false,
+                    claim_idle_ms: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(delivered.len(), 2);
+        for value in 3..=4 {
+            engine
+                .publish(
+                    "tenant-a",
+                    "audit",
+                    PublishInput {
+                        payload: json!({ "n": value }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let error = engine
+            .read_group(
+                "tenant-a",
+                "audit",
+                "workers",
+                GroupReadOptions {
+                    consumer: "worker-b".into(),
+                    count: Some(10),
+                    block_ms: None,
+                    auto_ack: false,
+                    claim_idle_ms: Some(1),
+                },
+            )
+            .await
+            .expect_err("trimmed pending entries must surface as a recovery error");
+        assert_eq!(error.code, "retention_gap");
+        assert!(error.message.contains("no longer retained"));
+        let recovered = engine
+            .read_group(
+                "tenant-a",
+                "audit",
+                "workers",
+                GroupReadOptions {
+                    consumer: "worker-b".into(),
+                    count: Some(10),
+                    block_ms: None,
+                    auto_ack: false,
+                    claim_idle_ms: Some(1),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.len(), 2, "the group must continue after the gap");
     }
 }

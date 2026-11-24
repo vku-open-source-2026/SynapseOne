@@ -1,4 +1,4 @@
-# SynapseNotifications — outbox, templates and delivery
+# SynapseNotifications — outbox, inline variables and delivery
 
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 <!-- SPDX-FileCopyrightText: 2026 VKU.VIC -->
@@ -15,6 +15,13 @@ It is tenant-scoped like every other service (`org:` → `account:` → `user:`)
 | GET | `/v1/notifications?status=&limit=` | List recent notifications |
 | GET | `/v1/notifications/:id` | Status + attempt history |
 | POST | `/v1/notifications/:id/cancel` | Cancel queued/failed delivery |
+| POST | `/v1/notifications/:id/retry` | Retry a failed/dead delivery with a fresh attempt budget |
+| POST | `/v1/notifications/templates` | Create a tenant-owned template |
+| GET | `/v1/notifications/templates?q=&includeArchived=&limit=&offset=` | List/search templates |
+| GET | `/v1/notifications/templates/:id` | Template + variables/version |
+| PATCH | `/v1/notifications/templates/:id` | Update content (version increments) |
+| POST | `/v1/notifications/templates/:id/preview` | Render with data |
+| DELETE | `/v1/notifications/templates/:id` | Archive |
 | GET | `/v1/notifications/preferences/:recipient` | Read preferences |
 | PUT | `/v1/notifications/preferences/:recipient` | Set channels/unsubscribe |
 | POST | `/v1/notifications/unsubscribe` | Unsubscribe a recipient |
@@ -33,9 +40,18 @@ Send body:
 ```
 
 `{{var}}` placeholders are replaced from `data`; missing keys are left intact.
-Fan-out creates one record per channel and returns `202` with
-`{notifications: [...]}`. `idempotencyKey` is scoped per tenant and channel: a
-retry returns the existing record instead of sending twice.
+Templates are a first-class tenant resource: `POST/GET/PATCH/DELETE
+/v1/notifications/templates` and `POST .../preview`. Variables are derived from
+`{{name}}` placeholders, validated at write time, and checked against `data` at
+enqueue time (missing → `400 missing_template_variables`). Enqueue with
+`templateId` or `templateSlug` instead of `body`; the rendered subject/body are
+stored with `templateId`/`templateVersion`, so editing or archiving a template
+never changes an already queued notification. Inline `body` rendering remains
+fully supported. Fan-out creates one record per channel and
+returns `202` with `{notifications: [...]}`. `idempotencyKey` is scoped per
+tenant and channel: a retry returns the existing record instead of sending
+twice. Manual retry is only valid for `failed`/`dead` rows; it resets the
+attempt budget and clears the outbox publish marker.
 
 ## Channels and provider adapters
 

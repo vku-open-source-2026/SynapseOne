@@ -31,6 +31,8 @@ export default function Workflows() {
   const [actionOut, setActionOut] = useState(null);
   const [execs, setExecs] = useState([]);
   const [execDetail, setExecDetail] = useState(null);
+  const [tasks, setTasks] = useState([]);
+  const [taskBusy, setTaskBusy] = useState(false);
   const [execMore, setExecMore] = useState(false);
   const [execBusy, setExecBusy] = useState(false);
   const [execStatus, setExecStatus] = useState('');
@@ -232,20 +234,23 @@ export default function Workflows() {
     setDetailErr(null);
     setActionOut(null);
     setExecDetail(null);
+    setTasks([]);
     setExecs([]);
     setExecMore(false);
     setExecStatus('');
     setExecInput('{}');
     try {
-      const [d, e] = await Promise.all([
+      const [d, e, t] = await Promise.all([
         api.workflow(id, headers),
         api.executions({ workflowId: id, limit: EXEC_PAGE }, headers).catch(() => ({ data: [] })),
+        api.humanTasks({ workflowId: id, status: 'pending', limit: 50 }, headers).catch(() => ({ items: [] })),
       ]);
       if (selSeq.current !== my) return; // stale: user already picked another workflow
       setDetail(d);
       const items = Array.isArray(e) ? e : e?.data || [];
       setExecs(items);
       setExecMore(items.length >= EXEC_PAGE);
+      setTasks(Array.isArray(t?.items) ? t.items : []);
     } catch (ex) {
       if (selSeq.current === my) setDetailErr(ex);
     }
@@ -412,6 +417,40 @@ export default function Workflows() {
       setExecDetail({ id, ...e });
     } catch (ex) {
       if (selRef.current === wf) setDetailErr(ex);
+    }
+  };
+
+  const reloadTasks = async (workflowId) => {
+    const t = await api.humanTasks({ workflowId, status: 'pending', limit: 50 }, headers).catch(() => ({ items: [] }));
+    if (selRef.current === workflowId) setTasks(Array.isArray(t?.items) ? t.items : []);
+  };
+
+  const decideTask = async (task, approve) => {
+    if (!sel || taskBusy) return;
+    const note = approve ? '' : window.prompt('Rejection note (required)');
+    if (!approve && (!note || note.trim().length < 3)) return;
+    setTaskBusy(true);
+    setDetailErr(null);
+    try {
+      if (approve) await api.completeHumanTask(task.id, { approved: true }, note, headers);
+      else await api.rejectHumanTask(task.id, note.trim(), headers);
+      await Promise.all([reloadExecs(sel), reloadTasks(sel)]);
+      setActionOut({ label: approve ? 'Approval recorded' : 'Rejection recorded', body: { task: task.id } });
+    } catch (ex) {
+      setDetailErr(ex);
+    } finally {
+      setTaskBusy(false);
+    }
+  };
+
+  const cancelExecution = async (id) => {
+    if (!window.confirm('Cancel this queued or paused execution? This closes its approval task.')) return;
+    try {
+      await api.cancelExecution(id, 'cancelled from Console', headers);
+      await Promise.all([reloadExecs(sel), reloadTasks(sel)]);
+      setExecDetail(null);
+    } catch (ex) {
+      setDetailErr(ex);
     }
   };
 
@@ -636,6 +675,30 @@ export default function Workflows() {
               ) : (
                 <Empty text="No executions yet" />
               )}
+              {tasks.length > 0 && (
+                <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50/60 p-3">
+                  <h4 className="font-semibold text-main-text text-sm mb-2">Pending approvals ({tasks.length})</h4>
+                  <Table head={['Task', 'Node', 'Deadline', 'Actions']}>
+                    {tasks.map((t) => (
+                      <tr key={t.id} className="border-t border-amber-100">
+                        <td className="py-2 pr-4 text-xs text-main-text">{t.title || t.id}</td>
+                        <td className="py-2 pr-4 font-mono text-[11px] text-normal-text">{t.node}</td>
+                        <td className="py-2 pr-4 text-xs text-normal-text">{t.deadline || '–'}</td>
+                        <td className="py-2 pr-4">
+                          <div className="flex items-center gap-2">
+                            <Btn variant="success" className="!px-2 !py-1 !text-[11px]" disabled={taskBusy} onClick={() => decideTask(t, true)}>
+                              Approve
+                            </Btn>
+                            <Btn variant="danger" className="!px-2 !py-1 !text-[11px]" disabled={taskBusy} onClick={() => decideTask(t, false)}>
+                              Reject
+                            </Btn>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </Table>
+                </div>
+              )}
               {execDetail && (
                 <div className="mt-2">
                   <div className="flex items-center gap-2 mb-1">
@@ -644,6 +707,11 @@ export default function Workflows() {
                     </Badge>
                     {execDetail.triggeredBy && <span className="text-[11px] text-normal-text">via {execDetail.triggeredBy}</span>}
                     {execDetail.error && <span className="text-[11px] text-red-500 break-words">{execDetail.error}</span>}
+                    {(execDetail.status === 'queued' || execDetail.status === 'paused') && (
+                      <Btn variant="danger" className="ml-auto !px-2 !py-1 !text-[11px]" onClick={() => cancelExecution(execDetail.id)}>
+                        Cancel execution
+                      </Btn>
+                    )}
                   </div>
                   {Array.isArray(execDetail.nodeRuns) && execDetail.nodeRuns.length > 0 ? (
                     <Table head={['Node', 'Type', 'Status', 'Time']}>

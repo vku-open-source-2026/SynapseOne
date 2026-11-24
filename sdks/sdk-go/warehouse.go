@@ -31,6 +31,18 @@ func (c *Client) ListWarehouseDatasets() (map[string]any, error) {
 	return out, c.warehouseReq("GET", warehousePath+"/datasets", nil, &out)
 }
 
+// ListWarehouseDatasetsPage lists datasets with q/name/mode/limit/offset filters.
+func (c *Client) ListWarehouseDatasetsPage(params map[string]string) (map[string]any, error) {
+	var out map[string]any
+	return out, c.warehouseReq("GET", warehousePath+"/datasets"+queryString(params), nil, &out)
+}
+
+// UpdateWarehouseDataset updates the dataset display name/description.
+func (c *Client) UpdateWarehouseDataset(id string, body map[string]any) (map[string]any, error) {
+	var out map[string]any
+	return out, c.warehouseReq("PATCH", warehousePath+"/datasets/"+url.PathEscape(id), body, &out)
+}
+
 // GetWarehouseDataset fetches one dataset and its schema.
 func (c *Client) GetWarehouseDataset(id string) (map[string]any, error) {
 	var out map[string]any
@@ -77,6 +89,18 @@ func (c *Client) ListWarehouseJobs() (map[string]any, error) {
 	return out, c.warehouseReq("GET", warehousePath+"/jobs", nil, &out)
 }
 
+// ListWarehouseJobsPage lists jobs with status/mode/targetDatasetId/name/limit/offset.
+func (c *Client) ListWarehouseJobsPage(params map[string]string) (map[string]any, error) {
+	var out map[string]any
+	return out, c.warehouseReq("GET", warehousePath+"/jobs"+queryString(params), nil, &out)
+}
+
+// UpdateWarehouseJob renames a non-stream or paused stream job.
+func (c *Client) UpdateWarehouseJob(id string, body map[string]any) (map[string]any, error) {
+	var out map[string]any
+	return out, c.warehouseReq("PATCH", warehousePath+"/jobs/"+url.PathEscape(id), body, &out)
+}
+
 // GetWarehouseJob fetches one ETL job.
 func (c *Client) GetWarehouseJob(id string) (map[string]any, error) {
 	var out map[string]any
@@ -87,6 +111,18 @@ func (c *Client) GetWarehouseJob(id string) (map[string]any, error) {
 func (c *Client) CreateWarehouseJob(body map[string]any) (map[string]any, error) {
 	var out map[string]any
 	return out, c.warehouseReq("POST", warehousePath+"/jobs", body, &out)
+}
+
+// WarehouseETLBase runs a one-shot Base snapshot into a dataset (Path A).
+func (c *Client) WarehouseETLBase(body map[string]any) (map[string]any, error) {
+	var out map[string]any
+	return out, c.warehouseReq("POST", warehousePath+"/etl/base", body, &out)
+}
+
+// WarehouseETLLakehouse materializes an authorized Iceberg table/snapshot (Path C).
+func (c *Client) WarehouseETLLakehouse(body map[string]any) (map[string]any, error) {
+	var out map[string]any
+	return out, c.warehouseReq("POST", warehousePath+"/etl/lakehouse", body, &out)
 }
 
 // RunWarehouseBatch runs a one-shot batch transform.

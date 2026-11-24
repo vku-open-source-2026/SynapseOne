@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 VKU.VIC
-//! Synapse Warehouse: OLAP datasets, SQL queries, ETL, reports and dashboards.
+//! Synapse Warehouse: OLAP datasets, SQL queries and ETL jobs.
 
 use crate::client::{segment, Client};
 use crate::error::Result;
@@ -19,8 +19,8 @@ impl WarehouseService {
         Self { client }
     }
 
-    pub async fn status(&self) -> Result<Value> {
-        self.client.get(format!("{PREFIX}/status")).await
+    pub async fn pipeline_status(&self) -> Result<Value> {
+        self.client.get(format!("{PREFIX}/pipeline/status")).await
     }
 
     pub async fn datasets(&self) -> Result<Value> {
@@ -58,18 +58,15 @@ impl WarehouseService {
         self.client.get(format!("{PREFIX}/templates")).await
     }
 
-    pub async fn workflow_templates(&self) -> Result<Value> {
+    pub async fn delete_dataset(&self, id: &str) -> Result<Value> {
         self.client
-            .get(format!("{PREFIX}/workflow-templates"))
+            .delete(format!("{PREFIX}/datasets/{}", segment(id)))
             .await
     }
 
-    pub async fn instantiate_workflow_template(&self, name: &str, input: Value) -> Result<Value> {
+    pub async fn update_dataset(&self, id: &str, input: Value) -> Result<Value> {
         self.client
-            .post(
-                format!("{PREFIX}/workflow-templates/{}/instantiate", segment(name)),
-                input,
-            )
+            .patch(format!("{PREFIX}/datasets/{}", segment(id)), input)
             .await
     }
 
@@ -87,6 +84,30 @@ impl WarehouseService {
             .await
     }
 
+    pub async fn base_to_warehouse(&self, input: Value) -> Result<Value> {
+        self.client.post(format!("{PREFIX}/etl/base"), input).await
+    }
+
+    pub async fn lakehouse_to_warehouse(&self, input: Value) -> Result<Value> {
+        self.client
+            .post(format!("{PREFIX}/etl/lakehouse"), input)
+            .await
+    }
+
+    pub async fn base_to_lakehouse(&self, input: Value) -> Result<Value> {
+        self.client
+            .post(format!("{PREFIX}/etl/base-lakehouse"), input)
+            .await
+    }
+
+    pub async fn preview_ocs(&self, input: Value) -> Result<Value> {
+        self.client.post(format!("{PREFIX}/etl/ocs/preview"), input).await
+    }
+
+    pub async fn import_ocs(&self, input: Value) -> Result<Value> {
+        self.client.post(format!("{PREFIX}/etl/ocs"), input).await
+    }
+
     pub async fn run_job(&self, id: &str) -> Result<Value> {
         self.client
             .post(format!("{PREFIX}/jobs/{}/run", segment(id)), json!({}))
@@ -99,79 +120,31 @@ impl WarehouseService {
             .await
     }
 
-    pub async fn reports(&self) -> Result<Value> {
-        self.client.get(format!("{PREFIX}/reports")).await
-    }
-
-    pub async fn create_report(&self, input: Value) -> Result<Value> {
-        self.client.post(format!("{PREFIX}/reports"), input).await
-    }
-
-    pub async fn run_report(&self, id: &str) -> Result<Value> {
+    pub async fn resume_job(&self, id: &str) -> Result<Value> {
         self.client
-            .post(format!("{PREFIX}/reports/{}/run", segment(id)), json!({}))
+            .post(format!("{PREFIX}/jobs/{}/resume", segment(id)), json!({}))
             .await
     }
 
-    pub async fn publish_report(&self, id: &str) -> Result<Value> {
+    pub async fn create_job(&self, input: Value) -> Result<Value> {
+        self.client.post(format!("{PREFIX}/jobs"), input).await
+    }
+
+    pub async fn get_job(&self, id: &str) -> Result<Value> {
         self.client
-            .post(
-                format!("{PREFIX}/reports/{}/publish", segment(id)),
-                json!({}),
-            )
+            .get(format!("{PREFIX}/jobs/{}", segment(id)))
             .await
     }
 
-    pub async fn public_report(&self, share_id: &str) -> Result<Value> {
+    pub async fn update_job(&self, id: &str, input: Value) -> Result<Value> {
         self.client
-            .get(format!("{PREFIX}/public/reports/{}", segment(share_id)))
+            .patch(format!("{PREFIX}/jobs/{}", segment(id)), input)
             .await
     }
 
-    pub async fn dashboards(&self) -> Result<Value> {
-        self.client.get(format!("{PREFIX}/dashboards")).await
-    }
-
-    pub async fn create_dashboard(&self, input: Value) -> Result<Value> {
+    pub async fn delete_job(&self, id: &str) -> Result<Value> {
         self.client
-            .post(format!("{PREFIX}/dashboards"), input)
-            .await
-    }
-
-    pub async fn run_dashboard(&self, id: &str) -> Result<Value> {
-        self.client
-            .post(
-                format!("{PREFIX}/dashboards/{}/run", segment(id)),
-                json!({}),
-            )
-            .await
-    }
-
-    pub async fn publish_dashboard(&self, id: &str) -> Result<Value> {
-        self.client
-            .post(
-                format!("{PREFIX}/dashboards/{}/publish", segment(id)),
-                json!({}),
-            )
-            .await
-    }
-
-    pub async fn public_dashboard(&self, share_id: &str) -> Result<Value> {
-        self.client
-            .get(format!("{PREFIX}/public/dashboards/{}", segment(share_id)))
-            .await
-    }
-
-    pub async fn use_cases(&self) -> Result<Value> {
-        self.client.get(format!("{PREFIX}/use-cases")).await
-    }
-
-    pub async fn seed_use_case(&self, id: &str) -> Result<Value> {
-        self.client
-            .post(
-                format!("{PREFIX}/use-cases/{}/seed", segment(id)),
-                json!({}),
-            )
+            .delete(format!("{PREFIX}/jobs/{}", segment(id)))
             .await
     }
 }

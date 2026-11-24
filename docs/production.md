@@ -48,12 +48,12 @@ Use when taking SynapseOne off your laptop. Every item already has a mechanism â
 ## 2. Network & TLS
 
 - [ ] Gateway is the single entry point (Ingress + TLS); IAM/workflow/AI/LDS/base/
-      faststore/queue/stream/inference/storage/notifications/postgres/valkey are not
+      faststore/queue/stream/warehouse/lakehouse/inference/storage/notifications/postgres/valkey are not
       internet-exposed (ClusterIP / internal compose network).
 - [ ] Lock down the gateway CORS to the real frontend origins (MVP default is wide open).
 - [ ] Rate limiting at the outer layer (Ingress NGINX `limit_req`, Cloudflare/AWS WAF):
-      the gateway's built-in limiter was removed â€” outer rate limiting is mandatory, especially
-      `/v1/auth/*` (brute-force login/refresh). Never expose IAM/workflow directly.
+      the gateway also has a bounded in-memory edge limiter, but outer rate limiting is
+      mandatory, especially `/v1/auth/*` (brute-force login/refresh). Never expose IAM/workflow directly.
 - [ ] `PROXY_TIMEOUT_MS` per upstream SLA (default 30s).
 - [ ] `TRUST_PROXY=1` (one nginx/Ingress hop) or a CIDR list, so per-client
       rate limits use `X-Forwarded-For` rather than the edge container IP.
@@ -67,18 +67,37 @@ Use when taking SynapseOne off your laptop. Every item already has a mechanism â
 - [ ] Backups run from `docker-compose.yml`, so every deploy path starts them:
       `pg-backup` (pg_dump custom format of `synapseone` and `authentik`, daily, each
       dump with a `.sha256`, volume `pgbackups`) and `s3-backup` (incremental object
-      snapshots, volume `s3backups`, `docs/object-storage.md`). Both keep
-      `BACKUP_RETENTION_DAYS`=7. Run them now with
+      snapshots, volume `s3backups`, `docs/object-storage.md`). The S3 snapshot must
+      include the **Lakehouse prefix** because Parquet/metadata are analytical data.
+      Both keep
+      `BACKUP_RETENTION_DAYS`=7 and retry a failed run
+      (`BACKUP_RETRY_SECONDS`/`BACKUP_MAX_RETRY_SECONDS`) instead of sleeping a
+      full day; `$BACKUP_DIR/.last-status.json` is the monitoring signal. Run them now with
       `docker compose -f docker-compose.yml run --rm --no-deps pg-backup --once` and
       `... run --rm --no-deps s3-backup once`, and rehearse `tools/backup/pg-restore.sh <file.dump>`
       and `s3-backup restore latest --dry-run` (`pg-restore.sh` asks you to type the database
       name, verifies the `.sha256` and restores in one transaction; stop the services
       using that database first). Both volumes live on the same host:
       copying them elsewhere is the operator's choice.
+- [ ] Warehouse/DuckDB: `WAREHOUSE_DATA_DIR` holds one `<tenant-hash>.duckdb` per
+      tenant (datasets, rows, ETL job/checkpoint metadata). No automated backup job
+      exists yet. Safe operator backup: stop `warehouse`, run
+      `CHECKPOINT` on each file (or let the clean shutdown flush the WAL), copy the
+      volume while the service is stopped, then restart. Restore is the reverse:
+      stop the service, replace the files, start, and verify
+      `GET /v1/warehouse/pipeline/status`. Do not copy a live writable DuckDB file.
 - [ ] Object storage: set `STORAGE_BACKEND=s3` plus `STORAGE_S3_*` credentials (they are
-      also the SeaweedFS identity, `docs/object-storage.md`). Set
+      also the SeaweedFS identity, `docs/object-storage.md`).
+- [ ] Lakehouse: set `LAKEHOUSE_CATALOG_URI` (Postgres with the BSD `pg8000`
+      driver), `LAKEHOUSE_WAREHOUSE=s3://<bucket>/lakehouse`, and
+      `LAKEHOUSE_S3_*` service credentials. Keep the same bucket in
+      `s3-backup`; enforce object-store quota/alerts and schedule snapshot/orphan
+      cleanup. Do not point it at a tenant prefix.
 - [ ] IAM: set `IAM_MFA_ENCRYPTION_KEY` (`openssl rand -hex 32`) before users enrol MFA;
       keep `IAM_LOGIN_MAX_FAILURES`/`IAM_LOGIN_LOCKOUT_SECONDS` at their defaults or stricter.
+      Compose now passes this key. Existing seals made with the legacy
+      JWT-derived key remain readable, so enabling it does not lock out enrolled
+      users; new seals use the dedicated key.
 - [ ] Notifications: set `DATABASE_URL`, `NOTIFICATIONS_QUEUE_URL`,
       `NOTIFICATIONS_EMAIL_RELAY_URL`/`_SMS_`/`_PUSH_` as needed; the service
       refuses to boot without the DB, internal secret and CORS origin
@@ -110,7 +129,7 @@ Use when taking SynapseOne off your laptop. Every item already has a mechanism â
 
 ## 4. Operations
 
-- [ ] Stream/inference/storage/notifications are included in
+- [ ] Stream/warehouse/lakehouse/inference/storage/notifications are included in
       `docker-compose.prod.yml` and `infra/k8s/base/all.yaml`, and `/ready` probes
       them when their URLs are configured.
 - [ ] `restart: unless-stopped` is already set for every long-lived compose service;

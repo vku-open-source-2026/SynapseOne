@@ -22,6 +22,22 @@ groups:
           summary: "SynapseBase is down"
           description: "Prometheus cannot scrape base:4005/metrics for >2m."
 
+      - alert: BaseOutboxBacklog
+        expr: synapseone_base_outbox_pending > 0
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "SynapseBase outbox is not draining"
+          description: "Committed change events have not reached SynapseStream for >15m. Check STREAM_SERVICE_URL, Stream health, and synapseone_base_outbox attempts/last_error."
+
+      - alert: BaseOutboxDeadLetter
+        expr: synapseone_base_outbox_dead_lettered > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "SynapseBase outbox has quarantined events"
+          description: "One or more change events exhausted retries or hit a permanent payload error. Inspect GET /internal/base/outbox and replay after fixing the cause."
+
       - alert: FaststoreDown
         expr: up{job="faststore"} == 0
         for: 2m
@@ -37,6 +53,14 @@ groups:
         annotations:
           summary: "SynapseQueue is down"
           description: "Prometheus cannot scrape queue:4007/metrics for >2m."
+
+      - alert: LakehouseDown
+        expr: up{job="lakehouse"} == 0
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "Synapse Lakehouse is down"
+          description: "Prometheus cannot scrape lakehouse:4013/metrics for >2m. Iceberg commits and Warehouse materialization will fail."
 
       - alert: PostgresDown
         expr: up{job="postgres"} == 0

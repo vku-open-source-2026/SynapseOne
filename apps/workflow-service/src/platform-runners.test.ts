@@ -873,7 +873,12 @@ describe('owner-scoped platform runners', () => {
   });
 
   it('rotates and revokes system keys on owner actions', async () => {
-    const runner = (await call('GET', '/v1/platform/runners', undefined, OWNER)).json.data[0];
+    const created = await call('POST', '/v1/platform/runners', {
+      name: `rotate-delete-${Date.now()}`,
+      kind: 'workflow',
+    }, OWNER);
+    assert.equal(created.status, 201, JSON.stringify(created.json));
+    const runner = created.json.runner;
     const originalKeyId = runner.apiKeyId;
     const rotated = await call('POST', `/v1/platform/runners/${runner.id}/rotate-key`, {}, OWNER);
     assert.equal(rotated.status, 200, JSON.stringify(rotated.json));
