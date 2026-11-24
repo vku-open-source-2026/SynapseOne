@@ -28,7 +28,11 @@ for i in $(seq 1 24); do
   sleep 5
 done
 
-LOGIN=$(curl -s -XPOST "$BASE/v1/auth/login" -H'Content-Type: application/json' -d'{"email":"e2e@acme.local","orgSlug":"acme"}')
+# CI signs in as ci@acme.local first, making it the bootstrap org admin. The
+# enforce-mode admin mutations below (account/role/policy creation) need that
+# identity; a second dev-login user would only be a member.
+E2E_EMAIL=${E2E_EMAIL:-ci@acme.local}
+LOGIN=$(curl -s -XPOST "$BASE/v1/auth/login" -H'Content-Type: application/json' -d"{\"email\":\"$E2E_EMAIL\",\"orgSlug\":\"acme\"}")
 TOK=$(echo "$LOGIN" | jq -r .accessToken)
 E2E_UID=$(echo "$LOGIN" | jq -r .user.id)
 if [ -n "${SYNAPSEONE_E2E_TOKEN:-}" ]; then
@@ -40,7 +44,7 @@ else
 fi
 H="Authorization: Bearer $TOK"
 if [ "$E2E_UID" != "external" ]; then
-  [ "$(curl -s "$BASE/v1/auth/me" -H"$H" | jq -r .user.email)" = "e2e@acme.local" ] && ok me || bad me ""
+  [ "$(curl -s "$BASE/v1/auth/me" -H"$H" | jq -r .user.email)" = "$E2E_EMAIL" ] && ok me || bad me ""
 fi
 
 if [ "$E2E_UID" = "external" ]; then
@@ -90,7 +94,7 @@ curl -s -XPOST "$BASE/v1/auth/logout" -H'Content-Type: application/json' -d"{\"r
 # Replaying the consumed refresh token above is a theft signal: by design IAM
 # revokes the whole token family and bumps auth_version, so the access token
 # minted at login is now dead. Sign in again for the remaining checks.
-LOGIN=$(curl -s -XPOST "$BASE/v1/auth/login" -H'Content-Type: application/json' -d'{"email":"e2e@acme.local","orgSlug":"acme"}')
+LOGIN=$(curl -s -XPOST "$BASE/v1/auth/login" -H'Content-Type: application/json' -d"{\"email\":\"$E2E_EMAIL\",\"orgSlug\":\"acme\"}")
 TOK=$(echo "$LOGIN" | jq -r .accessToken)
 [ -n "$TOK" ] && [ "$TOK" != "null" ] && ok relogin-after-reuse || bad relogin-after-reuse "$LOGIN"
 H="Authorization: Bearer $TOK"
