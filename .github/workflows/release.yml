@@ -75,14 +75,11 @@ jobs:
               "${context}"
           done
           # Self-hosted workflow runner: shares the workflow engine source and
-          # bakes the inference model stack that the loop just pushed. Pull and
-          # tag it under the Dockerfile's local default before building.
-          for attempt in 1 2 3; do
-            if docker pull "ghcr.io/${OWNER}/synapseone-inference:${TAG}"; then break; fi
-            sleep 10
-          done
-          docker tag "ghcr.io/${OWNER}/synapseone-inference:${TAG}" synapseone/inference:0.9.1-20261114
+          # bakes the inference model stack that the loop just pushed. Pass the
+          # released image explicitly: buildx uses a container driver and cannot
+          # see a tag made in the host Docker daemon.
           docker buildx build --push --provenance=true --sbom=true \
+            --build-arg "MODEL_STACK_IMAGE=ghcr.io/${OWNER}/synapseone-inference:${TAG}" \
             -f apps/workflow-runner/Dockerfile \
             -t "ghcr.io/${OWNER}/synapseone-workflow-runner:${TAG}" \
             -t "ghcr.io/${OWNER}/synapseone-workflow-runner:${SEMVER}" \
