@@ -198,6 +198,7 @@ for `AUTHZ_CACHE_TTL_MS` (default 30 s). `reason` is one of `org-admin`,
   stays open (bootstrap).
 - `POST /v1/authorize/dry-run {documents[], action, resource, context?}` → `{allowed}` (simulator, no user needed)
 - `GET /v1/audit?limit=50&offset=0&actor=&allowed=&action=&resource=&from=&to=` → tenant-scoped audit log (authorize decisions, IAM mutations **and** Base/Faststore/Queue/Stream/Workflow/LDS writes; newest first, limit clamped 1..200, offset ≤100000). Data-plane services post batched events to the internal `POST /v1/audit/ingest` (internal secret required; not a public route).
+  - When `DATABASE_READ_URL` is configured, the final tenant-scoped list/count SELECTs may use a read-only PostgreSQL replica after primary-side authorization. Results are eventually consistent; list and count can briefly reflect different replay positions. Connection, query, commit, or non-replica failures automatically fall back to the primary. Authentication, authorization, quota checks, audit writes/exports and mutations always use the primary.
 
 ## Keys
 
@@ -1102,7 +1103,7 @@ Tenant JWTs, API keys and service-account tokens are rejected.
 | POST | `/v1/platform/users/:userId/enable` | Reactivate a user (step-up `user:enable`). |
 | GET | `/v1/platform/usage/summary` | Platform-wide usage summary (optional `orgId`). |
 | GET | `/v1/platform/usage/events` | Platform-wide request log (optional `orgId`). |
-| GET | `/v1/platform/audit` | Platform-wide audit (optional `orgId`). |
+| GET | `/v1/platform/audit` | Platform-wide audit (optional `orgId`). May use the configured read-only audit replica after primary-side platform-admin authorization; eventually consistent with automatic primary fallback. |
 | GET/POST/DELETE | `/v1/platform/admins[/:userId]` | Owner-only platform administrator management. |
 
 Tenant organizations carry `status=active|suspended`. Suspension is reversible,

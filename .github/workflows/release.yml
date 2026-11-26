@@ -4,7 +4,7 @@ name: release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "sdk-v*"]
 
 jobs:
   release:
@@ -35,6 +35,7 @@ jobs:
           files: release-assets/*
 
   publish-images:
+    if: startsWith(github.ref_name, 'v')
     runs-on: ubuntu-latest
     needs: release
     permissions: { packages: write, id-token: write, contents: read }
@@ -124,6 +125,7 @@ jobs:
           fi
 
   publish-cli:
+    if: startsWith(github.ref_name, 'v')
     runs-on: ubuntu-latest
     needs: release
     permissions:

@@ -1,11 +1,12 @@
-# Database performance: PgBouncer, Postgres tuning and the Base read cache
+# Database performance: PgBouncer, Postgres tuning, IAM audit reads and the Base read cache
 
 This guide covers the Phase 1/2 database performance work:
 
 1. **PgBouncer** in transaction-pooling mode between the application services
    and Postgres.
 2. **Postgres tuning** for the production host.
-3. **L2 document-read cache** in SynapseBase backed by Synapse Faststore
+3. **Optional IAM audit read replica** for tenant/platform audit list and count.
+4. **L2 document-read cache** in SynapseBase backed by Synapse Faststore
    (Valkey).
 
 It applies to the single-node Compose deployment. The app services still use
@@ -44,6 +45,42 @@ user/database (30 with the reserve pool), and caps server connections at 60.
 Postgres keeps `max_connections = 100`, leaving room for Authentik, backups,
 exporters and migrations. Raise `default_pool_size` only after checking
 Postgres CPU, `pg_stat_activity` wait events and pgbouncer `SHOW POOLS`.
+
+## Optional IAM audit read replica
+
+`DATABASE_READ_URL` is an opt-in, IAM-only connection for the final SELECTs of
+`GET /v1/audit` and `GET /v1/platform/audit`. It is empty by default, so existing
+deployments keep using `DATABASE_URL` with no behavior change. For example:
+
+```dotenv
+DATABASE_READ_URL=postgresql://synapse_readonly:REPLACE_ME@synapse-read-replica-proxy:6433/synapseone
+```
+
+Use a dedicated role with database `CONNECT`, schema `USAGE`, and only `SELECT`
+on `audit_log` (and no migration, authentication, quota, usage, session, export
+or write privileges). Primary connections remain `DATABASE_URL` /
+`DATABASE_DIRECT_URL`. The replica pool is capped at 4 connections with a 2s
+connect timeout, 5s statement/query timeout, 1s lock timeout and 5s
+idle-in-transaction timeout.
+
+Each replica operation runs in its own `BEGIN READ ONLY` transaction with
+`transaction_read_only=on`; the client handle is private to that operation. The
+same transaction checks `pg_is_in_recovery()`. If the endpoint is not a
+replica, cannot be reached, times out, or the audit query fails, IAM logs a
+structured counter event (without connection strings or error messages) and
+falls back to the existing primary query/count implementation. A primary error
+still propagates normally.
+
+Replica data is **eventually consistent**. A newly written audit row may be
+absent briefly, and list/count are separate snapshots, so paged totals can lag
+or differ from the returned page. Do not use this path for read-after-write
+checks or security decisions. Caller org/platform-admin authorization,
+including session and MFA checks, always completes on primary before the
+replica SELECT. Audit export, `logAudit`, auth, quota, usage summary/meter,
+platform sessions and all mutations intentionally stay on primary.
+
+To disable the path, unset `DATABASE_READ_URL` (or set it empty) and recreate
+only the IAM service. No schema migration or data rollback is required.
 
 ## Postgres tuning
 

@@ -18,7 +18,7 @@ import {
   createRole, createPolicy,
   attachPolicy, assignRole, detachPolicy, unassignRole, policiesForUser, useDb, deleteRole, deletePolicy,
   createServiceAccount, listServiceAccounts, getServiceAccount,
-  listRoles, listPolicies, logAudit, listAudit, queryAudit, countAudit, purgeAudit,
+  listRoles, listPolicies, logAudit, listAudit, queryAudit, countAudit, queryAuditRead, countAuditRead, purgeAudit,
   getRoleById, getPolicyById, getAccountById, accountsForUser, getOrgById,
   policiesForRole, rolesForUser, ensureTables,
   setUserPassword, markEmailVerified, storeOneTimeToken, consumeOneTimeToken,
@@ -3486,10 +3486,12 @@ async function auditMutation(req: express.Request, action: string, resource: str
     }
     noStore(res);
     const filter = { actor, allowed, orgId: org, action, resource, from, to };
-    const items = await queryAudit({ limit, offset, ...filter });
+    // Org/admin authorization above is primary-side. Only the final audit
+    // list/count SELECTs may use the optional read replica.
+    const items = await queryAuditRead({ limit, offset, ...filter });
     const paged = ['1', 'true', 'yes'].includes(String(req.query.paged ?? '').toLowerCase());
     if (!paged) return res.json(items);
-    const total = await countAudit(filter);
+    const total = await countAuditRead(filter);
     res.json({
       items, total, limit, offset,
       nextOffset: offset + items.length < total ? offset + items.length : null,
@@ -4819,7 +4821,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
       return res.status(400).json({ error: 'invalid_time' });
     }
     noStore(res);
-    res.json(await queryAudit({ limit, offset, actor, allowed, orgId, action, resource, from, to }));
+    // Platform authorization/MFA/session checks above stay on primary; only
+    // the audit SELECT is eligible for the optional replica.
+    res.json(await queryAuditRead({ limit, offset, actor, allowed, orgId, action, resource, from, to }));
   });
 
   app.get('/v1/platform/admins', async (req, res) => {

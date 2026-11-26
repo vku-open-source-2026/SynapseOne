@@ -9,9 +9,9 @@
  */
 import path from 'path';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { Pool } from 'pg';
+import { Pool, type PoolClient } from 'pg';
 import { randomUUID, createHash, createHmac, timingSafeEqual } from 'crypto';
-import { and, asc, desc, eq, ilike, inArray, isNull, lt, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, ilike, inArray, isNull, lt, or, sql, type SQL } from 'drizzle-orm';
 import { drizzle, type NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import * as schema from './schema';
@@ -35,11 +35,40 @@ const DATABASE_URL = process.env.DATABASE_URL || '';
 // Migrations and advisory-lock work need a stable Postgres session; when
 // DATABASE_URL points at PgBouncer in transaction mode they must bypass it.
 const DIRECT_DATABASE_URL = process.env.DATABASE_DIRECT_URL || DATABASE_URL;
+// Optional audit-list/count replica only. It is deliberately never exposed as
+// a general database handle: migrations, auth and all writes stay on primary.
+const DATABASE_READ_URL = (process.env.DATABASE_READ_URL || '').trim();
+
+/** Only stable SQLSTATE/category codes are safe to log; error messages may
+ *  contain credentials or a full connection string. */
+function pgErrorCode(error: unknown): string | undefined {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === 'string' && /^[A-Z0-9_]{1,16}$/.test(code) ? code : undefined;
+}
 
 let pool: Pool | null = null;
 if (DATABASE_URL) {
   pool = new Pool({ connectionString: DATABASE_URL });
   pool.on('error', (e) => console.error('[iam][db] pool error', e.message));
+}
+
+let readPool: Pool | null = null;
+if (DATABASE_URL && DATABASE_READ_URL) {
+  readPool = new Pool({
+    connectionString: DATABASE_READ_URL,
+    max: 4,
+    connectionTimeoutMillis: 2_000,
+    query_timeout: 5_000,
+    idleTimeoutMillis: 10_000,
+    application_name: 'synapseone-iam-audit-read',
+    // Startup defaults protect even a mistakenly opened session. The audit
+    // path also applies these settings explicitly inside its transaction.
+    options: '-c default_transaction_read_only=on -c statement_timeout=5000 -c lock_timeout=1000 -c idle_in_transaction_session_timeout=5000',
+  });
+  readPool.on('error', (e) => console.error(JSON.stringify({
+    event: 'iam_audit_read_pool_error',
+    ...(pgErrorCode(e) ? { code: pgErrorCode(e) } : {}),
+  })));
 }
 
 let directPool: Pool | null = null;
@@ -881,6 +910,172 @@ export interface AuditQuery {
   to?: Date;
 }
 
+type AuditDatabase = NodePgDatabase<typeof schema>;
+
+/** One shared predicate builder keeps primary and replica filtering identical,
+ *  including the legacy context.org/context.callerOrg tenant fallback. */
+function auditConditions(q: AuditQuery): SQL[] {
+  const conds: SQL[] = [];
+  const dec = q.allowed === undefined ? undefined : !!q.allowed;
+  if (q.actor) conds.push(eq(schema.auditLog.actorId, q.actor));
+  if (dec !== undefined) conds.push(eq(schema.auditLog.decision, dec));
+  if (q.action) conds.push(eq(schema.auditLog.action, q.action));
+  if (q.resource) conds.push(eq(schema.auditLog.resource, q.resource));
+  if (q.from) conds.push(sql`${schema.auditLog.createdAt} >= ${q.from}`);
+  if (q.to) conds.push(sql`${schema.auditLog.createdAt} <= ${q.to}`);
+  if (q.orgId) {
+    const fallback = sql`(${schema.auditLog.context}->>'org' = ${q.orgId} OR ${schema.auditLog.context}->>'callerOrg' = ${q.orgId})`;
+    conds.push(or(eq(schema.auditLog.orgId, q.orgId), and(isNull(schema.auditLog.orgId), fallback))!);
+  }
+  return conds;
+}
+
+function auditRow(r: {
+  id: string;
+  createdAt: Date;
+  actorType: string;
+  actorId: string;
+  action: string;
+  resource: string;
+  decision: boolean;
+  orgId: string | null;
+  context: any;
+}): any {
+  return {
+    id: r.id,
+    created_at: iso(r.createdAt),
+    actor_type: r.actorType,
+    actor_id: r.actorId,
+    action: r.action,
+    resource: r.resource,
+    decision: r.decision,
+    org_id: r.orgId,
+    context: r.context,
+  };
+}
+
+async function queryAuditOn(database: AuditDatabase, q: AuditQuery): Promise<any[]> {
+  const lim = Math.min(Math.max(Number(q.limit) || 50, 1), 200);
+  const off = Math.min(Math.max(Number(q.offset) || 0, 0), 100_000);
+  const conds = auditConditions(q);
+  const where = conds.length ? and(...conds) : undefined;
+  const rows = await database.select({
+    id: schema.auditLog.id,
+    createdAt: schema.auditLog.createdAt,
+    actorType: schema.auditLog.actorType,
+    actorId: schema.auditLog.actorId,
+    action: schema.auditLog.action,
+    resource: schema.auditLog.resource,
+    decision: schema.auditLog.decision,
+    orgId: schema.auditLog.orgId,
+    context: schema.auditLog.context,
+  }).from(schema.auditLog).where(where).orderBy(desc(schema.auditLog.createdAt)).limit(lim).offset(off);
+  return rows.map(auditRow);
+}
+
+async function countAuditOn(database: AuditDatabase, q: AuditQuery): Promise<number> {
+  const conds = auditConditions(q);
+  const where = conds.length ? and(...conds) : undefined;
+  const rows = await database.select({ n: sql<number>`count(*)::int` }).from(schema.auditLog).where(where);
+  return Number(rows[0]?.n) || 0;
+}
+
+const auditReadCounters = {
+  attempts: 0,
+  replica_hits: 0,
+  fallbacks: 0,
+  not_in_recovery: 0,
+  replica_errors: 0,
+  primary_errors: 0,
+};
+
+function logAuditRead(
+  operation: 'query' | 'count',
+  outcome: 'replica' | 'fallback' | 'primary_error',
+  startedAt: number,
+  details: { reason?: 'not_in_recovery' | 'replica_error' | 'primary_error'; code?: string } = {},
+): void {
+  console.info(JSON.stringify({
+    event: 'iam_audit_read',
+    operation,
+    outcome,
+    duration_ms: Date.now() - startedAt,
+    ...details,
+    counters: { ...auditReadCounters },
+  }));
+}
+
+/** Run one audit SELECT on the replica inside an explicitly read-only,
+ *  bounded transaction. Any failure (including a non-replica endpoint) falls
+ *  back to the unchanged primary implementation. The client handle never
+ *  escapes this function, so no caller can use it for a write. */
+async function withAuditReadReplica<T>(
+  operation: 'query' | 'count',
+  read: (database: AuditDatabase) => Promise<T>,
+  fallback: () => Promise<T>,
+): Promise<T> {
+  if (!readPool) return fallback();
+  const startedAt = Date.now();
+  auditReadCounters.attempts++;
+  let client: PoolClient | null = null;
+  let result!: T;
+  let usedReplica = false;
+  let discardClient = false;
+  let reason: 'not_in_recovery' | 'replica_error' | undefined;
+  let code: string | undefined;
+  try {
+    client = await readPool.connect();
+    await client.query('BEGIN READ ONLY');
+    await client.query('SET LOCAL transaction_read_only = on');
+    await client.query("SET LOCAL statement_timeout = '5s'");
+    await client.query("SET LOCAL lock_timeout = '1s'");
+    await client.query("SET LOCAL idle_in_transaction_session_timeout = '5s'");
+    const recovery = await client.query<{ in_recovery: boolean }>('SELECT pg_is_in_recovery() AS in_recovery');
+    if (recovery.rows[0]?.in_recovery !== true) {
+      reason = 'not_in_recovery';
+    } else {
+      result = await read(drizzle(client, { schema }));
+      await client.query('COMMIT');
+      usedReplica = true;
+    }
+  } catch (error) {
+    reason = 'replica_error';
+    code = pgErrorCode(error);
+    discardClient = true;
+  } finally {
+    if (client) {
+      if (!usedReplica && !discardClient) {
+        try {
+          await client.query('ROLLBACK');
+        } catch {
+          discardClient = true;
+        }
+      }
+      client.release(discardClient);
+    }
+  }
+  if (usedReplica) {
+    auditReadCounters.replica_hits++;
+    logAuditRead(operation, 'replica', startedAt);
+    return result;
+  }
+
+  auditReadCounters.fallbacks++;
+  if (reason === 'not_in_recovery') auditReadCounters.not_in_recovery++;
+  if (reason === 'replica_error') auditReadCounters.replica_errors++;
+  logAuditRead(operation, 'fallback', startedAt, { reason, ...(code ? { code } : {}) });
+  try {
+    return await fallback();
+  } catch (error) {
+    auditReadCounters.primary_errors++;
+    logAuditRead(operation, 'primary_error', startedAt, {
+      reason: 'primary_error',
+      ...(pgErrorCode(error) ? { code: pgErrorCode(error) } : {}),
+    });
+    throw error;
+  }
+}
+
 /** Audit query with filters + pagination (#32). Tenant scoping stays mandatory:
  *  callers pass their resolved orgId and can never read another tenant's rows. */
 export async function queryAudit(q: AuditQuery = {}): Promise<any[]> {
@@ -889,40 +1084,7 @@ export async function queryAudit(q: AuditQuery = {}): Promise<any[]> {
   const dec = q.allowed === undefined ? undefined : !!q.allowed;
   if (db) {
     await ensureTables();
-    const conds = [];
-    if (q.actor) conds.push(eq(schema.auditLog.actorId, q.actor));
-    if (dec !== undefined) conds.push(eq(schema.auditLog.decision, dec));
-    if (q.action) conds.push(eq(schema.auditLog.action, q.action));
-    if (q.resource) conds.push(eq(schema.auditLog.resource, q.resource));
-    if (q.from) conds.push(sql`${schema.auditLog.createdAt} >= ${q.from}`);
-    if (q.to) conds.push(sql`${schema.auditLog.createdAt} <= ${q.to}`);
-    if (q.orgId) {
-      const fallback = sql`(${schema.auditLog.context}->>'org' = ${q.orgId} OR ${schema.auditLog.context}->>'callerOrg' = ${q.orgId})`;
-      conds.push(or(eq(schema.auditLog.orgId, q.orgId), and(isNull(schema.auditLog.orgId), fallback))!);
-    }
-    const where = conds.length ? and(...conds) : undefined;
-    const rows = await db.select({
-      id: schema.auditLog.id,
-      createdAt: schema.auditLog.createdAt,
-      actorType: schema.auditLog.actorType,
-      actorId: schema.auditLog.actorId,
-      action: schema.auditLog.action,
-      resource: schema.auditLog.resource,
-      decision: schema.auditLog.decision,
-      orgId: schema.auditLog.orgId,
-      context: schema.auditLog.context,
-    }).from(schema.auditLog).where(where).orderBy(desc(schema.auditLog.createdAt)).limit(lim).offset(off);
-    return rows.map((r) => ({
-      id: r.id,
-      created_at: iso(r.createdAt),
-      actor_type: r.actorType,
-      actor_id: r.actorId,
-      action: r.action,
-      resource: r.resource,
-      decision: r.decision,
-      org_id: r.orgId,
-      context: r.context,
-    }));
+    return queryAuditOn(db, q);
   }
   const all: any[] = (((__mem as any).audit as any[]) || []).slice().reverse();
   const fromMs = q.from ? q.from.getTime() : -Infinity;
@@ -940,25 +1102,22 @@ export async function queryAudit(q: AuditQuery = {}): Promise<any[]> {
   return filtered.slice(off, off + lim);
 }
 
+/** Optional replica variant. Authorization must already have completed on
+ *  primary; this function only executes the tenant-filtered audit SELECT. */
+export async function queryAuditRead(q: AuditQuery = {}): Promise<any[]> {
+  return withAuditReadReplica(
+    'query',
+    (database) => queryAuditOn(database, q),
+    () => queryAudit(q),
+  );
+}
+
 /** Count rows matching the same filters as queryAudit (paged management UI). */
 export async function countAudit(q: AuditQuery = {}): Promise<number> {
   const dec = q.allowed === undefined ? undefined : !!q.allowed;
   if (db) {
     await ensureTables();
-    const conds = [];
-    if (q.actor) conds.push(eq(schema.auditLog.actorId, q.actor));
-    if (dec !== undefined) conds.push(eq(schema.auditLog.decision, dec));
-    if (q.action) conds.push(eq(schema.auditLog.action, q.action));
-    if (q.resource) conds.push(eq(schema.auditLog.resource, q.resource));
-    if (q.from) conds.push(sql`${schema.auditLog.createdAt} >= ${q.from}`);
-    if (q.to) conds.push(sql`${schema.auditLog.createdAt} <= ${q.to}`);
-    if (q.orgId) {
-      const fallback = sql`(${schema.auditLog.context}->>'org' = ${q.orgId} OR ${schema.auditLog.context}->>'callerOrg' = ${q.orgId})`;
-      conds.push(or(eq(schema.auditLog.orgId, q.orgId), and(isNull(schema.auditLog.orgId), fallback))!);
-    }
-    const where = conds.length ? and(...conds) : undefined;
-    const rows = await db.select({ n: sql<number>`count(*)::int` }).from(schema.auditLog).where(where);
-    return Number(rows[0]?.n) || 0;
+    return countAuditOn(db, q);
   }
   const all: any[] = (((__mem as any).audit as any[]) || []);
   const fromMs = q.from ? q.from.getTime() : -Infinity;
@@ -973,6 +1132,16 @@ export async function countAudit(q: AuditQuery = {}): Promise<number> {
       && at >= fromMs
       && at <= toMs;
   }).length;
+}
+
+/** Optional replica count with the same fail-open-to-primary behavior as
+ *  queryAuditRead. It shares the exact primary predicate builder. */
+export async function countAuditRead(q: AuditQuery = {}): Promise<number> {
+  return withAuditReadReplica(
+    'count',
+    (database) => countAuditOn(database, q),
+    () => countAudit(q),
+  );
 }
 
 export async function listAudit(limit = 50, actorId?: string, allowed?: boolean, orgId?: string): Promise<any[]> {

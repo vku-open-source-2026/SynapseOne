@@ -28,6 +28,7 @@
 | [sdk-js.md](sdk-js.md) | JavaScript/TypeScript SDK — install, auth, full API reference |
 | [sdk-python.md](sdk-python.md) | Python SDK — install, auth, full API reference |
 | [sdk-go.md](sdk-go.md) | Go SDK — install, auth, full API reference |
+| [sdk-0.10.1.md](sdk-0.10.1.md) | SDK 0.10.1 packages, release tags and audit consistency |
 | [cli.md](cli.md) | CLI — install, configuration, all commands |
 | [adr/](adr/) | Architecture decisions (Lakehouse, search, runtime parity, workflow security) |
 | [production-readiness.md](production-readiness.md) | Current verification matrix, release blockers and operator prerequisites |

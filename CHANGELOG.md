@@ -5,6 +5,16 @@ Format based on Keep a Changelog; versioning follows SemVer.
 
 ## [Unreleased]
 
+### Added
+- **IAM audit read replica:** optional `DATABASE_READ_URL` routes only
+  tenant/platform audit list and count SELECTs to a read-only PostgreSQL hot
+  standby after primary-side authorization. Reads use short timeouts and
+  automatically fall back to primary; auth, quotas, writes, exports and
+  mutations remain primary-only.
+- **SDK 0.10.1 release channel:** `sdk-v*` tags publish the JavaScript and Python
+  SDK release assets/packages without building platform container images;
+  `sdk-rust-v*` continues to publish the Rust crate.
+
 ### Security
 - **Workflow approval checkpoints:** a paused execution now stores the exact
   engine-created `pause_task_id`/`pause_node`; API-created or legacy tasks can no
