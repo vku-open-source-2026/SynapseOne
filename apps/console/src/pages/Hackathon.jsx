@@ -11,7 +11,7 @@ import { PRIMARY_BTN, SECONDARY_BTN } from '../components/public-styles.js';
 import { api } from '../lib/api.js';
 import './hackathon.css';
 
-const CLOSE_AT = new Date('2026-11-28T10:00:00.000Z'); // 17:00 GMT+7
+const CLOSE_AT = new Date('2026-11-28T17:00:00.000Z'); // 00:00 GMT+7 on 29/11/2026
 const API_KEY_AT = new Date('2026-11-29T05:00:00.000Z'); // 12:00 GMT+7
 const PITCH_AT = new Date('2026-12-03T12:00:00.000Z'); // 19:00 GMT+7
 

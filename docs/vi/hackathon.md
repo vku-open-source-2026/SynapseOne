@@ -96,13 +96,13 @@ trạng thái/thời điểm gửi, không lưu API key plaintext.
 
 | Biến | Mặc định | Mục đích |
 |---|---|---|
-| `HACKATHON_REGISTRATION_CLOSE_AT` | `2026-11-28T10:00:00.000Z` | Hạn đóng đơn phía server; ISO timestamp. |
+| `HACKATHON_REGISTRATION_CLOSE_AT` | `2026-11-28T17:00:00.000Z` | Hạn đóng đơn phía server; ISO timestamp. |
 | `HACKATHON_MAX_REGISTRATIONS` | `500` | Số đội tối đa. |
 | `HACKATHON_REGISTRATION_RATE_LIMIT` | `5` | Số đơn công khai mỗi IP/window. |
 | `HACKATHON_REGISTRATION_RATE_WINDOW_MS` | `900000` | Cửa sổ giới hạn (15 phút). |
 
-Hạn mặc định tương ứng 17:00 giờ Việt Nam. Khi đổi ngày sự kiện, phải đồng bộ lịch
-trên trang công khai và biến server.
+Hạn mặc định tương ứng 00:00 ngày 29/11/2026 giờ Việt Nam. Khi đổi ngày sự kiện,
+phải đồng bộ lịch trên trang công khai và biến server.
 
 ## Quyền riêng tư và bảo mật
 

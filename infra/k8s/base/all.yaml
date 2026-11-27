@@ -63,7 +63,7 @@ spec:
             - { name: PLATFORM_ORG_SLUG, value: "synapseone-platform" }
             - { name: PLATFORM_BOOTSTRAP_SECRET, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: platform-bootstrap-secret, optional: true } } }
             - { name: PLATFORM_RECOVERY_SECRET, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: platform-recovery-secret, optional: true } } }
-            - { name: HACKATHON_REGISTRATION_CLOSE_AT, value: "2026-11-28T10:00:00.000Z" }
+            - { name: HACKATHON_REGISTRATION_CLOSE_AT, value: "2026-11-28T17:00:00.000Z" }
             - { name: HACKATHON_MAX_REGISTRATIONS, value: "500" }
             - { name: HACKATHON_REGISTRATION_RATE_LIMIT, value: "5" }
             - { name: HACKATHON_REGISTRATION_RATE_WINDOW_MS, value: "900000" }
