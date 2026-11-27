@@ -83,7 +83,9 @@ Never move or reuse these tags after publication; ship fixes as `0.10.3`.
 
 ## Compatibility notes
 
-No `0.10.x` method or response field is removed. Go consumers must update their
-import path to the public monorepo module above. IAM audit reads remain
-eventually consistent when a deployment enables `DATABASE_READ_URL`, as described
-in [sdk-0.10.1.md](sdk-0.10.1.md).
+No runtime method or response field is removed. The JavaScript/TypeScript legacy
+flat alias surface is narrowed to wrappers that actually exist at runtime; use
+the namespaced API for newer methods. Go consumers must update their import path
+to the public monorepo module above. IAM audit reads remain eventually
+consistent when a deployment enables `DATABASE_READ_URL`, as described in
+[sdk-0.10.1.md](sdk-0.10.1.md).
