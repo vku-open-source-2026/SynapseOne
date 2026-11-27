@@ -66,7 +66,7 @@ const AdminUsage = React.lazy(() => import('./pages/admin/Usage.jsx'));
 const AdminAudit = React.lazy(() => import('./pages/admin/Audit.jsx'));
 const AdminPlatformAdmins = React.lazy(() => import('./pages/admin/PlatformAdmins.jsx'));
 const AdminRunners = React.lazy(() => import('./pages/admin/Runners.jsx'));
-const AdminHackathon = React.lazy(() => import('./pages/admin/Hackathon.jsx'));
+const AdminHackathon = React.lazy(() => import('./pages/admin/AdminHackathon.jsx'));
 
 import { appLoginUrl, isCanonicalAppHost } from './lib/site.js';
 import { LanguageProvider } from './lib/i18n.jsx';
