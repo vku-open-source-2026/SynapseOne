@@ -15,7 +15,8 @@ pip install synapseone-sdk
 ```python
 from synapseone_sdk import SynapseOneClient
 
-c = SynapseOneClient()  # defaults to https://api.synapseone.space (or $SYNAPSEONE_BASE_URL)
+# Defaults to https://api.synapseone.space (or $SYNAPSEONE_BASE_URL).
+c = SynapseOneClient()
 login = c.iam.login("demo@acme.local")
 c.set_token(login["accessToken"])
 
