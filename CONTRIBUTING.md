@@ -15,7 +15,8 @@ Thanks for considering contributing. synapseone follows standard open-source pra
 5. New dependencies must be permissively licensed (MIT/ISC/Apache-2.0/BSD) — the
    fail-closed gate (`tools/license-check.cjs`) covers npm, Cargo, Python and
    first-party images and rejects copyleft/unknown licenses except the two
-   reviewed MPL-2.0 Python exceptions documented in `THIRD-PARTY.md`.
+   reviewed MPL-2.0 Python exceptions documented in `THIRD-PARTY.md`. Point
+   `PYTHON` at a clean service venv; the host Python may include OS packages.
 5. Open PR against `main` with: what/why, how tested, docs updated if API changed.
 
 ## Dev loop

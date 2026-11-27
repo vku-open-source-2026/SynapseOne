@@ -212,18 +212,20 @@ by service migrations/startup; do not put business tables in `init.sql`.
   Public docs and these agent notes are English.
 - **Commits:** Conventional Commits (`feat(iam): …`, `fix(gateway): …`,
   `docs: …`, `chore: …`). Keep PRs scoped; behavior changes need tests.
-- **Dependencies:** permissive licenses only (MIT/ISC/Apache-2.0/BSD). CI fails
-  closed on copyleft and unknown/missing licenses across npm, Cargo, Python and
-  first-party images. Regenerate `licenses/` with `make license-check` when
-  dependencies change; commit the SBOM/inventory/notice snapshot.
+- **Dependencies:** permissive licenses only (MIT/ISC/Apache-2.0/BSD). The
+  local gate fails closed on copyleft and unknown/missing licenses across npm,
+  Cargo, Python and first-party images. Run it against a clean service venv
+  (`make license-check PYTHON=/path/to/venv/bin/python`) and commit the
+  regenerated `licenses/` snapshot when dependencies change. CI wiring for this
+  gate and `tools/k8s-manifest-check.cjs` is staged but awaits approval to
+  change `.github/workflows/`.
 
 ## 7. CI and release
 
 `.github/workflows/ci.yml` (all branches except `main`, plus PRs and reusable
 gate):
 - build/test all workspaces, catalog drift check, `npm audit` (critical only),
-  K8s manifest gate, license gate + SBOM after every Python environment is
-  installed, Go vet/test, Python pytest + Ruff, `docker compose config`;
+  Go vet/test, Python pytest + Ruff, `docker compose config`;
 - Docker build job;
 - Compose e2e: core stack, `/ready`, auth smoke, `api-check.sh`, Python/JS SDK
   checks, services check, workflow showcase.
