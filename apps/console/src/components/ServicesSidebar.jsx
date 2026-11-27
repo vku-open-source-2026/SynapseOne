@@ -8,6 +8,7 @@ import React, { useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import {
+  faCode,
   faMagnifyingGlass,
   faXmark,
 } from '@fortawesome/free-solid-svg-icons';

@@ -22,6 +22,7 @@ import { OrganizationTable } from './pages/Orgs.jsx';
 import { keyStatus as apiKeyStatus, quotaFieldSource, organizationDetailKey } from './pages/admin/OrganizationDetail.jsx';
 import { DOC_TABS, SERVICE_CATALOG } from './lib/service-catalog.js';
 import { MobileServiceLinks } from './components/Topbar.jsx';
+import ServicesSidebar from './components/ServicesSidebar.jsx';
 import { en } from './locales/en.js';
 import { vi } from './locales/vi.js';
 
@@ -204,6 +205,17 @@ for (const [lang, dict] of [['en', en], ['vi', vi]] as const) {
       if (!html.includes(`href="${service.consoleRoute}"`)) throw new Error(`missing mobile link ${service.id}`);
     }
     console.log(`ok [mobile-services-${lang}] ${links} links`);
+    const sidebarHtml = renderToString(
+      <MemoryRouter>
+        <LanguageProvider>
+          <ServicesSidebar open />
+        </LanguageProvider>
+      </MemoryRouter>,
+    );
+    if (!sidebarHtml.includes('href="/api-docs"') || !sidebarHtml.includes('API')) {
+      throw new Error('services sidebar API link did not render');
+    }
+    console.log(`ok [services-sidebar-${lang}] API link renders`);
   } catch (e: any) {
     failures++;
     console.error(`FAIL [mobile-services-${lang}]: ${e?.message || e}`);
