@@ -1392,19 +1392,17 @@ func (c *Client) Call(method, path string, body any) (any, error) {
 	return out, nil
 }
 
-// ---------- IAM account credentials (account-scoped secrets) ----------
+// ---------- workflow credentials (account-scoped secrets) ----------
 //
-// Secrets are encrypted at rest and NEVER returned — create accepts a secret
-// once; list returns metadata only: {id, name, type, accountId, expiresAt, version}.
-// credType is one of bearer|basic|apiKey|oauth2 (passed through, not validated
-// client-side, so future types keep working).
+// Secrets are encrypted at rest and NEVER returned. Metadata is
+// {id, accountId, name, kind, createdAt, updatedAt}; expiry/version are not part
+// of this contract.
 
-// CreateCredential stores an account credential (secret is write-only, never returned).
+// CreateCredential is the legacy account-route alias. expiresAt is retained for
+// source compatibility and ignored; use CreateWorkflowCredential for new code.
 func (c *Client) CreateCredential(accountID, name, credType, secret, expiresAt string) (map[string]any, error) {
+	_ = expiresAt
 	body := map[string]any{"name": name, "type": credType, "secret": secret}
-	if expiresAt != "" {
-		body["expiresAt"] = expiresAt
-	}
 	b, err := c.do("POST", "/v1/accounts/"+pathEscape(accountID)+"/credentials", body)
 	if err != nil {
 		return nil, err
@@ -1416,11 +1414,17 @@ func (c *Client) CreateCredential(accountID, name, credType, secret, expiresAt s
 	return out, nil
 }
 
-// ListCredentials lists credential metadata for an account (never secret values).
+// ListCredentials is the legacy account-route alias for workflow credentials.
 func (c *Client) ListCredentials(accountID string) ([]any, error) {
 	b, err := c.do("GET", "/v1/accounts/"+pathEscape(accountID)+"/credentials", nil)
 	if err != nil {
 		return nil, err
+	}
+	var env struct {
+		Data []any `json:"data"`
+	}
+	if err := unmarshal(b, &env); err == nil && env.Data != nil {
+		return env.Data, nil
 	}
 	var out []any
 	if err := unmarshal(b, &out); err != nil {

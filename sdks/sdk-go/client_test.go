@@ -450,10 +450,13 @@ func TestCredentials(t *testing.T) {
 	if err := json.Unmarshal([]byte(seen["body"]), &body); err != nil {
 		t.Fatalf("create body: %v", err)
 	}
-	for _, k := range []string{"name", "type", "secret", "expiresAt"} {
+	for _, k := range []string{"name", "type", "secret"} {
 		if _, ok := body[k]; !ok {
 			t.Fatalf("create body missing %q: %v", k, body)
 		}
+	}
+	if _, ok := body["expiresAt"]; ok {
+		t.Fatalf("workflow credentials must not send expiry: %v", body)
 	}
 	if _, err := c.ListCredentials("a1"); err != nil {
 		t.Fatal(err)
@@ -491,6 +494,22 @@ func TestCredentials(t *testing.T) {
 	}
 	if seen["path"] != "/v1/credentials?accountId=a1" || seen["method"] != "GET" {
 		t.Fatalf("list workflow cred: %v", seen)
+	}
+}
+
+func TestListCredentialsReadsEnvelope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"c1","kind":"bearer"}]}`))
+	}))
+	defer srv.Close()
+
+	items, err := New(srv.URL).ListCredentials("a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].(map[string]any)["id"] != "c1" {
+		t.Fatalf("envelope not decoded: %#v", items)
 	}
 }
 

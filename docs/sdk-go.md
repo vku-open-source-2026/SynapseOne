@@ -393,33 +393,6 @@ result, err := c.ServiceAccountToken(saID, []string{"workflow:Execute"})
 token := result["accessToken"].(string)
 ```
 
-### IAM account credentials (implemented)
-
-These use `/v1/accounts/:accountId/credentials`, support `expiresAt`, and are
-separate from the workflow-node credential vault. Secrets are write-only;
-metadata is `{id, name, type, accountId, expiresAt, version}`. Types include
-`bearer`|`basic`|`apiKey`|`oauth2`.
-
-```go
-// Copy-paste: store an account credential, then list metadata.
-cred, err := c.CreateCredential(accountID, "stripe-live", "bearer", os.Getenv("STRIPE_TOKEN"), "2027-01-01T00:00:00Z")
-if err != nil { log.Fatal(err) }
-fmt.Println(cred["id"], cred["version"]) // secret is NOT in the response
-all, err := c.ListCredentials(accountID)
-if err != nil { log.Fatal(err) }
-```
-
-#### `CreateCredential(accountID, name, credType, secret, expiresAt string) (map[string]any, error)`
-```go
-func (c *Client) CreateCredential(accountID, name, credType, secret, expiresAt string) (map[string]any, error)
-```
-`expiresAt` is an ISO timestamp; pass `""` for no expiry.
-
-#### `ListCredentials(accountID string) ([]any, error)`
-```go
-func (c *Client) ListCredentials(accountID string) ([]any, error)
-```
-
 ### Workflow credentials (implemented)
 
 Workflow-node credentials use `/v1/credentials`; kinds are
@@ -447,6 +420,15 @@ func (c *Client) DeleteCredential(id string) error
 func (c *Client) RotateCredential(id, secret string) (map[string]any, error)
 ```
 `RotateCredential` replaces the secret immediately (the old secret stops working).
+
+#### Legacy account-route aliases
+```go
+func (c *Client) CreateCredential(accountID, name, credType, secret, expiresAt string) (map[string]any, error)
+func (c *Client) ListCredentials(accountID string) ([]any, error)
+```
+These call the workflow-service aliases under `/v1/accounts/:accountId/credentials`.
+`expiresAt` is retained for source compatibility and ignored because workflow
+credentials do not support expiry.
 
 ### Generic Call (escape hatch)
 
