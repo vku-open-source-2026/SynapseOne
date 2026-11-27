@@ -186,13 +186,17 @@ describe('exec-delegated grants', () => {
       '/v1/service-accounts',
       '/v1/roles',
       '/v1/policies',
-      '/v1/runner/jobs/exec-1/claim',
       '/v1/workflow-runners',
     ]) {
       const out = await call('GET', target);
       assert.equal(out.status, 403, target);
       assert.equal(out.body.error, 'execution_scope_forbidden', target);
     }
+    // Runner job protocol is API-key-only. A delegated user JWT is rejected at
+    // authentication (401), before delegation policy or upstream traffic.
+    const runner = await call('GET', '/v1/runner/jobs/exec-1/claim');
+    assert.equal(runner.status, 401, '/v1/runner/jobs/exec-1/claim');
+    assert.equal(runner.body.error, 'missing_api_key');
     assert.equal(upstreamHits, 0);
     assert.equal(verifyCalls, 0, 'denied paths do not need a grant check');
   });
