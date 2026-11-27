@@ -165,11 +165,22 @@ async def call_chat_completion(
     raise last_error or LlmError(500, "Unknown LLM upstream failure")
 
 
+def _stream_error_frame(message: str, code: int) -> str:
+    return f"data: {json.dumps({'error': {'message': message, 'code': code}})}\n\n"
+
+
 async def stream_chat_completion(
     req: ChatCompletionRequest,
     cfg: Optional[Settings] = None,
 ) -> AsyncGenerator[str, None]:
-    """Stream chat completion tokens, falling back before the first token."""
+    """Stream chat completion tokens, falling back only before the first byte.
+
+    Once any upstream line has been forwarded, the client has already received
+    a partial response and switching models would concatenate two different
+    outputs into one answer (audit F18). In that case the stream is terminated
+    with an explicit error event instead. A fallback is only attempted when the
+    primary failed before emitting anything.
+    """
     config = cfg or settings
     if not config.OPENROUTER_API_KEY:
         error_chunk = {
@@ -186,9 +197,13 @@ async def stream_chat_completion(
     url = f"{config.OPENROUTER_BASE_URL}/chat/completions"
     timeout_seconds = config.OPENROUTER_TIMEOUT_MS / 1000.0
     last_error: Optional[Dict[str, Any]] = None
+    emitted = False
+    saw_done = False
+    finished = False
 
     async with httpx.AsyncClient(timeout=timeout_seconds) as client:
         for target_model in _model_candidates(req, config):
+            saw_done = False
             try:
                 async with client.stream(
                     "POST",
@@ -206,6 +221,7 @@ async def stream_chat_completion(
                         }
                         if _should_try_fallback(response.status_code):
                             continue
+                        finished = True
                         yield f"data: {json.dumps({'error': last_error})}\n\n"
                         yield "data: [DONE]\n\n"
                         return
@@ -213,17 +229,59 @@ async def stream_chat_completion(
                     async for line in response.aiter_lines():
                         if not line:
                             continue
-                        if line.startswith("data:"):
-                            yield f"{line}\n\n"
-                        else:
-                            yield f"data: {line}\n\n"
+                        payload = (
+                            line[5:].strip()
+                            if line.startswith("data:")
+                            else line.strip()
+                        )
+                        frame = (
+                            f"{line}\n\n"
+                            if line.startswith("data:")
+                            else f"data: {line}\n\n"
+                        )
+                        if payload == "[DONE]":
+                            saw_done = True
+                            finished = True
+                        emitted = True
+                        yield frame
+                        if saw_done:
+                            return
+                    if not saw_done:
+                        # A clean EOF without the protocol terminator is a
+                        # truncated stream, not a completed response.
+                        message = (
+                            f"Streaming response ended before [DONE] for {target_model}"
+                        )
+                        if not emitted:
+                            last_error = {"message": message, "code": 502}
+                            continue
+                        finished = True
+                        yield _stream_error_frame(message, 502)
+                        yield "data: [DONE]\n\n"
+                        return
                     return
-            except Exception as exc:  # noqa: BLE001 - try the fallback model
+            except Exception as exc:  # noqa: BLE001 - only pre-output retries
+                if finished or saw_done:
+                    # The response already ended; a teardown error must not
+                    # append a second event to it.
+                    return
+                if emitted:
+                    # Never concatenate fallback output after partial primary
+                    # output. Tell the client the stream failed instead.
+                    finished = True
+                    yield _stream_error_frame(
+                        f"Streaming failed after partial output for {target_model}: {exc}",
+                        502,
+                    )
+                    yield "data: [DONE]\n\n"
+                    return
                 last_error = {
                     "message": f"Streaming failed for {target_model}: {exc}",
                     "code": 500,
                 }
                 continue
 
-    yield f"data: {json.dumps({'error': last_error or {'message': 'Streaming failed', 'code': 500}})}\n\n"
+    if last_error is None:
+        last_error = {"message": "Streaming failed", "code": 500}
+    yield f"data: {json.dumps({'error': last_error})}\n\n"
     yield "data: [DONE]\n\n"

@@ -353,22 +353,19 @@ async fn process_pending_once(state: &AppState, limit: i64) -> Result<(usize, us
             .store
             .get_preference(&notification.tenant, &recipient_key(&notification.recipient))
             .await?;
-        if let Some(pref) = &pref {
-            if pref.unsubscribed
-                || (!pref.channels.is_empty() && !pref.channels.contains(&notification.channel))
-            {
-                state
-                    .store
-                    .update(
-                        &notification.id,
-                        Some("cancelled"),
-                        None,
-                        None,
-                        Some("recipient_unsubscribed"),
-                    )
-                    .await?;
-                continue;
-            }
+        let consent = delivery::consent_decision(pref.as_ref(), &notification.channel);
+        if !consent.is_allowed() {
+            state
+                .store
+                .update(
+                    &notification.id,
+                    Some("cancelled"),
+                    None,
+                    None,
+                    Some(consent.reason()),
+                )
+                .await?;
+            continue;
         }
         let result = delivery::deliver(notification).await;
         let mut attempts = notification
@@ -586,7 +583,11 @@ async fn consume_from_queue(state: &AppState, consumer: &str) {
                 continue;
             }
         };
-        if pref.as_ref().is_some_and(|p| p.unsubscribed) {
+        // Re-evaluate consent against the current preference row at delivery
+        // time, not the enqueue-time snapshot. This honours unsubscribes and
+        // channel opt-outs that arrive while the job sits in the queue.
+        let consent = delivery::consent_decision(pref.as_ref(), &notification.channel);
+        if !consent.is_allowed() {
             if let Err(error) = state
                 .store
                 .update(
@@ -594,12 +595,12 @@ async fn consume_from_queue(state: &AppState, consumer: &str) {
                     Some("cancelled"),
                     None,
                     None,
-                    Some("recipient_unsubscribed"),
+                    Some(consent.reason()),
                 )
                 .await
             {
                 tracing::warn!(
-                    "[notifications] cancel of unsubscribed {} failed: {error}",
+                    "[notifications] cancel of opted-out {} failed: {error}",
                     notification.id
                 );
                 nack_requeue(
@@ -1393,18 +1394,7 @@ async fn unsubscribe(
     if recipient.is_empty() {
         return json_error(StatusCode::BAD_REQUEST, "recipient_required", None);
     }
-    let prev = state
-        .store
-        .get_preference(&tenant, &recipient)
-        .await
-        .ok()
-        .flatten();
-    let channels = prev.map(|p| p.channels).unwrap_or_default();
-    match state
-        .store
-        .set_preference(&tenant, &recipient, channels, true)
-        .await
-    {
+    match state.store.unsubscribe(&tenant, &recipient).await {
         Ok(pref) => Json(pref).into_response(),
         Err(error) => {
             tracing::error!("[notifications] unsubscribe failed: {error}");
@@ -2040,6 +2030,145 @@ mod tests {
             row.attempts, json!([]),
             "a preference-store error must never be treated as 'subscribed'"
         );
+    }
+
+    #[tokio::test]
+    async fn local_worker_enforces_channel_consent() {
+        let state = test_state().await;
+        let created = seed(&state.store, "org:qa", "channel opt-out").await;
+        state
+            .store
+            .set_preference("org:qa", "user:u1", vec!["email".into()], false)
+            .await
+            .unwrap();
+        let (claimed, delivered, failed) = process_pending_once(&state, 10).await.unwrap();
+        assert_eq!((claimed, delivered, failed), (1, 0, 0));
+        let row = state
+            .store
+            .get("org:qa", &created.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "cancelled");
+        assert_eq!(
+            row.dead_reason.as_deref(),
+            Some("recipient_channel_opted_out")
+        );
+        assert_eq!(row.attempts, json!([]), "no delivery attempt was made");
+    }
+
+    #[tokio::test]
+    async fn local_worker_fails_closed_on_preference_store_error() {
+        let state = test_state().await;
+        let created = seed(&state.store, "org:qa", "consent read error").await;
+        state.store.simulate_failure("get_preference").await;
+        assert!(process_pending_once(&state, 10).await.is_err());
+        let row = state
+            .store
+            .get("org:qa", &created.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "sending");
+        assert_eq!(row.attempts, json!([]), "nothing was delivered");
+    }
+
+    #[tokio::test]
+    async fn queue_worker_enforces_channel_consent() {
+        let store = Store::connect(None).await.expect("memory store");
+        let created = seed(&store, "org:qa", "queue channel opt-out").await;
+        store
+            .set_preference("org:qa", "user:u1", vec!["email".into()], false)
+            .await
+            .unwrap();
+        let (queue, url) =
+            spawn_fake_queue(vec![queue_message(&created.id, "org:qa", "r-channel")]).await;
+        let state = queue_state(store.clone(), url, 120).await;
+        consume_from_queue(&state, "qa-consumer").await;
+        assert!(queue.nacks.lock().await.is_empty());
+        assert_eq!(queue.acks.lock().await.len(), 1);
+        let row = store.get("org:qa", &created.id).await.unwrap().unwrap();
+        assert_eq!(row.status, "cancelled");
+        assert_eq!(
+            row.dead_reason.as_deref(),
+            Some("recipient_channel_opted_out")
+        );
+        assert_eq!(row.attempts, json!([]), "no delivery attempt was made");
+    }
+
+    #[tokio::test]
+    async fn queue_worker_delivers_when_channels_are_empty() {
+        let store = Store::connect(None).await.expect("memory store");
+        let created = seed(&store, "org:qa", "all channels allowed").await;
+        store
+            .set_preference("org:qa", "user:u1", vec![], false)
+            .await
+            .unwrap();
+        let (queue, url) =
+            spawn_fake_queue(vec![queue_message(&created.id, "org:qa", "r-all")]).await;
+        let state = queue_state(store.clone(), url, 120).await;
+        consume_from_queue(&state, "qa-consumer").await;
+        assert!(queue.nacks.lock().await.is_empty());
+        assert_eq!(queue.acks.lock().await.len(), 1);
+        let row = store.get("org:qa", &created.id).await.unwrap().unwrap();
+        assert_eq!(row.status, "delivered");
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_after_enqueue_is_honoured_by_queue_delivery() {
+        let store = Store::connect(None).await.expect("memory store");
+        let created = seed(&store, "org:qa", "unsubscribed while queued").await;
+        // Enqueue-time consent allowed the row; the recipient opts out while
+        // the message is still in the queue.
+        store
+            .set_preference("org:qa", "user:u1", vec!["log".into()], false)
+            .await
+            .unwrap();
+        store
+            .unsubscribe("org:qa", "user:u1")
+            .await
+            .expect("atomic unsubscribe");
+        let (queue, url) =
+            spawn_fake_queue(vec![queue_message(&created.id, "org:qa", "r-race")]).await;
+        let state = queue_state(store.clone(), url, 120).await;
+        consume_from_queue(&state, "qa-consumer").await;
+        assert!(queue.nacks.lock().await.is_empty());
+        assert_eq!(queue.acks.lock().await.len(), 1);
+        let row = store.get("org:qa", &created.id).await.unwrap().unwrap();
+        assert_eq!(row.status, "cancelled");
+        assert_eq!(row.dead_reason.as_deref(), Some("recipient_unsubscribed"));
+        assert_eq!(row.attempts, json!([]));
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_is_atomic_and_preserves_concurrent_channel_updates() {
+        let store = Store::connect(None).await.expect("memory store");
+        store
+            .set_preference("org:qa", "user:u1", vec!["email".into()], false)
+            .await
+            .unwrap();
+        // Model the interleaving the old read-modify-write path lost: a
+        // channel update lands after the old read but before the opt-out.
+        let stale = store
+            .get_preference("org:qa", "user:u1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale.channels, vec!["email"]);
+        store
+            .set_preference("org:qa", "user:u1", vec!["sms".into()], false)
+            .await
+            .unwrap();
+        let out = store.unsubscribe("org:qa", "user:u1").await.unwrap();
+        assert!(out.unsubscribed);
+        assert_eq!(out.channels, vec!["sms"]);
+        let latest = store
+            .get_preference("org:qa", "user:u1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(latest.unsubscribed);
+        assert_eq!(latest.channels, vec!["sms"]);
     }
 
     #[tokio::test]

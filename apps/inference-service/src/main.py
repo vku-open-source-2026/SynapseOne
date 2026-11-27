@@ -17,6 +17,7 @@ from .decision import DecisionRequest, RouteRequest, decision_engine
 from .embedding import (
     EmbeddingModelError,
     EmbeddingRequest,
+    EmbeddingRequestError,
     embedding_engine,
 )
 from .llm import (
@@ -228,8 +229,19 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 async def create_embeddings(req: EmbeddingRequest):
     """OpenAI-compatible embeddings endpoint using self-hosted lightweight embedding model."""
     try:
-        resp = embedding_engine.embed(inputs=req.input, model_override=req.model)
+        resp = embedding_engine.embed(
+            inputs=req.input,
+            dimensions=req.dimensions,
+            model=req.model,
+        )
         return resp.model_dump()
+    except EmbeddingRequestError as e:
+        # Caller-selected model/dimension combinations we cannot serve are
+        # rejected instead of producing mislabeled vectors (audit F20).
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"error": e.code, "message": e.message},
+        )
     except EmbeddingModelError as e:
         # Fail closed: a broken real model never answers with deterministic
         # mock vectors under the real model name (#98).

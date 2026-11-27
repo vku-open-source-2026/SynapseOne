@@ -54,6 +54,18 @@ class EmbeddingModelError(Exception):
         self.code = code
 
 
+class EmbeddingRequestError(ValueError):
+    """A caller asked for a model/dimension combination we cannot serve.
+
+    This is a client error (HTTP 400), distinct from a degraded backend.
+    """
+
+    def __init__(self, message: str, code: str = "invalid_embedding_request"):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+
 class EmbeddingEngine:
     """Self-hosted lightweight embedding service (default: sentence-transformers/all-MiniLM-L6-v2).
 
@@ -211,13 +223,38 @@ class EmbeddingEngine:
         raise RuntimeError(f"no embedding backend loaded (backend={self._backend})")
 
     def embed(
-        self, inputs: Union[str, List[str]], model_override: Optional[str] = None
+        self,
+        inputs: Union[str, List[str]],
+        dimensions: Optional[int] = None,
+        model: Optional[str] = None,
     ) -> EmbeddingResponse:
+        """Embed text with the model this service actually loaded.
+
+        ``model`` is a caller assertion, not an override: an unknown name is
+        rejected instead of being echoed back as the response label (audit
+        F20). ``dimensions`` is only honoured when it matches the loaded
+        model's native width; this model is not Matryoshka-trained, so silently
+        truncating vectors would corrupt similarity scores.
+        """
+        requested_model = (
+            model.strip() if isinstance(model, str) and model.strip() else None
+        )
+        if requested_model is not None and requested_model != self.model_name:
+            raise EmbeddingRequestError(
+                f"model {requested_model!r} is not served by this endpoint; "
+                f"use {self.model_name!r}",
+                "unsupported_model",
+            )
+        if dimensions is not None and (isinstance(dimensions, bool) or dimensions <= 0):
+            raise EmbeddingRequestError(
+                "dimensions must be a positive integer",
+                "unsupported_dimensions",
+            )
+
         texts = [inputs] if isinstance(inputs, str) else inputs
         if not texts:
             texts = [""]
 
-        model_to_report = model_override or self.model_name
         target_dim = self.dimension
 
         # Explicit dev mode only: deterministic mock vectors. Without this
@@ -247,6 +284,26 @@ class EmbeddingEngine:
                 f"{self._load_error or 'model not loaded'}"
             )
 
+        actual_dim = len(vectors[0]) if vectors else self.dimension
+        if any(len(vector) != actual_dim for vector in vectors):
+            raise EmbeddingModelError(
+                "embedding backend returned inconsistent vector dimensions"
+            )
+        if dimensions is not None and dimensions != actual_dim:
+            raise EmbeddingRequestError(
+                f"unsupported dimensions {dimensions}; this endpoint returns "
+                f"{actual_dim}-dimensional vectors",
+                "unsupported_dimensions",
+            )
+        if actual_dim != self.dimension:
+            logger.warning(
+                "embedding model returned %d dimensions; EMBEDDING_DIM=%d; "
+                "reporting the actual model width",
+                actual_dim,
+                self.dimension,
+            )
+            self.dimension = actual_dim
+
         # Calculate approximate token count (~4 chars per token)
         prompt_tokens = 0
         for t in texts:
@@ -258,7 +315,9 @@ class EmbeddingEngine:
 
         return EmbeddingResponse(
             data=data,
-            model=model_to_report,
+            # Always the model that produced these vectors, never the caller's
+            # requested label.
+            model=self.model_name,
             usage=EmbeddingUsage(
                 prompt_tokens=prompt_tokens, total_tokens=prompt_tokens
             ),

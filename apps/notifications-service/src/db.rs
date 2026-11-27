@@ -874,6 +874,55 @@ impl Store {
         }
     }
 
+    /// Atomically opt a recipient out without clobbering a concurrent channel
+    /// preference update. The previous implementation read the row and then
+    /// rewrote it, so a parallel `set_preference` could resurrect the
+    /// subscription or lose a channel list (audit F13).
+    pub async fn unsubscribe(
+        &self,
+        tenant: &str,
+        recipient: &str,
+    ) -> Result<PreferenceRecord, String> {
+        let updated_at = iso(Utc::now());
+        match &self.backend {
+            Backend::Postgres(pool) => {
+                let row = sqlx::query(
+                    r#"
+                    INSERT INTO notification_preferences (tenant, recipient, channels, unsubscribed, updated_at)
+                    VALUES ($1,$2,'[]'::jsonb,true,now())
+                    ON CONFLICT (tenant, recipient) DO UPDATE
+                      SET unsubscribed=true, updated_at=now()
+                    RETURNING *
+                    "#,
+                )
+                .bind(tenant)
+                .bind(recipient)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| format!("unsubscribe: {e}"))?;
+                row_to_preference(&row)
+            }
+            Backend::Memory(memory) => {
+                let mut mem = memory.lock().await;
+                let key = format!("{tenant}\u{0}{recipient}");
+                if let Some(existing) = mem.preferences.get_mut(&key) {
+                    existing.unsubscribed = true;
+                    existing.updated_at = updated_at.clone();
+                    return Ok(existing.clone());
+                }
+                let record = PreferenceRecord {
+                    tenant: tenant.to_string(),
+                    recipient: recipient.to_string(),
+                    channels: Vec::new(),
+                    unsubscribed: true,
+                    updated_at,
+                };
+                mem.preferences.insert(key, record.clone());
+                Ok(record)
+            }
+        }
+    }
+
     pub async fn create_template(&self, input: NewTemplate) -> Result<TemplateRecord, String> {
         let now = iso(Utc::now());
         let record = TemplateRecord {

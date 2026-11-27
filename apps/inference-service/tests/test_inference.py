@@ -161,6 +161,60 @@ def test_embeddings_fail_closed_on_runtime_encode_failure(monkeypatch):
     assert "embedding inference failed" in body["message"]
 
 
+def test_embeddings_honours_native_dimensions_and_reports_actual_model(monkeypatch):
+    monkeypatch.setattr(settings, "INFERENCE_MOCK_MODELS", True)
+    native = embedding_engine.dimension
+    res = client.post(
+        "/v1/embeddings",
+        json={"input": "dimensions", "dimensions": native},
+        headers=auth_headers(),
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert len(body["data"][0]["embedding"]) == native
+    assert body["model"] == embedding_engine.model_name
+
+
+def test_embeddings_rejects_unsupported_dimensions(monkeypatch):
+    monkeypatch.setattr(settings, "INFERENCE_MOCK_MODELS", True)
+    native = embedding_engine.dimension
+    for requested in (native + 1, max(1, native // 2), 0, -1):
+        res = client.post(
+            "/v1/embeddings",
+            json={"input": "dimensions", "dimensions": requested},
+            headers=auth_headers(),
+        )
+        assert res.status_code == 400, requested
+        assert res.json()["error"] == "unsupported_dimensions"
+        assert "data" not in res.json()
+
+
+def test_embeddings_rejects_caller_selected_model(monkeypatch):
+    monkeypatch.setattr(settings, "INFERENCE_MOCK_MODELS", True)
+    res = client.post(
+        "/v1/embeddings",
+        json={"input": "model", "model": "caller-selected-model"},
+        headers=auth_headers(),
+    )
+    assert res.status_code == 400
+    body = res.json()
+    assert body["error"] == "unsupported_model"
+    assert embedding_engine.model_name in body["message"]
+    assert "caller-selected-model" in body["message"]
+    assert "data" not in body
+
+
+def test_embeddings_accepts_the_actual_model_name(monkeypatch):
+    monkeypatch.setattr(settings, "INFERENCE_MOCK_MODELS", True)
+    res = client.post(
+        "/v1/embeddings",
+        json={"input": "model", "model": embedding_engine.model_name},
+        headers=auth_headers(),
+    )
+    assert res.status_code == 200
+    assert res.json()["model"] == embedding_engine.model_name
+
+
 def test_embeddings_explicit_mock_mode_still_serves(monkeypatch):
     # INFERENCE_MOCK_MODELS is the documented dev opt-in: mock vectors are
     # served, and only then.
@@ -303,6 +357,172 @@ def test_chat_completions_stream_sse():
                 text = "".join(res.iter_text())
     assert 'data: {"choices":[{"delta":{"content":"Hel"}}]}' in text
     assert text.strip().endswith("data: [DONE]")
+
+
+class _FakeStreamResponse:
+    def __init__(self, status_code=200, lines=None, error=None, body=b""):
+        self.status_code = status_code
+        self._lines = list(lines or [])
+        self._error = error
+        self._body = body
+
+    async def aread(self):
+        return self._body
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+        if self._error is not None:
+            raise self._error
+
+
+class _FakeStreamContext:
+    def __init__(self, response):
+        self._response = response
+
+    async def __aenter__(self):
+        return self._response
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeHttpClient:
+    def __init__(self, responses):
+        self._responses = responses
+        self.requested_models = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def stream(self, method, url, headers=None, json=None):
+        model = json["model"]
+        self.requested_models.append(model)
+        return _FakeStreamContext(self._responses[model])
+
+
+def _stream_cfg():
+    from src.config import Settings
+
+    cfg = Settings()
+    cfg.OPENROUTER_API_KEY = "mock-key"
+    cfg.OPENROUTER_BASE_URL = "https://upstream.test/api/v1"
+    cfg.OPENROUTER_MODEL = "primary/model"
+    cfg.OPENROUTER_FALLBACK_MODEL = "fallback/model"
+    return cfg
+
+
+def _stream_req():
+    from src.llm import ChatCompletionRequest, ChatMessage
+
+    return ChatCompletionRequest(
+        messages=[ChatMessage(role="user", content="hi")], stream=True
+    )
+
+
+async def _collect_stream(monkeypatch, responses):
+    from src.llm import stream_chat_completion
+
+    fake = _FakeHttpClient(responses)
+    monkeypatch.setattr("src.llm.httpx.AsyncClient", lambda **_kwargs: fake)
+    chunks = [
+        chunk async for chunk in stream_chat_completion(_stream_req(), _stream_cfg())
+    ]
+    return "".join(chunks), fake
+
+
+@pytest.mark.asyncio
+async def test_stream_midstream_failure_never_concatenates_fallback(monkeypatch):
+    import httpx
+
+    text, fake = await _collect_stream(
+        monkeypatch,
+        {
+            "primary/model": _FakeStreamResponse(
+                lines=['data: {"choices":[{"delta":{"content":"PARTIAL"}}]}'],
+                error=httpx.ReadError("connection dropped"),
+            ),
+            "fallback/model": _FakeStreamResponse(
+                lines=[
+                    'data: {"choices":[{"delta":{"content":"FALLBACK"}}]}',
+                    "data: [DONE]",
+                ]
+            ),
+        },
+    )
+    assert "PARTIAL" in text
+    assert "FALLBACK" not in text, "fallback must not be appended after partial output"
+    assert "connection dropped" in text
+    assert '"error"' in text
+    assert text.count("data: [DONE]") == 1
+    assert fake.requested_models == ["primary/model"]
+
+
+@pytest.mark.asyncio
+async def test_stream_falls_back_only_before_the_first_byte(monkeypatch):
+    import httpx
+
+    text, fake = await _collect_stream(
+        monkeypatch,
+        {
+            "primary/model": _FakeStreamResponse(
+                error=httpx.ReadError("dead upstream")
+            ),
+            "fallback/model": _FakeStreamResponse(
+                lines=[
+                    'data: {"choices":[{"delta":{"content":"FALLBACK"}}]}',
+                    "data: [DONE]",
+                ]
+            ),
+        },
+    )
+    assert "FALLBACK" in text
+    assert "dead upstream" not in text
+    assert '"error"' not in text
+    assert text.count("data: [DONE]") == 1
+    assert fake.requested_models == ["primary/model", "fallback/model"]
+
+
+@pytest.mark.asyncio
+async def test_stream_truncated_without_done_is_an_error_not_a_retry(monkeypatch):
+    text, fake = await _collect_stream(
+        monkeypatch,
+        {
+            "primary/model": _FakeStreamResponse(
+                lines=['data: {"choices":[{"delta":{"content":"PARTIAL"}}]}']
+            ),
+            "fallback/model": _FakeStreamResponse(
+                lines=["data: [DONE]"],
+            ),
+        },
+    )
+    assert "PARTIAL" in text
+    assert "before [DONE]" in text
+    assert '"error"' in text
+    assert text.count("data: [DONE]") == 1
+    assert fake.requested_models == ["primary/model"]
+
+
+@pytest.mark.asyncio
+async def test_stream_complete_primary_does_not_touch_fallback(monkeypatch):
+    text, fake = await _collect_stream(
+        monkeypatch,
+        {
+            "primary/model": _FakeStreamResponse(
+                lines=[
+                    'data: {"choices":[{"delta":{"content":"OK"}}]}',
+                    "data: [DONE]",
+                ]
+            ),
+            "fallback/model": _FakeStreamResponse(lines=["data: [DONE]"]),
+        },
+    )
+    assert '"error"' not in text
+    assert text.count("data: [DONE]") == 1
+    assert fake.requested_models == ["primary/model"]
 
 
 def test_chat_completions_stream_without_key_emits_error_frame():

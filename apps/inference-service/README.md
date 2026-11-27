@@ -69,7 +69,12 @@ Multi-model inference microservice for the SynapseOne ecosystem. Provides:
     "model": "sentence-transformers/all-MiniLM-L6-v2"
   }
   ```
-  Returns 384-dimensional unit-norm float vector.
+  Returns 384-dimensional unit-norm float vector. `model` is verified against
+  the loaded model (unknown names return `400 unsupported_model`) and the
+  response always reports the model that actually produced the vectors.
+  `dimensions` must equal the loaded model's native width; unsupported values
+  return `400 unsupported_dimensions` rather than silently truncating
+  non-Matryoshka vectors.
 
 ### 4. Decision Engine (`Decision-2.0-Eos-0.8B`)
 * `POST /v1/decision` (Advanced `system_one` structured questions):
