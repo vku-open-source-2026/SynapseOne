@@ -45,6 +45,9 @@ Format based on Keep a Changelog; versioning follows SemVer.
 
 ### Fixed
 
+- **SynapseCity client identity at the shared edge.** SynapseCity proxy locations
+  now overwrite `X-Forwarded-For` with `$remote_addr` instead of appending the
+  nginx peer, preserving independent per-client rate-limit buckets.
 - **Login after revocation.** `upsertUser` now projects `auth_version`, so
   dev/OIDC/register sessions mint tokens with the current version. Previously a
   `logout-all`, refresh-token reuse revoke or admin session revoke left every
