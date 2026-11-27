@@ -68,6 +68,15 @@ curl "https://api.synapseone.space/v1/ocs/buckets/city-assets/objects/2026/10/ph
   `quotaBytes`.
 * List responses include `objects`, `commonPrefixes` (when `delimiter` is
   supplied) and an opaque `nextCursor`.
+* The `@ocs/` prefix is reserved for internal bucket metadata. User keys may
+  not start with `@ocs/` or equal `@ocs`, and `.bucket` markers are protected
+  on both `/v1/ocs` and the legacy `/v1/storage` routes (including presign and
+  multipart).
+* The filesystem backend commits a new version by fsyncing a content-addressed
+  body under `<STORAGE_FS_ROOT>/bodies/` and then atomically renaming the
+  per-key metadata file. Per-key read/write locks prevent mixed versions, and
+  startup recovery removes orphan temporary/body files while preserving bodies
+  whose metadata is unreadable or corrupt.
 
 ## Multipart
 
@@ -81,7 +90,10 @@ native multipart. Abort removes the temporary upload directory.
 (default 900 s, max 7 days) for `GET`/`PUT`/`DELETE`/`HEAD`. It works on both
 backends and never exposes backend S3 credentials. The URL is scoped to one
 tenant/bucket/key/method; hand it only to the intended client. The legacy
-`/v1/storage/presign` route still requires the S3 backend.
+`/v1/storage/presign` route requires the S3 backend for compatibility but also
+returns an OCS HMAC-signed URL: direct S3 presigning is disabled so uploads
+cannot bypass object-size/content-type policy or expose the internal storage
+hostname.
 
 ## Backends
 

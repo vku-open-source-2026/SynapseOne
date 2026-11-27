@@ -332,6 +332,15 @@ fn clean_etag(etag: &str) -> String {
     etag.replace('"', "")
 }
 
+/// Parse `Content-Range: bytes <start>-<end>/<total>` returned by a successful
+/// S3 ranged GET.
+fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let rest = value.trim().strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    Some((start.parse().ok()?, end.parse().ok()?, total.parse().ok()?))
+}
+
 #[derive(Clone, Debug)]
 pub struct S3Client {
     cfg: S3Config,
@@ -457,6 +466,66 @@ impl S3Client {
             content_type,
             etag,
             size,
+            last_modified,
+        }))
+    }
+
+    /// Bounded ranged GET. Only a `206 Partial Content` response is accepted;
+    /// if a backend ignores the Range header we fail closed instead of
+    /// buffering the whole object.
+    pub async fn get_range(
+        &self,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<S3Object>, String> {
+        let headers = vec![("range".into(), format!("bytes={start}-{end}"))];
+        let response = self.call("GET", key, &[], &headers, None).await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if response.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            return Err(format!("s3 range not satisfiable for bytes={start}-{end}"));
+        }
+        if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            if response.status().is_success() {
+                return Err("s3 backend ignored the requested byte range".into());
+            }
+            return Err(Self::failure("s3 ranged get", response).await);
+        }
+        let content_range = header_value(response.headers(), "content-range");
+        let Some((actual_start, actual_end, total)) = parse_content_range(&content_range) else {
+            return Err(format!(
+                "s3 ranged get: invalid content-range '{content_range}'"
+            ));
+        };
+        if actual_start != start || actual_end != end || actual_end < actual_start {
+            return Err(format!(
+                "s3 ranged get: backend returned range {actual_start}-{actual_end}, requested {start}-{end}"
+            ));
+        }
+        let content_type = match header_value(response.headers(), "content-type") {
+            value if value.is_empty() => "application/octet-stream".into(),
+            value => value,
+        };
+        let etag = clean_etag(&header_value(response.headers(), "etag"));
+        let last_modified = match header_value(response.headers(), "last-modified") {
+            value if value.is_empty() => None,
+            value => Some(value),
+        };
+        let body = response.bytes().await.map_err(|error| error.to_string())?;
+        let expected = (end - start + 1) as usize;
+        if body.len() != expected {
+            return Err(format!(
+                "s3 ranged get: expected {expected} bytes, received {}",
+                body.len()
+            ));
+        }
+        Ok(Some(S3Object {
+            body,
+            content_type,
+            etag,
+            size: total,
             last_modified,
         }))
     }

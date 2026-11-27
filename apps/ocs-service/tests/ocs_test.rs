@@ -6,10 +6,11 @@ mod common;
 
 use axum::http::StatusCode;
 use common::*;
-use serde_json::json;
+use serde_json::{json, Value};
 use synapseone_ocs::backend::{checksum_hex, FileBackend};
 use synapseone_ocs::ocs::{create_presign_token, internal_key, marker_key, PresignPayload};
 use synapseone_ocs::{build_app, Backend};
+use tower::ServiceExt;
 
 async fn create_bucket(app: &axum::Router, name: &str) -> TestResponse {
     json_request(
@@ -1244,4 +1245,208 @@ async fn allowed_types_apply_to_ocs_writes() {
     )
     .await;
     assert_eq!(bad_multipart.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
+async fn signed_put_authenticates_before_reading_and_rejects_oversized_lengths() {
+    let (app, _dir) = fs_app_with(|config| {
+        config.max_object_bytes = 1024;
+        config.allowed_types = vec!["image/png".into()];
+    });
+    assert_eq!(
+        create_bucket(&app, "media").await.status,
+        StatusCode::CREATED
+    );
+
+    // An invalid token must fail before the body is buffered, even when the
+    // supplied body is over the object limit.
+    let invalid = request(
+        &app,
+        "PUT",
+        &format!("/v1/ocs/signed?token={}", percent_encode("invalid.token")),
+        Some(vec![0u8; 4096]),
+        vec![("content-type".into(), "image/png".into())],
+    )
+    .await;
+    assert_eq!(invalid.status, StatusCode::FORBIDDEN);
+    assert_eq!(invalid.json()["error"], "invalid_presign_token");
+
+    let get_token = create_presign_token(
+        &PresignPayload {
+            tenant: "org:org-a".into(),
+            bucket: "media".into(),
+            key: "a.png".into(),
+            method: "GET".into(),
+            exp: chrono::Utc::now().timestamp() + 60,
+            nonce: "n".into(),
+        },
+        "ocs-dev-presign-secret",
+    );
+    let wrong_method = request(
+        &app,
+        "PUT",
+        &format!("/v1/ocs/signed?token={}", percent_encode(&get_token)),
+        Some(vec![0u8; 4096]),
+        vec![("content-type".into(), "image/png".into())],
+    )
+    .await;
+    assert_eq!(wrong_method.status, StatusCode::FORBIDDEN);
+    assert_eq!(wrong_method.json()["error"], "presign_method_mismatch");
+
+    let reserved = create_presign_token(
+        &PresignPayload {
+            tenant: "org:org-a".into(),
+            bucket: "media".into(),
+            key: "@ocs/other/secret".into(),
+            method: "PUT".into(),
+            exp: chrono::Utc::now().timestamp() + 60,
+            nonce: "n".into(),
+        },
+        "ocs-dev-presign-secret",
+    );
+    let reserved_body = request(
+        &app,
+        "PUT",
+        &format!("/v1/ocs/signed?token={}", percent_encode(&reserved)),
+        Some(vec![0u8; 4096]),
+        vec![("content-type".into(), "image/png".into())],
+    )
+    .await;
+    assert_eq!(reserved_body.status, StatusCode::BAD_REQUEST);
+    assert_eq!(reserved_body.json()["error"], "invalid_key");
+
+    let put_token = create_presign_token(
+        &PresignPayload {
+            tenant: "org:org-a".into(),
+            bucket: "media".into(),
+            key: "upload.png".into(),
+            method: "PUT".into(),
+            exp: chrono::Utc::now().timestamp() + 60,
+            nonce: "n".into(),
+        },
+        "ocs-dev-presign-secret",
+    );
+    let uri = format!("/v1/ocs/signed?token={}", percent_encode(&put_token));
+
+    // Declared Content-Length is rejected before any body read. The request
+    // intentionally carries an empty body: only the header is inspected.
+    let raw_request = axum::http::Request::builder()
+        .method("PUT")
+        .uri(&uri)
+        .header("content-type", "image/png")
+        .header("content-length", "1025")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(raw_request).await.expect("oneshot");
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"], "object_too_large");
+
+    // Disallowed content types are rejected before the body is read as well.
+    let wrong_type = request(
+        &app,
+        "PUT",
+        &uri,
+        Some(vec![0u8; 4096]),
+        vec![("content-type".into(), "text/plain".into())],
+    )
+    .await;
+    assert_eq!(wrong_type.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    // Chunked/unknown-length bodies are still bounded by the streaming cap.
+    let chunked = request(
+        &app,
+        "PUT",
+        &uri,
+        Some(vec![1u8; 1025]),
+        vec![("content-type".into(), "image/png".into())],
+    )
+    .await;
+    assert_eq!(chunked.status, StatusCode::PAYLOAD_TOO_LARGE);
+
+    let accepted = request(
+        &app,
+        "PUT",
+        &uri,
+        Some(b"ok".to_vec()),
+        vec![("content-type".into(), "image/png".into())],
+    )
+    .await;
+    assert_eq!(accepted.status, StatusCode::CREATED, "{}", accepted.text());
+}
+
+#[tokio::test]
+async fn signed_get_range_returns_only_the_requested_bytes() {
+    let (app, _dir) = fs_app();
+    assert_eq!(
+        create_bucket(&app, "media").await.status,
+        StatusCode::CREATED
+    );
+    let body = vec![3u8; 1024 * 1024];
+    assert_eq!(
+        put_bucket_object(&app, "media", "big.bin", &body)
+            .await
+            .status,
+        StatusCode::CREATED
+    );
+    let presign = json_request(
+        &app,
+        "POST",
+        "/v1/ocs/buckets/media/presign",
+        &json!({"key": "big.bin", "method": "GET"}),
+        default_headers(),
+    )
+    .await;
+    let token = query_token(&presign);
+    let ranged = request(
+        &app,
+        "GET",
+        &format!("/v1/ocs/signed?token={}", percent_encode(&token)),
+        None,
+        {
+            let mut headers = default_headers();
+            with_header(&mut headers, "range", "bytes=1000-1999");
+            headers
+        },
+    )
+    .await;
+    assert_eq!(ranged.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(ranged.body.len(), 1000);
+    assert_eq!(ranged.header("content-range"), "bytes 1000-1999/1048576");
+    assert_eq!(ranged.header("content-length"), "1000");
+}
+
+#[tokio::test]
+async fn reserved_keys_are_rejected_by_ocs_presign_and_multipart_too() {
+    let (app, _dir) = fs_app();
+    assert_eq!(
+        create_bucket(&app, "media").await.status,
+        StatusCode::CREATED
+    );
+    for key in ["@ocs/other/secret", "@ocs", ".bucket", "folder/.bucket"] {
+        let presign = json_request(
+            &app,
+            "POST",
+            "/v1/ocs/buckets/media/presign",
+            &json!({"key": key, "method": "GET"}),
+            default_headers(),
+        )
+        .await;
+        assert_eq!(presign.status, StatusCode::BAD_REQUEST, "{key}");
+        assert_eq!(presign.json()["error"], "invalid_key", "{key}");
+
+        let multipart = json_request(
+            &app,
+            "POST",
+            "/v1/ocs/buckets/media/uploads",
+            &json!({"key": key}),
+            default_headers(),
+        )
+        .await;
+        assert_eq!(multipart.status, StatusCode::BAD_REQUEST, "{key}");
+        assert_eq!(multipart.json()["error"], "invalid_key", "{key}");
+    }
 }

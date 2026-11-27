@@ -3,13 +3,15 @@
 //! Object storage backends: local filesystem (dev/single-node) and
 //! S3-compatible stores (SeaweedFS / MinIO / AWS S3 / R2).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use bytes::Bytes;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -108,35 +110,163 @@ fn safe_components(key: &str) -> Option<Vec<&str>> {
     Some(segments)
 }
 
+/// On-disk metadata. `bodyFile` names an immutable, content-addressed body
+/// file; the metadata rename is the commit point for a new object version.
+/// Metadata written by older releases has no `bodyFile` and keeps using the
+/// legacy key-shaped body path.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredMeta {
+    #[serde(flatten)]
+    meta: ObjectMeta,
+    #[serde(default, rename = "bodyFile", skip_serializing_if = "Option::is_none")]
+    body_file: Option<String>,
+}
+
+fn valid_body_file(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".blob") else {
+        return false;
+    };
+    let Some((key_hash, etag)) = stem.split_once('.') else {
+        return false;
+    };
+    key_hash.len() == 64
+        && etag.len() == 64
+        && key_hash
+            .bytes()
+            .chain(etag.bytes())
+            .all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn body_path_for_segment(
+    root: &Path,
+    segment: &str,
+    key: &str,
+    stored: &StoredMeta,
+) -> Option<PathBuf> {
+    if let Some(name) = stored.body_file.as_deref() {
+        if !valid_body_file(name) {
+            return None;
+        }
+        // Committed bodies live in a dedicated top-level directory so a
+        // legacy user key can never collide with a content-addressed body
+        // file of another object.
+        return Some(root.join("bodies").join(segment).join(name));
+    }
+    let mut path = root.join("objects").join(segment);
+    for part in safe_components(key)? {
+        path.push(part);
+    }
+    Some(path)
+}
+
+/// Write `data` to a unique temporary file in `dir`, fsync it, and return the
+/// temporary path. The caller renames it into place.
+async fn write_temp(dir: &Path, stem: &str, data: &[u8]) -> Result<PathBuf, String> {
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|error| format!("create directory {}: {error}", dir.display()))?;
+    let temp = dir.join(format!(
+        ".tmp-{stem}-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .await
+        .map_err(|error| format!("create temporary file {}: {error}", temp.display()))?;
+    if let Err(error) = file.write_all(data).await {
+        drop(file);
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(format!("write temporary file {}: {error}", temp.display()));
+    }
+    if let Err(error) = file.sync_all().await {
+        drop(file);
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(format!("fsync temporary file {}: {error}", temp.display()));
+    }
+    drop(file);
+    Ok(temp)
+}
+
+/// Best-effort directory fsync so a rename is durable across a crash.
+async fn sync_directory(dir: &Path) {
+    #[cfg(unix)]
+    if let Ok(handle) = tokio::fs::File::open(dir).await {
+        let _ = handle.sync_all().await;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
+
 #[derive(Clone, Debug)]
 pub struct FileBackend {
     root: PathBuf,
+    /// Per-object read/write locks. Writes publish body+metadata atomically;
+    /// readers hold the shared side so they never observe a half-committed
+    /// version.
+    key_locks: Arc<StdMutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>>,
 }
 
 impl FileBackend {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, String> {
         let root = root.into();
         std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
-        Ok(Self { root })
+        let backend = Self {
+            root,
+            key_locks: Arc::new(StdMutex::new(HashMap::new())),
+        };
+        backend.recover_orphans();
+        Ok(backend)
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    fn key_lock(&self, tenant: &str, key: &str) -> Arc<tokio::sync::RwLock<()>> {
+        let mut locks = self
+            .key_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks
+            .entry(format!("{tenant}\u{0}{key}"))
+            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
+            .clone()
+    }
+
+    fn objects_dir(&self, tenant: &str) -> PathBuf {
+        self.root.join("objects").join(tenant_segment(tenant))
+    }
+
+    fn bodies_dir(&self, tenant: &str) -> PathBuf {
+        self.root.join("bodies").join(tenant_segment(tenant))
+    }
+
+    fn meta_dir(&self, tenant: &str) -> PathBuf {
+        self.root.join("meta").join(tenant_segment(tenant))
+    }
+
     fn object_path(&self, tenant: &str, key: &str) -> Option<PathBuf> {
         let segments = safe_components(key)?;
-        let mut path = self.root.join("objects").join(tenant_segment(tenant));
+        let mut path = self.objects_dir(tenant);
         for segment in segments {
             path.push(segment);
         }
         Some(path)
     }
 
+    fn body_path(&self, tenant: &str, name: &str) -> PathBuf {
+        self.bodies_dir(tenant).join(name)
+    }
+
+    fn body_path_for(&self, tenant: &str, key: &str, stored: &StoredMeta) -> Option<PathBuf> {
+        body_path_for_segment(&self.root, &tenant_segment(tenant), key, stored)
+    }
+
     fn meta_path(&self, tenant: &str, key: &str) -> PathBuf {
-        self.root
-            .join("meta")
-            .join(tenant_segment(tenant))
+        self.meta_dir(tenant)
             .join(format!("{}.json", checksum_hex(key.as_bytes())))
     }
 
@@ -152,24 +282,15 @@ impl FileBackend {
         })
     }
 
-    async fn write_meta(&self, tenant: &str, meta: &ObjectMeta) -> Result<(), String> {
-        let path = self.meta_path(tenant, &meta.key);
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-        let body = serde_json::to_vec(meta).map_err(|error| error.to_string())?;
-        tokio::fs::write(path, body)
-            .await
-            .map_err(|error| error.to_string())
-    }
-
-    /// Read object metadata. Only a missing meta file (ENOENT) means "no
-    /// such object"; any other read error (EACCES, …) or corrupt JSON
-    /// propagates as a backend error instead of masquerading as a 404
+    /// Read the stored metadata record. Only a missing meta file (ENOENT)
+    /// means "no such object"; any other read error (EACCES, …) or corrupt
+    /// JSON propagates as a backend error instead of masquerading as a 404
     /// (#100).
-    async fn read_meta(&self, tenant: &str, key: &str) -> Result<Option<ObjectMeta>, String> {
+    async fn read_stored_meta(
+        &self,
+        tenant: &str,
+        key: &str,
+    ) -> Result<Option<StoredMeta>, String> {
         let path = self.meta_path(tenant, key);
         let body = match tokio::fs::read(&path).await {
             Ok(body) => body,
@@ -183,6 +304,38 @@ impl FileBackend {
             .map_err(|error| format!("corrupt metadata for object '{key}': {error}"))
     }
 
+    /// Verify that the committed metadata points at an existing body of the
+    /// declared size. This prevents HEAD/GET from reporting a version whose
+    /// body was never written or was replaced by a partial file.
+    async fn checked_body_path(
+        &self,
+        tenant: &str,
+        key: &str,
+        stored: &StoredMeta,
+    ) -> Result<PathBuf, String> {
+        let path = self
+            .body_path_for(tenant, key, stored)
+            .ok_or_else(|| format!("invalid body reference for object '{key}'"))?;
+        let metadata = tokio::fs::metadata(&path).await.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                format!("object body missing for '{key}'")
+            } else {
+                format!("stat object '{key}': {error}")
+            }
+        })?;
+        if !metadata.is_file() {
+            return Err(format!("object body for '{key}' is not a regular file"));
+        }
+        if metadata.len() != stored.meta.size {
+            return Err(format!(
+                "object body size mismatch for '{key}': metadata says {} bytes, body is {} bytes",
+                stored.meta.size,
+                metadata.len()
+            ));
+        }
+        Ok(path)
+    }
+
     pub async fn put(
         &self,
         tenant: &str,
@@ -191,68 +344,190 @@ impl FileBackend {
         content_type: &str,
         checksum_sha256: Option<&str>,
     ) -> Result<ObjectMeta, String> {
-        let path = self
+        let _validated = self
             .object_path(tenant, key)
             .ok_or_else(|| "invalid object key".to_string())?;
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
+        let lock = self.key_lock(tenant, key);
+        let _guard = lock.write().await;
         let now = now_iso();
-        let previous = self.read_meta(tenant, key).await?;
+        let previous = self.read_stored_meta(tenant, key).await?;
+        let etag = checksum_hex(body);
+        let key_hash = checksum_hex(key.as_bytes());
+        let body_name = format!("{key_hash}.{etag}.blob");
+        let body_path = self.body_path(tenant, &body_name);
+        let bodies_dir = self.bodies_dir(tenant);
         let meta = ObjectMeta {
             key: key.to_string(),
             size: body.len() as u64,
             content_type: content_type.to_string(),
-            etag: checksum_hex(body),
+            etag,
             checksum_sha256: checksum_sha256.map(str::to_string),
             created_at: previous
                 .as_ref()
-                .map(|meta| meta.created_at.clone())
+                .map(|stored| stored.meta.created_at.clone())
                 .unwrap_or_else(|| now.clone()),
             updated_at: now,
         };
-        // Metadata first: a crash mid-put can leave a stale or orphaned
-        // meta entry (self-healing on the next put of the same key), never
-        // a body that no metadata points at (#100).
-        self.write_meta(tenant, &meta).await?;
-        tokio::fs::write(&path, body)
-            .await
-            .map_err(|error| error.to_string())?;
+        // Body first, then metadata: the body file is unreferenced until the
+        // metadata rename commits, so a crash can only leave an orphan body,
+        // never metadata that points at a missing/partial body.
+        let body_temp = write_temp(&bodies_dir, &key_hash, body).await?;
+        if let Err(error) = tokio::fs::rename(&body_temp, &body_path).await {
+            let _ = tokio::fs::remove_file(&body_temp).await;
+            return Err(format!("replace object body for '{key}': {error}"));
+        }
+        sync_directory(&bodies_dir).await;
+
+        let stored = StoredMeta {
+            meta: meta.clone(),
+            body_file: Some(body_name.clone()),
+        };
+        let meta_body = serde_json::to_vec(&stored).map_err(|error| error.to_string())?;
+        let meta_dir = self.meta_dir(tenant);
+        let meta_temp = match write_temp(&meta_dir, &key_hash, &meta_body).await {
+            Ok(path) => path,
+            Err(error) => {
+                let previous_body = previous
+                    .as_ref()
+                    .and_then(|stored| self.body_path_for(tenant, key, stored));
+                if previous_body.as_deref() != Some(body_path.as_path()) {
+                    let _ = tokio::fs::remove_file(&body_path).await;
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = tokio::fs::rename(&meta_temp, self.meta_path(tenant, key)).await {
+            let _ = tokio::fs::remove_file(&meta_temp).await;
+            let previous_body = previous
+                .as_ref()
+                .and_then(|stored| self.body_path_for(tenant, key, stored));
+            if previous_body.as_deref() != Some(body_path.as_path()) {
+                let _ = tokio::fs::remove_file(&body_path).await;
+            }
+            return Err(format!("commit metadata for object '{key}': {error}"));
+        }
+        sync_directory(&meta_dir).await;
+
+        if let Some(previous) = &previous {
+            if let Some(previous_path) = self.body_path_for(tenant, key, previous) {
+                if previous_path != body_path {
+                    let _ = tokio::fs::remove_file(previous_path).await;
+                }
+            }
+        }
+        self.cleanup_key_bodies(tenant, key, &body_name).await;
         Ok(meta)
     }
 
+    /// Remove stale bodies/temps for this key left by an interrupted older
+    /// version or a previous crash. The newly committed body is kept.
+    async fn cleanup_key_bodies(&self, tenant: &str, key: &str, keep: &str) {
+        let dir = self.bodies_dir(tenant);
+        let key_hash = checksum_hex(key.as_bytes());
+        let body_prefix = format!("{key_hash}.");
+        let temp_prefix = format!(".tmp-{key_hash}-");
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            return;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == keep {
+                continue;
+            }
+            let stale_body = name.starts_with(&body_prefix) && name.ends_with(".blob");
+            let stale_temp = name.starts_with(&temp_prefix);
+            if stale_body || stale_temp {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
+    }
+
     pub async fn get(&self, tenant: &str, key: &str) -> Result<Option<ObjectBody>, String> {
-        let Some(meta) = self.read_meta(tenant, key).await? else {
+        let lock = self.key_lock(tenant, key);
+        let _guard = lock.read().await;
+        let Some(stored) = self.read_stored_meta(tenant, key).await? else {
             return Ok(None);
         };
-        let path = self
-            .object_path(tenant, key)
-            .ok_or_else(|| "invalid object key".to_string())?;
-        let body = match tokio::fs::read(path).await {
-            Ok(body) => body,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(format!("read object '{key}': {error}")),
-        };
+        let path = self.checked_body_path(tenant, key, &stored).await?;
+        let body = tokio::fs::read(&path)
+            .await
+            .map_err(|error| format!("read object '{key}': {error}"))?;
+        if body.len() as u64 != stored.meta.size {
+            return Err(format!(
+                "object body size mismatch for '{key}': metadata says {} bytes, body is {} bytes",
+                stored.meta.size,
+                body.len()
+            ));
+        }
         Ok(Some(ObjectBody {
-            meta,
+            meta: stored.meta,
             body: Bytes::from(body),
         }))
     }
 
+    /// Read only `[start, end]` from the object file. Used by ranged GETs so
+    /// a small range never materializes the whole object.
+    pub async fn get_range(
+        &self,
+        tenant: &str,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<ObjectBody>, String> {
+        let lock = self.key_lock(tenant, key);
+        let _guard = lock.read().await;
+        let Some(stored) = self.read_stored_meta(tenant, key).await? else {
+            return Ok(None);
+        };
+        let path = self.checked_body_path(tenant, key, &stored).await?;
+        if start >= stored.meta.size || end < start || end >= stored.meta.size {
+            return Err(format!("range not satisfiable for object '{key}'"));
+        }
+        let length = end - start + 1;
+        let mut file = tokio::fs::File::open(&path)
+            .await
+            .map_err(|error| format!("read object '{key}': {error}"))?;
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|error| format!("seek object '{key}': {error}"))?;
+        let mut buffer = vec![0u8; length as usize];
+        file.read_exact(&mut buffer)
+            .await
+            .map_err(|error| format!("read object '{key}' range: {error}"))?;
+        Ok(Some(ObjectBody {
+            meta: stored.meta,
+            body: Bytes::from(buffer),
+        }))
+    }
+
     pub async fn head(&self, tenant: &str, key: &str) -> Result<Option<ObjectMeta>, String> {
-        self.read_meta(tenant, key).await
+        let lock = self.key_lock(tenant, key);
+        let _guard = lock.read().await;
+        let Some(stored) = self.read_stored_meta(tenant, key).await? else {
+            return Ok(None);
+        };
+        self.checked_body_path(tenant, key, &stored).await?;
+        Ok(Some(stored.meta))
     }
 
     pub async fn delete(&self, tenant: &str, key: &str) -> Result<bool, String> {
-        if self.read_meta(tenant, key).await?.is_none() {
+        let lock = self.key_lock(tenant, key);
+        let _guard = lock.write().await;
+        let Some(stored) = self.read_stored_meta(tenant, key).await? else {
             return Ok(false);
+        };
+        // Metadata first: once it is gone the object is deleted. A crash or
+        // failure afterwards can only leave an orphan body, which startup
+        // recovery removes.
+        match tokio::fs::remove_file(self.meta_path(tenant, key)).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("delete metadata for object '{key}': {error}")),
         }
-        if let Some(path) = self.object_path(tenant, key) {
+        if let Some(path) = self.body_path_for(tenant, key, &stored) {
             let _ = tokio::fs::remove_file(path).await;
         }
-        let _ = tokio::fs::remove_file(self.meta_path(tenant, key)).await;
+        self.cleanup_key_bodies(tenant, key, "").await;
         Ok(true)
     }
 
@@ -263,7 +538,7 @@ impl FileBackend {
         limit: usize,
         cursor: Option<&str>,
     ) -> ListPage {
-        let dir = self.root.join("meta").join(tenant_segment(tenant));
+        let dir = self.meta_dir(tenant);
         let mut names = Vec::new();
         let mut entries = match tokio::fs::read_dir(dir).await {
             Ok(entries) => entries,
@@ -283,15 +558,11 @@ impl FileBackend {
         }
         let mut metas = Vec::new();
         for name in names {
-            let path = self
-                .root
-                .join("meta")
-                .join(tenant_segment(tenant))
-                .join(name);
+            let path = self.meta_dir(tenant).join(name);
             if let Ok(body) = tokio::fs::read(path).await {
-                if let Ok(meta) = serde_json::from_slice::<ObjectMeta>(&body) {
-                    if meta.key.starts_with(prefix) {
-                        metas.push(meta);
+                if let Ok(stored) = serde_json::from_slice::<StoredMeta>(&body) {
+                    if stored.meta.key.starts_with(prefix) {
+                        metas.push(stored.meta);
                     }
                 }
             }
@@ -324,6 +595,162 @@ impl FileBackend {
             page.objects.len(),
             page.objects.iter().map(|meta| meta.size).sum(),
         )
+    }
+
+    /// Startup recovery for a filesystem volume: drop temporary files,
+    /// stale metadata whose body is gone, and body files that no committed
+    /// metadata references. Runs before the service starts serving traffic.
+    fn recover_orphans(&self) {
+        let meta_root = self.root.join("meta");
+        let objects_root = self.root.join("objects");
+        let bodies_root = self.root.join("bodies");
+        let mut referenced: HashSet<PathBuf> = HashSet::new();
+        let mut protected_tenants: HashSet<String> = HashSet::new();
+        let mut removed_meta = 0usize;
+        let mut removed_bodies = 0usize;
+        let mut removed_temps = 0usize;
+
+        match std::fs::read_dir(&meta_root) {
+            Ok(tenants) => {
+                for tenant in tenants.flatten() {
+                    let segment = tenant.file_name().to_string_lossy().into_owned();
+                    let dir = tenant.path();
+                    let Ok(entries) = std::fs::read_dir(&dir) else {
+                        // Do not delete bodies when their metadata directory
+                        // is unreadable; recovery must never turn a permissions
+                        // problem into data loss.
+                        protected_tenants.insert(segment);
+                        continue;
+                    };
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        if name.starts_with(".tmp-") {
+                            if std::fs::remove_file(entry.path()).is_ok() {
+                                removed_temps += 1;
+                            }
+                            continue;
+                        }
+                        if !name.ends_with(".json") {
+                            continue;
+                        }
+                        let Ok(raw) = std::fs::read(entry.path()) else {
+                            protected_tenants.insert(segment.clone());
+                            continue;
+                        };
+                        let Ok(stored) = serde_json::from_slice::<StoredMeta>(&raw) else {
+                            // Corrupt metadata: keep every body in this tenant
+                            // so an operator can still recover the bytes
+                            // manually.
+                            protected_tenants.insert(segment.clone());
+                            continue;
+                        };
+                        let Some(body_path) =
+                            body_path_for_segment(&self.root, &segment, &stored.meta.key, &stored)
+                        else {
+                            protected_tenants.insert(segment.clone());
+                            continue;
+                        };
+                        match std::fs::metadata(&body_path) {
+                            Ok(metadata) if metadata.is_file() => {
+                                referenced.insert(body_path);
+                            }
+                            Ok(_) => {
+                                // A directory/special file at the body path is
+                                // corruption; keep the reference so recovery
+                                // does not silently delete it, and let HEAD/GET
+                                // report a backend error.
+                                referenced.insert(body_path);
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                // Metadata was committed without a durable body
+                                // (older releases wrote metadata first). The
+                                // object is not readable; remove the stale entry.
+                                if std::fs::remove_file(entry.path()).is_ok() {
+                                    removed_meta += 1;
+                                }
+                            }
+                            Err(_) => {
+                                referenced.insert(body_path);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                // The metadata root exists but cannot be read. Deleting
+                // bodies would risk data loss, so leave recovery to an
+                // operator.
+                tracing::warn!(
+                    "[storage] filesystem recovery skipped: cannot read {}: {error}",
+                    meta_root.display()
+                );
+                return;
+            }
+        }
+
+        for storage_root in [&bodies_root, &objects_root] {
+            if let Ok(tenants) = std::fs::read_dir(storage_root) {
+                for tenant in tenants.flatten() {
+                    let segment = tenant.file_name().to_string_lossy().into_owned();
+                    if protected_tenants.contains(&segment) {
+                        continue;
+                    }
+                    let Ok(file_type) = tenant.file_type() else {
+                        continue;
+                    };
+                    if file_type.is_dir() {
+                        self.recover_objects_dir(
+                            &tenant.path(),
+                            &referenced,
+                            &mut removed_bodies,
+                            &mut removed_temps,
+                        );
+                    }
+                }
+            }
+        }
+
+        if removed_meta > 0 || removed_bodies > 0 || removed_temps > 0 {
+            tracing::warn!(
+                removed_meta,
+                removed_bodies,
+                removed_temps,
+                "[storage] filesystem recovery removed orphaned metadata/bodies/temp files"
+            );
+        }
+    }
+
+    fn recover_objects_dir(
+        &self,
+        dir: &Path,
+        referenced: &HashSet<PathBuf>,
+        removed_bodies: &mut usize,
+        removed_temps: &mut usize,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                self.recover_objects_dir(&path, referenced, removed_bodies, removed_temps);
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(".tmp-") {
+                if std::fs::remove_file(&path).is_ok() {
+                    *removed_temps += 1;
+                }
+                continue;
+            }
+            if !referenced.contains(&path) && std::fs::remove_file(&path).is_ok() {
+                *removed_bodies += 1;
+            }
+        }
     }
 
     pub async fn create_multipart(
@@ -506,6 +933,26 @@ impl S3Backend {
 
     pub async fn get(&self, tenant: &str, key: &str) -> Result<Option<ObjectBody>, String> {
         let Some(object) = self.client.get(&Self::full(tenant, key)).await? else {
+            return Ok(None);
+        };
+        Ok(Some(ObjectBody {
+            meta: s3_object_meta(key, &object),
+            body: object.body,
+        }))
+    }
+
+    pub async fn get_range(
+        &self,
+        tenant: &str,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<ObjectBody>, String> {
+        let Some(object) = self
+            .client
+            .get_range(&Self::full(tenant, key), start, end)
+            .await?
+        else {
             return Ok(None);
         };
         Ok(Some(ObjectBody {
@@ -737,6 +1184,22 @@ impl Backend {
         }
     }
 
+    /// Read only the requested byte range. Filesystem reads seek in place;
+    /// S3 uses a signed `Range` request. Handlers use this so a small ranged
+    /// GET does not materialize the whole object.
+    pub async fn get_range(
+        &self,
+        tenant: &str,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<ObjectBody>, String> {
+        match self {
+            Self::Fs(backend) => backend.get_range(tenant, key, start, end).await,
+            Self::S3(backend) => backend.get_range(tenant, key, start, end).await,
+        }
+    }
+
     pub async fn head(&self, tenant: &str, key: &str) -> Result<Option<ObjectMeta>, String> {
         match self {
             Self::Fs(backend) => backend.head(tenant, key).await,
@@ -926,4 +1389,274 @@ pub fn create_backend(env: &HashMap<String, String>, _config: &Config) -> Result
         }
     };
     Ok(Backend::Fs(FileBackend::new(root)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stored_body_name(key: &str, body: &[u8]) -> String {
+        format!(
+            "{}.{}.blob",
+            checksum_hex(key.as_bytes()),
+            checksum_hex(body)
+        )
+    }
+
+    fn test_meta(key: &str, body: &[u8]) -> ObjectMeta {
+        ObjectMeta {
+            key: key.into(),
+            size: body.len() as u64,
+            content_type: "application/octet-stream".into(),
+            etag: checksum_hex(body),
+            checksum_sha256: None,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_puts_and_reads_never_see_mismatched_versions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = Arc::new(FileBackend::new(dir.path()).expect("backend"));
+        let mut tasks = Vec::new();
+        for index in 0..24u8 {
+            let backend = backend.clone();
+            tasks.push(tokio::spawn(async move {
+                let body = vec![index; 64 + index as usize];
+                backend
+                    .put(
+                        "org:concurrent",
+                        "shared.bin",
+                        &body,
+                        "application/octet-stream",
+                        None,
+                    )
+                    .await
+                    .expect("put");
+            }));
+        }
+        for _ in 0..8 {
+            let backend = backend.clone();
+            tasks.push(tokio::spawn(async move {
+                for _ in 0..100 {
+                    if let Some(object) = backend
+                        .get("org:concurrent", "shared.bin")
+                        .await
+                        .expect("get")
+                    {
+                        assert_eq!(object.meta.size, object.body.len() as u64);
+                        assert_eq!(object.meta.etag, checksum_hex(&object.body));
+                        assert!(object.body.iter().all(|byte| *byte == object.body[0]));
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.expect("task");
+        }
+        let object = backend
+            .get("org:concurrent", "shared.bin")
+            .await
+            .expect("get")
+            .expect("object");
+        assert_eq!(object.meta.size, object.body.len() as u64);
+        assert_eq!(object.meta.etag, checksum_hex(&object.body));
+    }
+
+    #[tokio::test]
+    async fn failed_body_commit_preserves_the_previous_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = FileBackend::new(dir.path()).expect("backend");
+        backend
+            .put("org:fault", "key.bin", b"first", "text/plain", None)
+            .await
+            .expect("first put");
+        // Make the would-be body path a directory so the atomic rename fails
+        // after metadata validation but before the new body can be committed.
+        let blocked = backend.body_path("org:fault", &stored_body_name("key.bin", b"second"));
+        std::fs::create_dir_all(&blocked).expect("blocker");
+        let error = backend
+            .put("org:fault", "key.bin", b"second", "text/plain", None)
+            .await
+            .expect_err("put must fail");
+        assert!(error.contains("replace object body"), "{error}");
+        let object = backend
+            .get("org:fault", "key.bin")
+            .await
+            .expect("get")
+            .expect("previous version");
+        assert_eq!(object.body.as_ref(), b"first");
+        assert_eq!(object.meta.etag, checksum_hex(b"first"));
+        let stored = backend
+            .read_stored_meta("org:fault", "key.bin")
+            .await
+            .expect("metadata")
+            .expect("metadata");
+        assert_eq!(
+            stored.body_file.as_deref(),
+            Some(stored_body_name("key.bin", b"first").as_str())
+        );
+        std::fs::remove_dir_all(&blocked).expect("unblock");
+        backend
+            .put("org:fault", "key.bin", b"second", "text/plain", None)
+            .await
+            .expect("second put");
+        let object = backend
+            .get("org:fault", "key.bin")
+            .await
+            .expect("get")
+            .expect("object");
+        assert_eq!(object.body.as_ref(), b"second");
+    }
+
+    #[tokio::test]
+    async fn recovery_removes_orphans_and_stale_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = FileBackend::new(dir.path()).expect("backend");
+        backend
+            .put("org:recover", "kept.bin", b"kept", "text/plain", None)
+            .await
+            .expect("put");
+        let bodies = backend.bodies_dir("org:recover");
+        let orphan = bodies.join("deadbeef.orphan.blob");
+        tokio::fs::write(&orphan, b"orphan").await.expect("orphan");
+        let temp = bodies.join(".tmp-deadbeef-0-0");
+        tokio::fs::write(&temp, b"temp").await.expect("temp");
+
+        let missing_key = "missing.bin";
+        let stale = StoredMeta {
+            meta: test_meta(missing_key, b"gone"),
+            body_file: Some(format!(
+                "{}.{}.blob",
+                checksum_hex(missing_key.as_bytes()),
+                checksum_hex(b"gone")
+            )),
+        };
+        tokio::fs::write(
+            backend
+                .meta_dir("org:recover")
+                .join(format!("{}.json", checksum_hex(missing_key.as_bytes()))),
+            serde_json::to_vec(&stale).expect("stale metadata"),
+        )
+        .await
+        .expect("stale metadata");
+
+        backend.recover_orphans();
+        assert!(!orphan.exists());
+        assert!(!temp.exists());
+        assert!(backend
+            .get("org:recover", missing_key)
+            .await
+            .expect("get stale")
+            .is_none());
+        let kept = backend
+            .get("org:recover", "kept.bin")
+            .await
+            .expect("get kept")
+            .expect("kept object");
+        assert_eq!(kept.body.as_ref(), b"kept");
+    }
+
+    #[tokio::test]
+    async fn legacy_metadata_without_body_file_still_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = FileBackend::new(dir.path()).expect("backend");
+        let legacy_key = "legacy/object.bin";
+        let body = b"legacy-body";
+        let legacy_path = backend
+            .object_path("org:legacy", legacy_key)
+            .expect("legacy path");
+        tokio::fs::create_dir_all(legacy_path.parent().unwrap())
+            .await
+            .expect("legacy dir");
+        tokio::fs::write(&legacy_path, body)
+            .await
+            .expect("legacy body");
+        let meta = test_meta(legacy_key, body);
+        tokio::fs::create_dir_all(backend.meta_dir("org:legacy"))
+            .await
+            .expect("meta dir");
+        tokio::fs::write(
+            backend.meta_path("org:legacy", legacy_key),
+            serde_json::to_vec(&meta).expect("legacy meta"),
+        )
+        .await
+        .expect("legacy meta");
+
+        let object = backend
+            .get("org:legacy", legacy_key)
+            .await
+            .expect("get")
+            .expect("legacy object");
+        assert_eq!(object.body.as_ref(), body);
+
+        backend
+            .put("org:legacy", legacy_key, b"new-body", "text/plain", None)
+            .await
+            .expect("upgrade put");
+        assert!(!legacy_path.exists(), "legacy body must be removed");
+        let object = backend
+            .get("org:legacy", legacy_key)
+            .await
+            .expect("get")
+            .expect("upgraded object");
+        assert_eq!(object.body.as_ref(), b"new-body");
+    }
+
+    #[tokio::test]
+    async fn filesystem_range_read_returns_only_the_requested_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = FileBackend::new(dir.path()).expect("backend");
+        let body = vec![7u8; 1024 * 1024];
+        backend
+            .put(
+                "org:range",
+                "big.bin",
+                &body,
+                "application/octet-stream",
+                None,
+            )
+            .await
+            .expect("put");
+        let object = backend
+            .get_range("org:range", "big.bin", 10, 19)
+            .await
+            .expect("range")
+            .expect("object");
+        assert_eq!(object.meta.size, body.len() as u64);
+        assert_eq!(object.body.as_ref(), &body[10..=19]);
+        assert_eq!(object.body.len(), 10);
+    }
+    #[tokio::test]
+    async fn a_legacy_key_cannot_collide_with_a_content_addressed_body() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = FileBackend::new(dir.path()).expect("backend");
+        let victim = b"victim-body";
+        backend
+            .put("org:collide", "victim.bin", victim, "text/plain", None)
+            .await
+            .expect("victim");
+        // A legacy key deliberately shaped like another object's body file
+        // must not be able to overwrite it in the filesystem namespace.
+        let colliding_key = stored_body_name("victim.bin", victim);
+        backend
+            .put(
+                "org:collide",
+                &colliding_key,
+                b"attacker-body",
+                "text/plain",
+                None,
+            )
+            .await
+            .expect("colliding key");
+        let object = backend
+            .get("org:collide", "victim.bin")
+            .await
+            .expect("get")
+            .expect("victim");
+        assert_eq!(object.body.as_ref(), victim);
+        assert_eq!(object.meta.etag, checksum_hex(victim));
+    }
 }

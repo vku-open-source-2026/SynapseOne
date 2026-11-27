@@ -84,7 +84,7 @@ pub fn validate_ocs_key(key: &str) -> Option<String> {
     if let Some(error) = validate_key(key) {
         return Some(error);
     }
-    if key.starts_with(OCS_PREFIX) {
+    if key == "@ocs" || key.starts_with(OCS_PREFIX) {
         return Some("key uses a reserved prefix".into());
     }
     if key == BUCKET_MARKER || key.ends_with(&format!("/{BUCKET_MARKER}")) {
@@ -156,6 +156,9 @@ pub fn verify_presign_token(
             "presign_method_mismatch",
             "presign method mismatch",
         ));
+    }
+    if validate_bucket_name(&payload.bucket).is_some() {
+        return Err(invalid());
     }
     Ok(payload)
 }
@@ -259,6 +262,7 @@ mod tests {
     #[test]
     fn ocs_key_validation_rejects_internal_namespace() {
         assert!(validate_ocs_key("normal/path.txt").is_none());
+        assert!(validate_ocs_key("@ocs").is_some());
         assert!(validate_ocs_key("@ocs/evil").is_some());
         assert!(validate_ocs_key(".bucket").is_some());
         assert!(validate_ocs_key("a/.bucket").is_some());
@@ -286,6 +290,15 @@ mod tests {
         );
         assert_eq!(
             verify_presign_token(&token, "GET", "other")
+                .unwrap_err()
+                .code,
+            "invalid_presign_token"
+        );
+        let mut invalid_bucket = payload.clone();
+        invalid_bucket.bucket = "Bad Name".into();
+        let invalid_bucket = create_presign_token(&invalid_bucket, "secret");
+        assert_eq!(
+            verify_presign_token(&invalid_bucket, "GET", "secret")
                 .unwrap_err()
                 .code,
             "invalid_presign_token"

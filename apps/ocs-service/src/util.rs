@@ -350,6 +350,16 @@ pub fn object_too_large(max_object_bytes: usize) -> Response {
     )
 }
 
+/// Reject an oversized declared `Content-Length` before touching the body.
+/// Requests without a valid `Content-Length` (chunked uploads) are still
+/// bounded by `read_body_limited`'s streaming cap.
+pub fn content_length_exceeds(headers: &HeaderMap, limit: usize) -> bool {
+    header(headers, "content-length")
+        .parse::<u64>()
+        .map(|length| length > limit as u64)
+        .unwrap_or(false)
+}
+
 #[allow(clippy::result_large_err)]
 pub async fn read_body_limited(
     body: Body,

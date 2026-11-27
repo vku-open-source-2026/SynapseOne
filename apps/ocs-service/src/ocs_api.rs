@@ -19,9 +19,10 @@ use crate::ocs::{
     BucketMeta, PresignPayload, BUCKET_MARKER, DEFAULT_BUCKET, OCS_PREFIX,
 };
 use crate::util::{
-    backend_error, decode_base64url, encode_uri_component, error_response, header, is_integer,
-    js_coerce_string, js_number, js_string, js_string_or, media_type_or_default, now_iso,
-    parse_js_number, read_body_limited, read_json, ApiError, QueryParams,
+    backend_error, content_length_exceeds, decode_base64url, encode_uri_component, error_response,
+    header, is_integer, js_coerce_string, js_number, js_string, js_string_or,
+    media_type_or_default, now_iso, parse_js_number, read_body_limited, read_json, ApiError,
+    QueryParams,
 };
 use crate::{AppState, Tenant};
 
@@ -397,20 +398,19 @@ async fn signed_get(
         Ok(None) => return error_response(StatusCode::NOT_FOUND, "bucket_not_found", None, None),
         Err(error) => return error.into_response(),
     }
-    let object = match state
-        .backend
-        .get(
-            &payload.tenant,
-            &internal_key(&payload.bucket, &payload.key),
-        )
-        .await
-    {
-        Ok(Some(object)) => object,
-        Ok(None) => return error_response(StatusCode::NOT_FOUND, "object_not_found", None, None),
-        Err(error) => return backend_error(error),
-    };
+    if let Some(error) = validate_ocs_key(&payload.key) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_key", Some(error), None);
+    }
+    let target = internal_key(&payload.bucket, &payload.key);
     let range_header = header(&headers, "range");
     if range_header.is_empty() {
+        let object = match state.backend.get(&payload.tenant, &target).await {
+            Ok(Some(object)) => object,
+            Ok(None) => {
+                return error_response(StatusCode::NOT_FOUND, "object_not_found", None, None)
+            }
+            Err(error) => return backend_error(error),
+        };
         return range_response(
             StatusCode::OK,
             &payload.bucket,
@@ -419,15 +419,33 @@ async fn signed_get(
             None,
         );
     }
-    let Some((start, end)) = parse_range(&range_header, object.meta.size) else {
-        return invalid_range(object.meta.size);
+    // Parse the range against metadata and read only the requested bytes;
+    // never materialize the whole object for a ranged GET.
+    let meta = match state.backend.head(&payload.tenant, &target).await {
+        Ok(Some(meta)) => meta,
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "object_not_found", None, None),
+        Err(error) => return backend_error(error),
     };
-    let slice = object.body.slice(start as usize..=end as usize);
+    let Some((start, end)) = parse_range(&range_header, meta.size) else {
+        return invalid_range(meta.size);
+    };
+    let object = match state
+        .backend
+        .get_range(&payload.tenant, &target, start, end)
+        .await
+    {
+        Ok(Some(object)) => object,
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "object_not_found", None, None),
+        Err(error) => return backend_error(error),
+    };
+    let end = start
+        .saturating_add(object.body.len().saturating_sub(1) as u64)
+        .min(object.meta.size.saturating_sub(1));
     range_response(
         StatusCode::PARTIAL_CONTENT,
         &payload.bucket,
         &object.meta,
-        slice,
+        object.body,
         Some((start, end)),
     )
 }
@@ -446,6 +464,9 @@ async fn signed_head(State(state): State<AppState>, RawQuery(raw): RawQuery) -> 
         Ok(Some(_)) => {}
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return error.into_response(),
+    }
+    if let Some(error) = validate_ocs_key(&payload.key) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_key", Some(error), None);
     }
     match state
         .backend
@@ -477,16 +498,8 @@ async fn signed_put(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let bytes = match read_body_limited(
-        body,
-        state.config.max_object_bytes,
-        state.config.max_object_bytes,
-    )
-    .await
-    {
-        Ok(bytes) => bytes,
-        Err(response) => return response,
-    };
+    // Authenticate and authorize the token before touching the body: an
+    // invalid/expired/method-mismatched token must not cause any buffering.
     let query = QueryParams::parse(raw.as_deref());
     let payload = match crate::ocs::verify_presign_token(
         &query.js_string("token"),
@@ -504,6 +517,28 @@ async fn signed_put(
     if let Some(error) = validate_ocs_key(&payload.key) {
         return error_response(StatusCode::BAD_REQUEST, "invalid_key", Some(error), None);
     }
+    let content_type = media_type_or_default(&headers);
+    if let Err(error) = ensure_allowed_type(&state, &content_type) {
+        return error.into_response();
+    }
+    if content_length_exceeds(&headers, state.config.max_object_bytes) {
+        return error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "object_too_large",
+            None,
+            None,
+        );
+    }
+    let bytes = match read_body_limited(
+        body,
+        state.config.max_object_bytes,
+        state.config.max_object_bytes,
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(response) => return response,
+    };
     if bytes.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "empty_body", None, None);
     }
@@ -514,10 +549,6 @@ async fn signed_put(
             None,
             None,
         );
-    }
-    let content_type = media_type_or_default(&headers);
-    if let Err(error) = ensure_allowed_type(&state, &content_type) {
-        return error.into_response();
     }
     let checksum = header(&headers, "x-object-checksum-sha256").to_lowercase();
     let result = put_object(
@@ -570,6 +601,9 @@ async fn signed_delete(State(state): State<AppState>, RawQuery(raw): RawQuery) -
         Ok(Some(_)) => {}
         Ok(None) => return error_response(StatusCode::NOT_FOUND, "bucket_not_found", None, None),
         Err(error) => return error.into_response(),
+    }
+    if let Some(error) = validate_ocs_key(&payload.key) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_key", Some(error), None);
     }
     match state
         .backend
@@ -913,7 +947,8 @@ async fn list_objects(
     let mut objects = Vec::new();
     let mut common_prefixes = std::collections::BTreeSet::new();
     for object in page_objects {
-        if object.key == marker {
+        if object.key == marker || (bucket == DEFAULT_BUCKET && object.key.starts_with(OCS_PREFIX))
+        {
             continue;
         }
         let key = user_key(&bucket, &object.key);
@@ -1037,6 +1072,20 @@ async fn put_object_handler(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    if let Err(response) = require_bucket(&state, &tenant, &bucket).await {
+        return response;
+    }
+    if let Some(error) = validate_ocs_key(&key) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_key", Some(error), None);
+    }
+    if content_length_exceeds(&headers, state.config.max_object_bytes) {
+        return error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "object_too_large",
+            None,
+            None,
+        );
+    }
     let bytes = match read_body_limited(
         body,
         state.config.max_object_bytes,
@@ -1047,12 +1096,6 @@ async fn put_object_handler(
         Ok(bytes) => bytes,
         Err(response) => return response,
     };
-    if let Err(response) = require_bucket(&state, &tenant, &bucket).await {
-        return response;
-    }
-    if let Some(error) = validate_ocs_key(&key) {
-        return error_response(StatusCode::BAD_REQUEST, "invalid_key", Some(error), None);
-    }
     if bytes.is_empty() {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -1126,16 +1169,16 @@ async fn get_object(
     if let Err(response) = require_bucket(&state, &tenant, &bucket).await {
         return response;
     }
-    let object = match state
-        .backend
-        .get(&tenant, &internal_key(&bucket, &key))
-        .await
-    {
-        Ok(Some(object)) => object,
+    if let Some(error) = validate_ocs_key(&key) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_key", Some(error), None);
+    }
+    let target = internal_key(&bucket, &key);
+    let meta = match state.backend.head(&tenant, &target).await {
+        Ok(Some(meta)) => meta,
         Ok(None) => return error_response(StatusCode::NOT_FOUND, "object_not_found", None, None),
         Err(error) => return backend_error(error),
     };
-    let etag = format!("\"{}\"", object.meta.etag);
+    let etag = format!("\"{}\"", meta.etag);
     let if_none_match = header(&headers, "if-none-match");
     if !if_none_match.is_empty()
         && (if_none_match == "*"
@@ -1163,17 +1206,31 @@ async fn get_object(
     }
     let range_header = header(&headers, "range");
     if range_header.is_empty() {
+        let object = match state.backend.get(&tenant, &target).await {
+            Ok(Some(object)) => object,
+            Ok(None) => {
+                return error_response(StatusCode::NOT_FOUND, "object_not_found", None, None)
+            }
+            Err(error) => return backend_error(error),
+        };
         return range_response(StatusCode::OK, &bucket, &object.meta, object.body, None);
     }
-    let Some((start, end)) = parse_range(&range_header, object.meta.size) else {
-        return invalid_range(object.meta.size);
+    let Some((start, end)) = parse_range(&range_header, meta.size) else {
+        return invalid_range(meta.size);
     };
-    let slice = object.body.slice(start as usize..=end as usize);
+    let object = match state.backend.get_range(&tenant, &target, start, end).await {
+        Ok(Some(object)) => object,
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "object_not_found", None, None),
+        Err(error) => return backend_error(error),
+    };
+    let end = start
+        .saturating_add(object.body.len().saturating_sub(1) as u64)
+        .min(object.meta.size.saturating_sub(1));
     range_response(
         StatusCode::PARTIAL_CONTENT,
         &bucket,
         &object.meta,
-        slice,
+        object.body,
         Some((start, end)),
     )
 }
@@ -1185,6 +1242,9 @@ async fn head_object(
 ) -> Response {
     if let Err(response) = require_bucket(&state, &tenant, &bucket).await {
         return response;
+    }
+    if let Some(error) = validate_ocs_key(&key) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_key", Some(error), None);
     }
     match state
         .backend
@@ -1214,6 +1274,9 @@ async fn delete_object(
 ) -> Response {
     if let Err(response) = require_bucket(&state, &tenant, &bucket).await {
         return response;
+    }
+    if let Some(error) = validate_ocs_key(&key) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_key", Some(error), None);
     }
     match state
         .backend
@@ -1335,18 +1398,9 @@ async fn upload_part(
     Extension(Tenant(tenant)): Extension<Tenant>,
     Path((bucket, upload_id, part)): Path<(String, String, String)>,
     RawQuery(raw): RawQuery,
+    headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let bytes = match read_body_limited(
-        body,
-        state.config.max_object_bytes,
-        state.config.max_object_bytes,
-    )
-    .await
-    {
-        Ok(bytes) => bytes,
-        Err(response) => return response,
-    };
     if let Err(response) = require_bucket(&state, &tenant, &bucket).await {
         return response;
     }
@@ -1367,6 +1421,19 @@ async fn upload_part(
     if let Some(error) = validate_ocs_key(&key) {
         return error_response(StatusCode::BAD_REQUEST, "invalid_key", Some(error), None);
     }
+    if content_length_exceeds(&headers, state.config.max_object_bytes) {
+        return error_response(StatusCode::PAYLOAD_TOO_LARGE, "part_too_large", None, None);
+    }
+    let bytes = match read_body_limited(
+        body,
+        state.config.max_object_bytes,
+        state.config.max_object_bytes,
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(response) => return response,
+    };
     if bytes.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "empty_body", None, None);
     }
@@ -1576,9 +1643,7 @@ mod tests {
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt;
 
-    fn quota_app(
-        tenant_quota_bytes: u64,
-    ) -> (axum::Router, Backend, tempfile::TempDir) {
+    fn quota_app(tenant_quota_bytes: u64) -> (axum::Router, Backend, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("temp dir");
         let backend = Backend::Fs(FileBackend::new(dir.path()).expect("fs backend"));
         let mut config = Config::for_test();
@@ -1613,8 +1678,20 @@ mod tests {
         (status, json)
     }
 
-    async fn json_call(app: &axum::Router, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
-        call(app, method, uri, serde_json::to_vec(&body).unwrap(), "application/json").await
+    async fn json_call(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        call(
+            app,
+            method,
+            uri,
+            serde_json::to_vec(&body).unwrap(),
+            "application/json",
+        )
+        .await
     }
 
     /// Create an upload, push the given parts, and return
@@ -1685,7 +1762,10 @@ mod tests {
         assert_eq!(body["error"], "quota_exceeded");
         assert_eq!(body["details"]["quotaBytes"], json!(100));
         // The rejected upload is aborted: parts are gone and no object exists.
-        assert!(backend.part_sizes("org:org-qa", &upload_id, "default/big.bin").await.is_err());
+        assert!(backend
+            .part_sizes("org:org-qa", &upload_id, "default/big.bin")
+            .await
+            .is_err());
         let (status, _) = call(
             &app,
             "GET",
@@ -1715,7 +1795,10 @@ mod tests {
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
         assert_eq!(body["error"], "bucket_quota_exceeded");
         assert_eq!(body["details"]["quotaBytes"], json!(1024));
-        assert!(backend.part_sizes("org:org-qa", &upload_id, "tiny/video.bin").await.is_err());
+        assert!(backend
+            .part_sizes("org:org-qa", &upload_id, "tiny/video.bin")
+            .await
+            .is_err());
         let (status, _) = call(
             &app,
             "GET",
@@ -1736,7 +1819,10 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED, "{body}");
         assert_eq!(body["object"]["size"], json!(30));
         // Parts are consumed by a successful complete.
-        assert!(backend.part_sizes("org:org-qa", &upload_id, "default/small.bin").await.is_err());
+        assert!(backend
+            .part_sizes("org:org-qa", &upload_id, "default/small.bin")
+            .await
+            .is_err());
         let (status, _) = call(
             &app,
             "GET",

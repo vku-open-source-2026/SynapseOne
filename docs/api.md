@@ -893,7 +893,7 @@ configuration and SDK examples.
 - `HEAD /v1/storage/objects/*` — metadata (`ETag`, `x-object-checksum-sha256`, size)
 - `DELETE /v1/storage/objects/*` → `{ok, key}`
 - `GET /v1/storage/objects?prefix=&limit=&cursor=` → `{objects, nextCursor}`
-- `POST /v1/storage/presign {key, method?, expiresIn?}` → `{url}` (S3 backend; `501` on fs)
+- `POST /v1/storage/presign {key, method?, expiresIn?}` → `{url}` (OCS HMAC-signed URL; S3 backend; `501` on fs)
 - `POST /v1/storage/uploads {key, contentType}` → `{uploadId}`
 - `PUT /v1/storage/uploads/:id/parts/:n?key=...` — raw part body → `{partNumber, etag}`
 - `POST /v1/storage/uploads/:id/complete {key, parts}` → `{object}`

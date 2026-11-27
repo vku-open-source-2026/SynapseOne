@@ -3,12 +3,16 @@
 //! S3 SigV4 signing, presigning, XML decoding and backend tests against a
 //! mock S3 HTTP server.
 
+mod common;
+
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use common::*;
 use serde_json::json;
 use synapseone_ocs::backend::{checksum_hex, tenant_segment, Backend, S3Backend};
 use synapseone_ocs::s3::{presign_url, sign_request, xml_decode, S3Client, S3Config};
-use wiremock::matchers::{method, path, query_param};
+use synapseone_ocs::{build_app, Config};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn config(endpoint: &str) -> S3Config {
@@ -425,10 +429,7 @@ async fn s3_backend_part_sizes_pages_through_list_parts() {
         .part_sizes("org:org-a", "up-1", "video.bin")
         .await
         .unwrap();
-    assert_eq!(
-        sizes,
-        vec![(1, 10), (2, 20), (3, 30), (4, 70), (5, 80)]
-    );
+    assert_eq!(sizes, vec![(1, 10), (2, 20), (3, 30), (4, 70), (5, 80)]);
 
     let requests = server.received_requests().await.unwrap();
     assert_eq!(
@@ -452,4 +453,150 @@ fn xml_decode_matrix() {
     assert_eq!(xml_decode("&amp;amp;"), "&amp;");
     assert_eq!(xml_decode("&unknown;"), "&unknown;");
     assert_eq!(json!(xml_decode("&#x1F600;")), json!("😀"));
+}
+
+#[tokio::test]
+async fn legacy_presign_returns_a_public_ocs_url_and_secures_put() {
+    let server = MockServer::start().await;
+    let backend = Backend::S3(S3Backend::new(
+        S3Client::new(config(&server.uri())).unwrap(),
+    ));
+    let mut cfg = Config::for_test();
+    cfg.public_base_url = "https://cdn.example.test".into();
+    cfg.max_object_bytes = 1024;
+    cfg.allowed_types = vec!["image/png".into()];
+    let app = build_app(backend, cfg);
+
+    let presign = json_request(
+        &app,
+        "POST",
+        "/v1/storage/presign",
+        &serde_json::json!({"key": "a.png", "method": "PUT", "expiresIn": 300}),
+        default_headers(),
+    )
+    .await;
+    assert_eq!(
+        presign.status,
+        reqwest::StatusCode::OK,
+        "{}",
+        presign.text()
+    );
+    let url = presign.json()["url"].as_str().unwrap().to_string();
+    assert!(url.starts_with("https://cdn.example.test/v1/ocs/signed?token="));
+    assert!(
+        !url.contains(&server.uri()),
+        "internal S3 endpoint leaked: {url}"
+    );
+    assert!(!url.contains("127.0.0.1"), "internal S3 host leaked: {url}");
+    let token = url
+        .split("token=")
+        .nth(1)
+        .unwrap()
+        .split('&')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // The legacy PUT token is an OCS token: object-size and content-type
+    // policy are enforced before the storage backend sees any request.
+    let oversized = request(
+        &app,
+        "PUT",
+        &format!("/v1/ocs/signed?token={token}"),
+        Some(vec![0u8; 4096]),
+        vec![("content-type".into(), "image/png".into())],
+    )
+    .await;
+    assert_eq!(oversized.status, reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(oversized.json()["error"], "object_too_large");
+
+    let wrong_type = request(
+        &app,
+        "PUT",
+        &format!("/v1/ocs/signed?token={token}"),
+        Some(b"small".to_vec()),
+        vec![("content-type".into(), "text/plain".into())],
+    )
+    .await;
+    assert_eq!(
+        wrong_type.status,
+        reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+    assert_eq!(wrong_type.json()["error"], "unsupported_media_type");
+
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "policy rejects must not reach the S3 backend"
+    );
+}
+
+#[tokio::test]
+async fn s3_range_get_is_signed_and_bounded() {
+    let server = MockServer::start().await;
+    let segment = tenant_segment("org:org-a");
+    let object_path = format!("/b/tenants/{segment}/ranged.bin");
+    Mock::given(method("GET"))
+        .and(path(&object_path))
+        .and(header("range", "bytes=2-5"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-type", "application/octet-stream")
+                .insert_header("content-range", "bytes 2-5/10")
+                .insert_header("etag", "\"range-etag\"")
+                .set_body_bytes(b"2345".to_vec()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/b/tenants/{segment}/ignore.bin")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/octet-stream")
+                .set_body_bytes(vec![9u8; 1024 * 1024]),
+        )
+        .mount(&server)
+        .await;
+
+    let backend = Backend::S3(S3Backend::new(
+        S3Client::new(config(&server.uri())).unwrap(),
+    ));
+    let object = backend
+        .get_range("org:org-a", "ranged.bin", 2, 5)
+        .await
+        .expect("range")
+        .expect("object");
+    assert_eq!(object.body.as_ref(), b"2345");
+    assert_eq!(object.meta.size, 10);
+    assert_eq!(object.meta.etag, "range-etag");
+
+    // A backend that ignores Range must fail closed instead of buffering the
+    // full object into memory.
+    let ignored = backend
+        .get_range("org:org-a", "ignore.bin", 0, 9)
+        .await
+        .expect_err("ignored range must be an error");
+    assert!(
+        ignored.contains("ignored the requested byte range"),
+        "{ignored}"
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    let ranged = requests
+        .iter()
+        .find(|request| request.url.path().ends_with("/ranged.bin"))
+        .expect("ranged request");
+    assert_eq!(
+        ranged.headers.get("range").unwrap().to_str().unwrap(),
+        "bytes=2-5"
+    );
+    let authorization = ranged
+        .headers
+        .get("authorization")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        authorization.contains("range"),
+        "the Range header must be part of SigV4: {authorization}"
+    );
 }

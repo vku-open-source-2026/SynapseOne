@@ -196,7 +196,8 @@ async fn rejects_checksum_mismatch_empty_bodies_and_traversal() {
         default_headers(),
     )
     .await;
-    assert_eq!(unsafe_get.status, StatusCode::NOT_FOUND);
+    assert_eq!(unsafe_get.status, StatusCode::BAD_REQUEST);
+    assert_eq!(unsafe_get.json()["error"], "invalid_key");
 
     let encoded_space = request(
         &app,
@@ -755,4 +756,348 @@ async fn request_id_and_security_headers_are_present() {
 
     let generated = request(&app, "GET", "/v1/storage/objects", None, default_headers()).await;
     assert!(!generated.header("x-request-id").is_empty());
+}
+
+#[tokio::test]
+async fn legacy_routes_cannot_touch_reserved_namespace_or_bucket_markers() {
+    let (app, _dir) = fs_app();
+    let created = json_request(
+        &app,
+        "POST",
+        "/v1/ocs/buckets",
+        &json!({"name": "media"}),
+        default_headers(),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.text());
+
+    let mut headers = default_headers();
+    with_header(&mut headers, "content-type", "text/plain");
+    with_header(
+        &mut headers,
+        "x-object-checksum-sha256",
+        &sha256_hex(b"original"),
+    );
+    let put = request(
+        &app,
+        "PUT",
+        "/v1/ocs/buckets/media/objects/secret",
+        Some(b"original".to_vec()),
+        headers,
+    )
+    .await;
+    assert_eq!(put.status, StatusCode::CREATED, "{}", put.text());
+
+    // Every legacy object verb and the bucket-aware default bucket must
+    // reject the reserved prefix before they can read, overwrite or delete
+    // the named-bucket object.
+    for base in ["/v1/storage/objects", "/v1/ocs/buckets/default/objects"] {
+        for method in ["GET", "HEAD", "DELETE"] {
+            let response = request(
+                &app,
+                method,
+                &format!("{base}/@ocs/media/secret"),
+                None,
+                default_headers(),
+            )
+            .await;
+            assert_eq!(response.status, StatusCode::BAD_REQUEST, "{base} {method}");
+            if method != "HEAD" {
+                assert_eq!(response.json()["error"], "invalid_key", "{base} {method}");
+            }
+        }
+    }
+    let overwrite = request(
+        &app,
+        "PUT",
+        "/v1/storage/objects/@ocs/media/secret",
+        Some(b"attacker".to_vec()),
+        default_headers(),
+    )
+    .await;
+    assert_eq!(overwrite.status, StatusCode::BAD_REQUEST);
+    assert_eq!(overwrite.json()["error"], "invalid_key");
+    let untouched = request(
+        &app,
+        "GET",
+        "/v1/ocs/buckets/media/objects/secret",
+        None,
+        default_headers(),
+    )
+    .await;
+    assert_eq!(untouched.status, StatusCode::OK);
+    assert_eq!(untouched.body.as_ref(), b"original");
+
+    // Listing the default bucket must not disclose named-bucket objects or
+    // internal marker metadata.
+    for uri in ["/v1/storage/objects", "/v1/ocs/buckets/default/objects"] {
+        let listed = request(&app, "GET", uri, None, default_headers()).await;
+        assert_eq!(listed.status, StatusCode::OK, "{uri}");
+        let keys = listed.json()["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|object| object["key"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            keys.iter().all(|key| !key.starts_with("@ocs/")
+                && key != ".bucket"
+                && !key.ends_with("/.bucket")),
+            "{uri} leaked reserved keys: {keys:?}"
+        );
+    }
+
+    // Bucket markers are internal metadata and cannot be removed or replaced.
+    for base in ["/v1/storage/objects", "/v1/ocs/buckets/default/objects"] {
+        for method in ["PUT", "DELETE"] {
+            let response = request(
+                &app,
+                method,
+                &format!("{base}/@ocs/media/.bucket"),
+                Some(b"corrupt".to_vec()),
+                default_headers(),
+            )
+            .await;
+            assert_eq!(response.status, StatusCode::BAD_REQUEST, "{base} {method}");
+            assert_eq!(response.json()["error"], "invalid_key", "{base} {method}");
+        }
+    }
+    let bucket = request(
+        &app,
+        "HEAD",
+        "/v1/ocs/buckets/media",
+        None,
+        default_headers(),
+    )
+    .await;
+    assert_eq!(bucket.status, StatusCode::OK);
+
+    // The namespace root itself must not be claimed as a default-bucket key:
+    // on the filesystem backend a file named `@ocs` would block every bucket.
+    let root = request(
+        &app,
+        "PUT",
+        "/v1/storage/objects/@ocs",
+        Some(b"x".to_vec()),
+        default_headers(),
+    )
+    .await;
+    assert_eq!(root.status, StatusCode::BAD_REQUEST);
+    assert_eq!(root.json()["error"], "invalid_key");
+
+    let prefix = request(
+        &app,
+        "GET",
+        "/v1/storage/objects?prefix=@ocs/",
+        None,
+        default_headers(),
+    )
+    .await;
+    assert_eq!(prefix.status, StatusCode::BAD_REQUEST);
+    assert_eq!(prefix.json()["error"], "invalid_prefix");
+
+    let presign = json_request(
+        &app,
+        "POST",
+        "/v1/storage/presign",
+        &json!({"key": "@ocs/media/secret", "method": "GET"}),
+        default_headers(),
+    )
+    .await;
+    assert_eq!(presign.status, StatusCode::BAD_REQUEST);
+    assert_eq!(presign.json()["error"], "invalid_key");
+
+    let multipart = json_request(
+        &app,
+        "POST",
+        "/v1/storage/uploads",
+        &json!({"key": "@ocs/media/new.bin"}),
+        default_headers(),
+    )
+    .await;
+    assert_eq!(multipart.status, StatusCode::BAD_REQUEST);
+    assert_eq!(multipart.json()["error"], "invalid_key");
+
+    let valid = json_request(
+        &app,
+        "POST",
+        "/v1/storage/uploads",
+        &json!({"key": "safe.bin"}),
+        default_headers(),
+    )
+    .await;
+    assert_eq!(valid.status, StatusCode::CREATED);
+    let upload_id = valid.json()["uploadId"].as_str().unwrap().to_string();
+    let part = request(
+        &app,
+        "PUT",
+        &format!("/v1/storage/uploads/{upload_id}/parts/1?key=@ocs/media/evil"),
+        Some(b"x".to_vec()),
+        default_headers(),
+    )
+    .await;
+    assert_eq!(part.status, StatusCode::BAD_REQUEST);
+    assert_eq!(part.json()["error"], "invalid_key");
+
+    let complete = json_request(
+        &app,
+        "POST",
+        &format!("/v1/storage/uploads/{upload_id}/complete"),
+        &json!({
+            "key": "@ocs/media/evil",
+            "parts": [{"partNumber": 1, "etag": "x"}]
+        }),
+        default_headers(),
+    )
+    .await;
+    assert_eq!(complete.status, StatusCode::BAD_REQUEST);
+    assert_eq!(complete.json()["error"], "invalid_key");
+
+    let abort = request(
+        &app,
+        "DELETE",
+        &format!("/v1/storage/uploads/{upload_id}?key=@ocs/media/evil"),
+        None,
+        default_headers(),
+    )
+    .await;
+    assert_eq!(abort.status, StatusCode::BAD_REQUEST);
+    assert_eq!(abort.json()["error"], "invalid_key");
+
+    let bucket_still_there = request(
+        &app,
+        "HEAD",
+        "/v1/ocs/buckets/media",
+        None,
+        default_headers(),
+    )
+    .await;
+    assert_eq!(bucket_still_there.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn concurrent_legacy_puts_leave_a_consistent_body_and_metadata() {
+    let (app, _dir) = fs_app();
+    let mut tasks = Vec::new();
+    for index in 0..16u8 {
+        let app = app.clone();
+        tasks.push(tokio::spawn(async move {
+            let body = vec![index; 256 + index as usize];
+            request(
+                &app,
+                "PUT",
+                "/v1/storage/objects/concurrent.bin",
+                Some(body),
+                default_headers(),
+            )
+            .await
+            .status
+        }));
+    }
+    for task in tasks {
+        let status = task.await.expect("task");
+        assert!(
+            status == StatusCode::CREATED || status == StatusCode::OK,
+            "unexpected status {status}"
+        );
+    }
+    let get = request(
+        &app,
+        "GET",
+        "/v1/storage/objects/concurrent.bin",
+        None,
+        default_headers(),
+    )
+    .await;
+    assert_eq!(get.status, StatusCode::OK);
+    assert_eq!(get.header("etag"), format!("\"{}\"", sha256_hex(&get.body)));
+    let head = request(
+        &app,
+        "HEAD",
+        "/v1/storage/objects/concurrent.bin",
+        None,
+        default_headers(),
+    )
+    .await;
+    assert_eq!(head.header("content-length"), get.body.len().to_string());
+}
+
+#[tokio::test]
+async fn legacy_list_skips_reserved_keys_without_breaking_pagination() {
+    let (app, _dir) = fs_app();
+    assert_eq!(
+        json_request(
+            &app,
+            "POST",
+            "/v1/ocs/buckets",
+            &json!({"name": "media"}),
+            default_headers(),
+        )
+        .await
+        .status,
+        StatusCode::CREATED
+    );
+    let mut headers = default_headers();
+    with_header(&mut headers, "content-type", "text/plain");
+    assert_eq!(
+        request(
+            &app,
+            "PUT",
+            "/v1/ocs/buckets/media/objects/secret",
+            Some(b"secret".to_vec()),
+            headers.clone(),
+        )
+        .await
+        .status,
+        StatusCode::CREATED
+    );
+    for key in ["a.txt", "b.txt"] {
+        assert_eq!(
+            request(
+                &app,
+                "PUT",
+                &format!("/v1/storage/objects/{key}"),
+                Some(key.as_bytes().to_vec()),
+                headers.clone(),
+            )
+            .await
+            .status,
+            StatusCode::CREATED
+        );
+    }
+
+    let first = request(
+        &app,
+        "GET",
+        "/v1/storage/objects?limit=1",
+        None,
+        default_headers(),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK);
+    assert_eq!(first.json()["objects"][0]["key"], "a.txt");
+    let cursor = first.json()["nextCursor"].as_str().unwrap().to_string();
+    assert!(!cursor.is_empty());
+    assert!(!cursor.starts_with("@ocs/"));
+
+    let second = request(
+        &app,
+        "GET",
+        &format!("/v1/storage/objects?limit=1&cursor={cursor}"),
+        None,
+        default_headers(),
+    )
+    .await;
+    assert_eq!(second.status, StatusCode::OK);
+    assert_eq!(second.json()["objects"][0]["key"], "b.txt");
+    assert!(second.json()["nextCursor"].is_null());
+
+    let all = request(&app, "GET", "/v1/storage/objects", None, default_headers()).await;
+    let keys = all.json()["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|object| object["key"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(keys, vec!["a.txt", "b.txt"]);
 }

@@ -17,11 +17,14 @@ use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, Any, CorsLayer};
 use uuid::Uuid;
 
 use crate::audit::{self, AuditEvent};
-use crate::backend::{checksum_hex, validate_key, ObjectMeta};
-use crate::ocs::set_header;
+use crate::backend::{checksum_hex, ObjectMeta};
+use crate::ocs::{
+    create_presign_token, set_header, PresignPayload, BUCKET_MARKER, DEFAULT_BUCKET, OCS_PREFIX,
+};
 use crate::util::{
-    backend_error, error_response, header, is_integer, js_number, js_string, media_type_or_default,
-    parse_js_number, read_body_limited, read_json, resolve_tenant, verify_internal, QueryParams,
+    backend_error, content_length_exceeds, encode_uri_component, error_response, header,
+    is_integer, js_number, js_string, media_type_or_default, parse_js_number, read_body_limited,
+    read_json, resolve_tenant, verify_internal, QueryParams,
 };
 use crate::{AppState, Tenant};
 
@@ -34,7 +37,6 @@ fn build_version() -> String {
         .filter(|value| !value.is_empty() && value.len() <= 128)
         .unwrap_or_else(|| VERSION.to_string())
 }
-
 
 fn legacy_meta_headers(meta: &ObjectMeta) -> Vec<(String, String)> {
     let mut headers = vec![
@@ -118,6 +120,12 @@ async fn put_object(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    if let Some(error) = crate::ocs::validate_ocs_key(&key) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_key", Some(error), None);
+    }
+    if content_length_exceeds(&headers, state.config.max_object_bytes) {
+        return crate::util::object_too_large(state.config.max_object_bytes);
+    }
     let bytes = match read_body_limited(
         body,
         state.config.max_object_bytes,
@@ -128,9 +136,6 @@ async fn put_object(
         Ok(bytes) => bytes,
         Err(response) => return response,
     };
-    if let Some(error) = validate_key(&key) {
-        return error_response(StatusCode::BAD_REQUEST, "invalid_key", Some(error), None);
-    }
     if bytes.is_empty() {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -240,7 +245,7 @@ async fn list_objects(
     let prefix = query.js_string("prefix");
     if !prefix.is_empty() {
         let trimmed = prefix.strip_suffix('/').unwrap_or(&prefix);
-        if validate_key(trimmed).is_some() {
+        if crate::ocs::validate_ocs_key(trimmed).is_some() {
             return error_response(StatusCode::BAD_REQUEST, "invalid_prefix", None, None);
         }
     }
@@ -261,14 +266,43 @@ async fn list_objects(
         }
     };
     let cursor = query.single("cursor");
-    match state.backend.list(&tenant, &prefix, limit, cursor).await {
-        Ok(page) => Json(json!({
-            "objects": page.objects,
-            "nextCursor": page.next_cursor,
-        }))
-        .into_response(),
-        Err(error) => backend_error(error),
+    let marker_suffix = format!("/{BUCKET_MARKER}");
+    let mut objects = Vec::new();
+    let mut scan_cursor = cursor.map(str::to_string);
+    for _ in 0..100 {
+        let remaining = limit.saturating_sub(objects.len()).max(1);
+        let page = match state
+            .backend
+            .list(&tenant, &prefix, remaining, scan_cursor.as_deref())
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => return backend_error(error),
+        };
+        let next_cursor = page.next_cursor.clone();
+        for object in page.objects {
+            if object.key.starts_with(OCS_PREFIX)
+                || object.key == BUCKET_MARKER
+                || object.key.ends_with(&marker_suffix)
+            {
+                continue;
+            }
+            objects.push(object);
+        }
+        if objects.len() >= limit || next_cursor.is_none() {
+            return Json(json!({
+                "objects": objects,
+                "nextCursor": next_cursor,
+            }))
+            .into_response();
+        }
+        scan_cursor = next_cursor;
     }
+    Json(json!({
+        "objects": objects,
+        "nextCursor": scan_cursor,
+    }))
+    .into_response()
 }
 
 async fn get_object(
@@ -276,6 +310,9 @@ async fn get_object(
     Extension(Tenant(tenant)): Extension<Tenant>,
     Path(key): Path<String>,
 ) -> Response {
+    if let Some(error) = crate::ocs::validate_ocs_key(&key) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_key", Some(error), None);
+    }
     match state.backend.get(&tenant, &key).await {
         Ok(Some(object)) => {
             let mut response = StatusCode::OK.into_response();
@@ -293,6 +330,9 @@ async fn head_object(
     Extension(Tenant(tenant)): Extension<Tenant>,
     Path(key): Path<String>,
 ) -> Response {
+    if let Some(error) = crate::ocs::validate_ocs_key(&key) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_key", Some(error), None);
+    }
     match state.backend.head(&tenant, &key).await {
         Ok(Some(meta)) => {
             let mut response = StatusCode::OK.into_response();
@@ -309,6 +349,9 @@ async fn delete_object(
     Extension(Tenant(tenant)): Extension<Tenant>,
     Path(key): Path<String>,
 ) -> Response {
+    if let Some(error) = crate::ocs::validate_ocs_key(&key) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_key", Some(error), None);
+    }
     match state.backend.delete(&tenant, &key).await {
         Ok(true) => Json(json!({ "ok": true, "key": key })).into_response(),
         Ok(false) => error_response(StatusCode::NOT_FOUND, "not_found", None, None),
@@ -327,7 +370,7 @@ async fn presign(
         Err(response) => return response,
     };
     let key = js_string(body.get("key"));
-    if let Some(error) = validate_key(&key) {
+    if let Some(error) = crate::ocs::validate_ocs_key(&key) {
         return error_response(StatusCode::BAD_REQUEST, "invalid_key", Some(error), None);
     }
     let verb = {
@@ -364,25 +407,39 @@ async fn presign(
         );
     }
     let ttl = ttl as u64;
-    match state.backend.presign(&tenant, &verb, &key, ttl) {
-        Ok(Some(url)) => Json(json!({
-            "url": url,
-            "method": verb,
-            "expiresIn": ttl,
-        }))
-        .into_response(),
-        Ok(None) => {
-            let mut body = Map::new();
-            body.insert("error".into(), Value::String("presign_unsupported".into()));
-            body.insert(
-                "message".into(),
-                Value::String("presigned URLs require the S3 backend".into()),
-            );
-            body.insert("backend".into(), Value::String(state.backend.name().into()));
-            (StatusCode::NOT_IMPLEMENTED, Json(Value::Object(body))).into_response()
-        }
-        Err(error) => backend_error(error),
+    if !state.backend.supports_presign() {
+        let mut body = Map::new();
+        body.insert("error".into(), Value::String("presign_unsupported".into()));
+        body.insert(
+            "message".into(),
+            Value::String("presigned URLs require the S3 backend".into()),
+        );
+        body.insert("backend".into(), Value::String(state.backend.name().into()));
+        return (StatusCode::NOT_IMPLEMENTED, Json(Value::Object(body))).into_response();
     }
+    // Never hand out a direct S3 URL: it would expose the internal storage
+    // hostname and bypass OCS size/content-type checks. Route every legacy
+    // presigned operation through the OCS HMAC-signed endpoint, including
+    // PUT, so `signed_put` applies the same policy as a normal upload.
+    let payload = PresignPayload {
+        tenant,
+        bucket: DEFAULT_BUCKET.into(),
+        key: key.clone(),
+        method: verb.clone(),
+        exp: chrono::Utc::now().timestamp() + ttl as i64,
+        nonce: Uuid::new_v4().to_string(),
+    };
+    let token = create_presign_token(&payload, &state.config.presign_secret);
+    Json(json!({
+        "url": format!(
+            "{}/v1/ocs/signed?token={}",
+            state.config.public_base_url,
+            encode_uri_component(&token)
+        ),
+        "method": verb,
+        "expiresIn": ttl,
+    }))
+    .into_response()
 }
 
 async fn create_multipart(
@@ -396,7 +453,7 @@ async fn create_multipart(
         Err(response) => return response,
     };
     let key = js_string(body.get("key"));
-    if let Some(error) = validate_key(&key) {
+    if let Some(error) = crate::ocs::validate_ocs_key(&key) {
         return error_response(StatusCode::BAD_REQUEST, "invalid_key", Some(error), None);
     }
     let content_type = {
@@ -444,18 +501,9 @@ async fn upload_part(
     Extension(Tenant(tenant)): Extension<Tenant>,
     Path((upload_id, part)): Path<(String, String)>,
     RawQuery(raw): RawQuery,
+    headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let bytes = match read_body_limited(
-        body,
-        state.config.max_object_bytes,
-        state.config.max_object_bytes,
-    )
-    .await
-    {
-        Ok(bytes) => bytes,
-        Err(response) => return response,
-    };
     let valid_upload_id = !upload_id.is_empty()
         && upload_id.len() <= 128
         && upload_id
@@ -470,6 +518,22 @@ async fn upload_part(
     };
     let query = QueryParams::parse(raw.as_deref());
     let key = query.js_string("key");
+    if let Some(error) = crate::ocs::validate_ocs_key(&key) {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_key", Some(error), None);
+    }
+    if content_length_exceeds(&headers, state.config.max_object_bytes) {
+        return error_response(StatusCode::PAYLOAD_TOO_LARGE, "part_too_large", None, None);
+    }
+    let bytes = match read_body_limited(
+        body,
+        state.config.max_object_bytes,
+        state.config.max_object_bytes,
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(response) => return response,
+    };
     if bytes.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "empty_body", None, None);
     }
@@ -503,7 +567,7 @@ async fn complete_multipart(
         Err(response) => return response,
     };
     let key = js_string(body.get("key"));
-    if let Some(error) = validate_key(&key) {
+    if let Some(error) = crate::ocs::validate_ocs_key(&key) {
         return error_response(StatusCode::BAD_REQUEST, "invalid_key", Some(error), None);
     }
     let parts = match body.get("parts") {
@@ -563,10 +627,12 @@ async fn complete_multipart(
     if next_bytes > state.config.tenant_quota_bytes {
         // Abort the rejected upload so its parts do not keep occupying
         // storage; the error still reports the quota envelope.
-        if let Err(error) = state.backend.abort_multipart(&tenant, &upload_id, &key).await {
-            tracing::warn!(
-                "[storage] abort of quota-exceeding upload {upload_id} failed: {error}"
-            );
+        if let Err(error) = state
+            .backend
+            .abort_multipart(&tenant, &upload_id, &key)
+            .await
+        {
+            tracing::warn!("[storage] abort of quota-exceeding upload {upload_id} failed: {error}");
         }
         let mut body = Map::new();
         body.insert("error".into(), Value::String("quota_exceeded".into()));
@@ -599,6 +665,14 @@ async fn abort_multipart(
 ) -> Response {
     let query = QueryParams::parse(raw.as_deref());
     let key = query.js_string("key");
+    // The legacy abort route historically allowed an empty key (the fs
+    // backend does not need it, and older S3 clients passed it optionally).
+    // Any supplied key must still respect the reserved namespace.
+    if !key.is_empty() {
+        if let Some(error) = crate::ocs::validate_ocs_key(&key) {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_key", Some(error), None);
+        }
+    }
     match state
         .backend
         .abort_multipart(&tenant, &upload_id, &key)
