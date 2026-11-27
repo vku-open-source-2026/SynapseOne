@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 VKU.VIC
+name: Release metadata maintenance
+
+# Operator-only repair for release notes/checksums. Publishing remains in the
+# SDK-specific workflows; this job never publishes a package or moves a tag.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing SDK release tag to repair
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Normalize JavaScript/Python checksum paths
+        if: startsWith(inputs.tag, 'sdk-v')
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          gh release download "${RELEASE_TAG}" --dir "${work}" \
+            --pattern '*.tgz' --pattern '*.whl' --pattern '*.tar.gz'
+          (
+            cd "${work}"
+            find . -maxdepth 1 -type f -printf '%f\n' \
+              | sort | xargs sha256sum > SHA256SUMS
+          )
+          gh release upload "${RELEASE_TAG}" "${work}/SHA256SUMS" --clobber
+
+      - name: Render Go release notes
+        if: startsWith(inputs.tag, 'sdks/sdk-go/v')
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#sdks/sdk-go/v}"
+          cat > "${RUNNER_TEMP}/go-release-notes.md" <<EOF
+          Go SDK \`${version}\` is available from the public Go module proxy.
+
+          \`\`\`bash
+          go get github.com/vku-open-source-2026/SynapseOne/sdks/sdk-go@v${version}
+          \`\`\`
+
+          Documentation: https://synapseone.space/docs?tab=go
+          EOF
+          gh release edit "${RELEASE_TAG}" --notes-file "${RUNNER_TEMP}/go-release-notes.md"
+
+      - name: Ensure Rust GitHub release exists
+        if: startsWith(inputs.tag, 'sdk-rust-v')
+        run: |
+          set -euo pipefail
+          if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" --generate-notes
+          fi
