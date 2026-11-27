@@ -106,6 +106,13 @@
       "when": 1798001000000,
       "tag": "0014_burly_silver_sable",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1798001000003,
+      "tag": "0017_hackathon_registrations",
+      "breakpoints": true
     }
   ]
 }

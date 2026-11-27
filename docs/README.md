@@ -20,6 +20,7 @@
 | [console.md](console.md) | Management UI (run, configure, SSO, frontend dev) |
 | [platform-superadmin.md](platform-superadmin.md) | Platform Super Admin dashboard: bootstrap, MFA, platform admins, rollback |
 | [platform-superadmin-login.md](platform-superadmin-login.md) | Provisioned local Platform Owner: login, MFA, modules, recovery, verification |
+| [hackathon.md](hackathon.md) · [Tiếng Việt](vi/hackathon.md) | VIC Hackathon #1: schedule, rules, prizes, registration API and superadmin review |
 | [ai-assistant.md](ai-assistant.md) | AI testing assistant (agent design, models, limits, chatbot) |
 | [database-performance.md](database-performance.md) | PgBouncer, Postgres tuning, SynapseBase Faststore read cache |
 | [monitoring.md](monitoring.md) | Prometheus (run, targets, alerts, useful queries) |

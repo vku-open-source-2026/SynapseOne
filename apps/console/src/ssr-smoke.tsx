@@ -22,6 +22,7 @@ const ROUTES = [
   '/login',
   '/register',
   '/about',
+  '/hackathon',
   '/oidc/callback',
   '/dashboard',
   '/orgs',
@@ -53,6 +54,7 @@ const ROUTES = [
   '/admin/usage',
   '/admin/audit',
   '/admin/access',
+  '/admin/hackathon',
   '/admin/not-a-route',
 ];
 
@@ -89,6 +91,7 @@ const GUARDED = new Set([
   '/admin/usage',
   '/admin/audit',
   '/admin/access',
+  '/admin/hackathon',
   '/admin/not-a-route',
 ]);
 

@@ -46,6 +46,7 @@ export default function PublicHeader() {
               <StableLabel pick={l.pick} />
             </Link>
           ))}
+          <Link to="/hackathon" className="rounded-lg px-3 py-1.5 font-semibold text-s1-accent transition hover:bg-s1-accent/10">Hackathon</Link>
           <SiteToggles className="ml-1" />
           {offSite ? (
             <a
@@ -85,6 +86,7 @@ export default function PublicHeader() {
               {l.pick(m)}
             </Link>
           ))}
+          <Link to="/hackathon" onClick={() => setOpen(false)} className="block py-2 text-sm font-semibold text-s1-accent">Hackathon</Link>
           {offSite ? (
             <a
               href={authHref}

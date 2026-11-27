@@ -57,6 +57,10 @@ import {
 } from './mfa';
 import { decideForPrincipal, managedPolicyList, MANAGED_POLICIES, type PrincipalInput } from './authz';
 import { secretsEqual, hashCandidates, withTransaction } from './db';
+import {
+  createHackathonRegistration, getHackathonRegistration, listHackathonRegistrations,
+  reviewHackathonRegistration, markHackathonApiKeySent,
+} from './hackathon';
 import { ingestUsageEvents, listUsageEvents, purgeUsage, usageSummary, type UsageFilter } from './usage';
 import { startUsageRollup } from './usage-rollup';
 import { assertOidcConfig, isPublicHttpsUrl, createOidcState, exchangeCode, authorizationEndpoint, oidcSettings, OidcError } from './oidc';
@@ -437,7 +441,16 @@ const PLATFORM_STEP_UP_ACTIONS = new Set([
   'user:unlock',
   'admin:grant',
   'admin:revoke',
+  'hackathon:review',
+  'hackathon:api-key-sent',
 ]);
+
+const HACKATHON_DEFAULT_CLOSE_AT = Date.parse('2026-11-28T10:00:00.000Z'); // 17:00 UTC+7
+function hackathonCloseAt(): number {
+  const raw = String(process.env.HACKATHON_REGISTRATION_CLOSE_AT || '').trim();
+  const parsed = raw ? Date.parse(raw) : Number.NaN;
+  return Number.isFinite(parsed) ? parsed : HACKATHON_DEFAULT_CLOSE_AT;
+}
 
 /**
  * A recent login that completed a second factor can open the platform console
@@ -1243,7 +1256,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
   // Hourly usage rollups → Synapse Warehouse (no-op without WAREHOUSE_SERVICE_URL).
   startUsageRollup();
   const PUBLIC_PREFIXES = ['/v1/auth/'];
-  const PUBLIC_EXACT = new Set(['/v1/auth', '/ready']);
+  const PUBLIC_EXACT = new Set(['/v1/auth', '/v1/hackathon/registrations', '/ready']);
   app.use(((async (req: express.Request, res: express.Response, next: express.NextFunction) => {
     const p = req.path;
     if (p === '/health' || PUBLIC_EXACT.has(p) || PUBLIC_PREFIXES.some((x) => p.startsWith(x))) return next();
@@ -1380,6 +1393,13 @@ async function auditMutation(req: express.Request, action: string, resource: str
   // SCIM is machine-to-machine but still needs a brute-force / abuse ceiling.
   const scimLimiter = rateLimit(120, 60_000);
   app.use('/scim/', scimLimiter as any);
+  // Public event registration is intentionally anonymous, so use a strict
+  // per-address ceiling in addition to validation and database uniqueness.
+  const hackathonLimiter = rateLimit(
+    Math.max(1, Number(process.env.HACKATHON_REGISTRATION_RATE_LIMIT) || 5),
+    Math.max(60_000, Number(process.env.HACKATHON_REGISTRATION_RATE_WINDOW_MS) || 15 * 60_000),
+  );
+  app.use('/v1/hackathon/registrations', hackathonLimiter as any);
   // Per-route ceiling for second-factor and account-recovery endpoints
   // (per-user lockout in mfa.ts is the primary brute-force defence).
   const mfaLimiter = expressRateLimit({
@@ -4131,6 +4151,53 @@ async function auditMutation(req: express.Request, action: string, resource: str
     res.json(await listUsageEvents({ ...parsed.filter, orgId: org }));
   });
 
+  // ---------- Public VIC Hackathon registration ----------
+  app.post('/v1/hackathon/registrations', async (req, res) => {
+    noStore(res);
+    if (Date.now() >= hackathonCloseAt()) {
+      return res.status(410).json({ error: 'registration_closed', message: 'Đã hết thời hạn đăng ký VIC Hackathon #1.' });
+    }
+    const parsed = z.object({
+      teamName: z.string().trim().min(2).max(100),
+      captainName: z.string().trim().min(2).max(100),
+      captainEmail: z.string().trim().toLowerCase().email().max(320),
+      captainPhone: z.string().trim().regex(/^[0-9+().\-\s]{8,20}$/),
+      captainStudentId: z.string().trim().regex(/^[A-Za-z0-9._-]{3,32}$/),
+      members: z.array(z.string().trim().min(2).max(100)).min(1).max(2),
+      projectIdea: z.string().trim().max(2000).nullish(),
+      acceptedRules: z.literal(true),
+      website: z.string().max(200).nullish(),
+    }).safeParse(req.body);
+    if (!parsed.success || parsed.data.website) {
+      return res.status(400).json({ error: 'invalid_body', message: parsed.success ? 'Invalid submission' : parsed.error.message });
+    }
+    const maxRegistrations = Math.max(1, Number(process.env.HACKATHON_MAX_REGISTRATIONS) || 500);
+    const b = parsed.data;
+    try {
+      const registration = await createHackathonRegistration({
+        teamName: sanitizeName(b.teamName, 100),
+        captainName: sanitizeName(b.captainName, 100),
+        captainEmail: b.captainEmail,
+        captainPhone: b.captainPhone,
+        captainStudentId: b.captainStudentId,
+        members: b.members.map((name) => sanitizeName(name, 100)),
+        projectIdea: b.projectIdea ? b.projectIdea.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f<>]/g, '').trim() : undefined,
+      }, maxRegistrations);
+      return res.status(201).json({
+        registration,
+        message: 'Đăng ký thành công! Ban tổ chức sẽ liên hệ qua email của đội trưởng.',
+      });
+    } catch (e: any) {
+      if (isUniqueViolation(e)) {
+        return res.status(409).json({ error: 'registration_exists', message: 'Tên đội hoặc email đội trưởng đã được đăng ký.' });
+      }
+      if (e?.code === 'hackathon_full') {
+        return res.status(409).json({ error: 'registration_full', message: 'Số lượng đội đã đủ. Vui lòng liên hệ ban tổ chức.' });
+      }
+      throw e;
+    }
+  });
+
   // ---------- Platform Super Admin control plane ----------
   // These routes are served by IAM but only accept a dedicated platform-admin
   // token (kind=platform-admin, aud=synapseone-platform-admin). They never
@@ -4293,6 +4360,80 @@ async function auditMutation(req: express.Request, action: string, resource: str
       usage: usage.totals,
       audit,
     });
+  });
+
+  app.get('/v1/platform/hackathon/registrations', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'auditor');
+    if (!ctx) return;
+    const limit = req.query.limit === undefined ? 50 : Number(req.query.limit);
+    const offset = req.query.offset === undefined ? 0 : Number(req.query.offset);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) return res.status(400).json({ error: 'invalid_limit' });
+    if (!Number.isInteger(offset) || offset < 0 || offset > 100_000) return res.status(400).json({ error: 'invalid_offset' });
+    const status = String(req.query.status || '').trim();
+    if (status && !['pending', 'approved', 'rejected'].includes(status)) return res.status(400).json({ error: 'invalid_status' });
+    const out = await listHackathonRegistrations({
+      status: status || undefined,
+      q: String(req.query.q || '').trim().slice(0, 200),
+      limit,
+      offset,
+    });
+    noStore(res);
+    res.json({ ...out, limit, offset });
+  });
+
+  app.get('/v1/platform/hackathon/registrations/:id', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'auditor');
+    if (!ctx) return;
+    if (!isUuid(req.params.id)) return res.status(400).json({ error: 'invalid_id' });
+    const registration = await getHackathonRegistration(req.params.id);
+    if (!registration) return res.status(404).json({ error: 'not_found' });
+    noStore(res);
+    res.json({ registration });
+  });
+
+  app.patch('/v1/platform/hackathon/registrations/:id', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.id)) return res.status(400).json({ error: 'invalid_id' });
+    const parsed = z.object({
+      status: z.enum(['pending', 'approved', 'rejected']),
+      reviewNote: z.string().trim().max(1000).nullish(),
+    }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'hackathon:review'))) return;
+    const registration = await reviewHackathonRegistration({
+      id: req.params.id,
+      status: parsed.data.status,
+      reviewNote: parsed.data.reviewNote || undefined,
+      reviewedBy: ctx.user.id,
+    });
+    if (!registration) return res.status(404).json({ error: 'not_found' });
+    await auditPlatformAction(req, ctx.user.id, 'platform:hackathon:review', null, {
+      registrationId: registration.id,
+      teamName: registration.teamName,
+      status: registration.status,
+    });
+    noStore(res);
+    res.json({ registration });
+  });
+
+  app.post('/v1/platform/hackathon/registrations/:id/api-key-sent', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.id)) return res.status(400).json({ error: 'invalid_id' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'hackathon:api-key-sent'))) return;
+    const existing = await getHackathonRegistration(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'not_found' });
+    if (existing.status !== 'approved') {
+      return res.status(409).json({ error: 'registration_not_approved', message: 'Chỉ đội đã được duyệt mới có thể nhận API key.' });
+    }
+    const registration = await markHackathonApiKeySent(req.params.id);
+    await auditPlatformAction(req, ctx.user.id, 'platform:hackathon:api-key-sent', null, {
+      registrationId: registration!.id,
+      teamName: registration!.teamName,
+    });
+    noStore(res);
+    res.json({ registration });
   });
 
   app.get('/v1/platform/orgs', async (req, res) => {

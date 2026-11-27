@@ -24,6 +24,7 @@ import Register from './pages/Register.jsx';
 import OidcCallback from './pages/OidcCallback.jsx';
 import Landing from './pages/Landing.jsx';
 import About from './pages/About.jsx';
+import Hackathon from './pages/Hackathon.jsx';
 
 // Lazy-load heavy console pages so the first paint stays fast and every
 // route change shows a skeleton instead of a blank flash.
@@ -65,6 +66,7 @@ const AdminUsage = React.lazy(() => import('./pages/admin/Usage.jsx'));
 const AdminAudit = React.lazy(() => import('./pages/admin/Audit.jsx'));
 const AdminPlatformAdmins = React.lazy(() => import('./pages/admin/PlatformAdmins.jsx'));
 const AdminRunners = React.lazy(() => import('./pages/admin/Runners.jsx'));
+const AdminHackathon = React.lazy(() => import('./pages/admin/Hackathon.jsx'));
 
 import { appLoginUrl, isCanonicalAppHost } from './lib/site.js';
 import { LanguageProvider } from './lib/i18n.jsx';
@@ -176,6 +178,7 @@ function AppRoutes() {
           <Route path="/" element={<Landing />} />
           <Route path="/welcome" element={<Navigate to="/" replace />} />
           <Route path="/about" element={<About />} />
+          <Route path="/hackathon" element={<Hackathon />} />
           <Route path="/login" element={<Login />} />
           <Route path="/register" element={<Register />} />
           <Route path="/oidc/callback" element={<OidcCallback />} />
@@ -218,6 +221,7 @@ function AppRoutes() {
           <Route path="/admin/audit" element={<PlatformGuard><AdminLayout><AdminAudit /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/access" element={<PlatformGuard><AdminLayout><AdminPlatformAdmins /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/runners" element={<PlatformGuard><AdminLayout><AdminRunners /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/hackathon" element={<PlatformGuard><AdminLayout><AdminHackathon /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/*" element={<PlatformGuard><AdminLayout><AdminNotFound /></AdminLayout></PlatformGuard>} />
           <Route path="*" element={<NotFound />} />
         </Routes>

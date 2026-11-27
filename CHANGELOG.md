@@ -6,6 +6,10 @@ Format based on Keep a Changelog; versioning follows SemVer.
 ## [Unreleased]
 
 ### Added
+- **VIC Hackathon #1:** public Vietnamese `/hackathon` page with animation,
+  countdown, timeline, rules, prizes, jury and anonymous 2–3 member registration;
+  superadmin review dashboard with step-up/audit and manual API-key delivery
+  tracking. Includes bilingual operator documentation.
 - **IAM audit read replica:** optional `DATABASE_READ_URL` routes only
   tenant/platform audit list and count SELECTs to a read-only PostgreSQL hot
   standby after primary-side authorization. Reads use short timeouts and

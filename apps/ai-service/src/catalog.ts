@@ -37,6 +37,12 @@ export const CATALOG: CatalogEndpoint[] = [
   { method: 'POST', path: '/v1/auth/mfa/totp/enable', auth: 'jwt', desc: 'Confirm enrolment with a code → 10 recovery codes (shown once)', body: { code: '123456' } },
   { method: 'POST', path: '/v1/auth/mfa/recovery-codes', auth: 'jwt', desc: 'Replace your recovery codes (needs a TOTP code)', body: { code: '123456' } },
   { method: 'POST', path: '/v1/auth/mfa/disable', auth: 'jwt', desc: 'Turn MFA off (TOTP or recovery code)', body: { code: '123456' } },
+  // VIC Hackathon
+  { method: 'POST', path: '/v1/hackathon/registrations', auth: 'none', desc: 'Public 2–3 member team registration (no account required)', body: { teamName: 'Synapse Builders', captainName: 'Nguyen Van A', captainEmail: 'captain@example.com', captainPhone: '0912345678', captainStudentId: '123456789', members: ['Tran Thi B'], acceptedRules: true } },
+  { method: 'GET', path: '/v1/platform/hackathon/registrations', auth: 'platform', desc: 'Superadmin list/search registrations and delivery counts' },
+  { method: 'GET', path: '/v1/platform/hackathon/registrations/:id', auth: 'platform', desc: 'Superadmin registration detail' },
+  { method: 'PATCH', path: '/v1/platform/hackathon/registrations/:id', auth: 'platform', desc: 'Approve/reject with step-up and audit', body: { status: 'approved', reviewNote: 'Eligible' } },
+  { method: 'POST', path: '/v1/platform/hackathon/registrations/:id/api-key-sent', auth: 'platform', desc: 'Mark manual API-key email delivery (no secret stored)' },
   // Organizations & Accounts
   { method: 'GET', path: '/v1/orgs', auth: 'either', desc: 'List organizations' },
   { method: 'POST', path: '/v1/orgs', auth: 'either', desc: 'Create an org', body: { slug: 'acme-2', displayName: 'ACME 2' } },

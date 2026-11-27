@@ -1,0 +1,152 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* SPDX-FileCopyrightText: 2026 VKU.VIC */
+.hackathon-page {
+  --hack-ink: #eef7ff;
+  --hack-muted: #9fb4ca;
+  --hack-cyan: #67e8f9;
+  --hack-blue: #60a5fa;
+  --hack-violet: #a78bfa;
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 12% 8%, rgba(34, 211, 238, 0.16), transparent 32rem),
+    radial-gradient(circle at 88% 22%, rgba(139, 92, 246, 0.2), transparent 34rem),
+    linear-gradient(180deg, #07111f 0%, #0a1728 46%, #07111f 100%);
+  color: var(--hack-ink);
+}
+
+.hackathon-page::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -2;
+  opacity: 0.22;
+  background-image:
+    linear-gradient(rgba(148, 163, 184, 0.12) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(148, 163, 184, 0.12) 1px, transparent 1px);
+  background-size: 56px 56px;
+  mask-image: linear-gradient(to bottom, black, transparent 82%);
+}
+
+.hackathon-orb {
+  position: absolute;
+  z-index: -1;
+  border-radius: 9999px;
+  filter: blur(2px);
+  opacity: 0.55;
+  pointer-events: none;
+  animation: hackathon-drift 12s ease-in-out infinite alternate;
+}
+
+.hackathon-orb-one {
+  width: 22rem;
+  height: 22rem;
+  left: -10rem;
+  top: 20rem;
+  background: radial-gradient(circle at 30% 30%, rgba(34, 211, 238, 0.5), rgba(34, 211, 238, 0.02) 68%);
+}
+
+.hackathon-orb-two {
+  width: 26rem;
+  height: 26rem;
+  right: -12rem;
+  top: 4rem;
+  background: radial-gradient(circle at 60% 40%, rgba(167, 139, 250, 0.5), rgba(167, 139, 250, 0.02) 70%);
+  animation-delay: -4s;
+}
+
+.hackathon-glass {
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.085), rgba(255, 255, 255, 0.025));
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  box-shadow: 0 24px 80px rgba(2, 6, 23, 0.32);
+  backdrop-filter: blur(14px);
+}
+
+.hackathon-gradient-text {
+  background: linear-gradient(100deg, #67e8f9 0%, #60a5fa 44%, #c4b5fd 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.hackathon-reveal {
+  animation: hackathon-reveal 0.8s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.hackathon-reveal-delay-1 { animation-delay: 0.1s; }
+.hackathon-reveal-delay-2 { animation-delay: 0.2s; }
+.hackathon-reveal-delay-3 { animation-delay: 0.3s; }
+
+.hackathon-countdown-cell {
+  position: relative;
+  min-width: 4.5rem;
+  overflow: hidden;
+  border: 1px solid rgba(103, 232, 249, 0.24);
+  background: rgba(8, 20, 36, 0.72);
+}
+
+.hackathon-countdown-cell::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.08), transparent 55%);
+  pointer-events: none;
+}
+
+.hackathon-timeline-line {
+  background: linear-gradient(180deg, rgba(103, 232, 249, 0.9), rgba(96, 165, 250, 0.7), rgba(167, 139, 250, 0.9));
+  box-shadow: 0 0 24px rgba(34, 211, 238, 0.32);
+}
+
+.hackathon-form-input {
+  width: 100%;
+  border-radius: 0.9rem;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  background: rgba(4, 12, 24, 0.66);
+  padding: 0.75rem 0.9rem;
+  color: #eef7ff;
+  outline: none;
+  transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+
+.hackathon-form-input::placeholder { color: #71869e; }
+.hackathon-form-input:focus {
+  border-color: rgba(103, 232, 249, 0.8);
+  box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.12);
+}
+
+.hackathon-primary-btn {
+  background: linear-gradient(100deg, #22d3ee, #3b82f6 55%, #8b5cf6);
+  box-shadow: 0 12px 35px rgba(37, 99, 235, 0.3);
+  transition: transform 180ms ease, filter 180ms ease, box-shadow 180ms ease;
+}
+
+.hackathon-primary-btn:hover:not(:disabled) {
+  transform: translateY(-2px);
+  filter: brightness(1.08);
+  box-shadow: 0 16px 42px rgba(37, 99, 235, 0.42);
+}
+
+.hackathon-primary-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.hackathon-prize-first {
+  background: linear-gradient(150deg, rgba(250, 204, 21, 0.2), rgba(245, 158, 11, 0.06));
+  border-color: rgba(250, 204, 21, 0.4);
+}
+
+@keyframes hackathon-drift {
+  from { transform: translate3d(0, 0, 0) scale(1); }
+  to { transform: translate3d(2.5rem, -1.5rem, 0) scale(1.08); }
+}
+
+@keyframes hackathon-reveal {
+  from { opacity: 0; transform: translateY(18px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hackathon-orb,
+  .hackathon-reveal { animation: none !important; }
+  .hackathon-primary-btn { transition: none; }
+}

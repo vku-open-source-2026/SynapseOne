@@ -1065,6 +1065,30 @@ The chat proxy is also mounted at `/v1/chat/completions`; the other inference
 handlers accept the `/v1/embeddings` and `/v1/decision*` aliases. The public
 gateway only exposes `/v1/ai` and `/v1/inference` (the aliases stay internal).
 
+## VIC Hackathon registration (`/v1/hackathon`)
+
+`POST /v1/hackathon/registrations` is public and requires no account, JWT or API key.
+It accepts a 2–3 member team and closes at **17:00 on 28 November 2026 (Vietnam time)**.
+The server validates contact data, rules consent, duplicates, rate limits and the
+configured deadline. API keys are created and emailed manually by the organizers;
+the registration API never stores or returns an API-key secret.
+
+```json
+{
+  "teamName": "Synapse Builders",
+  "captainName": "Nguyen Van A",
+  "captainEmail": "captain@example.com",
+  "captainPhone": "0912345678",
+  "captainStudentId": "123456789",
+  "members": ["Tran Thi B"],
+  "projectIdea": "A product built with SynapseOne",
+  "acceptedRules": true
+}
+```
+
+See [the bilingual event guide](hackathon.md) for schedule, rules, prizes and the
+superadmin review workflow.
+
 ## Platform Super Admin (`/v1/platform`)
 
 These routes are **not** part of the tenant API catalog and are not exposed to
@@ -1105,6 +1129,10 @@ Tenant JWTs, API keys and service-account tokens are rejected.
 | GET | `/v1/platform/usage/events` | Platform-wide request log (optional `orgId`). |
 | GET | `/v1/platform/audit` | Platform-wide audit (optional `orgId`). May use the configured read-only audit replica after primary-side platform-admin authorization; eventually consistent with automatic primary fallback. |
 | GET/POST/DELETE | `/v1/platform/admins[/:userId]` | Owner-only platform administrator management. |
+| GET | `/v1/platform/hackathon/registrations?q&status&limit&offset` | Hackathon teams, status and manual API-key delivery counts. |
+| GET | `/v1/platform/hackathon/registrations/:id` | Full team registration detail. |
+| PATCH | `/v1/platform/hackathon/registrations/:id` | Approve/reject with step-up action `hackathon:review` and audit. |
+| POST | `/v1/platform/hackathon/registrations/:id/api-key-sent` | Record manual API-key email delivery with step-up action `hackathon:api-key-sent`; no secret is stored. |
 
 Tenant organizations carry `status=active|suspended`. Suspension is reversible,
 requires a reason plus step-up, revokes refresh sessions/API keys and bumps each

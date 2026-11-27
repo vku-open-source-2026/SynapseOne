@@ -441,3 +441,32 @@ export const platformStepUps = pgTable(
     index('idx_platform_step_ups_expiry').on(t.expiresAt),
   ],
 );
+
+/** Public VIC Hackathon team registrations. No tenant/user binding is required;
+ *  platform administrators review them and manually deliver API keys. */
+export const hackathonRegistrations = pgTable(
+  'hackathon_registrations',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    teamName: text('team_name').notNull(),
+    captainName: text('captain_name').notNull(),
+    captainEmail: text('captain_email').notNull(),
+    captainPhone: text('captain_phone').notNull(),
+    captainStudentId: text('captain_student_id').notNull(),
+    memberNames: jsonb('member_names').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    projectIdea: text('project_idea'),
+    status: text('status').notNull().default('pending'),
+    reviewNote: text('review_note'),
+    reviewedBy: text('reviewed_by'),
+    reviewedAt: timestamp('reviewed_at', { withTimezone: true }),
+    apiKeySentAt: timestamp('api_key_sent_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('hackathon_registrations_team_name_key').on(sql`lower(${t.teamName})`),
+    uniqueIndex('hackathon_registrations_captain_email_key').on(sql`lower(${t.captainEmail})`),
+    index('idx_hackathon_registrations_status').on(t.status, t.createdAt.desc()),
+    index('idx_hackathon_registrations_created_at').on(t.createdAt.desc()),
+  ],
+);

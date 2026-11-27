@@ -13,6 +13,12 @@ routes:
     target: ${IAM_SERVICE_URL:http://iam:4001}
     auth: none
 
+  # Public VIC Hackathon registration. IAM enforces validation, deadline and
+  # per-IP abuse limits; no account or API key is required.
+  - path: /v1/hackathon
+    target: ${IAM_SERVICE_URL:http://iam:4001}
+    auth: none
+
   - path: /v1/orgs
     target: ${IAM_SERVICE_URL:http://iam:4001}
     auth: either

@@ -29,6 +29,16 @@ export const GROUPS = [
     ],
   },
   {
+    name: 'VIC Hackathon',
+    endpoints: [
+      { method: 'POST', path: '/v1/hackathon/registrations', auth: 'none', desc: 'Public 2–3 member team registration (no account required)', body: { teamName: 'Synapse Builders', captainName: 'Nguyen Van A', captainEmail: 'captain@example.com', captainPhone: '0912345678', captainStudentId: '123456789', members: ['Tran Thi B'], acceptedRules: true } },
+      { method: 'GET', path: '/v1/platform/hackathon/registrations', auth: 'platform', desc: 'Superadmin list/search registrations and delivery counts' },
+      { method: 'GET', path: '/v1/platform/hackathon/registrations/:id', auth: 'platform', desc: 'Superadmin registration detail' },
+      { method: 'PATCH', path: '/v1/platform/hackathon/registrations/:id', auth: 'platform', desc: 'Approve/reject with step-up and audit', body: { status: 'approved', reviewNote: 'Eligible' } },
+      { method: 'POST', path: '/v1/platform/hackathon/registrations/:id/api-key-sent', auth: 'platform', desc: 'Mark manual API-key email delivery (no secret stored)' },
+    ],
+  },
+  {
     name: 'Organizations & Accounts',
     endpoints: [
       { method: 'GET', path: '/v1/orgs', auth: 'either', desc: 'List organizations' },
