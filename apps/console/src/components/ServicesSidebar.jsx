@@ -8,44 +8,12 @@ import React, { useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import {
-  faBolt,
-  faDatabase,
-  faInbox,
-  faGaugeHigh,
-  faLink,
   faMagnifyingGlass,
   faXmark,
-  faCode,
-  faBrain,
-  faStream,
-  faCloud,
-  faServer,
-  faWarehouse,
-  faLayerGroup,
-  faBell,
-  faUserShield,
 } from '@fortawesome/free-solid-svg-icons';
 import { useI18n } from '../lib/i18n-context.js';
 import { SERVICE_CATALOG, matchesService } from '../lib/service-catalog.js';
-
-const SERVICE_ICONS = {
-  gateway: faServer,
-  iam: faUserShield,
-  workflow: faBolt,
-  runner: faServer,
-  ai: faBrain,
-  inference: faBrain,
-  lds: faLink,
-  base: faDatabase,
-  search: faMagnifyingGlass,
-  faststore: faGaugeHigh,
-  queue: faInbox,
-  stream: faStream,
-  ocs: faCloud,
-  notifications: faBell,
-  warehouse: faWarehouse,
-  lakehouse: faLayerGroup,
-};
+import { SERVICE_ICONS } from '../lib/service-icons.js';
 
 // Kept as a named export for Topbar and existing imports.
 export const PLATFORM_SERVICES = SERVICE_CATALOG;

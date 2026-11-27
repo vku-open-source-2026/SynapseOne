@@ -52,17 +52,19 @@ func TestLakehouseTableLifecycleAndSnapshots(t *testing.T) {
 	if seen["path"] != "/v1/lakehouse/namespaces/analytics/tables/events/snapshots" {
 		t.Fatalf("snapshots: %s", seen["path"])
 	}
-	add := map[string]any{"country": "string"}
+	add := []map[string]any{{"name": "country", "type": "string", "required": false}}
 	if _, err := c.LakehouseEvolveSchema("analytics", "events", add); err != nil {
 		t.Fatal(err)
 	}
-	body = nil
-	if err := json.Unmarshal([]byte(seen["body"]), &body); err != nil {
+	var evolvedBody struct {
+		Add []map[string]any `json:"add"`
+	}
+	if err := json.Unmarshal([]byte(seen["body"]), &evolvedBody); err != nil {
 		t.Fatal(err)
 	}
 	if seen["path"] != "/v1/lakehouse/namespaces/analytics/tables/events/schema" ||
-		!reflect.DeepEqual(body["add"], add) {
-		t.Fatalf("evolve schema: %s %#v", seen["path"], body)
+		!reflect.DeepEqual(evolvedBody.Add, add) {
+		t.Fatalf("evolve schema: %s %#v", seen["path"], evolvedBody)
 	}
 	if _, err := c.LakehouseDeleteTable("analytics", "events"); err != nil {
 		t.Fatal(err)

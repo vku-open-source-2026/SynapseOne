@@ -23,6 +23,7 @@ import { api } from '../lib/api.js';
 import ContextSwitcher from './ContextSwitcher.jsx';
 import { useScope } from './Scope.jsx';
 import { PLATFORM_SERVICES } from './ServicesSidebar.jsx';
+import { SERVICE_ICONS } from '../lib/service-icons.js';
 import SiteToggles from './SiteToggles.jsx';
 import StableLabel from './StableLabel.jsx';
 import { useI18n } from '../lib/i18n-context.js';
@@ -59,6 +60,29 @@ function ScopePicks({ scope, onDone }) {
   );
 }
 
+
+export function MobileServiceLinks({ onNavigate }) {
+  const { m } = useI18n();
+  return PLATFORM_SERVICES.map((service) => (
+    <Link
+      key={service.id}
+      to={service.consoleRoute}
+      onClick={onNavigate}
+      className="flex items-center gap-2.5 py-1.5 text-main-text text-sm hover:text-main-blue group"
+    >
+      <div
+        style={{
+          background: service.bgGradient,
+          boxShadow: `0 2px 6px ${service.shadowColor}`,
+        }}
+        className="w-6 h-6 rounded-lg flex items-center justify-center text-white text-xs shrink-0 group-hover:scale-105 transition-transform"
+      >
+        <FontAwesomeIcon icon={SERVICE_ICONS[service.id]} className="w-3 h-3" />
+      </div>
+      <span className="font-medium text-xs">{m.services[service.id]?.label || service.label}</span>
+    </Link>
+  ));
+}
 
 export default function Topbar({ servicesOpen = true, onToggleServices }) {
   const [open, setOpen] = useState(false);
@@ -211,25 +235,7 @@ export default function Topbar({ servicesOpen = true, onToggleServices }) {
             <div className="mt-3 pt-2 border-t border-slate-100 text-[11px] font-semibold uppercase tracking-wider text-main-blue py-1">
               {m.console.servicesSection}
             </div>
-            {PLATFORM_SERVICES.map((s) => (
-              <Link
-                key={s.to}
-                to={s.to}
-                onClick={() => setOpen(false)}
-                className="flex items-center gap-2.5 py-1.5 text-main-text text-sm hover:text-main-blue group"
-              >
-                <div
-                  style={{
-                    background: s.bgGradient,
-                    boxShadow: `0 2px 6px ${s.shadowColor}`,
-                  }}
-                  className="w-6 h-6 rounded-lg flex items-center justify-center text-white text-xs shrink-0 group-hover:scale-105 transition-transform"
-                >
-                  <FontAwesomeIcon icon={s.icon} className="w-3 h-3" />
-                </div>
-                <span className="font-medium text-xs">{s.label}</span>
-              </Link>
-            ))}
+            <MobileServiceLinks onNavigate={() => setOpen(false)} />
 
             {/* Docs Section */}
             <div className="mt-3 pt-2 border-t border-slate-100 text-[11px] font-semibold uppercase tracking-wider text-slate-400 py-1">

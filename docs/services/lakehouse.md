@@ -188,8 +188,8 @@ func main() {
     if err != nil {
         panic(err)
     }
-    evolved, err := client.LakehouseEvolveSchema(namespace, table, map[string]any{
-        "name": "source", "type": "string", "required": false,
+    evolved, err := client.LakehouseEvolveSchema(namespace, table, []map[string]any{
+        {"name": "source", "type": "string", "required": false},
     })
     if err != nil {
         panic(err)

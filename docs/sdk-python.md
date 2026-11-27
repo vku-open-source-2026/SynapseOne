@@ -409,40 +409,41 @@ result = c.service_account_token(sa_id, ["workflow:Execute"])
 token = result["accessToken"]
 ```
 
-### Credentials (implemented, account-scoped)
+### Workflow credentials (implemented, account-scoped)
 
 Account-scoped secrets for workflow nodes (webhook auth, DB passwords, OAuth
 tokens...). Secrets are encrypted at rest and **never returned**: `create`/`rotate`
 accept a `secret` once; `list`/`get` return metadata only —
-`{"id", "name", "type", "accountId", "expiresAt", "version"}`.
-`type` is one of `bearer`|`basic`|`apiKey`|`oauth2`.
+`{id, accountId, name, kind, createdAt, updatedAt}`.
+`kind` is one of `bearer`|`api-key`|`basic`|`hmac`.
 
 ```python
 import os
 
 # Copy-paste: store a bearer token, then list metadata (no secrets leak).
-cred = c.create_credential(
+cred = c.workflow.create_credential(
     account_id,
     "stripe-live",
     "bearer",
     os.environ["STRIPE_TOKEN"],
-    expires_at="2027-01-01T00:00:00Z",
 )
-print(cred["id"], cred["version"])  # secret is NOT in the response
-all_creds = c.list_credentials(account_id)
-one = c.get_credential(cred["id"])
-rotated = c.rotate_credential(cred["id"], os.environ["STRIPE_TOKEN_V2"])
-c.delete_credential(cred["id"])
+print(cred["id"], cred["kind"])  # secret is NOT in the response
+all_creds = c.workflow.list_credentials(account_id)
+one = c.workflow.get_credential(cred["id"])
+rotated = c.workflow.rotate_credential(cred["id"], os.environ["STRIPE_TOKEN_V2"])
+c.workflow.delete_credential(cred["id"])
 ```
 
-#### `create_credential(account_id, name, type, secret, expires_at=None)`
+#### `create_credential(account_id, name, kind="bearer", secret="", *, type=None, expires_at=None)`
 ```python
-def create_credential(self, account_id: str, name: str, type: str, secret: str, expires_at: str | None = None) -> dict
+def create_credential(self, account_id: str, name: str, kind: str = "bearer", secret: str = "", *, type: str | None = None, expires_at: str | None = None) -> dict
 ```
+Workflow credentials do not support expiry. `expires_at` is retained for source
+compatibility and is ignored.
 
-#### `list_credentials(account_id)`
+#### `list_credentials(account_id=None)`
 ```python
-def list_credentials(self, account_id: str) -> list
+def list_credentials(self, account_id: str | None = None) -> list
 ```
 Lists credential metadata (never secret values).
 
@@ -452,7 +453,7 @@ def get_credential(self, cred_id: str) -> dict
 def delete_credential(self, cred_id: str) -> dict
 def rotate_credential(self, cred_id: str, secret: str) -> dict
 ```
-`rotate_credential` replaces the secret and bumps `version` (the old secret stops working).
+`rotate_credential` replaces the secret immediately (the old secret stops working).
 
 ### Generic call (escape hatch)
 

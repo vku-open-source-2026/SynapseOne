@@ -338,17 +338,16 @@ impl WorkflowService {
         name: &str,
         kind: &str,
         secret: &str,
-        expires_at: Option<&str>,
+        _expires_at: Option<&str>,
     ) -> Result<Value> {
-        let mut body = json!({
+        // `expires_at` is retained for source compatibility and ignored: the
+        // workflow credential contract has no expiry field.
+        let body = json!({
             "accountId": account_id,
             "name": name,
             "kind": kind,
             "secret": secret,
         });
-        if let Some(expires_at) = expires_at {
-            body["expiresAt"] = json!(expires_at);
-        }
         self.client.post("/v1/credentials", body).await
     }
 

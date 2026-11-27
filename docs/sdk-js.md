@@ -416,47 +416,50 @@ scopes unless the caller holds `*`.
 const { accessToken } = await c.serviceAccountToken(saId, ['workflow:Execute']);
 ```
 
-### Credentials (implemented, account-scoped)
+### Workflow credentials (implemented, account-scoped)
 
 Account-scoped secrets for workflow nodes (webhook auth, DB passwords, OAuth
 tokens...). Secrets are encrypted at rest and **never returned**: `create`/`rotate`
 accept a `secret` once; `list`/`get` return metadata only —
-`{id, name, type, accountId, expiresAt, version}`.
-`type` is one of `bearer`|`basic`|`apiKey`|`oauth2`.
+`{id, accountId, name, kind, createdAt, updatedAt}`.
+`kind` is one of `bearer`|`api-key`|`basic`|`hmac`.
 
 ```ts
 // Copy-paste: store a bearer token, then list metadata (no secrets leak).
-const cred = await c.createCredential(accountId, {
+const cred = await c.workflow.createCredential({
+  accountId,
   name: 'stripe-live',
-  type: 'bearer',
+  kind: 'bearer',
   secret: process.env.STRIPE_TOKEN!,
-  expiresAt: '2027-01-01T00:00:00Z',
 });
-console.log(cred.id, cred.version); // secret is NOT in the response
-const all = await c.listCredentials(accountId);
-const one = await c.getCredential(cred.id);
-const rotated = await c.rotateCredential(cred.id, process.env.STRIPE_TOKEN_V2!);
-await c.deleteCredential(cred.id);
+console.log(cred.id, cred.kind); // secret is NOT in the response
+const all = await c.workflow.listCredentials(accountId);
+const one = await c.workflow.getCredential(cred.id);
+const rotated = await c.workflow.rotateCredential(cred.id, process.env.STRIPE_TOKEN_V2!);
+await c.workflow.deleteCredential(cred.id);
 ```
 
-#### `createCredential(accountId, opts)`
+#### `createCredential(input)` / legacy `createCredential(accountId, opts)`
 ```ts
-createCredential(accountId: string, opts: { name: string; type: string; secret: string; expiresAt?: string }): Promise<any>
+createCredential(input: CredentialInput): Promise<CredentialMetadata>
+createCredential(accountId: string, opts: { name: string; kind?: string; type?: string; secret: string; expiresAt?: string }): Promise<CredentialMetadata>
 ```
+Workflow credentials do not support expiry. `expiresAt` is retained in the
+legacy input type for source compatibility and is ignored.
 
-#### `listCredentials(accountId)`
+#### `listCredentials(accountId?)`
 ```ts
-listCredentials(accountId: string): Promise<any>
+listCredentials(accountId?: string): Promise<CredentialMetadata[]>
 ```
 Lists credential metadata (never secret values).
 
 #### `getCredential(id)` / `deleteCredential(id)` / `rotateCredential(id, secret)`
 ```ts
-getCredential(id: string): Promise<any>
+getCredential(id: string): Promise<CredentialMetadata>
 deleteCredential(id: string): Promise<any>
-rotateCredential(id: string, secret: string): Promise<any>
+rotateCredential(id: string, secret: string): Promise<CredentialMetadata>
 ```
-`rotate` replaces the secret and bumps `version` (the old secret stops working).
+`rotate` replaces the secret immediately (the old secret stops working).
 
 ### Generic call (escape hatch)
 

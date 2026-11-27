@@ -47,8 +47,9 @@ của từng bản phát hành nằm trong `CHANGELOG.md` tiếng Anh.
 
 - **Lỗi phát hành SDK 0.10.2:** khôi phục package export JS
   `ocs/search/warehouse/lakehouse`, đồng bộ type/runtime của flat alias, sửa
-  Python Search, chuyển expiry credential workflow trong JS/Python, thêm đủ bộ
-  wrapper Lakehouse của Go và sửa request MFA recovery-code của Rust.
+  Python Search, ghi rõ workflow credential không hỗ trợ expiry thay vì gửi
+  trường backend bỏ qua, thêm đủ bộ wrapper Lakehouse của Go và sửa request MFA
+  recovery-code của Rust.
 - **Ba blocker re-review quota:** execution workflow thường và MCP call dùng
   chung hourly counter/lease concurrency IAM nguyên tử; rotation grace PostgreSQL
   giữ expiry gốc của key kế nhiệm; snapshot quota rebase lên snapshot hackathon

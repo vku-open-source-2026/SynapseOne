@@ -94,7 +94,9 @@ let value = client.request(Method::GET, "/v1/whatever", None).await?;
 * Both token and API key can be supplied; the gateway decides which to verify.
 
 MFA recovery-code rotation requires the current TOTP code:
-`regenerate_recovery_codes("492039")`. Disable MFA with either
+`regenerate_recovery_codes_with_code("492039")`. The older no-argument
+`regenerate_recovery_codes()` remains for source compatibility but is deprecated
+and cannot satisfy the server's TOTP requirement. Disable MFA with either
 `disable_mfa("492039")` or `disable_mfa_with_recovery_code("...")`.
 
 ## Retries and errors

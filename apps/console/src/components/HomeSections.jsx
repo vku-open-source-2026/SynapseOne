@@ -139,7 +139,7 @@ c.base.create_document(
   {
     id: 'go',
     label: 'Go',
-    pkg: 'go get github.com/synapseone/synapseone-sdk-go',
+    pkg: 'go get github.com/vku-open-source-2026/SynapseOne/sdks/sdk-go',
     code: `c := synapseone.New("https://api.synapseone.space")
 
 login, err := c.Login("demo@acme.local", "acme")

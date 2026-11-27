@@ -34,6 +34,34 @@ async fn sends_auth_tenant_and_accept_headers() {
 }
 
 #[tokio::test]
+async fn workflow_credential_expiry_is_not_sent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/credentials"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": "c1", "accountId": "a1", "name": "runner", "kind": "bearer"
+        })))
+        .mount(&server)
+        .await;
+
+    client(&server)
+        .workflow()
+        .create_credential(
+            "a1",
+            "runner",
+            "bearer",
+            "secret",
+            Some("2027-01-01T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(body.get("expiresAt").is_none());
+}
+
+#[tokio::test]
 async fn mfa_recovery_code_regeneration_sends_current_totp() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -45,7 +73,7 @@ async fn mfa_recovery_code_regeneration_sends_current_totp() {
 
     client(&server)
         .iam()
-        .regenerate_recovery_codes("492039")
+        .regenerate_recovery_codes_with_code("492039")
         .await
         .unwrap();
 }

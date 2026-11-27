@@ -67,9 +67,10 @@ Format based on Keep a Changelog; versioning follows SemVer.
 
 - **SDK 0.10.2 release defects:** restored the missing JavaScript
   `ocs/search/warehouse/lakehouse` package exports, aligned legacy flat types
-  with runtime wrappers, made Python Search callable, forwarded workflow
-  credential expiry in JavaScript/Python, added the complete Go Lakehouse
-  lifecycle wrappers and corrected Rust MFA recovery-code requests.
+  with runtime wrappers, made Python Search callable, documented workflow
+  credentials as non-expiring instead of forwarding an unsupported expiry,
+  added the complete Go Lakehouse lifecycle wrappers and corrected Rust MFA
+  recovery-code requests.
 - **SynapseCity client identity at the shared edge.** SynapseCity proxy locations
   now overwrite `X-Forwarded-For` with `$remote_addr` instead of appending the
   nginx peer, preserving independent per-client rate-limit buckets.

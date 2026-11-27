@@ -331,7 +331,7 @@ const SERVICE_DOCS = {
     endpoints: [
       ['GET', '/v1/templates', 'templates'], ['GET · POST', '/v1/workflows', 'workflows'], ['GET · PUT · DELETE', '/v1/workflows/:id', 'workflowDetail'],
       ['POST', '/v1/workflows/:id/execute', 'execute'], ['POST', '/v1/workflows/test-run', 'testRun'], ['GET', '/v1/executions', 'executions'],
-      ['GET · POST · DELETE', '/v1/credentials', 'credentials'], ['GET · POST', '/v1/human-tasks', 'humanTasks'], ['GET · POST', '/v1/secrets', 'secrets'],
+      ['GET · POST', '/v1/credentials', 'credentials'], ['GET · POST · DELETE', '/v1/credentials/:id', 'credentialDetail'], ['GET · POST', '/v1/human-tasks', 'humanTasks'], ['GET · POST', '/v1/secrets', 'secrets'],
       ['POST', '/mcp', 'mcp'], ['ANY', '/webhook/:path', 'webhook'],
     ],
   },
@@ -414,7 +414,7 @@ c = SynapseOneClient(
     "http://localhost:8080",
     token="<access-token>",
 )`,
-  go: `import synapseone "github.com/synapseone/synapseone-sdk-go"
+  go: `import synapseone "github.com/vku-open-source-2026/SynapseOne/sdks/sdk-go"
 
 c := synapseone.New("http://localhost:8080")
 c.SetToken("<access-token>")`,
@@ -883,8 +883,8 @@ except SynapseOneError as error:
 c.call("GET", "/v1/base/collections")`,
   },
   go: {
-    package: 'github.com/synapseone/synapseone-sdk-go',
-    install: `go get github.com/synapseone/synapseone-sdk-go@latest
+    package: 'github.com/vku-open-source-2026/SynapseOne/sdks/sdk-go',
+    install: `go get github.com/vku-open-source-2026/SynapseOne/sdks/sdk-go@latest
 // Go 1.22+; the client uses the standard library.`,
     auth: SDK_SETUP.go,
     errors: `// Inside func main(); imports: "errors", "log", and synapseone.
@@ -902,7 +902,7 @@ result, err = c.Call("GET", "/v1/base/collections", nil)`,
   rust: {
     package: 'synapseone',
     install: `cargo add synapseone
-# Cargo.toml: synapseone = "0.10.1"
+# Cargo.toml: synapseone = "0.10.2"
 # Rust 1.82+; async client built on reqwest and tokio.`,
     auth: SDK_SETUP.rust,
     errors: `match c.base().get_collection("missing").await {

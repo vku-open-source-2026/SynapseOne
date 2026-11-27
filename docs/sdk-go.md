@@ -393,22 +393,20 @@ result, err := c.ServiceAccountToken(saID, []string{"workflow:Execute"})
 token := result["accessToken"].(string)
 ```
 
-### Credentials (implemented, account-scoped)
+### IAM account credentials (implemented)
 
-Account-scoped secrets for workflow nodes (webhook auth, DB passwords, OAuth
-tokens...). Secrets are encrypted at rest and **never returned**: `Create`/`Rotate`
-accept a secret once; `List`/`Get` return metadata only —
-`{id, name, type, accountId, expiresAt, version}`.
-The type is one of `bearer`|`basic`|`apiKey`|`oauth2`.
+These use `/v1/accounts/:accountId/credentials`, support `expiresAt`, and are
+separate from the workflow-node credential vault. Secrets are write-only;
+metadata is `{id, name, type, accountId, expiresAt, version}`. Types include
+`bearer`|`basic`|`apiKey`|`oauth2`.
 
 ```go
-// Copy-paste: store a bearer token, then list metadata (no secrets leak).
+// Copy-paste: store an account credential, then list metadata.
 cred, err := c.CreateCredential(accountID, "stripe-live", "bearer", os.Getenv("STRIPE_TOKEN"), "2027-01-01T00:00:00Z")
+if err != nil { log.Fatal(err) }
 fmt.Println(cred["id"], cred["version"]) // secret is NOT in the response
 all, err := c.ListCredentials(accountID)
-one, err := c.GetCredential(cred["id"].(string))
-rotated, err := c.RotateCredential(cred["id"].(string), os.Getenv("STRIPE_TOKEN_V2"))
-err = c.DeleteCredential(cred["id"].(string))
+if err != nil { log.Fatal(err) }
 ```
 
 #### `CreateCredential(accountID, name, credType, secret, expiresAt string) (map[string]any, error)`
@@ -421,15 +419,34 @@ func (c *Client) CreateCredential(accountID, name, credType, secret, expiresAt s
 ```go
 func (c *Client) ListCredentials(accountID string) ([]any, error)
 ```
-Lists credential metadata (never secret values).
 
-#### `GetCredential(id string) (map[string]any, error)` / `DeleteCredential(id string) error` / `RotateCredential(id, secret string) (map[string]any, error)`
+### Workflow credentials (implemented)
+
+Workflow-node credentials use `/v1/credentials`; kinds are
+`bearer`|`api-key`|`basic`|`hmac`. Metadata is
+`{id, accountId, name, kind, createdAt, updatedAt}` and has no expiry/version.
+
 ```go
+cred, err := c.CreateWorkflowCredential(accountID, "runner", "bearer", os.Getenv("RUNNER_TOKEN"))
+if err != nil { log.Fatal(err) }
+all, err := c.ListWorkflowCredentials(accountID)
+if err != nil { log.Fatal(err) }
+one, err := c.GetCredential(cred["id"].(string))
+if err != nil { log.Fatal(err) }
+rotated, err := c.RotateCredential(cred["id"].(string), os.Getenv("RUNNER_TOKEN_V2"))
+if err != nil { log.Fatal(err) }
+err = c.DeleteCredential(cred["id"].(string))
+```
+
+#### Workflow credential methods
+```go
+func (c *Client) CreateWorkflowCredential(accountID, name, kind, secret string) (map[string]any, error)
+func (c *Client) ListWorkflowCredentials(accountID string) ([]any, error)
 func (c *Client) GetCredential(id string) (map[string]any, error)
 func (c *Client) DeleteCredential(id string) error
 func (c *Client) RotateCredential(id, secret string) (map[string]any, error)
 ```
-`RotateCredential` replaces the secret and bumps `version` (the old secret stops working).
+`RotateCredential` replaces the secret immediately (the old secret stops working).
 
 ### Generic Call (escape hatch)
 

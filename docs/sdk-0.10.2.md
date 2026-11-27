@@ -73,12 +73,15 @@ Never move or reuse these tags after publication; ship fixes as `0.10.3`.
 - JavaScript package exports now include `./ocs`, `./search`, `./warehouse` and
   `./lakehouse`; legacy flat TypeScript methods match the wrappers that actually
   exist at runtime.
-- Python Search methods are callable on `client.base` again, and workflow
-  credential expiry is forwarded.
+- Python Search methods are callable on `client.base` again. Workflow credential
+  expiry is now documented as unsupported; compatibility parameters are ignored
+  instead of sending a field the server discards.
 - Go publishes from the real monorepo module and adds the complete Lakehouse
   namespace/table/snapshot/schema-evolution wrapper set.
-- Rust MFA recovery-code rotation sends the current TOTP code, and MFA can be
-  disabled with a recovery code.
+- Rust MFA recovery-code rotation has a working
+  `regenerate_recovery_codes_with_code` method; the old no-argument method remains
+  deprecated for source compatibility. MFA can also be disabled with a recovery
+  code.
 - Python packaging uses the SPDX license expression and ships `LICENSE`/`NOTICE`.
 
 ## Compatibility notes

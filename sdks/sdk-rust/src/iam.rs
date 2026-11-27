@@ -146,7 +146,16 @@ impl IamService {
             .await
     }
 
-    pub async fn regenerate_recovery_codes(&self, code: &str) -> Result<Value> {
+    #[deprecated(
+        note = "use regenerate_recovery_codes_with_code; recovery-code rotation requires a current TOTP code"
+    )]
+    pub async fn regenerate_recovery_codes(&self) -> Result<Value> {
+        self.client
+            .post("/v1/auth/mfa/recovery-codes", json!({}))
+            .await
+    }
+
+    pub async fn regenerate_recovery_codes_with_code(&self, code: &str) -> Result<Value> {
         self.client
             .post("/v1/auth/mfa/recovery-codes", json!({ "code": code }))
             .await

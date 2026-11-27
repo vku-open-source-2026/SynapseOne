@@ -321,7 +321,6 @@ def test_credentials_crud_contract():
             "name": "stripe-live",
             "kind": "bearer",
             "secret": "s3cr3t",
-            "expiresAt": "2027-01-01T00:00:00Z",
         }, _seen
         c.list_credentials("a1")
         assert _seen["path"] == "/v1/credentials?accountId=a1", _seen

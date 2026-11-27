@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import { CLIENT_TABS, DOC_GROUPS, DOC_TABS, SERVICE_CATALOG, matchesService } from './service-catalog.js';
 import { en } from '../locales/en.js';
 import { vi } from '../locales/vi.js';
+import { SERVICE_ICONS } from './service-icons.js';
 
 const REQUIRED_SERVICES = [
   'gateway', 'iam', 'workflow', 'runner', 'ai', 'inference', 'lds', 'base', 'search',
@@ -45,6 +46,7 @@ test('English and Vietnamese Docs/service locale shapes stay in parity', () => {
   assert.deepEqual(shape(en.docsPage), shape(vi.docsPage));
   assert.deepEqual(shape(en.services), shape(vi.services));
   for (const service of SERVICE_CATALOG) {
+    assert.ok(SERVICE_ICONS[service.id], `${service.id} shared icon`);
     assert.ok(en.docsPage.tabs[service.id], `${service.id} English tab`);
     assert.ok(vi.docsPage.tabs[service.id], `${service.id} Vietnamese tab`);
     assert.ok(en.docsPage.guides[service.id], `${service.id} English guide`);

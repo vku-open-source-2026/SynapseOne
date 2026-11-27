@@ -222,7 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[allow(dead_code)]
 async fn mfa_actions(client: &SynapseOneClient, use_recovery_code: bool) -> synapseone::Result<()> {
     let regenerated = client.iam()
-        .regenerate_recovery_codes("<totp-code-for-regenerate>")
+        .regenerate_recovery_codes_with_code("<totp-code-for-regenerate>")
         .await?;
     println!("{regenerated}");
     if use_recovery_code {

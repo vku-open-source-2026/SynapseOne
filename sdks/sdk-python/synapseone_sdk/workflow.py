@@ -288,15 +288,17 @@ class WorkflowService:
         type: str | None = None,
         expires_at: str | None = None,
     ) -> dict:
-        """Store an account credential (secret is write-only, encrypted at rest)."""
+        """Store an account credential (secret is write-only, encrypted at rest).
+
+        ``expires_at`` is retained for source compatibility and ignored: the
+        workflow credential contract has no expiry field.
+        """
         body: dict[str, Any] = {
             "accountId": account_id,
             "name": name,
             "kind": kind or type or "bearer",
             "secret": secret,
         }
-        if expires_at:
-            body["expiresAt"] = expires_at
         return self._req("POST", "/v1/credentials", body)
 
     def list_credentials(self, account_id: str | None = None) -> list:

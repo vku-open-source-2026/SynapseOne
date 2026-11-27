@@ -219,9 +219,9 @@ describe('SynapseOneClient', () => {
     await c.createCredential('a1', { name: 'stripe-live', type: 'bearer', secret: 's3cr3t', expiresAt: '2027-01-01T00:00:00Z' });
     assert.equal(lastPath, '/v1/credentials');
     assert.equal(lastMethod, 'POST');
-    assert.deepEqual(JSON.parse(lastBody), { accountId: 'a1', name: 'stripe-live', kind: 'bearer', secret: 's3cr3t', expiresAt: '2027-01-01T00:00:00Z' });
+    assert.deepEqual(JSON.parse(lastBody), { accountId: 'a1', name: 'stripe-live', kind: 'bearer', secret: 's3cr3t' });
     await c.workflow.createCredential({ accountId: 'a1', name: 'object-form', secret: 's3cr3t', expiresAt: '2027-02-01T00:00:00Z' });
-    assert.deepEqual(JSON.parse(lastBody), { accountId: 'a1', name: 'object-form', kind: 'bearer', secret: 's3cr3t', expiresAt: '2027-02-01T00:00:00Z' });
+    assert.deepEqual(JSON.parse(lastBody), { accountId: 'a1', name: 'object-form', kind: 'bearer', secret: 's3cr3t' });
     await c.listCredentials('a1');
     assert.equal(lastPath, '/v1/credentials?accountId=a1');
     assert.equal(lastMethod, 'GET');

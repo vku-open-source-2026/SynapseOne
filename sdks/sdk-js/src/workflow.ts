@@ -20,7 +20,7 @@ export interface CredentialInput {
   type?: CredentialKind | string;
   /** Write-only: never returned by any endpoint. */
   secret: string;
-  /** Optional ISO-8601 expiry for the stored credential. */
+  /** @deprecated Workflow credentials do not support expiry; this field is ignored. */
   expiresAt?: string;
 }
 
@@ -159,20 +159,20 @@ export class WorkflowService {
     inputOrAccountId: CredentialInput | string,
     opts?: { name: string; kind?: CredentialKind | string; type?: CredentialKind | string; secret: string; expiresAt?: string }
   ): Promise<CredentialMetadata> {
+    // `expiresAt` remains in the input type for source compatibility only.
+    // Workflow credentials have no expiry field in the server contract.
     const body = typeof inputOrAccountId === 'string'
       ? {
           accountId: inputOrAccountId,
           name: opts?.name,
           kind: opts?.kind || opts?.type || 'bearer',
           secret: opts?.secret,
-          ...(opts?.expiresAt ? { expiresAt: opts.expiresAt } : {}),
         }
       : {
           accountId: inputOrAccountId.accountId,
           name: inputOrAccountId.name,
           kind: inputOrAccountId.kind || inputOrAccountId.type || 'bearer',
           secret: inputOrAccountId.secret,
-          ...(inputOrAccountId.expiresAt ? { expiresAt: inputOrAccountId.expiresAt } : {}),
         };
     return this.http.req('/v1/credentials', {
       method: 'POST',

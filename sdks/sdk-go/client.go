@@ -1392,11 +1392,10 @@ func (c *Client) Call(method, path string, body any) (any, error) {
 	return out, nil
 }
 
-// ---------- credentials (account-scoped secrets; PROPOSED contract — backend in progress) ----------
+// ---------- IAM account credentials (account-scoped secrets) ----------
 //
-// Backend contract (dev1, pending): secrets are encrypted at rest and NEVER
-// returned — create/rotate accept a secret once; list/get return metadata
-// only: {id, name, type, accountId, expiresAt, version}.
+// Secrets are encrypted at rest and NEVER returned — create accepts a secret
+// once; list returns metadata only: {id, name, type, accountId, expiresAt, version}.
 // credType is one of bearer|basic|apiKey|oauth2 (passed through, not validated
 // client-side, so future types keep working).
 
@@ -1486,7 +1485,7 @@ func (c *Client) DeleteCredential(id string) error {
 	return err
 }
 
-// RotateCredential rotates a credential's secret (bumps version; old secret stops working).
+// RotateCredential rotates a workflow credential's secret; the old secret stops working.
 func (c *Client) RotateCredential(id, secret string) (map[string]any, error) {
 	b, err := c.do("POST", "/v1/credentials/"+pathEscape(id)+"/rotate", map[string]any{"secret": secret})
 	if err != nil {
@@ -2124,7 +2123,7 @@ func (c *Client) LakehouseSnapshots(namespace, table string) (map[string]any, er
 }
 
 // LakehouseEvolveSchema applies additive schema evolution to a table.
-func (c *Client) LakehouseEvolveSchema(namespace, table string, add map[string]any) (map[string]any, error) {
+func (c *Client) LakehouseEvolveSchema(namespace, table string, add []map[string]any) (map[string]any, error) {
 	return c.postJSON("/v1/lakehouse/namespaces/"+pathEscape(namespace)+"/tables/"+pathEscape(table)+"/schema", map[string]any{"add": add})
 }
 
