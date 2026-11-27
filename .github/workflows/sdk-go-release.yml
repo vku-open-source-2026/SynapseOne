@@ -21,6 +21,8 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -32,7 +34,11 @@ jobs:
           cache: false
 
       - name: Verify SDK version and tag
-        run: node tools/sdk-version-check.cjs "${GITHUB_REF_NAME}"
+        id: version
+        run: |
+          set -euo pipefail
+          node tools/sdk-version-check.cjs "${GITHUB_REF_NAME}"
+          echo "version=${GITHUB_REF_NAME#sdks/sdk-go/v}" >> "${GITHUB_OUTPUT}"
 
       - name: Check formatting
         working-directory: sdks/sdk-go
@@ -83,10 +89,10 @@ jobs:
         with:
           generate_release_notes: true
           body: |
-            Go SDK `${GITHUB_REF_NAME#sdks/sdk-go/v}` is available from the public Go module proxy.
+            Go SDK `${{ needs.verify.outputs.version }}` is available from the public Go module proxy.
 
             ```bash
-            go get github.com/vku-open-source-2026/SynapseOne/sdks/sdk-go@v${GITHUB_REF_NAME#sdks/sdk-go/v}
+            go get github.com/vku-open-source-2026/SynapseOne/sdks/sdk-go@v${{ needs.verify.outputs.version }}
             ```
 
             Documentation: https://synapseone.space/docs?tab=go
