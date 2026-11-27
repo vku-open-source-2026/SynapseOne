@@ -200,13 +200,23 @@ describe('platform api keys and quotas', () => {
     }, platformToken);
     assert.equal(cross.status, 404);
 
+    const resources = await call('GET', `/v1/platform/orgs/${tenantOrgId}/resources`, undefined, platformToken);
+    assert.equal(resources.status, 200, JSON.stringify(resources.json));
+    const allScopes = resources.json.keyScopeOptions;
+    assert.ok(Array.isArray(allScopes));
+    assert.ok(allScopes.length > 20, 'the catalog must support a real Select all operation');
+    assert.ok(allScopes.includes('base:read'));
+    assert.ok(allScopes.includes('workflow:Execute'));
+    assert.ok(allScopes.includes('*'));
+    assert.ok(!allScopes.some((scope: string) => scope.startsWith('platform:')));
+
     const created = await call('POST', `/v1/platform/orgs/${tenantOrgId}/keys`, {
-      accountId, name: 'support-breakglass', scopes: ['base:read', 'workflow:Execute'], expiresInDays: 30, reason: 'support access',
+      accountId, name: 'support-breakglass', scopes: allScopes, expiresInDays: 30, reason: 'support access',
     }, platformToken, { 'x-platform-step-up': await stepUp('org:key:create') });
     assert.equal(created.status, 201, JSON.stringify(created.json));
     assert.equal(created.headers.get('cache-control'), 'no-store');
     assert.ok(String(created.json.apiKey).startsWith('synapseone_'));
-    assert.deepEqual(created.json.scopes, ['base:read', 'workflow:Execute']);
+    assert.deepEqual(created.json.scopes, allScopes);
 
     // The plaintext works exactly once-visible: verify accepts it, and the
     // resources view lists the key metadata (never the secret).
@@ -214,9 +224,9 @@ describe('platform api keys and quotas', () => {
     assert.equal(verify.status, 200, JSON.stringify(verify.json));
     assert.equal(verify.json.valid, true);
 
-    const resources = await call('GET', `/v1/platform/orgs/${tenantOrgId}/resources`, undefined, platformToken);
-    assert.equal(resources.status, 200, JSON.stringify(resources.json));
-    const listed = resources.json.keys.find((k: any) => k.id === created.json.id);
+    const listedResources = await call('GET', `/v1/platform/orgs/${tenantOrgId}/resources`, undefined, platformToken);
+    assert.equal(listedResources.status, 200, JSON.stringify(listedResources.json));
+    const listed = listedResources.json.keys.find((k: any) => k.id === created.json.id);
     assert.ok(listed, 'created key is listed');
     assert.equal(listed.name, 'support-breakglass');
     assert.ok(listed.created_at);

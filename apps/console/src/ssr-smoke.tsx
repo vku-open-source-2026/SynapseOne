@@ -23,6 +23,7 @@ import { keyStatus as apiKeyStatus, quotaFieldSource, organizationDetailKey } fr
 import { DOC_TABS, SERVICE_CATALOG } from './lib/service-catalog.js';
 import { MobileServiceLinks } from './components/Topbar.jsx';
 import ServicesSidebar from './components/ServicesSidebar.jsx';
+import TenantKeyScopePicker from './components/TenantKeyScopePicker.jsx';
 import { en } from './locales/en.js';
 import { vi } from './locales/vi.js';
 
@@ -220,6 +221,30 @@ for (const [lang, dict] of [['en', en], ['vi', vi]] as const) {
     failures++;
     console.error(`FAIL [mobile-services-${lang}]: ${e?.message || e}`);
   }
+}
+
+try {
+  const scopePickerHtml = renderToString(
+    <TenantKeyScopePicker
+      options={['*', 'base:read', 'base:write', 'workflow:Execute', 'platform:Admin']}
+      selected={['base:read']}
+      onChange={() => undefined}
+    />,
+  );
+  if (!scopePickerHtml.includes('Select all') || !scopePickerHtml.includes('Clear')) {
+    throw new Error('tenant scope picker bulk actions did not render');
+  }
+  if (!scopePickerHtml.includes('data-scope-option="base:read"')
+    || !scopePickerHtml.includes('data-scope-option="workflow:Execute"')) {
+    throw new Error('tenant scope picker options did not render');
+  }
+  if (scopePickerHtml.includes('data-scope-option="platform:Admin"')) {
+    throw new Error('platform scope leaked into tenant scope picker');
+  }
+  console.log(`ok [tenant-scope-picker] ${scopePickerHtml.length} chars`);
+} catch (e: any) {
+  console.error(`FAIL [tenant-scope-picker]: ${e?.message || e}`);
+  process.exit(1);
 }
 
 if (failures > 0) {

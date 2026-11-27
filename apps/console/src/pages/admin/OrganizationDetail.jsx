@@ -3,7 +3,9 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useLocation, useParams } from 'react-router-dom';
 import { usePlatformAuth } from '../../lib/platform-auth.jsx';
+import { normalizeTenantKeyScopes } from '../../lib/api-key-scopes.js';
 import AdminActionDialog from '../../components/AdminActionDialog.jsx';
+import TenantKeyScopePicker from '../../components/TenantKeyScopePicker.jsx';
 import { Badge, Btn, Card, Empty, Err, Field, Input, Modal, PageTitle, Skeleton, StatValue, Table } from '../../components/ui.jsx';
 
 const TABS = [
@@ -52,7 +54,7 @@ function OrganizationDetailContent({ orgId }) {
   const [quotaService, setQuotaService] = useState('ai');
   const [form, setForm] = useState({ slug: '', displayName: '', reason: '', code: '' });
   const [roleForm, setRoleForm] = useState({ accountId: '', slug: '', description: '', code: '' });
-  const [keyForm, setKeyForm] = useState({ accountId: '', name: '', scopes: 'base:read', expiresInDays: '90', reason: '', code: '' });
+  const [keyForm, setKeyForm] = useState({ accountId: '', name: '', scopes: [], expiresInDays: '90', reason: '', code: '' });
   const [quotaForm, setQuotaForm] = useState({ requestsPerMin: '', requestsPer5h: '', requestsPerDay: '', tokensPerDay: '', executionsPerHour: '', concurrentExecutions: '', reason: '', code: '' });
   const [policyForm, setPolicyForm] = useState({ accountId: '', slug: '', description: '', document: '{\n  "Version": "2026-01-01",\n  "Statement": [\n    { "Effect": "Deny", "Action": ["*"], "Resource": ["*"] }\n  ]\n}', code: '' });
   const canWrite = platform.role === 'owner' || platform.role === 'operator';
@@ -87,7 +89,7 @@ function OrganizationDetailContent({ orgId }) {
     setData(null); setAudit([]); setErr(null); setAuditErr(null); setModalErr(null);
     setNotice(null); setCreatedKey(null); setConfirm(null); setTab('overview');
     setCreateKeyOpen(false); setCreateAccountOpen(false); setCreateRoleOpen(false); setCreatePolicyOpen(false);
-    setKeyForm({ accountId: '', name: '', scopes: 'base:read', expiresInDays: '90', reason: '', code: '' });
+    setKeyForm({ accountId: '', name: '', scopes: [], expiresInDays: '90', reason: '', code: '' });
     setQuotaForm({ requestsPerMin: '', requestsPer5h: '', requestsPerDay: '', tokensPerDay: '', executionsPerHour: '', concurrentExecutions: '', reason: '', code: '' });
   }, [orgId]);
   useEffect(() => { load(); loadAudit(); }, [load, loadAudit]);
@@ -142,9 +144,12 @@ function OrganizationDetailContent({ orgId }) {
   const createKey = async (e) => {
     e.preventDefault(); if (busy) return; setBusy(true); setErr(null); setModalErr(null);
     try {
-      const scopes = keyForm.scopes.split(',').map((s) => s.trim()).filter(Boolean);
+      const availableScopes = normalizeTenantKeyScopes(data?.keyScopeOptions);
+      const selectedScopes = normalizeTenantKeyScopes(keyForm.scopes);
+      const scopes = availableScopes.filter((scope) => selectedScopes.includes(scope));
       if (!keyForm.accountId) throw { body: { error: 'invalid_body', message: 'Select an account for the new key' } };
-      if (!scopes.length) throw { body: { error: 'invalid_body', message: 'Enter at least one scope (e.g. base:read)' } };
+      if (!scopes.length) throw { body: { error: 'invalid_body', message: 'Select at least one tenant scope for the new key' } };
+      if (scopes.length !== selectedScopes.length) throw { body: { error: 'invalid_scopes', message: 'One or more selected scopes are no longer available for this organization' } };
       const step = await platform.stepUp(keyForm.code.trim(), 'org:key:create');
       const out = await platform.request(`/v1/platform/orgs/${encodeURIComponent(orgId)}/keys`, {
         method: 'POST',
@@ -158,7 +163,7 @@ function OrganizationDetailContent({ orgId }) {
         stepUpToken: step.token,
       });
       setCreateKeyOpen(false);
-      setKeyForm({ accountId: '', name: '', scopes: 'base:read', expiresInDays: '90', reason: '', code: '' });
+      setKeyForm({ accountId: '', name: '', scopes: [], expiresInDays: '90', reason: '', code: '' });
       setCreatedKey(out);
       setNotice('API key created. Copy the secret now — it is shown only once.');
       await load(); await loadAudit();
@@ -356,7 +361,44 @@ function OrganizationDetailContent({ orgId }) {
 
       {createPolicyOpen && <Modal title="New organization policy" onClose={() => { setCreatePolicyOpen(false); setModalErr(null); }}><form onSubmit={createPolicy}><Err e={modalErr} /><Field label="Account"><select value={policyForm.accountId} onChange={(e) => setPolicyForm({ ...policyForm, accountId: e.target.value })} required className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm">{<option value="">Select account</option>}{data?.accounts?.map((a) => <option key={a.id} value={a.id}>{a.slug}</option>)}</select></Field><Field label="Policy slug"><Input value={policyForm.slug} onChange={(e) => setPolicyForm({ ...policyForm, slug: e.target.value })} required /></Field><Field label="Description"><Input value={policyForm.description} onChange={(e) => setPolicyForm({ ...policyForm, description: e.target.value })} /></Field><Field label="Policy JSON"><textarea value={policyForm.document} onChange={(e) => setPolicyForm({ ...policyForm, document: e.target.value })} rows={10} className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-xs font-mono" /></Field><Field label="Authenticator code"><Input value={policyForm.code} onChange={(e) => setPolicyForm({ ...policyForm, code: e.target.value })} autoComplete="one-time-code" required /></Field><Btn type="submit" loading={busy}>Create policy</Btn></form></Modal>}
 
-      {createKeyOpen && <Modal title="New tenant API key" onClose={() => { setCreateKeyOpen(false); setModalErr(null); }}><form onSubmit={createKey}><Err e={modalErr} /><p className="text-xs text-normal-text mb-3">Minted by a platform super admin on behalf of this tenant. The secret is shown once — send it through a trusted channel.</p><Field label="Account"><select value={keyForm.accountId} onChange={(e) => setKeyForm({ ...keyForm, accountId: e.target.value })} required className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm">{<option value="">Select account</option>}{data?.accounts?.map((a) => <option key={a.id} value={a.id}>{a.slug}</option>)}</select></Field><Field label="Key name"><Input value={keyForm.name} onChange={(e) => setKeyForm({ ...keyForm, name: e.target.value })} placeholder="support-breakglass" /></Field><Field label="Scopes (comma-separated, platform:* never allowed)"><Input value={keyForm.scopes} onChange={(e) => setKeyForm({ ...keyForm, scopes: e.target.value })} placeholder="base:read, workflow:Execute" required /></Field><Field label="Expires in days (empty = never)"><Input value={keyForm.expiresInDays} onChange={(e) => setKeyForm({ ...keyForm, expiresInDays: e.target.value })} inputMode="numeric" placeholder="90" /></Field><Field label="Reason"><Input value={keyForm.reason} onChange={(e) => setKeyForm({ ...keyForm, reason: e.target.value })} /></Field><Field label="Authenticator code"><Input value={keyForm.code} onChange={(e) => setKeyForm({ ...keyForm, code: e.target.value })} autoComplete="one-time-code" required /></Field><Btn type="submit" loading={busy}>Create key</Btn></form></Modal>}
+      {createKeyOpen && (
+        <Modal title="New tenant API key" onClose={() => { setCreateKeyOpen(false); setModalErr(null); }}>
+          <form onSubmit={createKey}>
+            <Err e={modalErr} />
+            <p className="text-xs text-normal-text mb-3">Minted by a platform super admin on behalf of this tenant. The secret is shown once — send it through a trusted channel.</p>
+            <Field label="Account">
+              <select
+                value={keyForm.accountId}
+                onChange={(e) => setKeyForm({ ...keyForm, accountId: e.target.value, scopes: [] })}
+                required
+                className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm"
+              >
+                <option value="">Select account</option>
+                {data?.accounts?.map((a) => <option key={a.id} value={a.id}>{a.slug}</option>)}
+              </select>
+            </Field>
+            <Field label="Key name">
+              <Input value={keyForm.name} onChange={(e) => setKeyForm({ ...keyForm, name: e.target.value })} placeholder="support-breakglass" />
+            </Field>
+            <TenantKeyScopePicker
+              options={data?.keyScopeOptions || []}
+              selected={keyForm.scopes}
+              onChange={(scopes) => setKeyForm((current) => ({ ...current, scopes }))}
+              disabled={!keyForm.accountId || busy}
+            />
+            <Field label="Expires in days (empty = never)">
+              <Input value={keyForm.expiresInDays} onChange={(e) => setKeyForm({ ...keyForm, expiresInDays: e.target.value })} inputMode="numeric" placeholder="90" />
+            </Field>
+            <Field label="Reason">
+              <Input value={keyForm.reason} onChange={(e) => setKeyForm({ ...keyForm, reason: e.target.value })} />
+            </Field>
+            <Field label="Authenticator code">
+              <Input value={keyForm.code} onChange={(e) => setKeyForm({ ...keyForm, code: e.target.value })} autoComplete="one-time-code" required />
+            </Field>
+            <Btn type="submit" loading={busy} disabled={!keyForm.accountId || !keyForm.scopes.length}>Create key</Btn>
+          </form>
+        </Modal>
+      )}
 
       {confirm && <AdminActionDialog open title={confirm.title} message={confirm.message} action={confirm.action} confirmLabel={confirm.confirmLabel || 'Confirm'} requireReason={!!confirm.requireReason} minReasonLength={confirm.minReasonLength || 1} onClose={() => setConfirm(null)} onConfirm={runConfirm} />}
     </>

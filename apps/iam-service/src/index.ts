@@ -4627,6 +4627,35 @@ async function auditMutation(req: express.Request, action: string, resource: str
   });
 
 
+  // Tenant keys may hold any known tenant-service permission, never platform
+  // administration permissions. Keep one catalog for validation and Console so
+  // the UI cannot offer a scope the API would reject.
+  const TENANT_KEY_SCOPE_OPTIONS = [
+    '*', '*:read', '*:write',
+    'iam:read', 'iam:write', 'iam:*',
+    'base:read', 'base:write', 'base:*',
+    'search:read', 'search:*',
+    'lds:read', 'lds:write', 'lds:*',
+    'faststore:read', 'faststore:write', 'faststore:*',
+    'queue:read', 'queue:write', 'queue:*',
+    'stream:read', 'stream:write', 'stream:*',
+    'storage:read', 'storage:write', 'storage:*',
+    'ocs:read', 'ocs:write', 'ocs:*',
+    'warehouse:read', 'warehouse:write', 'warehouse:*',
+    'lakehouse:read', 'lakehouse:write', 'lakehouse:*',
+    'workflow:read', 'workflow:write', 'workflow:*', 'workflow:Execute',
+    'inference:read', 'inference:write', 'inference:*', 'inference:Invoke',
+    'ai:read', 'ai:write', 'ai:*', 'ai:Invoke',
+    'secrets:read', 'secrets:write', 'secrets:*',
+    'notifications:read', 'notifications:write', 'notifications:*',
+  ] as const;
+  const TENANT_SCOPE_ALLOWLIST = new Set<string>(TENANT_KEY_SCOPE_OPTIONS);
+  const MAX_TENANT_KEY_SCOPES = TENANT_KEY_SCOPE_OPTIONS.length;
+  function platformKeyScopesValid(scopes: unknown): scopes is string[] {
+    return Array.isArray(scopes) && scopes.length > 0 && scopes.length <= MAX_TENANT_KEY_SCOPES
+      && scopes.every((scope) => typeof scope === 'string' && TENANT_SCOPE_ALLOWLIST.has(scope));
+  }
+
   app.get('/v1/platform/orgs/:orgId/resources', async (req, res) => {
     const ctx = await currentPlatformAdmin(req, res, 'auditor');
     if (!ctx) return;
@@ -4644,7 +4673,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       key.owner_name = owner?.display_name || null;
     }
     noStore(res);
-    res.json({ ...out, quotas, quotaEffective, quotaDefaults: quotaDefaults() });
+    res.json({ ...out, quotas, quotaEffective, quotaDefaults: quotaDefaults(), keyScopeOptions: TENANT_KEY_SCOPE_OPTIONS });
   });
 
   app.get('/v1/platform/orgs/:orgId/audit', async (req, res) => {
@@ -4758,30 +4787,6 @@ async function auditMutation(req: express.Request, action: string, resource: str
 
   // ---------- Super admin: tenant API-key issuance and rotation ----------
   // Plaintext is returned only by create/rotate. Every listing is metadata-only.
-  const TENANT_SCOPE_ALLOWLIST = new Set([
-    '*', '*:read', '*:write',
-    'iam:read', 'iam:write', 'iam:*',
-    'base:read', 'base:write', 'base:*',
-    'search:read', 'search:*',
-    'lds:read', 'lds:write', 'lds:*',
-    'faststore:read', 'faststore:write', 'faststore:*',
-    'queue:read', 'queue:write', 'queue:*',
-    'stream:read', 'stream:write', 'stream:*',
-    'storage:read', 'storage:write', 'storage:*',
-    'ocs:read', 'ocs:write', 'ocs:*',
-    'warehouse:read', 'warehouse:write', 'warehouse:*',
-    'lakehouse:read', 'lakehouse:write', 'lakehouse:*',
-    'workflow:read', 'workflow:write', 'workflow:*', 'workflow:Execute',
-    'inference:read', 'inference:write', 'inference:*', 'inference:Invoke',
-    'ai:read', 'ai:write', 'ai:*', 'ai:Invoke',
-    'secrets:read', 'secrets:write', 'secrets:*',
-    'notifications:read', 'notifications:write', 'notifications:*',
-  ]);
-  function platformKeyScopesValid(scopes: unknown): scopes is string[] {
-    return Array.isArray(scopes) && scopes.length > 0 && scopes.length <= 20
-      && scopes.every((scope) => typeof scope === 'string' && TENANT_SCOPE_ALLOWLIST.has(scope));
-  }
-
   app.post('/v1/platform/orgs/:orgId/keys', async (req, res) => {
     const ctx = await currentPlatformAdmin(req, res, 'operator');
     if (!ctx) return;
@@ -4789,7 +4794,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
     const parsed = z.object({
       accountId: z.string().uuid(),
       name: z.string().trim().min(1).max(100).nullish(),
-      scopes: z.array(z.string().trim().min(1).max(200)).min(1).max(20),
+      scopes: z.array(z.string().trim().min(1).max(200)).min(1).max(MAX_TENANT_KEY_SCOPES),
       expiresInDays: z.number().int().min(1).max(3650).nullish(),
       expiresAt: z.string().trim().max(64).nullish(),
       reason: z.string().trim().max(500).nullish(),
