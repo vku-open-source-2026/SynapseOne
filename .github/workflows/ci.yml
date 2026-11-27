@@ -36,6 +36,7 @@ jobs:
       - run: node tools/version-check.cjs
       - run: node tools/sdk-version-check.cjs
       - run: node --test tools/sdk-version-check.test.cjs
+      - run: node --test tools/cd-workflow.test.cjs
       # API catalog drift gate (console try-it + AI agent + docs/api.md).
       - run: node tools/migration-check.mjs
       - run: node tools/catalog-check.mjs

@@ -110,9 +110,12 @@ jobs:
             esac
             echo "::group::build $SVC"
             df -h /
+            # Every service Dockerfile copies from repo-root paths (apps/*,
+            # LICENSE, licenses), so the build context must remain the root.
             docker build --progress=plain \
+              -f "$CTX/Dockerfile" \
               -t "ghcr.io/$OWNER/synapseone-$SVC:main" \
-              -t "ghcr.io/$OWNER/synapseone-$SVC:main-$SHA" "$CTX"
+              -t "ghcr.io/$OWNER/synapseone-$SVC:main-$SHA" .
             docker push "ghcr.io/$OWNER/synapseone-$SVC:main"
             docker push "ghcr.io/$OWNER/synapseone-$SVC:main-$SHA"
             docker builder prune -f >/dev/null || true
