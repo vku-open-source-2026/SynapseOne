@@ -1068,19 +1068,25 @@ gateway only exposes `/v1/ai` and `/v1/inference` (the aliases stay internal).
 ## VIC Hackathon registration (`/v1/hackathon`)
 
 `POST /v1/hackathon/registrations` is public and requires no account, JWT or API key.
-It accepts a 2–3 member team and closes at **17:00 on 28 November 2026 (Vietnam time)**.
-The server validates contact data, rules consent, duplicates, rate limits and the
-configured deadline. API keys are created and emailed manually by the organizers;
-the registration API never stores or returns an API-key secret.
+It accepts either a 2–3 member team or an individual registration. Each person
+provides their year of study and optional advanced skills (competitive programming,
+practical experience, product experience). Registration closes at **17:00 on 28
+November 2026 (Vietnam time)**. The server validates contact data, rules consent,
+duplicates, rate limits and the configured deadline. API keys are created and
+emailed manually by the organizers; the registration API never stores or returns
+an API-key secret.
 
 ```json
 {
+  "registrationType": "team",
   "teamName": "Synapse Builders",
   "captainName": "Nguyen Van A",
   "captainEmail": "captain@example.com",
   "captainPhone": "0912345678",
   "captainStudentId": "123456789",
   "members": ["Tran Thi B"],
+  "memberYears": [2, 1],
+  "memberSkills": [[], []],
   "projectIdea": "A product built with SynapseOne",
   "acceptedRules": true
 }
@@ -1129,7 +1135,8 @@ Tenant JWTs, API keys and service-account tokens are rejected.
 | GET | `/v1/platform/usage/events` | Platform-wide request log (optional `orgId`). |
 | GET | `/v1/platform/audit` | Platform-wide audit (optional `orgId`). May use the configured read-only audit replica after primary-side platform-admin authorization; eventually consistent with automatic primary fallback. |
 | GET/POST/DELETE | `/v1/platform/admins[/:userId]` | Owner-only platform administrator management. |
-| GET | `/v1/platform/hackathon/registrations?q&status&limit&offset` | Hackathon teams, status and manual API-key delivery counts. |
+| GET | `/v1/platform/hackathon/registrations?q&status&limit&offset` | Hackathon teams/individuals, status and manual API-key delivery counts. |
+| GET | `/v1/platform/hackathon/match-suggestions` | Non-mutating suggestions for individual players, prioritizing a year-2 or skilled anchor plus two members. |
 | GET | `/v1/platform/hackathon/registrations/:id` | Full team registration detail. |
 | PATCH | `/v1/platform/hackathon/registrations/:id` | Approve/reject with step-up action `hackathon:review` and audit. |
 | POST | `/v1/platform/hackathon/registrations/:id/api-key-sent` | Record manual API-key email delivery with step-up action `hackathon:api-key-sent`; no secret is stored. |

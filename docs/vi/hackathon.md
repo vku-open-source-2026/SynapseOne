@@ -8,7 +8,8 @@ Trang công khai: **https://cloud.synapseone.space/hackathon**
 
 VIC Hackathon #1 là sự kiện xây dựng sản phẩm dành cho thành viên CLB Lập trình
 VIC. Mỗi đội **2–3 thành viên** phát triển sản phẩm từ SynapseOne và pitching trước
-ban giám khảo. Đăng ký không cần tài khoản SynapseOne.
+ban giám khảo. Thí sinh chưa có team có thể đăng ký cá nhân và BTC sẽ gợi ý đồng
+đội phù hợp. Đăng ký không cần tài khoản SynapseOne.
 
 ## Lịch trình — giờ Việt Nam (UTC+7)
 
@@ -23,7 +24,8 @@ chót nên gọi API trực tiếp không thể vượt qua thời hạn.
 
 ## Thể lệ
 
-1. Mỗi đội có 2–3 thành viên và một đội trưởng làm đầu mối liên hệ.
+1. Mỗi đội có 2–3 thành viên và một đội trưởng làm đầu mối liên hệ. Thí sinh chưa
+   có team có thể đăng ký cá nhân; BTC sẽ sắp xếp dựa trên gợi ý của admin.
 2. Sản phẩm phải được phát triển từ SynapseOne, sử dụng API, workflow, dữ liệu
    hoặc các năng lực khác của nền tảng.
 3. Tôn trọng bản quyền, không phá hoại hệ thống và không chia sẻ API key công khai.
@@ -58,8 +60,14 @@ API key. Các trường bắt buộc:
 - `captainEmail`
 - `captainPhone`
 - `captainStudentId`
-- `members`: 1–2 thành viên còn lại, tổng đội 2–3 người
+- `members`: 1–2 thành viên còn lại nếu đăng ký team; để trống nếu đăng ký cá nhân
+- `memberYears`: một số năm học 1–5 cho mỗi người, đội trưởng ở đầu
+- `memberSkills`: một mảng checklist cho mỗi người; giá trị gồm
+  `competitive-programming`, `practical-experience`, `product-experience`
 - `acceptedRules: true`
+
+Đặt `registrationType` là `team` hoặc `individual`. Đăng ký cá nhân không có
+`teamName` và `members`.
 
 Tùy chọn: `projectIdea`. Trường honeypot `website` bị từ chối nếu bot điền. Tên đội
 và email đội trưởng là duy nhất, không phân biệt hoa/thường. API công khai có
@@ -76,7 +84,10 @@ Platform operator/owner mở **Admin → VIC Hackathon** để:
 3. Duyệt/từ chối bằng step-up `hackathon:review`.
 4. Tạo API key theo quy trình vận hành tin cậy hiện có và tự gửi email cho đội
    trưởng.
-5. Đánh dấu đã gửi bằng step-up `hackathon:api-key-sent`.
+5. Mở **Gợi ý ghép team** để xem gợi ý không thay đổi dữ liệu cho thí sinh cá nhân.
+   Thuật toán chọn một sinh viên năm 2 hoặc người có kỹ năng nâng cao làm anchor,
+   sau đó ưu tiên hai sinh viên năm 1.
+6. Đánh dấu đã gửi bằng step-up `hackathon:api-key-sent`.
 
 Auditor chỉ được xem. Hành động duyệt và gửi key đều được audit. Hệ thống chỉ lưu
 trạng thái/thời điểm gửi, không lưu API key plaintext.

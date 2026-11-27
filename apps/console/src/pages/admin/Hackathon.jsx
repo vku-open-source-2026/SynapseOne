@@ -6,6 +6,11 @@ import { Badge, Btn, Card, Empty, Err, Field, Input, Modal, PageTitle, Table, Ta
 
 const PAGE = 25;
 const STATUS_LABELS = { pending: 'Chờ duyệt', approved: 'Đã duyệt', rejected: 'Từ chối' };
+const SKILL_LABELS = {
+  'competitive-programming': 'Lập trình thi đấu',
+  'practical-experience': 'Kinh nghiệm thực chiến',
+  'product-experience': 'Đã từng làm product',
+};
 
 function formatDate(value) {
   if (!value) return '–';
@@ -31,6 +36,10 @@ export default function AdminHackathon() {
   const [reviewNote, setReviewNote] = useState('');
   const [busy, setBusy] = useState(false);
   const [actionErr, setActionErr] = useState(null);
+  const [suggestions, setSuggestions] = useState(null);
+  const [suggestionsOpen, setSuggestionsOpen] = useState(false);
+  const [suggestionsLoading, setSuggestionsLoading] = useState(false);
+  const [suggestionsErr, setSuggestionsErr] = useState(null);
   const seqRef = useRef(0);
   const canReview = platform.role === 'operator' || platform.role === 'owner';
 
@@ -62,6 +71,21 @@ export default function AdminHackathon() {
     setOffset(0);
     setQuery(q.trim());
     if (q.trim() === query && offset === 0) load(0);
+  };
+
+  const loadSuggestions = async () => {
+    setSuggestionsLoading(true);
+    setSuggestionsErr(null);
+    try {
+      const out = await platform.request('/v1/platform/hackathon/match-suggestions');
+      setSuggestions(out);
+      setSuggestionsOpen(true);
+    } catch (e) {
+      setSuggestionsErr(e);
+      setSuggestionsOpen(true);
+    } finally {
+      setSuggestionsLoading(false);
+    }
   };
 
   const openAction = (registration, type) => {
@@ -108,14 +132,15 @@ export default function AdminHackathon() {
     <>
       <PageTitle
         title="VIC Hackathon #1"
-        sub="Đơn đăng ký đội và trạng thái gửi API key thủ công"
-        right={<Btn kind="secondary" onClick={() => load()} loading={loading}>Làm mới</Btn>}
+        sub="Đơn đăng ký team/cá nhân, gợi ý ghép đội và trạng thái gửi API key"
+        right={<><Btn kind="secondary" onClick={loadSuggestions} loading={suggestionsLoading}>Gợi ý ghép team</Btn><Btn kind="secondary" onClick={() => load()} loading={loading}>Làm mới</Btn></>}
       />
       {!canReview && <div className="mb-4 rounded-2xl bg-amber-500/10 px-4 py-3 text-sm text-amber-700">Tài khoản auditor chỉ có thể xem đơn. Cần operator hoặc owner để duyệt và cập nhật API key.</div>}
-      <div className="mb-4 grid gap-3 sm:grid-cols-4">
+      <div className="mb-4 grid gap-3 sm:grid-cols-5">
         {[
           ['Chờ duyệt', data.counts.pending || 0],
           ['Đã duyệt', data.counts.approved || 0],
+          ['Chưa có team', data.counts.individuals || 0],
           ['Đã gửi API key', data.counts.apiKeySent || 0],
           ['Từ chối', data.counts.rejected || 0],
         ].map(([label, value]) => (
@@ -146,8 +171,8 @@ export default function AdminHackathon() {
             {data.items.map((row) => (
               <tr key={row.id} className="border-t border-slate-100 align-top">
                 <td className="py-3 pr-4">
-                  <button type="button" onClick={() => setDetail(row)} className="text-left font-semibold text-main-blue hover:underline">{row.teamName}</button>
-                  <p className="max-w-[220px] truncate text-xs text-normal-text">{row.projectIdea || 'Chưa có ý tưởng'}</p>
+                  <button type="button" onClick={() => setDetail(row)} className="text-left font-semibold text-main-blue hover:underline">{row.registrationType === 'individual' ? `Cá nhân: ${row.captainName}` : row.teamName}</button>
+                  <p className="max-w-[220px] truncate text-xs text-normal-text">{row.registrationType === 'individual' ? `Năm ${row.memberYears?.[0] || '–'} · ${(row.memberSkills?.[0] || []).map((skill) => SKILL_LABELS[skill] || skill).join(', ') || 'Chưa có kỹ năng nâng cao'}` : (row.projectIdea || 'Chưa có ý tưởng')}</p>
                 </td>
                 <td className="py-3 pr-4"><div>{row.captainName}</div><div className="font-mono text-xs text-normal-text">{row.captainStudentId}</div></td>
                 <td className="py-3 pr-4 text-xs"><a className="block text-main-blue hover:underline" href={`mailto:${row.captainEmail}`}>{row.captainEmail}</a><span className="block text-normal-text">{row.captainPhone}</span></td>
@@ -182,7 +207,7 @@ export default function AdminHackathon() {
             </div>
             <div>
               <div className="font-semibold">Thành viên</div>
-              <ul className="mt-1 list-disc pl-5 text-normal-text">{(detail.memberNames || []).map((name, index) => <li key={`${name}-${index}`}>{name}{index === 0 ? ' (đội trưởng)' : ''}</li>)}</ul>
+              <ul className="mt-1 list-disc pl-5 text-normal-text">{(detail.memberNames || []).map((name, index) => <li key={`${name}-${index}`}>{name}{index === 0 ? (detail.registrationType === 'individual' ? '' : ' (đội trưởng)') : ''} · Năm {detail.memberYears?.[index] || '–'}{(detail.memberSkills?.[index]?.length ? ` · ${detail.memberSkills[index].map((skill) => SKILL_LABELS[skill] || skill).join(', ')}` : '')}</li>)}</ul>
             </div>
             <div><div className="font-semibold">Ý tưởng sản phẩm</div><p className="mt-1 whitespace-pre-wrap text-normal-text">{detail.projectIdea || 'Chưa cung cấp.'}</p></div>
             {detail.reviewNote && <div><div className="font-semibold">Ghi chú duyệt</div><p className="mt-1 whitespace-pre-wrap text-normal-text">{detail.reviewNote}</p></div>}
@@ -196,6 +221,35 @@ export default function AdminHackathon() {
               </div>
             )}
           </div>
+        </Modal>
+      )}
+
+      {suggestionsOpen && (
+        <Modal title="Gợi ý ghép team cho thí sinh chưa có đội" onClose={() => setSuggestionsOpen(false)}>
+          <Err e={suggestionsErr} />
+          {suggestions && (
+            <div className="space-y-4 text-sm">
+              <div className="rounded-2xl bg-background p-4 text-normal-text">
+                {suggestions.summary?.individuals || 0} thí sinh cá nhân · {suggestions.summary?.suggestedTeams || 0} team gợi ý · {suggestions.summary?.unmatched || 0} chưa xếp được
+              </div>
+              {(suggestions.suggestions || []).map((team) => (
+                <div key={team.id} className="rounded-2xl border border-slate-200 p-4">
+                  <div className="font-semibold text-main-text">{team.pattern}</div>
+                  <ul className="mt-2 space-y-1 text-normal-text">
+                    {team.members.map((member) => <li key={member.id}>{member.name} · Năm {member.year || '–'}{member.skills?.length ? ` · ${member.skills.map((skill) => SKILL_LABELS[skill] || skill).join(', ')}` : ''}</li>)}
+                  </ul>
+                </div>
+              ))}
+              {!suggestions.suggestions?.length && <Empty text="Chưa đủ thí sinh để tạo team 3 người theo tiêu chí anchor năm 2/kỹ năng." />}
+              {!!suggestions.unmatched?.length && (
+                <div>
+                  <div className="font-semibold">Chưa có gợi ý phù hợp</div>
+                  <p className="mt-1 text-normal-text">{suggestions.unmatched.map((row) => `${row.captainName} (năm ${row.memberYears?.[0] || '–'})`).join(', ')}</p>
+                </div>
+              )}
+              <p className="text-xs text-normal-text">Đây chỉ là gợi ý không thay đổi dữ liệu. Admin cần liên hệ và cập nhật team sau khi thống nhất.</p>
+            </div>
+          )}
         </Modal>
       )}
 

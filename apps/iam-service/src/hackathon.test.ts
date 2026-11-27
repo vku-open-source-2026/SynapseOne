@@ -32,13 +32,30 @@ describe('VIC Hackathon registration', () => {
   };
 
   const validBody = () => ({
+    registrationType: 'team',
     teamName: `Synapse Team ${suffix()}`,
     captainName: 'Nguyen Van A',
     captainEmail: `captain-${suffix()}@example.com`,
     captainPhone: '0912345678',
     captainStudentId: '123456789',
     members: ['Tran Thi B'],
+    memberYears: [2, 1],
+    memberSkills: [[], []],
     projectIdea: 'Xây dựng sản phẩm sử dụng SynapseOne.',
+    acceptedRules: true,
+    website: '',
+  });
+
+  const individualBody = (name: string, year: number, skills: string[] = []) => ({
+    registrationType: 'individual',
+    captainName: name,
+    captainEmail: `${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${suffix()}@example.com`,
+    captainPhone: '0912345678',
+    captainStudentId: `sv-${suffix()}`,
+    members: [],
+    memberYears: [year],
+    memberSkills: [skills],
+    projectIdea: '',
     acceptedRules: true,
     website: '',
   });
@@ -91,6 +108,8 @@ describe('VIC Hackathon registration', () => {
     assert.equal(result.status, 201, JSON.stringify(result.json));
     assert.equal(result.json.registration.status, 'pending');
     assert.deepEqual(result.json.registration.memberNames, [body.captainName, body.members[0]]);
+    assert.deepEqual(result.json.registration.memberYears, body.memberYears);
+    assert.deepEqual(result.json.registration.memberSkills, body.memberSkills);
     assert.equal(result.json.registration.captainEmail, body.captainEmail);
     registrationId = result.json.registration.id;
   });
@@ -116,6 +135,41 @@ describe('VIC Hackathon registration', () => {
     const sameEmail = validBody();
     sameEmail.captainEmail = body.captainEmail;
     assert.equal((await call('POST', '/v1/hackathon/registrations', sameEmail)).status, 409);
+  });
+
+  it('suggests individual teams with a year-2 or skilled anchor', async () => {
+    for (const body of [
+      individualBody('Second Year', 2),
+      individualBody('First One', 1),
+      individualBody('First Two', 1),
+    ]) assert.equal((await call('POST', '/v1/hackathon/registrations', body)).status, 201);
+    for (const body of [
+      individualBody('Skilled First', 1, ['product-experience']),
+      individualBody('First Three', 1),
+      individualBody('First Four', 1),
+    ]) assert.equal((await call('POST', '/v1/hackathon/registrations', body)).status, 201);
+
+    const result = await call('GET', '/v1/platform/hackathon/match-suggestions', undefined, adminToken);
+    assert.equal(result.status, 200, JSON.stringify(result.json));
+    assert.ok(result.json.suggestions.length >= 2);
+    assert.deepEqual(result.json.suggestions[0].members.map((member: any) => member.year), [2, 1, 1]);
+    assert.match(result.json.suggestions[1].pattern, /kỹ năng nâng cao/);
+    assert.equal(result.json.suggestions[1].members[0].name, 'Skilled First');
+  });
+
+  it('accepts an individual registration without a team', async () => {
+    const body = individualBody('Solo Player', 3, ['practical-experience']);
+    const result = await call('POST', '/v1/hackathon/registrations', body);
+    assert.equal(result.status, 201, JSON.stringify(result.json));
+    assert.equal(result.json.registration.registrationType, 'individual');
+    assert.equal(result.json.registration.teamName, null);
+    assert.deepEqual(result.json.registration.memberNames, ['Solo Player']);
+    assert.deepEqual(result.json.registration.memberYears, [3]);
+    assert.deepEqual(result.json.registration.memberSkills, [['practical-experience']]);
+
+    const invalid = individualBody('Invalid Solo', 2);
+    (invalid as any).teamName = 'Should not be here';
+    assert.equal((await call('POST', '/v1/hackathon/registrations', invalid)).status, 400);
   });
 
   it('rejects new teams when the configured capacity is reached', async () => {

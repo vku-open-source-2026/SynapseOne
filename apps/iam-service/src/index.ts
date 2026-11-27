@@ -59,7 +59,7 @@ import { decideForPrincipal, managedPolicyList, MANAGED_POLICIES, type Principal
 import { secretsEqual, hashCandidates, withTransaction } from './db';
 import {
   createHackathonRegistration, getHackathonRegistration, listHackathonRegistrations,
-  reviewHackathonRegistration, markHackathonApiKeySent,
+  reviewHackathonRegistration, markHackathonApiKeySent, suggestHackathonTeams,
 } from './hackathon';
 import { ingestUsageEvents, listUsageEvents, purgeUsage, usageSummary, type UsageFilter } from './usage';
 import { startUsageRollup } from './usage-rollup';
@@ -4158,12 +4158,15 @@ async function auditMutation(req: express.Request, action: string, resource: str
       return res.status(410).json({ error: 'registration_closed', message: 'Đã hết thời hạn đăng ký VIC Hackathon #1.' });
     }
     const parsed = z.object({
-      teamName: z.string().trim().min(2).max(100),
+      registrationType: z.enum(['team', 'individual']).default('team'),
+      teamName: z.string().trim().min(2).max(100).nullish(),
       captainName: z.string().trim().min(2).max(100),
       captainEmail: z.string().trim().toLowerCase().email().max(320),
       captainPhone: z.string().trim().regex(/^[0-9+().\-\s]{8,20}$/),
       captainStudentId: z.string().trim().regex(/^[A-Za-z0-9._-]{3,32}$/),
-      members: z.array(z.string().trim().min(2).max(100)).min(1).max(2),
+      members: z.array(z.string().trim().min(2).max(100)).max(2).default([]),
+      memberYears: z.array(z.number().int().min(1).max(5)).min(1).max(3),
+      memberSkills: z.array(z.array(z.enum(['competitive-programming', 'practical-experience', 'product-experience'])).max(3)).min(1).max(3),
       projectIdea: z.string().trim().max(2000).nullish(),
       acceptedRules: z.literal(true),
       website: z.string().max(200).nullish(),
@@ -4171,21 +4174,34 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!parsed.success || parsed.data.website) {
       return res.status(400).json({ error: 'invalid_body', message: parsed.success ? 'Invalid submission' : parsed.error.message });
     }
-    const maxRegistrations = Math.max(1, Number(process.env.HACKATHON_MAX_REGISTRATIONS) || 500);
     const b = parsed.data;
+    const expectedMembers = b.registrationType === 'team' ? b.members.length + 1 : 1;
+    const invalidShape = b.memberYears.length !== expectedMembers
+      || b.memberSkills.length !== expectedMembers
+      || (b.registrationType === 'team' && (!b.teamName || b.members.length < 1))
+      || (b.registrationType === 'individual' && (b.members.length > 0 || b.teamName));
+    if (invalidShape) {
+      return res.status(400).json({ error: 'invalid_body', message: 'Thông tin thành viên, năm học và kỹ năng chưa phù hợp với loại đăng ký.' });
+    }
+    const maxRegistrations = Math.max(1, Number(process.env.HACKATHON_MAX_REGISTRATIONS) || 500);
     try {
       const registration = await createHackathonRegistration({
-        teamName: sanitizeName(b.teamName, 100),
+        registrationType: b.registrationType,
+        teamName: b.teamName || '',
         captainName: sanitizeName(b.captainName, 100),
         captainEmail: b.captainEmail,
         captainPhone: b.captainPhone,
         captainStudentId: b.captainStudentId,
         members: b.members.map((name) => sanitizeName(name, 100)),
+        memberYears: b.memberYears,
+        memberSkills: b.memberSkills,
         projectIdea: b.projectIdea ? b.projectIdea.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f<>]/g, '').trim() : undefined,
       }, maxRegistrations);
       return res.status(201).json({
         registration,
-        message: 'Đăng ký thành công! Ban tổ chức sẽ liên hệ qua email của đội trưởng.',
+        message: b.registrationType === 'individual'
+          ? 'Đăng ký cá nhân thành công! Ban tổ chức sẽ liên hệ để sắp xếp team.'
+          : 'Đăng ký thành công! Ban tổ chức sẽ liên hệ qua email của đội trưởng.',
       });
     } catch (e: any) {
       if (isUniqueViolation(e)) {
@@ -4379,6 +4395,14 @@ async function auditMutation(req: express.Request, action: string, resource: str
     });
     noStore(res);
     res.json({ ...out, limit, offset });
+  });
+
+  app.get('/v1/platform/hackathon/match-suggestions', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'auditor');
+    if (!ctx) return;
+    const out = await suggestHackathonTeams();
+    noStore(res);
+    res.json(out);
   });
 
   app.get('/v1/platform/hackathon/registrations/:id', async (req, res) => {

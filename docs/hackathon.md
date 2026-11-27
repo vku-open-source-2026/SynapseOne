@@ -8,7 +8,9 @@ Public page: **https://cloud.synapseone.space/hackathon**
 
 VIC Hackathon #1 is a Vietnamese-first product-building event for members of the
 VIC Programming Club. Teams of **2–3 members** build a product using SynapseOne,
-then pitch it to the jury. Registration does not require a SynapseOne account.
+then pitch it to the jury. Players without a team may register individually and
+BTC will suggest suitable teammates. Registration does not require a SynapseOne
+account.
 
 ## Schedule — Vietnam time (UTC+7)
 
@@ -23,7 +25,9 @@ also enforces the deadline so direct API calls cannot bypass it.
 
 ## Rules
 
-1. Each team has 2–3 members and one captain as the contact person.
+1. Each team has 2–3 members and one captain as the contact person. Players
+   without a team can register individually; BTC will arrange teams using the
+   admin suggestions.
 2. The product must be developed from SynapseOne, using its APIs, workflows, data
    services or other platform capabilities.
 3. Teams must respect copyright, avoid malicious behavior and must not share API
@@ -59,8 +63,14 @@ Team introduction: <https://cloud.synapseone.space/about>
 - `captainEmail`
 - `captainPhone`
 - `captainStudentId`
-- `members`: 1–2 additional member names, so the team totals 2–3 people
+- `members`: 1–2 additional member names for a team; empty for individual registration
+- `memberYears`: one integer 1–5 per person, captain first
+- `memberSkills`: one checklist array per person; values are
+  `competitive-programming`, `practical-experience`, `product-experience`
 - `acceptedRules: true`
+
+Set `registrationType` to `team` or `individual`. Individual registrations omit
+`teamName` and `members`.
 
 Optional: `projectIdea`. A hidden `website` honeypot field is rejected when filled.
 Team names and captain emails are unique case-insensitively. Public submissions
@@ -78,7 +88,10 @@ Platform operators and owners can open **Admin → VIC Hackathon** to:
 3. Approve or reject with a fresh step-up proof (`hackathon:review`).
 4. Create the API key through the normal trusted operator process and email it
    manually to the captain.
-5. Mark the registration as sent with step-up action
+5. Open **Gợi ý ghép team** to see non-mutating suggestions for individual players.
+   The algorithm anchors each suggested trio with a second-year student or someone
+   with advanced skills, then prefers two first-year students.
+6. Mark the registration as sent with step-up action
    `hackathon:api-key-sent`.
 
 Auditors are read-only. Review and delivery actions are audited. The system stores

@@ -592,7 +592,14 @@
           "name": "team_name",
           "type": "text",
           "primaryKey": false,
-          "notNull": true
+          "notNull": false
+        },
+        "registration_type": {
+          "name": "registration_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'team'"
         },
         "captain_name": {
           "name": "captain_name",
@@ -620,6 +627,20 @@
         },
         "member_names": {
           "name": "member_names",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'[]'::jsonb"
+        },
+        "member_years": {
+          "name": "member_years",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'[]'::jsonb"
+        },
+        "member_skills": {
+          "name": "member_skills",
           "type": "jsonb",
           "primaryKey": false,
           "notNull": true,

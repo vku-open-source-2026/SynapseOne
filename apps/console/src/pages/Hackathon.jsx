@@ -20,6 +20,31 @@ const JURY = [
   { name: 'Trần Thị Thùy Dương', initials: 'TD', role: 'SynapseOne Core Team' },
 ];
 
+const SKILL_OPTIONS = [
+  { value: 'competitive-programming', label: 'Lập trình thi đấu' },
+  { value: 'practical-experience', label: 'Kinh nghiệm thực chiến' },
+  { value: 'product-experience', label: 'Đã từng làm product' },
+];
+
+function SkillCheckboxes({ value, onChange, disabled, legend }) {
+  return (
+    <fieldset className="sm:col-span-2">
+      <legend className="mb-1.5 block text-xs font-medium text-slate-300">{legend}</legend>
+      <div className="flex flex-wrap gap-2">
+        {SKILL_OPTIONS.map((skill) => {
+          const checked = value.includes(skill.value);
+          return (
+            <label key={skill.value} className={`cursor-pointer rounded-full border px-3 py-1.5 text-[11px] font-medium transition ${checked ? 'border-cyan-300/60 bg-cyan-300/15 text-cyan-100' : 'border-white/15 bg-white/5 text-slate-400 hover:bg-white/10'}`}>
+              <input type="checkbox" className="sr-only" checked={checked} disabled={disabled} onChange={() => onChange(checked ? value.filter((item) => item !== skill.value) : [...value, skill.value])} />
+              {checked ? '✓ ' : ''}{skill.label}
+            </label>
+          );
+        })}
+      </div>
+    </fieldset>
+  );
+}
+
 const TIMELINE = [
   { at: CLOSE_AT, title: 'Đóng đơn đăng ký', text: 'Hoàn tất form và chờ ban tổ chức xác nhận.' },
   { at: API_KEY_AT, title: 'Phát API key', text: 'BTC gửi API key đến email đội trưởng đã đăng ký.' },
@@ -62,13 +87,20 @@ function Countdown({ now }) {
 }
 
 const initialForm = {
+  registrationType: 'team',
   teamName: '',
   captainName: '',
   captainEmail: '',
   captainPhone: '',
   captainStudentId: '',
+  captainYear: '',
+  captainSkills: [],
   member2: '',
+  member2Year: '',
+  member2Skills: [],
   member3: '',
+  member3Year: '',
+  member3Skills: [],
   projectIdea: '',
   acceptedRules: false,
   website: '',
@@ -95,7 +127,7 @@ export default function Hackathon() {
     setError('');
   };
 
-  const memberCount = showMember3 ? 3 : 2;
+  const memberCount = form.registrationType === 'individual' ? 1 : (showMember3 ? 3 : 2);
 
   const submit = async (event) => {
     event.preventDefault();
@@ -105,19 +137,31 @@ export default function Hackathon() {
       setError('Bạn cần đồng ý với thể lệ trước khi gửi đơn.');
       return;
     }
-    if (!form.member2.trim() || (showMember3 && !form.member3.trim())) {
-      setError('Vui lòng nhập đầy đủ tên thành viên trong đội.');
+    if (!form.captainYear) {
+      setError('Vui lòng chọn năm học cho đội trưởng/thí sinh.');
+      return;
+    }
+    if (form.registrationType === 'team' && (!form.teamName.trim() || !form.member2.trim() || !form.member2Year || (showMember3 && (!form.member3.trim() || !form.member3Year)))) {
+      setError('Vui lòng nhập đầy đủ tên đội, thành viên và năm học.');
       return;
     }
     setBusy(true);
     try {
+      const team = form.registrationType === 'team';
       const result = await api.call('POST', '/v1/hackathon/registrations', {
-        teamName: form.teamName.trim(),
+        registrationType: form.registrationType,
+        teamName: team ? form.teamName.trim() : undefined,
         captainName: form.captainName.trim(),
         captainEmail: form.captainEmail.trim(),
         captainPhone: form.captainPhone.trim(),
         captainStudentId: form.captainStudentId.trim(),
-        members: [form.member2.trim(), ...(showMember3 ? [form.member3.trim()] : [])],
+        members: team ? [form.member2.trim(), ...(showMember3 ? [form.member3.trim()] : [])] : [],
+        memberYears: team
+          ? [Number(form.captainYear), Number(form.member2Year), ...(showMember3 ? [Number(form.member3Year)] : [])]
+          : [Number(form.captainYear)],
+        memberSkills: team
+          ? [form.captainSkills, form.member2Skills, ...(showMember3 ? [form.member3Skills] : [])]
+          : [form.captainSkills],
         projectIdea: form.projectIdea.trim() || undefined,
         acceptedRules: true,
         website: form.website,
@@ -225,7 +269,7 @@ export default function Hackathon() {
           </div>
           <div className="mt-10 grid gap-4 md:grid-cols-2">
             {[
-              { icon: Users, title: 'Đội 2–3 thành viên', text: 'Dành cho thành viên CLB Lập trình VIC. Mỗi đội cần một đội trưởng làm đầu mối liên hệ.' },
+              { icon: Users, title: 'Team 2–3 người hoặc đăng ký cá nhân', text: 'Dành cho thành viên CLB Lập trình VIC. Nếu chưa có team, hãy đăng ký cá nhân; BTC sẽ gợi ý ghép đội theo năm học và kỹ năng.' },
               { icon: Code2, title: 'Phát triển sản phẩm từ SynapseOne', text: 'Sử dụng API, workflow, dữ liệu hoặc các dịch vụ của SynapseOne để tạo sản phẩm có giá trị thực tế.' },
               { icon: ShieldCheck, title: 'Làm việc công bằng, an toàn', text: 'Tôn trọng bản quyền, không phá hoại hệ thống, không lạm dụng API key và tuân thủ hướng dẫn của ban tổ chức.' },
               { icon: Trophy, title: 'Pitching trước ban giám khảo', text: 'Trình bày sản phẩm, cách dùng SynapseOne và giá trị mà đội mang lại. Ban tổ chức sẽ hướng dẫn chi tiết thời lượng.' },
@@ -317,68 +361,122 @@ export default function Hackathon() {
                   </div>
                   <h3 className="mt-5 text-2xl font-bold text-white">Đơn đăng ký đã được gửi!</h3>
                   <p className="mx-auto mt-3 max-w-md text-sm leading-relaxed text-slate-400">
-                    Đội <strong className="text-cyan-200">{success.teamName}</strong> đang chờ ban tổ chức xác nhận.
-                    BTC sẽ liên hệ qua <strong className="text-cyan-200">{success.captainEmail}</strong>.
+                    {success.registrationType === 'individual' ? (
+                      <>Thí sinh <strong className="text-cyan-200">{success.captainName}</strong> đang chờ ban tổ chức sắp xếp team.</>
+                    ) : (
+                      <>Đội <strong className="text-cyan-200">{success.teamName}</strong> đang chờ ban tổ chức xác nhận.</>
+                    )}
+                    {' '}BTC sẽ liên hệ qua <strong className="text-cyan-200">{success.captainEmail}</strong>.
                   </p>
                   <div className="mx-auto mt-5 max-w-sm rounded-2xl border border-white/10 bg-black/20 p-4 text-left text-xs text-slate-400">
                     <div>Mã đăng ký</div>
                     <div className="mt-1 break-all font-mono text-slate-200">{success.id}</div>
                   </div>
                   <button type="button" onClick={() => setSuccess(null)} className="mt-6 rounded-full border border-white/15 px-6 py-2.5 text-sm font-semibold text-white hover:bg-white/5">
-                    Đăng ký đội khác
+                    Đăng ký khác
                   </button>
                 </div>
               ) : (
                 <form onSubmit={submit} noValidate>
                   <div className="mb-6 flex items-center justify-between gap-3">
                     <div>
-                      <h3 className="text-xl font-bold text-white">Form đăng ký đội</h3>
+                      <h3 className="text-xl font-bold text-white">{form.registrationType === 'team' ? 'Form đăng ký đội' : 'Form đăng ký cá nhân'}</h3>
                       <p className="mt-1 text-xs text-slate-400">Các trường có dấu * là bắt buộc</p>
                     </div>
-                    <div className="rounded-full bg-cyan-300/10 px-3 py-1 text-xs font-semibold text-cyan-200">{memberCount} thành viên</div>
+                    <div className="rounded-full bg-cyan-300/10 px-3 py-1 text-xs font-semibold text-cyan-200">{form.registrationType === 'individual' ? 'Cá nhân' : `${memberCount} thành viên`}</div>
                   </div>
 
                   {closed && <div className="mb-5 rounded-2xl border border-amber-300/30 bg-amber-300/10 p-4 text-sm text-amber-100">Đã hết thời hạn đăng ký. Bạn vẫn có thể xem thông tin sự kiện tại trang này.</div>}
                   {error && <div className="mb-5 rounded-2xl border border-red-400/30 bg-red-400/10 p-4 text-sm text-red-100" role="alert">{error}</div>}
 
+                  <div className="mb-6 grid gap-2 sm:grid-cols-2">
+                    <button type="button" onClick={() => update('registrationType', 'team')} className={`rounded-2xl border px-4 py-3 text-left text-sm transition ${form.registrationType === 'team' ? 'border-cyan-300/60 bg-cyan-300/10 text-cyan-100' : 'border-white/10 bg-white/5 text-slate-400 hover:bg-white/10'}`}>
+                      <strong className="block">Đã có team</strong>
+                      <span className="mt-1 block text-[11px]">Đăng ký 2–3 thành viên</span>
+                    </button>
+                    <button type="button" onClick={() => update('registrationType', 'individual')} className={`rounded-2xl border px-4 py-3 text-left text-sm transition ${form.registrationType === 'individual' ? 'border-cyan-300/60 bg-cyan-300/10 text-cyan-100' : 'border-white/10 bg-white/5 text-slate-400 hover:bg-white/10'}`}>
+                      <strong className="block">Chưa có team</strong>
+                      <span className="mt-1 block text-[11px]">BTC sẽ sắp xếp team phù hợp</span>
+                    </button>
+                  </div>
+
+                  {form.registrationType === 'individual' && (
+                    <div className="mb-5 rounded-2xl border border-violet-300/20 bg-violet-300/10 p-4 text-xs leading-relaxed text-violet-100">
+                      Hệ thống sẽ gợi ý ghép team cho admin dựa trên năm học và kỹ năng nâng cao, ưu tiên một sinh viên năm 2 hoặc người có kỹ năng nổi bật làm anchor.
+                    </div>
+                  )}
+
                   <div className="grid gap-4 sm:grid-cols-2">
-                    <label className="block sm:col-span-2">
-                      <span className="mb-1.5 block text-xs font-medium text-slate-300">Tên đội *</span>
-                      <input className="hackathon-form-input" value={form.teamName} onChange={(e) => update('teamName', e.target.value)} placeholder="Ví dụ: Synapse Builders" maxLength={100} required disabled={closed} />
-                    </label>
+                    {form.registrationType === 'team' && (
+                      <label className="block sm:col-span-2">
+                        <span className="mb-1.5 block text-xs font-medium text-slate-300">Tên đội *</span>
+                        <input className="hackathon-form-input" value={form.teamName} onChange={(e) => update('teamName', e.target.value)} placeholder="Ví dụ: Synapse Builders" maxLength={100} required disabled={closed} />
+                      </label>
+                    )}
                     <label className="block">
-                      <span className="mb-1.5 block text-xs font-medium text-slate-300">Họ tên đội trưởng *</span>
+                      <span className="mb-1.5 block text-xs font-medium text-slate-300">{form.registrationType === 'team' ? 'Họ tên đội trưởng *' : 'Họ tên thí sinh *'}</span>
                       <input className="hackathon-form-input" value={form.captainName} onChange={(e) => update('captainName', e.target.value)} placeholder="Nguyễn Văn A" maxLength={100} required disabled={closed} />
                     </label>
                     <label className="block">
-                      <span className="mb-1.5 block text-xs font-medium text-slate-300">MSV đội trưởng *</span>
+                      <span className="mb-1.5 block text-xs font-medium text-slate-300">Sinh viên năm thứ *</span>
+                      <select className="hackathon-form-input" value={form.captainYear} onChange={(e) => update('captainYear', e.target.value)} required disabled={closed}>
+                        <option value="">Chọn năm học</option>
+                        {[1, 2, 3, 4, 5].map((year) => <option key={year} value={year}>Năm {year}</option>)}
+                      </select>
+                    </label>
+                    <label className="block">
+                      <span className="mb-1.5 block text-xs font-medium text-slate-300">MSV *</span>
                       <input className="hackathon-form-input" value={form.captainStudentId} onChange={(e) => update('captainStudentId', e.target.value)} placeholder="123456789" maxLength={32} required disabled={closed} />
                     </label>
                     <label className="block">
-                      <span className="mb-1.5 block text-xs font-medium text-slate-300">Email đội trưởng *</span>
+                      <span className="mb-1.5 block text-xs font-medium text-slate-300">Email *</span>
                       <div className="relative"><Mail className="pointer-events-none absolute left-3 top-3 h-4 w-4 text-slate-500" /><input type="email" className="hackathon-form-input pl-9" value={form.captainEmail} onChange={(e) => update('captainEmail', e.target.value)} placeholder="captain@example.com" maxLength={320} required disabled={closed} /></div>
                     </label>
                     <label className="block">
                       <span className="mb-1.5 block text-xs font-medium text-slate-300">Số điện thoại *</span>
                       <div className="relative"><Phone className="pointer-events-none absolute left-3 top-3 h-4 w-4 text-slate-500" /><input type="tel" className="hackathon-form-input pl-9" value={form.captainPhone} onChange={(e) => update('captainPhone', e.target.value)} placeholder="0912 345 678" maxLength={20} required disabled={closed} /></div>
                     </label>
-                    <label className="block">
-                      <span className="mb-1.5 block text-xs font-medium text-slate-300">Thành viên 2 *</span>
-                      <input className="hackathon-form-input" value={form.member2} onChange={(e) => update('member2', e.target.value)} placeholder="Trần Thị B" maxLength={100} required disabled={closed} />
-                    </label>
-                    {showMember3 ? (
-                      <label className="block">
-                        <span className="mb-1.5 block text-xs font-medium text-slate-300">Thành viên 3 *</span>
-                        <input className="hackathon-form-input" value={form.member3} onChange={(e) => update('member3', e.target.value)} placeholder="Lê Văn C" maxLength={100} required disabled={closed} />
-                      </label>
-                    ) : (
-                      <button type="button" onClick={() => setShowMember3(true)} disabled={closed} className="self-end rounded-2xl border border-dashed border-cyan-300/30 px-4 py-2.5 text-sm font-medium text-cyan-200 hover:bg-cyan-300/5 disabled:opacity-50">
-                        + Thêm thành viên thứ 3
-                      </button>
+                    <SkillCheckboxes legend={form.registrationType === 'team' ? 'Kỹ năng nâng cao của đội trưởng' : 'Kỹ năng nâng cao của bạn'} value={form.captainSkills} onChange={(value) => update('captainSkills', value)} disabled={closed} />
+
+                    {form.registrationType === 'team' && (
+                      <>
+                        <label className="block">
+                          <span className="mb-1.5 block text-xs font-medium text-slate-300">Thành viên 2 *</span>
+                          <input className="hackathon-form-input" value={form.member2} onChange={(e) => update('member2', e.target.value)} placeholder="Trần Thị B" maxLength={100} required disabled={closed} />
+                        </label>
+                        <label className="block">
+                          <span className="mb-1.5 block text-xs font-medium text-slate-300">Sinh viên năm thứ *</span>
+                          <select className="hackathon-form-input" value={form.member2Year} onChange={(e) => update('member2Year', e.target.value)} required disabled={closed}>
+                            <option value="">Chọn năm học</option>
+                            {[1, 2, 3, 4, 5].map((year) => <option key={year} value={year}>Năm {year}</option>)}
+                          </select>
+                        </label>
+                        <SkillCheckboxes legend="Kỹ năng nâng cao của thành viên 2" value={form.member2Skills} onChange={(value) => update('member2Skills', value)} disabled={closed} />
+                        {showMember3 ? (
+                          <>
+                            <label className="block">
+                              <span className="mb-1.5 block text-xs font-medium text-slate-300">Thành viên 3 *</span>
+                              <input className="hackathon-form-input" value={form.member3} onChange={(e) => update('member3', e.target.value)} placeholder="Lê Văn C" maxLength={100} required disabled={closed} />
+                            </label>
+                            <label className="block">
+                              <span className="mb-1.5 block text-xs font-medium text-slate-300">Sinh viên năm thứ *</span>
+                              <select className="hackathon-form-input" value={form.member3Year} onChange={(e) => update('member3Year', e.target.value)} required disabled={closed}>
+                                <option value="">Chọn năm học</option>
+                                {[1, 2, 3, 4, 5].map((year) => <option key={year} value={year}>Năm {year}</option>)}
+                              </select>
+                            </label>
+                            <SkillCheckboxes legend="Kỹ năng nâng cao của thành viên 3" value={form.member3Skills} onChange={(value) => update('member3Skills', value)} disabled={closed} />
+                          </>
+                        ) : (
+                          <button type="button" onClick={() => setShowMember3(true)} disabled={closed} className="self-end rounded-2xl border border-dashed border-cyan-300/30 px-4 py-2.5 text-sm font-medium text-cyan-200 hover:bg-cyan-300/5 disabled:opacity-50">
+                            + Thêm thành viên thứ 3
+                          </button>
+                        )}
+                      </>
                     )}
                     <label className="block sm:col-span-2">
                       <span className="mb-1.5 block text-xs font-medium text-slate-300">Ý tưởng sản phẩm (không bắt buộc)</span>
-                      <textarea className="hackathon-form-input min-h-[110px] resize-y" value={form.projectIdea} onChange={(e) => update('projectIdea', e.target.value)} placeholder="Đội dự định xây dựng gì với SynapseOne?" maxLength={2000} disabled={closed} />
+                      <textarea className="hackathon-form-input min-h-[110px] resize-y" value={form.projectIdea} onChange={(e) => update('projectIdea', e.target.value)} placeholder={form.registrationType === 'team' ? 'Đội dự định xây dựng gì với SynapseOne?' : 'Bạn muốn xây dựng gì hoặc có kinh nghiệm gì nổi bật?'} maxLength={2000} disabled={closed} />
                     </label>
                   </div>
 
@@ -388,7 +486,7 @@ export default function Hackathon() {
 
                   <label className="mt-5 flex cursor-pointer items-start gap-3 text-xs leading-relaxed text-slate-400">
                     <input type="checkbox" checked={form.acceptedRules} onChange={(e) => update('acceptedRules', e.target.checked)} className="mt-0.5 h-4 w-4 accent-cyan-400" required disabled={closed} />
-                    <span>Tôi đại diện cho đội, xác nhận thông tin chính xác và đồng ý với <a href="#the-le" className="font-semibold text-cyan-200 underline underline-offset-2">thể lệ VIC Hackathon #1</a>.</span>
+                    <span>Tôi xác nhận thông tin chính xác, đồng ý với <a href="#the-le" className="font-semibold text-cyan-200 underline underline-offset-2">thể lệ VIC Hackathon #1</a>{form.registrationType === 'individual' ? ' và để BTC hỗ trợ sắp xếp team' : ''}.</span>
                   </label>
 
                   <button type="submit" disabled={busy || closed} className="hackathon-primary-btn mt-6 inline-flex w-full items-center justify-center gap-2 rounded-2xl px-6 py-3.5 text-sm font-bold text-white">
