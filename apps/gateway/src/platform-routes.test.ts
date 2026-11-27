@@ -78,6 +78,20 @@ describe('platform principal propagation', () => {
   });
 });
 
+describe('service-account attribution isolation', () => {
+  it('stamps quota attribution without widening authorization org scope', () => {
+    const req: any = {
+      headers: { 'x-synapseone-org': 'forged', 'x-synapseone-quota-org': 'forged' },
+      principal: { type: 'jwt', kind: 'service-account', sub: 'sa1', org: null, attributionOrg: 'org-1', account: 'acct-1', scopes: ['base:read'] },
+    };
+    propagatePrincipal(req);
+    assert.equal(req.headers['x-synapseone-org'], undefined);
+    assert.equal(req.headers['x-synapsedx-org'], undefined);
+    assert.equal(req.headers['x-synapseone-account'], 'acct-1');
+    assert.equal(req.headers['x-synapseone-quota-org'], 'org-1');
+  });
+});
+
 describe('platform runner credentials', () => {
   it('propagates the platform-runner kind and bound runner id', () => {
     const req: any = {

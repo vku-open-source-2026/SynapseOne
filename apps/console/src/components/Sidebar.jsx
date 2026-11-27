@@ -21,6 +21,7 @@ import {
   faBook,
   faCode,
   faLock,
+  faGauge,
 } from '@fortawesome/free-solid-svg-icons';
 import { useI18n } from '../lib/i18n-context.js';
 import BrandSymbol from './BrandSymbol.jsx';
@@ -34,6 +35,7 @@ const CORE_ITEMS = [
   { to: '/policies', key: 'policies', icon: faScroll, match: (p) => p.startsWith('/policies') },
   { to: '/keys', key: 'keys', icon: faKey, match: (p) => p.startsWith('/keys') },
   { to: '/service-accounts', key: 'serviceAccounts', icon: faRobot, match: (p) => p.startsWith('/service-accounts') },
+  { to: '/quotas', key: 'quotas', icon: faGauge, match: (p) => p.startsWith('/quotas') },
   { to: '/authorize', key: 'authorize', icon: faFlask, match: (p) => p.startsWith('/authorize') },
   { to: '/audit', key: 'audit', icon: faListCheck, match: (p) => p.startsWith('/audit') },
   { to: '/security', key: 'security', icon: faLock, match: (p) => p.startsWith('/security') },

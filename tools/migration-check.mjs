@@ -51,6 +51,7 @@ for (const root of roots) {
     continue; // service has no migration journal
   }
   let previous = -1;
+  let previousSnapshotId = null;
   for (const entry of journal.entries || []) {
     if (!Number.isFinite(entry.when) || entry.when <= previous) {
       console.error(`migration-check: ${path} entry ${entry.idx} (${entry.tag}) is not newer than the previous entry`);
@@ -61,6 +62,15 @@ for (const root of roots) {
     if (!files.length) {
       console.error(`migration-check: ${path} entry ${entry.tag} has no SQL file`);
       failed = true;
+    }
+    const snapshotPath = join(root, 'drizzle', 'meta', `${String(entry.idx).padStart(4, '0')}_snapshot.json`);
+    if (existsSync(snapshotPath)) {
+      const snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8'));
+      if (previousSnapshotId && snapshot.prevId !== previousSnapshotId) {
+        console.error(`migration-check: ${snapshotPath} prevId does not chain to the previous snapshot`);
+        failed = true;
+      }
+      previousSnapshotId = snapshot.id;
     }
   }
   const entries = journal.entries || [];

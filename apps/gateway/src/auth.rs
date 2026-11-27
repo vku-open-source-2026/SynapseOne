@@ -21,7 +21,11 @@ pub struct Principal {
     pub r#type: String,
     pub kind: Option<String>,
     pub sub: Option<String>,
+    /// Authorization scope. Service accounts deliberately keep this None.
     pub org: Option<String>,
+    /// Verified owning org used only for quota/usage attribution and trusted
+    /// downstream quota checks; never stamped as authorization scope.
+    pub attribution_org: Option<String>,
     pub account: Option<String>,
     pub scopes: Vec<String>,
     pub key_id: Option<String>,
@@ -84,10 +88,18 @@ pub struct SessionRejection {
     pub error: String,
 }
 
+#[derive(Default)]
+pub struct SessionValidation {
+    pub rejection: Option<SessionRejection>,
+    /// Returned directly for this request, independent of authorization cache TTL.
+    pub attribution_org: Option<String>,
+}
+
 struct SessionCacheEntry {
     expires: Instant,
     status: u16,
     error: String,
+    attribution_org: Option<String>,
 }
 
 pub struct AuthService {
@@ -120,6 +132,17 @@ impl AuthService {
     #[cfg(test)]
     pub fn clear_session_cache(&self) {
         self.session_cache.lock().expect("session cache").clear();
+    }
+
+    fn verified_principal(&self, claims: &Value, attribution_org: Option<String>) -> Principal {
+        let mut principal = principal_from_claims(claims);
+        if principal.kind.as_deref() == Some("service-account") {
+            // Machine identities remain account-bound for authorization. The
+            // owning org is attribution-only and must never widen access.
+            principal.org = None;
+        }
+        principal.attribution_org = attribution_org;
+        principal
     }
 
     /// Verify the JWT and IAM session, then return the verified principal.
@@ -161,8 +184,9 @@ impl AuthService {
                         }
                         // A revoked token falls back to anonymous and must not
                         // then be re-used as an API key.
-                        return if self.validate_jwt_session(bearer, &claims).await.is_none() {
-                            Ok(Some(principal_from_claims(&claims)))
+                        let validation = self.validate_jwt_session_detailed(bearer, &claims).await;
+                        return if validation.rejection.is_none() {
+                            Ok(Some(self.verified_principal(&claims, validation.attribution_org)))
                         } else {
                             Ok(None)
                         };
@@ -196,8 +220,8 @@ impl AuthService {
                                     "step-up token is not an access token",
                                 ));
                             }
-                            if let Some(rejected) = self.validate_jwt_session(bearer, &claims).await
-                            {
+                            let validation = self.validate_jwt_session_detailed(bearer, &claims).await;
+                            if let Some(rejected) = validation.rejection {
                                 let message = match rejected.error.as_str() {
                                     "iam_unavailable" => "IAM session check unavailable",
                                     "org_suspended" => "This organization is suspended.",
@@ -213,7 +237,7 @@ impl AuthService {
                                     message,
                                 ));
                             }
-                            return Ok(Some(principal_from_claims(&claims)));
+                            return Ok(Some(self.verified_principal(&claims, validation.attribution_org)));
                         }
                         Err(_) => {
                             if route.auth == AuthMode::Jwt {
@@ -325,26 +349,27 @@ impl AuthService {
         token: &str,
         decoded: &Value,
     ) -> Option<SessionRejection> {
+        self.validate_jwt_session_detailed(token, decoded).await.rejection
+    }
+
+    /// Validate the session and return attribution metadata for this exact
+    /// request. At TTL=0 no authorization cache entry is created, but the
+    /// verified org is still returned directly to the caller.
+    pub async fn validate_jwt_session_detailed(
+        &self,
+        token: &str,
+        decoded: &Value,
+    ) -> SessionValidation {
+        let claimed_org = claim_text(decoded, "org");
         let kind = decoded.get("kind").and_then(Value::as_str).unwrap_or("");
-        // Service-account tokens are introspected too: revocation and org
-        // suspension must take effect while the short-lived JWT is still valid.
-        if kind == "platform-step-up" {
-            return None;
+        if kind == "platform-step-up" || kind == "exec-delegated" {
+            return SessionValidation { attribution_org: claimed_org, rejection: None };
         }
-        // Execution grants are verified by `verify_execution_grant` on every
-        // request (no session cache): completing, releasing or deleting the
-        // runner must invalidate the grant immediately.
-        if kind == "exec-delegated" {
-            return None;
-        }
-        if claim_text(decoded, "sub")
-            .filter(|value| !value.is_empty())
-            .is_none()
-        {
-            return Some(SessionRejection {
-                status: 401,
-                error: "invalid_token".into(),
-            });
+        if claim_text(decoded, "sub").filter(|value| !value.is_empty()).is_none() {
+            return SessionValidation {
+                attribution_org: None,
+                rejection: Some(SessionRejection { status: 401, error: "invalid_token".into() }),
+            };
         }
         let ttl = self.session_cache_ttl;
         let key = sha256_hex(token);
@@ -353,13 +378,13 @@ impl AuthService {
             let mut cache = self.session_cache.lock().expect("session cache");
             if let Some(hit) = cache.get(&key) {
                 if hit.expires > now {
-                    return if hit.status == 200 {
-                        None
-                    } else {
-                        Some(SessionRejection {
-                            status: hit.status,
-                            error: hit.error.clone(),
-                        })
+                    return SessionValidation {
+                        attribution_org: if hit.status == 200 { hit.attribution_org.clone() } else { None },
+                        rejection: if hit.status == 200 {
+                            None
+                        } else {
+                            Some(SessionRejection { status: hit.status, error: hit.error.clone() })
+                        },
                     };
                 }
                 cache.remove(&key);
@@ -369,67 +394,54 @@ impl AuthService {
             }
         }
         let url = format!("{}/v1/auth/verify", self.iam_base);
-        let response = self
-            .client
-            .get(url)
-            .bearer_auth(token)
-            .timeout(Duration::from_millis(2_500))
-            .send()
-            .await;
+        let response = self.client.get(url).bearer_auth(token)
+            .timeout(Duration::from_millis(2_500)).send().await;
         match response {
             Ok(response) if response.status().is_success() => {
-                self.put_session(&key, ttl, 200, "");
-                None
+                let org_id = response.json::<Value>().await.ok().and_then(|body| {
+                    body.get("org_id").and_then(Value::as_str).map(str::to_string)
+                }).or(claimed_org);
+                self.put_session(&key, ttl, 200, "", org_id.clone());
+                SessionValidation { attribution_org: org_id, rejection: None }
             }
             Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-                self.put_session(&key, ttl, 401, "token_revoked");
-                Some(SessionRejection {
-                    status: 401,
-                    error: "token_revoked".into(),
-                })
+                self.put_session(&key, ttl, 401, "token_revoked", None);
+                SessionValidation {
+                    attribution_org: None,
+                    rejection: Some(SessionRejection { status: 401, error: "token_revoked".into() }),
+                }
             }
             Ok(response) if response.status() == StatusCode::FORBIDDEN => {
-                // IAM uses 403 for organization suspension and service-account
-                // revocation. Preserve the machine-readable error and fail
-                // closed instead of treating it as an IAM outage.
-                let error = response
-                    .json::<Value>()
-                    .await
-                    .ok()
-                    .and_then(|body| {
-                        body.get("error")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    })
-                    .unwrap_or_else(|| "org_suspended".into());
-                self.put_session(&key, ttl, 403, &error);
-                Some(SessionRejection { status: 403, error })
+                let error = response.json::<Value>().await.ok().and_then(|body| {
+                    body.get("error").and_then(Value::as_str).map(str::to_string)
+                }).unwrap_or_else(|| "org_suspended".into());
+                self.put_session(&key, ttl, 403, &error, None);
+                SessionValidation {
+                    attribution_org: None,
+                    rejection: Some(SessionRejection { status: 403, error }),
+                }
             }
             _ => {
-                if !ttl.is_zero() {
-                    self.put_session(&key, Duration::from_millis(500), 503, "iam_unavailable");
+                self.put_session(&key, Duration::from_millis(500), 503, "iam_unavailable", None);
+                SessionValidation {
+                    attribution_org: None,
+                    rejection: Some(SessionRejection { status: 503, error: "iam_unavailable".into() }),
                 }
-                Some(SessionRejection {
-                    status: 503,
-                    error: "iam_unavailable".into(),
-                })
             }
         }
     }
 
-    fn put_session(&self, key: &str, ttl: Duration, status: u16, error: &str) {
+    fn put_session(&self, key: &str, ttl: Duration, status: u16, error: &str, attribution_org: Option<String>) {
         if ttl.is_zero() {
             return;
         }
         let mut cache = self.session_cache.lock().expect("session cache");
-        cache.insert(
-            key.to_string(),
-            SessionCacheEntry {
-                expires: Instant::now() + ttl,
-                status,
-                error: error.to_string(),
-            },
-        );
+        cache.insert(key.to_string(), SessionCacheEntry {
+            expires: Instant::now() + ttl,
+            status,
+            error: error.to_string(),
+            attribution_org,
+        });
     }
 
     /// Verify a per-execution delegated grant against IAM on **every** request.
@@ -576,6 +588,7 @@ pub fn principal_from_claims(claims: &Value) -> Principal {
         ),
         sub: claim_text(claims, "sub"),
         org: claim_text(claims, "org"),
+        attribution_org: claim_text(claims, "org"),
         account: claim_text(claims, "account"),
         scopes: claim_string_list(claims, "scopes"),
         key_id: None,
@@ -599,7 +612,8 @@ fn principal_from_api_key(info: ApiKeyInfo) -> Principal {
         r#type: "apikey".into(),
         kind: info.kind,
         sub: None,
-        org: info.org_id,
+        org: info.org_id.clone(),
+        attribution_org: info.org_id,
         account: info.account_id,
         scopes: info.scopes,
         key_id: info.id,

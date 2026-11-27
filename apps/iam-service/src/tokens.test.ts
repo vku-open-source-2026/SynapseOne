@@ -7,7 +7,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { signAccess, verifyAccess, newRefreshToken, storeRefresh, consumeRefresh, consumeAndRevokeRefresh, revokeRefresh, revokeAllRefresh, revokeApiKey, createApiKeyRecord, verifyApiKey } from './tokens';
+import { signAccess, verifyAccess, newRefreshToken, storeRefresh, consumeRefresh, consumeAndRevokeRefresh, revokeRefresh, revokeAllRefresh, revokeApiKey, createApiKeyRecord, verifyApiKey, rotateApiKey, findApiKeyById } from './tokens';
 import { logAudit, listAudit, upsertUser, setUserActive } from './db';
 
 describe('access tokens', () => {
@@ -77,6 +77,24 @@ describe('refresh + api keys (memory)', () => {
     assert.equal(await verifyApiKey(k.value), null);
     assert.equal(await revokeApiKey(k.id), false);
     assert.equal(await revokeApiKey('nope'), false);
+  });
+  it('concurrent api key rotation has exactly one winner', async () => {
+    const original = await createApiKeyRecord('acc-rotate', null, 'rotate', ['base:read'], null);
+    const results = await Promise.all([rotateApiKey(original.id, 0), rotateApiKey(original.id, 0)]);
+    const winners = results.filter(Boolean);
+    assert.equal(winners.length, 1);
+    assert.equal(await verifyApiKey(original.value), null);
+    assert.equal((await verifyApiKey(winners[0]!.value))?.account_id, 'acc-rotate');
+  });
+  it('rotation grace never extends the original expiry and cannot rotate twice', async () => {
+    const originalExpiry = new Date(Date.now() + 60_000);
+    const original = await createApiKeyRecord('acc-expiry', null, 'short', ['*'], originalExpiry);
+    const rotated = await rotateApiKey(original.id, 3600);
+    assert.ok(rotated);
+    assert.equal(Date.parse(rotated.oldKeyExpiresAt), originalExpiry.getTime());
+    assert.equal((await findApiKeyById(original.id))?.expires_at, originalExpiry.toISOString());
+    assert.equal((await verifyApiKey(original.value))?.account_id, 'acc-expiry');
+    assert.equal(await rotateApiKey(original.id, 3600), null);
   });
   it('user-bound api key dies with its owner (unknown/deactivated)', async () => {
     // A key bound to a user that does not exist must not verify (fail-closed).

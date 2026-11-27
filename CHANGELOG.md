@@ -1,5 +1,7 @@
 # Changelog
 
+[Tiếng Việt](docs/vi/CHANGELOG.md) · English
+
 All notable changes to this project will be documented in this file.
 Format based on Keep a Changelog; versioning follows SemVer.
 
@@ -11,6 +13,20 @@ Format based on Keep a Changelog; versioning follows SemVer.
   registration with per-member year and advanced skills; superadmin review
   dashboard with team-matching suggestions, step-up/audit and manual API-key
   delivery tracking. Includes bilingual operator documentation.
+- **Organization quotas and API-key control plane.** Platform admins can inspect
+  tenant API-key metadata, create/rotate keys with one-time secrets, and manage
+  nullable per-org `ai`/`inference`/`workflow` overrides. Tenants can read their
+  own organization and effective quotas. Request admission now uses atomic IAM
+  Valkey checks across fixed epoch-minute, epoch-five-hour and UTC-day windows;
+  429s identify the binding window and `Retry-After`. Central authorization runs
+  before shared quota, and normal workflow routes plus MCP tool calls share one
+  atomic IAM execution-hour/concurrency budget, including JSON-RPC batches.
+  IAM/Valkey request-admission outages fall back to the gateway's local minute
+  limiter; execution-admission outages fail closed. Includes migrations
+  0018/0019/0020, Console `/admin/quotas`, organization API Keys/Quotas tabs and
+  tenant `/quotas`. API-key rotation is atomic, caps old-key grace at the
+  original expiry and preserves that expiry on the successor. Existing
+  token-usage propagation remains best-effort.
 - **IAM audit read replica:** optional `DATABASE_READ_URL` routes only
   tenant/platform audit list and count SELECTs to a read-only PostgreSQL hot
   standby after primary-side authorization. Reads use short timeouts and
@@ -48,6 +64,10 @@ Format based on Keep a Changelog; versioning follows SemVer.
 - **SynapseCity client identity at the shared edge.** SynapseCity proxy locations
   now overwrite `X-Forwarded-For` with `$remote_addr` instead of appending the
   nginx peer, preserving independent per-client rate-limit buckets.
+- **Quota re-review blockers:** normal workflow execution and MCP calls now share
+  IAM's atomic hourly counter and concurrency leases; PostgreSQL grace rotation
+  preserves the successor's original expiry; quota snapshots rebase onto the
+  merged hackathon 0017 snapshot and retain `hackathon_registrations` through 0020.
 - **Login after revocation.** `upsertUser` now projects `auth_version`, so
   dev/OIDC/register sessions mint tokens with the current version. Previously a
   `logout-all`, refresh-token reuse revoke or admin session revoke left every

@@ -29,6 +29,20 @@ spec:
             - { name: SYNAPSEONE_INTERNAL_SECRET, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: internal-secret } } }
             - { name: VALKEY_URL, value: "redis://valkey:6379" }
             - { name: REDIS_URL, value: "redis://valkey:6379" }
+            - { name: AI_QUOTA_REQUESTS_PER_MIN, value: "30" }
+            - { name: AI_QUOTA_REQUESTS_PER_5H, value: "" }
+            - { name: AI_QUOTA_REQUESTS_PER_DAY, value: "" }
+            - { name: AI_QUOTA_TOKENS_PER_DAY, value: "1000000" }
+            - { name: INFERENCE_QUOTA_REQUESTS_PER_MIN, value: "60" }
+            - { name: INFERENCE_QUOTA_REQUESTS_PER_5H, value: "" }
+            - { name: INFERENCE_QUOTA_REQUESTS_PER_DAY, value: "" }
+            - { name: INFERENCE_QUOTA_TOKENS_PER_DAY, value: "1000000" }
+            - { name: WORKFLOW_QUOTA_REQUESTS_PER_MIN, value: "120" }
+            - { name: WORKFLOW_QUOTA_REQUESTS_PER_5H, value: "" }
+            - { name: WORKFLOW_QUOTA_REQUESTS_PER_DAY, value: "" }
+            - { name: IAM_QUOTA_VALKEY_URL, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: quota-valkey-url, optional: true } } }
+            - { name: WORKFLOW_QUOTA_EXECUTIONS_PER_HOUR, value: "1000" }
+            - { name: WORKFLOW_QUOTA_CONCURRENT, value: "10" }
             - { name: OIDC_ISSUER, value: "https://auth.example.com/application/o/synapseone/" }
             - { name: OIDC_CLIENT_ID, value: "synapseone-platform" }
             - { name: OIDC_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: synapseone-secrets, key: oidc-client-secret } } }
@@ -105,6 +119,20 @@ spec:
             - { name: AUTHZ_MODE, value: "enforce" }
             - { name: AUTHZ_MODE_REQUIRED, value: "true" }
             - { name: PROXY_TIMEOUT_MS, value: "30000" }
+            - { name: AI_QUOTA_REQUESTS_PER_MIN, value: "30" }
+            - { name: AI_QUOTA_REQUESTS_PER_5H, value: "" }
+            - { name: AI_QUOTA_REQUESTS_PER_DAY, value: "" }
+            - { name: AI_QUOTA_TOKENS_PER_DAY, value: "1000000" }
+            - { name: INFERENCE_QUOTA_REQUESTS_PER_MIN, value: "60" }
+            - { name: INFERENCE_QUOTA_REQUESTS_PER_5H, value: "" }
+            - { name: INFERENCE_QUOTA_REQUESTS_PER_DAY, value: "" }
+            - { name: INFERENCE_QUOTA_TOKENS_PER_DAY, value: "1000000" }
+            - { name: WORKFLOW_QUOTA_REQUESTS_PER_MIN, value: "120" }
+            - { name: WORKFLOW_QUOTA_REQUESTS_PER_5H, value: "" }
+            - { name: WORKFLOW_QUOTA_REQUESTS_PER_DAY, value: "" }
+            - { name: WORKFLOW_QUOTA_EXECUTIONS_PER_HOUR, value: "1000" }
+            - { name: WORKFLOW_QUOTA_CONCURRENT, value: "10" }
+            - { name: QUOTA_CACHE_TTL_MS, value: "30000" }
             # Trust exactly one hop (the Ingress controller) for client IPs.
             - { name: TRUST_PROXY, value: "1" }
           securityContext: { runAsNonRoot: true, runAsUser: 1000, allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } }
@@ -149,6 +177,7 @@ spec:
             - { name: IAM_SERVICE_URL, value: "http://iam:4001" }
             - { name: AUDIT_TRAIL, value: "true" }
             - { name: WORKFLOW_TIMEOUT_MS, value: "60000" }
+            - { name: WORKFLOW_MCP_QUOTA_ENFORCEMENT, value: "true" }
             - { name: INFERENCE_TIMEOUT_MS, value: "120000" }
             - { name: NODE_ENV, value: "production" }
             - { name: HSTS_ENABLED, value: "true" }

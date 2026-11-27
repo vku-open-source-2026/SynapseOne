@@ -23,6 +23,7 @@ use crate::config::{validate_security_config, Config};
 use crate::headers::{propagate_principal, request_id, HSTS_HEADER, SECURITY_HEADERS};
 use crate::metrics::{Metrics, CONTENT_TYPE};
 use crate::proxy::{proxy_error_response, proxy_request, ProxyError};
+use crate::quotas::{consumes_workflow_execution, quota_service_for_route, QuotaClient, QuotaService};
 use crate::rate_limit::{LimitResult, RateLimiter};
 use crate::routes::{find_route, validate_routes, AuthMode, RouteRule};
 use crate::scopes::scope_allows;
@@ -221,6 +222,7 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     pub rate: Arc<RateLimiter>,
     pub quota: Arc<RateLimiter>,
+    pub quotas: Arc<QuotaClient>,
     pub client: reqwest::Client,
 }
 
@@ -333,6 +335,13 @@ fn build_state_with_decider(
         &config.internal_secret,
         config.usage_enabled,
     );
+    let quotas = Arc::new(QuotaClient::new(
+        client.clone(),
+        &config.iam_service_url,
+        &config.internal_secret,
+        config.quota_cache_ttl,
+        config.quota_defaults.clone(),
+    ));
     Ok(AppState {
         config: Arc::new(config),
         routes: Arc::new(routes),
@@ -342,6 +351,7 @@ fn build_state_with_decider(
         metrics,
         rate: Arc::new(RateLimiter::new()),
         quota: Arc::new(RateLimiter::new()),
+        quotas,
         client,
     })
 }
@@ -576,7 +586,7 @@ async fn usage_middleware(
                 status: status.as_u16(),
                 duration_ms,
                 auth_kind,
-                org_id: principal.and_then(|principal| principal.org.clone()),
+                org_id: principal.and_then(|principal| principal.attribution_org.clone().or_else(|| principal.org.clone())),
                 account_id: principal.and_then(|principal| principal.account.clone()),
                 user_id: if is_user {
                     principal.and_then(|principal| principal.sub.clone())
@@ -1001,34 +1011,6 @@ async fn dispatch(State(state): State<AppState>, mut request: Request) -> Respon
         }
     }
 
-    if route.path == "/v1/inference" || route.path == "/v1/ai" {
-        let tenant = principal
-            .as_ref()
-            .and_then(|principal| principal.org.clone().or_else(|| principal.account.clone()))
-            .unwrap_or_else(|| ip.clone());
-        let limit = u64::from(state.config.inference_rate_limit_per_min);
-        if let LimitResult::Limited { retry_after } =
-            state.quota.hit(&format!("inference:{tenant}"), limit)
-        {
-            update_meta(&meta, |meta| meta.error = Some("quota_exceeded".into()));
-            let mut response = json_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                json!({
-                    "error": "quota_exceeded",
-                    "message": format!(
-                        "Inference quota is {} requests/minute per tenant",
-                        limit
-                    ),
-                    "retryAfter": retry_after,
-                }),
-            );
-            if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
-                response.headers_mut().insert("retry-after", value);
-            }
-            return response;
-        }
-    }
-
     propagate_principal(
         request.headers_mut(),
         principal.as_ref(),
@@ -1071,7 +1053,214 @@ async fn dispatch(State(state): State<AppState>, mut request: Request) -> Respon
         }
     }
 
-    forward(&state, route, request, &meta, audit_header).await
+    // Authorization is authoritative and happens before any shared org quota is
+    // charged. Execution admission is acquired before request admission so a
+    // denial also leaves minute/5h/day counters untouched. Normal execution routes
+    // and MCP tools/call share IAM's hourly counter and concurrency lease set.
+    let execution_guard = match admit_service_quota(
+        &state,
+        route,
+        principal.as_ref(),
+        &method_text,
+        &path,
+        &ip,
+        &meta,
+    ).await {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
+
+    let response = forward(&state, route, request, &meta, audit_header).await;
+    if let Some(guard) = execution_guard {
+        guard.release().await;
+    }
+    response
+}
+
+async fn admit_service_quota(
+    state: &AppState,
+    route: &RouteRule,
+    principal: Option<&Principal>,
+    method: &str,
+    path: &str,
+    ip: &str,
+    meta: &Option<MetaHandle>,
+) -> Result<Option<ExecutionGuard>, Response> {
+    let Some(service) = quota_service_for_route(&route.path) else { return Ok(None) };
+    let org_id = principal.and_then(|principal| principal.attribution_org.clone().or_else(|| principal.org.clone()));
+    let bucket = org_id.clone()
+        .or_else(|| principal.and_then(|principal| principal.account.clone()))
+        .unwrap_or_else(|| ip.to_string());
+    let lookup = match org_id.as_deref() {
+        Some(org) => state.quotas.effective(org, service).await,
+        None => crate::quotas::QuotaLookup {
+            quota: state.quotas.default_for(service),
+            authoritative: false,
+        },
+    };
+    let quota = lookup.quota;
+    let execution = service == QuotaService::Workflow && consumes_workflow_execution(method, path);
+
+    // One atomic IAM admission is shared by normal execute/test-run/inference-job
+    // routes and every actual MCP tools/call. It must precede request admission so
+    // an execution denial does not consume minute/5h/day request quota.
+    let execution_guard = if execution
+        && (quota.executions_per_hour.is_some() || quota.concurrent_executions.is_some())
+    {
+        let Some(org) = org_id.as_deref() else {
+            update_meta(meta, |meta| meta.error = Some("quota_unavailable".into()));
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "quota_unavailable",
+                Some("workflow execution quota attribution unavailable"),
+            ));
+        };
+        if !lookup.authoritative {
+            update_meta(meta, |meta| meta.error = Some("quota_unavailable".into()));
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "quota_unavailable",
+                Some("workflow execution quota configuration unavailable"),
+            ));
+        }
+        let admitted = match state.quotas.admit_execution(
+            &format!("org:{org}"),
+            quota.executions_per_hour.unwrap_or(1_000_000),
+            quota.concurrent_executions.unwrap_or(1_000),
+        ).await {
+            Ok(result) => result,
+            Err(()) => {
+                update_meta(meta, |meta| meta.error = Some("quota_unavailable".into()));
+                return Err(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "quota_unavailable",
+                    Some("workflow execution quota store unavailable"),
+                ));
+            }
+        };
+        if !admitted.allowed {
+            update_meta(meta, |meta| meta.error = Some("quota_exceeded".into()));
+            return Err(quota_exceeded_response(
+                service,
+                &admitted.window,
+                admitted.limit,
+                admitted.retry_after_seconds,
+                if admitted.window == "hour" { "flow executions/hour" } else { "concurrent flow executions" },
+                admitted.reset_at.as_deref(),
+            ));
+        }
+        Some(ExecutionGuard::new(
+            state.quotas.clone(),
+            format!("org:{org}"),
+            admitted.token.unwrap_or_default(),
+        ))
+    } else { None };
+
+    if service != QuotaService::Workflow {
+        if let (Some(org), Some(limit)) = (org_id.as_deref(), quota.tokens_per_day) {
+            let meter = state.quotas.meter(bucket.as_str()).await;
+            let used = match service {
+                QuotaService::Ai => meter.tokens_today_ai,
+                QuotaService::Inference => meter.tokens_today_inference,
+                QuotaService::Workflow => 0,
+            };
+            if used >= limit {
+                update_meta(meta, |meta| meta.error = Some("quota_exceeded".into()));
+                return Err(quota_exceeded_response(service, "day", limit, 3_600, "tokens/day", None));
+            }
+        }
+    }
+
+    let mut shared_admitted = false;
+    if let (Some(org), true) = (org_id.as_deref(), lookup.authoritative) {
+        if let Ok(result) = state.quotas.check(&format!("org:{org}"), &quota).await {
+            if !result.allowed {
+                update_meta(meta, |meta| meta.error = Some("quota_exceeded".into()));
+                return Err(quota_exceeded_response(
+                    service,
+                    &result.window,
+                    result.limit,
+                    result.retry_after_seconds,
+                    match result.window.as_str() {
+                        "fiveHour" => "requests/5h",
+                        "day" => "requests/day",
+                        _ => "requests/minute",
+                    },
+                    result.reset_at.as_deref(),
+                ));
+            }
+            shared_admitted = true;
+        }
+    }
+    if !shared_admitted {
+        if let LimitResult::Limited { retry_after } = state.quota.hit(
+            &format!("quota:{}:{bucket}", service.as_str()),
+            quota.requests_per_min,
+        ) {
+            update_meta(meta, |meta| meta.error = Some("quota_exceeded".into()));
+            return Err(quota_exceeded_response(service, "minute", quota.requests_per_min, retry_after, "requests/minute", None));
+        }
+    }
+    Ok(execution_guard)
+}
+
+/// Holds one shared IAM execution lease for the proxy request. Explicit release
+/// keeps completion deterministic; Drop covers early returns and cancellation.
+struct ExecutionGuard {
+    quotas: Arc<QuotaClient>,
+    lease: Option<(String, String)>,
+}
+
+impl ExecutionGuard {
+    fn new(quotas: Arc<QuotaClient>, subject: String, token: String) -> Self {
+        Self { quotas, lease: Some((subject, token)) }
+    }
+
+    async fn release(mut self) {
+        let Some((subject, token)) = self.lease.take() else { return };
+        if let Err(()) = self.quotas.release_execution(&subject, &token).await {
+            tracing::warn!(event = "gateway_execution_quota_release_failed", subject, "execution lease release failed");
+        }
+    }
+}
+
+impl Drop for ExecutionGuard {
+    fn drop(&mut self) {
+        let Some((subject, token)) = self.lease.take() else { return };
+        let quotas = self.quotas.clone();
+        tokio::spawn(async move {
+            if let Err(()) = quotas.release_execution(&subject, &token).await {
+                tracing::warn!(event = "gateway_execution_quota_release_failed", subject, "execution lease release failed");
+            }
+        });
+    }
+}
+
+fn quota_exceeded_response(
+    service: QuotaService,
+    window: &str,
+    limit: u64,
+    retry_after: u64,
+    unit: &str,
+    reset_at: Option<&str>,
+) -> Response {
+    let mut body = json!({
+        "error": "quota_exceeded",
+        "message": format!("{} quota is {} {unit} per tenant", service.as_str(), limit),
+        "service": service.as_str(),
+        "window": window,
+        "limit": limit,
+        "retryAfter": retry_after,
+        "retryAfterSeconds": retry_after,
+    });
+    if let Some(reset_at) = reset_at {
+        body["resetAt"] = json!(reset_at);
+    }
+    let mut response = json_response(StatusCode::TOO_MANY_REQUESTS, body);
+    if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
+        response.headers_mut().insert("retry-after", value);
+    }
+    response
 }
 
 async fn forward(

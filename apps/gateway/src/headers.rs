@@ -50,6 +50,9 @@ pub fn propagate_principal(
     }
 
     if let Some(principal) = principal {
+        if let Some(org) = &principal.attribution_org {
+            insert(headers, "x-synapseone-quota-org", org);
+        }
         if principal.r#type == "jwt" {
             if let Some(sub) = &principal.sub {
                 insert(headers, "x-synapseone-user", sub);
@@ -113,7 +116,7 @@ pub fn propagate_principal(
     // Mirror canonical headers onto the legacy prefix for rolling deploys.
     // Values were stripped above, so this cannot amplify client identity.
     for name in [
-        "user", "org", "account", "scopes", "kind", "runner", "internal", "anon",
+        "user", "org", "account", "scopes", "kind", "runner", "internal", "anon", "quota-org",
     ] {
         if let Some(value) = headers.get(format!("x-synapseone-{name}")).cloned() {
             headers.insert(HeaderName::from_static(legacy_static(name)), value);
@@ -131,6 +134,7 @@ fn legacy_static(name: &str) -> &'static str {
         "runner" => "x-synapsedx-runner",
         "internal" => "x-synapsedx-internal",
         "anon" => "x-synapsedx-anon",
+        "quota-org" => "x-synapsedx-quota-org",
         _ => "x-synapsedx-kind",
     }
 }

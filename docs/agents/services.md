@@ -1,5 +1,7 @@
 # SynapseOne — Service Reference
 
+[Tiếng Việt](../vi/agents/services.md) · English
+
 Per-service map for agents: purpose, key files, API surface, data, rules, env.
 Ports assume Compose defaults. Apart from explicit public gateway routes
 (`/v1/auth/*`, LDS public reads, `/webhook/*`), services are internal in
@@ -37,9 +39,21 @@ upstreams. `routes.yaml` covers `/v1/auth`, IAM resources, `/v1/workflows`,
 - No global `express.json()` (must preserve raw proxy body). No path rewrite.
 - Per-route `timeoutMs` 1–300 s (LLM/webhook routes are longer); 502 on upstream
   failure, 504 on timeout.
-- In-memory per-client limits: `/v1/auth/*` 120/min, `/ready` 30/min,
-  inference/AI per-tenant `INFERENCE_RATE_LIMIT_PER_MIN` (default 60, 429 +
-  `Retry-After`). Keys on `req.ip`; set `TRUST_PROXY` behind the edge.
+- In-memory per-client limits: `/v1/auth/*` 120/min, `/ready` 30/min.
+  Managed service quotas cover `ai`, `inference` and `workflow`. IAM effective
+  limits are cached ~30 s (`QUOTA_CACHE_TTL_MS`). Tenant traffic uses IAM
+  `POST /internal/quota/check` for atomic fixed epoch-minute, epoch-five-hour and
+  UTC-day admission. Anonymous traffic and IAM/Valkey outages use the local
+  minute limiter. 429 responses bind `window`, `limit`, `retryAfterSeconds` and
+  `Retry-After`. Token/day checks remain best-effort. Workflow execution/hour and
+  concurrency use one atomic IAM lease budget: the gateway admits normal
+  execute/test-run/inference-job routes before request admission, and
+  workflow-service admits every actual MCP tool call (including batches) through
+  the same endpoint and `org:<id>` subject. Service-account account → org
+  attribution is resolved from IAM principal verification and carried only in
+  `x-synapseone-quota-org`; authorization remains account-bound. Central
+  authorization runs before shared quota. `/mcp` is request-metered without
+  buffering its body.
 - Per-route scope enforcement (`src/scopes.ts`): `<service>:read|write|*` or a
   concrete verb; 403 `scope_denied` before proxying. User JWTs carry `*`.
 - `/ready` probes iam/workflow/ai/lds/base/faststore/queue plus stream,
@@ -51,7 +65,12 @@ upstreams. `routes.yaml` covers `/v1/auth`, IAM resources, `/v1/workflows`,
 **Env:** `PORT`/`GATEWAY_PORT`, `IAM_SERVICE_URL`, all `*_SERVICE_URL`,
 `IAM_JWT_SECRET`, `SYNAPSEONE_INTERNAL_SECRET`, `GATEWAY_ROUTES_PATH`,
 `GATEWAY_VERIFY_APIKEY`, `PROXY_TIMEOUT_MS`, `CORS_ORIGIN`, `HSTS_ENABLED`,
-`USAGE_TELEMETRY`.
+`USAGE_TELEMETRY`, canonical `AI_QUOTA_REQUESTS_PER_MIN` (30),
+`INFERENCE_QUOTA_REQUESTS_PER_MIN` (60), `WORKFLOW_QUOTA_REQUESTS_PER_MIN` (120),
+their `*_REQUESTS_PER_5H` (minute × 300) and `*_REQUESTS_PER_DAY` (minute × 1440)
+defaults, `AI_QUOTA_TOKENS_PER_DAY`, `INFERENCE_QUOTA_TOKENS_PER_DAY` (1M),
+`WORKFLOW_QUOTA_EXECUTIONS_PER_HOUR` (1000), `WORKFLOW_QUOTA_CONCURRENT` (10),
+`QUOTA_CACHE_TTL_MS` (30 s). Legacy `INFERENCE_RATE_LIMIT_PER_MIN` is a fallback.
 
 ---
 
@@ -70,7 +89,9 @@ accessors + seed), `src/tokens.ts` (JWT/refresh/API keys), `src/policy.ts`
   `POST /v1/auth/oidc/callback`, `POST /v1/auth/login` (dev-only),
   `POST /v1/auth/refresh`, `POST /v1/auth/logout`, `POST /v1/auth/logout-all`,
   `GET /v1/auth/me`, `GET /v1/auth/verify`.
-- Tenancy: `GET/POST /v1/orgs`, `GET/POST /v1/orgs/:orgId/accounts`,
+- Tenancy: `GET/POST /v1/orgs`, `GET /v1/orgs/:orgId`,
+  `GET /v1/orgs/:orgId/quotas` (tenant-safe via `canActForOrg`),
+  `GET/POST /v1/orgs/:orgId/accounts`,
   `GET/POST /v1/orgs/:orgId/users`, `GET/POST /v1/accounts/:accountId/roles`,
   `GET/POST /v1/accounts/:accountId/policies`,
   `DELETE /v1/policies/:policyId`;
@@ -89,13 +110,22 @@ accessors + seed), `src/tokens.ts` (JWT/refresh/API keys), `src/policy.ts`
   `GET /v1/usage/events`.
 - Platform Super Admin: `/v1/platform/session`, `/step-up` (one-time,
   session/action-bound), `/me`, `/overview`, `/orgs`, `/orgs/:id/accounts`,
-  `/users`, `/usage/*`, `/audit`, `/admins`; internal one-time
-  `/internal/platform/bootstrap|recovery`. Requires a `kind=platform-admin`
+  `/orgs/:id/keys` (create/rotate tenant API key; metadata-only listing,
+  plaintext once, step-up `org:key:create` / `org:key:rotate`),
+  `/orgs/:id/quotas` + `/quotas[/defaults]` (nullable per-org
+  AI/Inference/Workflow overrides, step-up `org:quota:update`), `/users`,
+  `/usage/*`, `/audit`, `/admins`; internal one-time
+  `/internal/platform/bootstrap|recovery`; internal gateway lookups
+  `/internal/quotas[/org/:orgId]`, atomic `POST /internal/quota/check`, and
+  `/internal/usage/meter`. Internal routes have no public gateway entry and
+  require the internal secret when configured. Requires a `kind=platform-admin`
   token; invited users activate with `/v1/auth/invite/accept` or Console
   `/register`. See `docs/platform-superadmin.md`.
 
 **Data:** `organizations`, `accounts`, `users`, `roles`, `policies`,
 `role_policies`, `user_roles`, `api_keys`, `service_accounts`,
+`org_quotas` (nullable per-org `ai`/`inference`/`workflow` overrides; NULL =
+global default; request windows are fixed minute/5h/UTC-day),
 `refresh_tokens` (hash, expiry, `revoked_at`, `consumed_at` for rotation-replay
 detection), legacy `workflows`, `usage_events`, `audit_log`.
 Migrations seed demo org `acme` and account `prod`; the memory fallback seeds
@@ -121,7 +151,14 @@ Migrations seed demo org `acme` and account `prod`; the memory fallback seeds
 `IAM_JWT_EXPIRES_IN`, `IAM_REFRESH_EXPIRES_IN`, `IAM_API_KEY_PEPPER`,
 `IAM_ALLOW_DEV_LOGIN`, `IAM_ALLOW_OIDC_DEMO_CALLBACK`,
 `SYNAPSEONE_INTERNAL_SECRET`, `OIDC_*`, `AUDIT_RETENTION_DAYS`,
-`USAGE_RETENTION_DAYS`, `HSTS_ENABLED`, `CORS_ORIGIN`.
+`USAGE_RETENTION_DAYS`, `HSTS_ENABLED`, `CORS_ORIGIN`,
+`IAM_QUOTA_VALKEY_URL` (falls back to `VALKEY_URL`/`REDIS_URL`),
+`AI_QUOTA_REQUESTS_PER_MIN` (30), `INFERENCE_QUOTA_REQUESTS_PER_MIN` (60),
+`WORKFLOW_QUOTA_REQUESTS_PER_MIN` (120), each service's
+`*_QUOTA_REQUESTS_PER_5H` (minute × 300) and `*_QUOTA_REQUESTS_PER_DAY`
+(minute × 1440), `AI_QUOTA_TOKENS_PER_DAY`, `INFERENCE_QUOTA_TOKENS_PER_DAY`
+(1M), `WORKFLOW_QUOTA_EXECUTIONS_PER_HOUR` (1000),
+`WORKFLOW_QUOTA_CONCURRENT` (10).
 
 ---
 
@@ -208,6 +245,10 @@ chat/embeddings/decision work for inference/hybrid runners),
 - Workflows are tenant-scoped: visibility = account match OR org match; create/
   update cannot bind outside the caller's org; anonymous direct calls keep the
   dev/test global view.
+- Gateway and workflow-service share IAM's atomic execution/hour and concurrency
+  leases. Accepted `POST .../execute`, `POST /v1/workflows/test-run`,
+  `POST /v1/inference-jobs` and actual MCP `tools/call` messages consume the same
+  `org:<id>` budget; denied requests, reads and status mutations do not.
 - Executions are filtered by the run-time principal snapshot; callers without
   tenant scope fail closed.
 - Webhook paths are unique among active workflows; template creation suffixes

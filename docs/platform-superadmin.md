@@ -1,5 +1,7 @@
 # Platform Super Admin
 
+[Tiếng Việt](vi/platform-superadmin.md) · English
+
 The Platform Super Admin is a **human-operated, cross-tenant control plane** for
 SynapseOne. It is deliberately separate from `users.is_org_admin` (tenant-scoped)
 and from the internal `SYNAPSEONE_INTERNAL_SECRET` platform caller.
@@ -23,8 +25,8 @@ and from the internal `SYNAPSEONE_INTERNAL_SECRET` platform caller.
 - Destructive actions require a second, short-lived step-up token
   (`x-platform-step-up`, TTL 5 minutes). A proof is **single-use**, bound to the
   issuing platform session (`sid`) and to one action such as `org:create`,
-  `org:suspend`, `org:role:create`, `user:reset-mfa`, `user:enable` or
-  `admin:grant`.
+  `org:suspend`, `org:role:create`, `org:key:create`, `org:key:rotate`,
+  `org:quota:update`, `user:reset-mfa`, `user:enable` or `admin:grant`.
 - The reserved platform slug cannot be created as a tenant. `bootstrap` refuses
   to reuse a tenant organization with that slug, and `currentPlatformAdmin`
   verifies the administrator's organization is `kind=platform`.
@@ -55,9 +57,11 @@ and from the internal `SYNAPSEONE_INTERNAL_SECRET` platform caller.
 |---|---|
 | Overview | `GET /v1/platform/overview`, `/v1/platform/usage/summary` |
 | Organizations | `GET/POST /v1/platform/orgs`, `GET /v1/platform/orgs/:id`, `/resources`, `/audit`, suspend/reactivate |
+| API keys | `POST /v1/platform/orgs/:id/keys` (create), `POST .../keys/:keyId/rotate`, `POST .../keys/:keyId/revoke`; metadata-only listings |
+| Rate Limits | `/admin/quotas` and the organization Quotas tab; `GET/PUT/DELETE /v1/platform/orgs/:id/quotas[/:service]`, `GET /v1/platform/quotas[/defaults]` |
 | Accounts | `GET /v1/platform/accounts` |
 | Users & Access | `GET /v1/platform/users`, `GET /v1/platform/users/:id`, user action routes |
-| Organization detail | Overview, Accounts, Members, Administrators, Roles, Policies, API Keys, Service Accounts, Audit tabs under `/admin/orgs/:id` |
+| Organization detail | Overview, Accounts, Members, Administrators, Roles, Policies, API Keys, Quotas, Service Accounts, Audit tabs under `/admin/orgs/:id` |
 | Service Health | gateway `GET /ready` |
 | Usage | `GET /v1/platform/usage/summary`, `/v1/platform/usage/events` |
 | Audit & Security | `GET /v1/platform/audit` |
@@ -216,6 +220,31 @@ The response includes `inviteToken` for a new account. Send it out-of-band; the
 person activates it at `/register` and enrols TOTP before their first platform
 session. The only owner cannot be demoted or revoked (`409 last_owner`).
 
+## Organizations, API keys and quotas
+
+1. Open **Organizations**, select a tenant, then use **API Keys** to inspect
+   account, prefix, scopes, owner, created/last-used/expiry timestamps and status.
+   Secrets and hashes are never listed. Use **New key** or **Rotate** with a fresh
+   step-up code; copy the returned secret immediately. Rotation can revoke the old
+   key immediately (`graceSeconds: 0`) or allow a bounded overlap.
+2. Open the **Quotas** tab to compare effective limits with global defaults.
+   Enter positive integers for Requests/min, Requests/5h, Requests/day and the
+   service-specific token/execution/concurrency fields. Empty fields inherit the
+   default; **Reset to default** removes the service override. Every mutation is
+   step-up protected and audited.
+3. Use **Rate Limits** in the admin sidebar to search/page all overrides. Request
+   windows are fixed epoch-minute, epoch-five-hour and UTC-day buckets. IAM/Valkey
+   performs atomic three-window admission; an outage falls back to the gateway's
+   local minute limiter and returns `503 quota_unavailable` from the internal
+   check endpoint.
+4. Tenant users have a read-only **Quotas** page at `/quotas`, backed by
+   `GET /v1/orgs/:orgId` and `GET /v1/orgs/:orgId/quotas`. Cross-tenant reads are
+   denied. Platform and internal endpoints are not exposed to tenants.
+
+The Console distinguishes field-level default/override values and shows
+non-applicable or unlimited dimensions rather than misleading zeroes. Tables
+scroll horizontally on narrow screens and tabs expose ARIA tab semantics.
+
 ## Database
 
 IAM migrations add:
@@ -229,8 +258,21 @@ IAM migrations add:
 - `0010_wonderful_alex_wilder.sql`: `organizations.status`,
   `suspended_at`, `suspended_by`, `suspend_reason`; `service_accounts.revoked_at`.
   Additive and backwards-compatible (existing rows default to `active`).
+- `0018_org_quotas.sql`: `org_quotas` with nullable per-service limits.
+  Its journal timestamp is corrected to be newer than `0014` because production
+  never applied the original misordered entry and has no `org_quotas` table.
+- `0019_org_quota_request_windows.sql`: adds nullable `requests_per_5h` and
+  `requests_per_day`. Fresh installs and 0014-upgrade databases both reach the
+  same schema; journal timestamps are strictly increasing.
+- `0020_api_key_rotation_marker.sql`: adds nullable `api_keys.rotated_at` so
+  concurrent rotations have exactly one winner while grace-period keys remain
+  usable. Requires 0019; it is not safe to rerun manually.
 
-The migrations are additive and idempotent. Backfill existing audit rows with:
+The migrations are additive but **not rerunnable/idempotent**. Supported
+preconditions are a fresh database or a database migrated through 0014 with no
+`org_quotas` table; 0020 additionally requires the 0019 schema. Do not rerun the
+SQL files manually—Drizzle records applied hashes in its journal. Backfill
+existing audit rows with:
 
 ```bash
 node tools/backfill-audit-org.mjs
@@ -250,5 +292,11 @@ The script batches updates and can be rerun safely.
    them during an incident rollback.
 5. If a security rollout must be relaxed, set
    `IAM_SENSITIVE_MUTATION_MODE=audit` and keep monitoring; do not leave it off.
+6. For quota rollback, first restore the previous IAM/gateway/Console images and
+   canonical quota env values. Keep `org_quotas` and migration rows; old images
+   ignore the new columns. Do not drop the table during an incident. To stop new
+   shared enforcement without a schema rollback, make Valkey unreachable to IAM:
+   `/internal/quota/check` returns 503 and the gateway uses its local minute
+   fallback. Existing quota counters expire by their fixed-window TTLs.
 
 See `docs/iam-model.md` and `docs/api.md` for the underlying IAM behavior.

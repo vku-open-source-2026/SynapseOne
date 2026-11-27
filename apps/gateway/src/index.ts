@@ -24,6 +24,7 @@ import {
 } from './usage';
 import { scopeAllows } from './scopes';
 import { authzMiddleware, registerAuthzMetrics, authzMode, actionFor, type ActionOverride } from './authz';
+import { QuotaManager, gatewayQuotaDefaults, quotaServiceForRoute, consumesWorkflowExecution } from './quotas';
 
 dotenv.config();
 
@@ -174,7 +175,7 @@ function loadRoutes(): RouteRule[] {
   ];
 }
 
-const SESSION_CACHE = new Map<string, { exp: number; status: number; error?: string }>();
+const SESSION_CACHE = new Map<string, { exp: number; status: number; error?: string; attributionOrg?: string | null }>();
 function jwtCacheTtlMs(): number {
   const n = Number(process.env.GATEWAY_SESSION_CACHE_MS ?? 2000);
   return Number.isFinite(n) ? Math.min(Math.max(Math.floor(n), 0), 30_000) : 2000;
@@ -185,49 +186,57 @@ function jwtCacheTtlMs(): number {
  *  for a very short window to avoid an IAM round-trip per request. IAM/network
  *  failures fail closed for routes that require authentication. */
 export function clearSessionCache(): void { SESSION_CACHE.clear(); }
-export async function validateJwtSession(token: string, decoded: any, iamBase = IAM_SERVICE_URL): Promise<{ status: number; error: string } | null> {
-  if (!decoded || decoded.kind === 'platform-step-up') return null;
-  // Execution grants are verified by verifyExecGrant on every request (never
-  // cached): completion/release/runner revocation must invalidate immediately.
-  if (decoded.kind === 'exec-delegated') return null;
-  if (!decoded.sub) return { status: 401, error: 'invalid_token' };
+export interface SessionValidation { rejection: { status: number; error: string } | null; attributionOrg: string | null }
+export async function validateJwtSessionDetailed(token: string, decoded: any, iamBase = IAM_SERVICE_URL): Promise<SessionValidation> {
+  const claimedOrg = typeof decoded?.org === 'string' && decoded.org ? decoded.org : null;
+  if (!decoded || decoded.kind === 'platform-step-up' || decoded.kind === 'exec-delegated') {
+    return { rejection: null, attributionOrg: claimedOrg };
+  }
+  if (!decoded.sub) return { rejection: { status: 401, error: 'invalid_token' }, attributionOrg: null };
   const ttl = jwtCacheTtlMs();
   const key = createHash('sha256').update(token).digest('hex');
   const now = Date.now();
   const hit = SESSION_CACHE.get(key);
-  if (hit && hit.exp > now) return hit.status === 200 ? null : { status: hit.status, error: hit.error || 'token_revoked' };
+  if (hit && hit.exp > now) {
+    return hit.status === 200
+      ? { rejection: null, attributionOrg: hit.attributionOrg || claimedOrg }
+      : { rejection: { status: hit.status, error: hit.error || 'token_revoked' }, attributionOrg: null };
+  }
   if (SESSION_CACHE.size > 20_000) SESSION_CACHE.clear();
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 2500);
   try {
     const r = await fetch(`${iamBase.replace(/\/$/, '')}/v1/auth/verify`, {
-      method: 'GET',
-      headers: { Authorization: `Bearer ${token}` },
-      signal: ctl.signal,
+      method: 'GET', headers: { Authorization: `Bearer ${token}` }, signal: ctl.signal,
     });
     clearTimeout(timer);
     if (r.ok) {
-      if (ttl > 0) SESSION_CACHE.set(key, { exp: Date.now() + ttl, status: 200 });
-      return null;
+      let orgId: string | null = null;
+      try { const body: any = await r.json(); if (typeof body?.org_id === 'string') orgId = body.org_id; } catch { /* status remains authoritative */ }
+      const attributionOrg = orgId || claimedOrg;
+      if (ttl > 0) SESSION_CACHE.set(key, { exp: Date.now() + ttl, status: 200, attributionOrg });
+      return { rejection: null, attributionOrg };
     }
     if (r.status === 401) {
       if (ttl > 0) SESSION_CACHE.set(key, { exp: Date.now() + ttl, status: 401, error: 'token_revoked' });
-      return { status: 401, error: 'token_revoked' };
+      return { rejection: { status: 401, error: 'token_revoked' }, attributionOrg: null };
     }
     if (r.status === 403) {
       let error = 'org_suspended';
       try { const body: any = await r.json(); if (body?.error) error = String(body.error); } catch { /* default */ }
       if (ttl > 0) SESSION_CACHE.set(key, { exp: Date.now() + ttl, status: 403, error });
-      return { status: 403, error };
+      return { rejection: { status: 403, error }, attributionOrg: null };
     }
-    // IAM errors are never treated as "still valid".
     if (ttl > 0) SESSION_CACHE.set(key, { exp: Date.now() + 500, status: 503, error: 'iam_unavailable' });
-    return { status: 503, error: 'iam_unavailable' };
+    return { rejection: { status: 503, error: 'iam_unavailable' }, attributionOrg: null };
   } catch {
     clearTimeout(timer);
     if (ttl > 0) SESSION_CACHE.set(key, { exp: Date.now() + 500, status: 503, error: 'iam_unavailable' });
-    return { status: 503, error: 'iam_unavailable' };
+    return { rejection: { status: 503, error: 'iam_unavailable' }, attributionOrg: null };
   }
+}
+export async function validateJwtSession(token: string, decoded: any, iamBase = IAM_SERVICE_URL): Promise<{ status: number; error: string } | null> {
+  return (await validateJwtSessionDetailed(token, decoded, iamBase)).rejection;
 }
 
 /** Verify a per-execution delegated grant against IAM on every request.
@@ -283,7 +292,8 @@ function authMiddleware(mode: RouteRule['auth']) {
             (req as any).synapseoneError = 'invalid_token';
             return res.status(401).json({ error: 'invalid_token', message: 'step-up token is not an access token' });
           }
-          if (await validateJwtSession(bearer, decoded)) {
+          const validation = await validateJwtSessionDetailed(bearer, decoded);
+          if (validation.rejection) {
             // Optional auth: a revoked token falls back to anonymous, never tenant access.
             return next();
           }
@@ -291,7 +301,8 @@ function authMiddleware(mode: RouteRule['auth']) {
             type: 'jwt',
             kind: decoded.kind || 'user',
             sub: decoded.sub,
-            org: decoded.org,
+            org: decoded.kind === 'service-account' ? null : decoded.org || validation.attributionOrg,
+            attributionOrg: validation.attributionOrg,
             account: decoded.account,
             scopes: decoded.scopes || [],
             ...(decoded.jti ? { jti: String(decoded.jti) } : {}),
@@ -314,6 +325,7 @@ function authMiddleware(mode: RouteRule['auth']) {
                 kind: info.kind || 'apikey',
                 account: info.account_id,
                 org: (info as any).org_id,
+                attributionOrg: (info as any).org_id,
                 scopes: info.scopes,
                 keyId: info.id,
                 owner: info.user_id,
@@ -344,8 +356,9 @@ function authMiddleware(mode: RouteRule['auth']) {
             (req as any).synapseoneError = 'invalid_token';
             return res.status(401).json({ error: 'invalid_token', message: 'step-up token is not an access token' });
           }
-          const rejected = await validateJwtSession(token, decoded);
-          if (rejected) {
+          const validation = await validateJwtSessionDetailed(token, decoded);
+          if (validation.rejection) {
+            const rejected = validation.rejection;
             (req as any).synapseoneError = rejected.error;
             return res.status(rejected.status).json({ error: rejected.error, message: rejected.error === 'iam_unavailable' ? 'IAM session check unavailable' : rejected.error === 'org_suspended' ? 'This organization is suspended.' : 'This session was revoked. Sign in again.' });
           }
@@ -353,7 +366,8 @@ function authMiddleware(mode: RouteRule['auth']) {
             type: 'jwt',
             kind: decoded.kind || 'user',
             sub: decoded.sub,
-            org: decoded.org,
+            org: decoded.kind === 'service-account' ? null : decoded.org || validation.attributionOrg,
+            attributionOrg: validation.attributionOrg,
             account: decoded.account,
             scopes: decoded.scopes || [],
             ...(decoded.jti ? { jti: String(decoded.jti) } : {}),
@@ -386,6 +400,7 @@ function authMiddleware(mode: RouteRule['auth']) {
                 kind: info.kind || 'apikey',
                 account: info.account_id,
                 org: (info as any).org_id,
+                attributionOrg: (info as any).org_id,
                 scopes: info.scopes,
                 keyId: info.id,
                 owner: info.user_id,
@@ -611,6 +626,7 @@ export function propagatePrincipal(req: express.Request): void {
   const h = req.headers as Record<string, string | string[] | undefined>;
   delete h['x-synapseone-user'];
   delete h['x-synapseone-org'];
+  delete h['x-synapseone-quota-org'];
   delete h['x-synapseone-account'];
   delete h['x-synapseone-scopes'];
   delete h['x-synapseone-kind'];
@@ -632,6 +648,7 @@ export function propagatePrincipal(req: express.Request): void {
   // but BEFORE the principal check — unauthenticated routes (/v1/auth/*) need it too.
   if (INTERNAL_SECRET) h['x-synapseone-internal'] = INTERNAL_SECRET;
   const p = (req as any).principal;
+  if (p?.attributionOrg) h['x-synapseone-quota-org'] = String(p.attributionOrg);
   if (p?.type === 'jwt') {
     if (p.sub) h['x-synapseone-user'] = String(p.sub);
     if (p.org) h['x-synapseone-org'] = String(p.org);
@@ -661,7 +678,7 @@ export function propagatePrincipal(req: express.Request): void {
   // Mirror canonical headers onto the legacy prefix so a rolling deploy can
   // keep older upstream images working. Values are set only after the strip
   // above, so this can never amplify client-supplied identity.
-  for (const name of ['user', 'org', 'account', 'scopes', 'kind', 'runner', 'internal', 'anon']) {
+  for (const name of ['user', 'org', 'account', 'scopes', 'kind', 'runner', 'internal', 'anon', 'quota-org']) {
     const value = h[`x-synapseone-${name}`];
     if (value !== undefined) h[`x-synapsedx-${name}`] = value;
   }
@@ -741,7 +758,7 @@ export function createApp(): express.Express {
         status: res.statusCode,
         durationMs,
         authKind,
-        orgId: p?.org || null,
+        orgId: p?.attributionOrg || p?.org || null,
         accountId: p?.account || null,
         userId: isUser ? p.sub || null : null,
         error:
@@ -781,16 +798,15 @@ export function createApp(): express.Express {
       return next();
     };
   }
-  // Per-tenant inference quota (#26): LLM calls burn a shared provider budget,
-  // so cap requests per org/account (or client IP for anonymous) per minute.
-  const INFERENCE_LIMIT_PER_MIN = Math.min(
-    Math.max(Number(process.env.INFERENCE_RATE_LIMIT_PER_MIN || 60), 1),
-    100_000,
-  );
+  // IAM effective quotas are authoritative when reachable. The local limiter is
+  // retained only for anonymous traffic and IAM/Valkey outage fallback.
+  const quotaCacheTtlMs = (() => {
+    const value = Number(process.env.QUOTA_CACHE_TTL_MS ?? 30_000);
+    return Number.isFinite(value) ? Math.min(Math.max(Math.floor(value), 0), 300_000) : 30_000;
+  })();
+  const quotas = new QuotaManager(IAM_SERVICE_URL, INTERNAL_SECRET, quotaCacheTtlMs, gatewayQuotaDefaults());
   const quotaHits = new Map<string, { n: number; reset: number }>();
-  function inferenceQuota(req: express.Request): { ok: boolean; retryAfter: number } {
-    const p = (req as any).principal;
-    const key = `inference:${p?.org || p?.account || req.ip || 'anon'}`;
+  function localMinuteQuota(key: string, max: number): { ok: boolean; retryAfter: number } {
     const now = Date.now();
     const cur = quotaHits.get(key);
     if (!cur || cur.reset < now) {
@@ -798,15 +814,36 @@ export function createApp(): express.Express {
       return { ok: true, retryAfter: 0 };
     }
     cur.n++;
-    if (cur.n > INFERENCE_LIMIT_PER_MIN) {
-      return { ok: false, retryAfter: Math.max(1, Math.ceil((cur.reset - now) / 1000)) };
-    }
+    if (cur.n > max) return { ok: false, retryAfter: Math.max(1, Math.ceil((cur.reset - now) / 1000)) };
     return { ok: true, retryAfter: 0 };
   }
+
   setInterval(() => {
     const now = Date.now();
     for (const [k, v] of quotaHits) if (v.reset < now) quotaHits.delete(k);
   }, WINDOW_MS).unref?.();
+
+  function quotaExceeded(
+    res: express.Response,
+    service: string,
+    window: string,
+    limit: number,
+    retryAfter: number,
+    unit: string,
+    resetAt?: string,
+  ) {
+    res.setHeader('Retry-After', String(retryAfter));
+    return res.status(429).json({
+      error: 'quota_exceeded',
+      message: `${service} quota is ${limit} ${unit} per tenant`,
+      service,
+      window,
+      limit,
+      retryAfter,
+      retryAfterSeconds: retryAfter,
+      ...(resetAt ? { resetAt } : {}),
+    });
+  }
 
   // NOTE: không dùng express.json() toàn cục — body-parser sẽ nuốt stream
   // khiến http-proxy-middleware forward body rỗng/bể tới upstream.
@@ -1062,21 +1099,104 @@ export function createApp(): express.Express {
           message: `Credential scopes do not allow ${String(req.method || 'GET').toUpperCase()} ${req.path}`,
         });
       }
-      // Per-tenant inference quota (configurable budget, 429 + Retry-After).
-      if (route.path === '/v1/inference' || route.path === '/v1/ai') {
-        const quota = inferenceQuota(req);
-        if (!quota.ok) {
-          (req as any).synapseoneError = 'quota_exceeded';
-          res.setHeader('Retry-After', String(quota.retryAfter));
-          return res.status(429).json({
-            error: 'quota_exceeded',
-            message: `Inference quota is ${INFERENCE_LIMIT_PER_MIN} requests/minute per tenant`,
-            retryAfter: quota.retryAfter,
-          });
-        }
-      }
       propagatePrincipal(req);
-      return authz(req, res, next);
+      return authz(req, res, async () => {
+        // Central authorization has succeeded. Only now may shared org quota be
+        // charged. Execution admission is acquired before request admission so its
+        // denial also leaves minute/5h/day counters untouched. Normal executions
+        // and MCP tools/call use the same IAM hourly counter and lease set.
+        const quotaService = quotaServiceForRoute(route.path);
+        let releaseExecution: (() => void) | null = null;
+        try {
+          if (quotaService) {
+            const orgId = principal?.attributionOrg || principal?.org || null;
+            const bucket = orgId || principal?.account || req.ip || 'anon';
+            const lookup = orgId
+              ? await quotas.effective(orgId, quotaService)
+              : { quota: quotas.defaultFor(quotaService), authoritative: false };
+            const quota = lookup.quota;
+            const execution = quotaService === 'workflow' && consumesWorkflowExecution(req.method, req.path);
+            const deny = (window: string, limit: number, retryAfter: number, unit: string, resetAt?: string) => {
+              releaseExecution?.();
+              (req as any).synapseoneError = 'quota_exceeded';
+              return quotaExceeded(res, quotaService, window, limit, retryAfter, unit, resetAt);
+            };
+
+            if (execution && (quota.executionsPerHour != null || quota.concurrentExecutions != null)) {
+              if (!orgId) {
+                (req as any).synapseoneError = 'quota_unavailable';
+                return res.status(503).json({ error: 'quota_unavailable', message: 'workflow execution quota attribution unavailable' });
+              }
+              if (!lookup.authoritative) {
+                (req as any).synapseoneError = 'quota_unavailable';
+                return res.status(503).json({ error: 'quota_unavailable', message: 'workflow execution quota configuration unavailable' });
+              }
+              const admitted = await quotas.admitExecution(
+                `org:${orgId}`,
+                quota.executionsPerHour ?? 1_000_000,
+                quota.concurrentExecutions ?? 1_000,
+              );
+              if (!admitted) {
+                (req as any).synapseoneError = 'quota_unavailable';
+                return res.status(503).json({ error: 'quota_unavailable', message: 'workflow execution quota store unavailable' });
+              }
+              if (!admitted.allowed) {
+                return deny(
+                  admitted.window,
+                  admitted.limit,
+                  admitted.retryAfterSeconds,
+                  admitted.window === 'hour' ? 'flow executions/hour' : 'concurrent flow executions',
+                  admitted.resetAt || undefined,
+                );
+              }
+              const subject = `org:${orgId}`;
+              const token = admitted.token!;
+              let released = false;
+              releaseExecution = () => {
+                if (released) return;
+                released = true;
+                void quotas.releaseExecution(subject, token)
+                  .then((releasedOk) => {
+                    if (!releasedOk) console.warn(JSON.stringify({ event: 'gateway_execution_quota_release_failed', subject }));
+                  })
+                  .catch((error: any) => console.warn(JSON.stringify({
+                    event: 'gateway_execution_quota_release_failed', subject, message: String(error?.message || error).slice(0, 120),
+                  })));
+              };
+            }
+
+            if (quotaService !== 'workflow' && orgId && quota.tokensPerDay != null) {
+              const meter = await quotas.meter(bucket);
+              const used = Number(quotaService === 'ai' ? meter?.tokensToday?.ai : meter?.tokensToday?.inference) || 0;
+              if (used >= quota.tokensPerDay) return deny('day', quota.tokensPerDay, 3600, 'tokens/day');
+            }
+
+            let sharedAdmitted = false;
+            if (orgId && lookup.authoritative) {
+              const result = await quotas.check(`org:${orgId}`, quota);
+              if (result) {
+                if (!result.allowed) {
+                  const unit = result.window === 'fiveHour' ? 'requests/5h' : result.window === 'day' ? 'requests/day' : 'requests/minute';
+                  return deny(result.window, result.limit, result.retryAfterSeconds, unit, result.resetAt);
+                }
+                sharedAdmitted = true;
+              }
+            }
+            if (!sharedAdmitted) {
+              const local = localMinuteQuota(`quota:${quotaService}:${bucket}`, quota.requestsPerMin);
+              if (!local.ok) return deny('minute', quota.requestsPerMin, local.retryAfter, 'requests/minute');
+            }
+          }
+        } catch (error) {
+          releaseExecution?.();
+          throw error;
+        }
+        if (releaseExecution) {
+          res.once('finish', releaseExecution);
+          res.once('close', releaseExecution);
+        }
+        next();
+      });
     });
   }) as any);
 

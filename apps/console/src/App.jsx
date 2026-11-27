@@ -36,6 +36,7 @@ const Roles = React.lazy(() => import('./pages/Roles.jsx'));
 const Policies = React.lazy(() => import('./pages/Policies.jsx'));
 const Keys = React.lazy(() => import('./pages/Keys.jsx'));
 const ServiceAccounts = React.lazy(() => import('./pages/ServiceAccounts.jsx'));
+const Quotas = React.lazy(() => import('./pages/Quotas.jsx'));
 const Workflows = React.lazy(() => import('./pages/Workflows.jsx'));
 const WorkflowRunners = React.lazy(() => import('./pages/WorkflowRunners.jsx'));
 const SynapseBase = React.lazy(() => import('./pages/SynapseBase.jsx'));
@@ -63,6 +64,7 @@ const AdminUsers = React.lazy(() => import('./pages/admin/Users.jsx'));
 const AdminUserDetail = React.lazy(() => import('./pages/admin/UserDetail.jsx'));
 const AdminServiceHealth = React.lazy(() => import('./pages/admin/ServiceHealth.jsx'));
 const AdminUsage = React.lazy(() => import('./pages/admin/Usage.jsx'));
+const AdminQuotas = React.lazy(() => import('./pages/admin/Quotas.jsx'));
 const AdminAudit = React.lazy(() => import('./pages/admin/Audit.jsx'));
 const AdminPlatformAdmins = React.lazy(() => import('./pages/admin/PlatformAdmins.jsx'));
 const AdminRunners = React.lazy(() => import('./pages/admin/Runners.jsx'));
@@ -192,6 +194,7 @@ function AppRoutes() {
           <Route path="/policies" element={<Guard><ConsoleLayout><Policies /></ConsoleLayout></Guard>} />
           <Route path="/keys" element={<Guard><ConsoleLayout><Keys /></ConsoleLayout></Guard>} />
           <Route path="/service-accounts" element={<Guard><ConsoleLayout><ServiceAccounts /></ConsoleLayout></Guard>} />
+          <Route path="/quotas" element={<Guard><ConsoleLayout><Quotas /></ConsoleLayout></Guard>} />
           <Route path="/workflows" element={<Guard><ConsoleLayout><Workflows /></ConsoleLayout></Guard>} />
           <Route path="/runner-engine" element={<Guard><ConsoleLayout><WorkflowRunners /></ConsoleLayout></Guard>} />
           <Route path="/workflow-runners" element={<Guard><ConsoleLayout><WorkflowRunners /></ConsoleLayout></Guard>} />
@@ -218,6 +221,7 @@ function AppRoutes() {
           <Route path="/admin/users/:userId" element={<PlatformGuard><AdminLayout><AdminUserDetail /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/health" element={<PlatformGuard><AdminLayout><AdminServiceHealth /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/usage" element={<PlatformGuard><AdminLayout><AdminUsage /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/quotas" element={<PlatformGuard><AdminLayout><AdminQuotas /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/audit" element={<PlatformGuard><AdminLayout><AdminAudit /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/access" element={<PlatformGuard><AdminLayout><AdminPlatformAdmins /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/runners" element={<PlatformGuard><AdminLayout><AdminRunners /></AdminLayout></PlatformGuard>} />

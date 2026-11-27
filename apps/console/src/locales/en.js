@@ -230,6 +230,7 @@ export const en = {
       policies: 'Policies',
       keys: 'API Keys',
       serviceAccounts: 'Service Accts',
+      quotas: 'Quotas',
       authorize: 'Authorize',
       audit: 'Audit Log',
       security: 'Security',

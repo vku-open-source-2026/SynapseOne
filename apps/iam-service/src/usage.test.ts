@@ -222,6 +222,26 @@ describe('inference token metering (#26)', () => {
   });
 });
 
+describe('workflow execution quota meter', () => {
+  it('counts accepted execute, test-run and inference-job requests, not denials or reads', async () => {
+    const before = await call('GET', `/internal/usage/meter?orgId=${orgId}`);
+    assert.equal(before.status, 200);
+    const ingest = await call('POST', '/v1/usage/ingest', {
+      events: [
+        { feature: 'workflow', route: '/v1/workflows', method: 'POST', path: '/v1/workflows/test-run', status: 200, durationMs: 1, orgId },
+        { feature: 'workflow', route: '/v1/workflows', method: 'POST', path: '/v1/workflows/w1/execute', status: 429, durationMs: 1, orgId },
+        { feature: 'workflow', route: '/v1/inference-jobs', method: 'POST', path: '/v1/inference-jobs', status: 202, durationMs: 1, orgId },
+        { feature: 'workflow', route: '/v1/workflows', method: 'GET', path: '/v1/workflows/w1/execute', status: 200, durationMs: 1, orgId },
+        { feature: 'workflow', route: '/v1/inference-jobs', method: 'POST', path: '/v1/inference-jobs/j1/complete', status: 200, durationMs: 1, orgId },
+      ],
+    });
+    assert.equal(ingest.status, 202, JSON.stringify(ingest.data));
+    const after = await call('GET', `/internal/usage/meter?orgId=${orgId}`);
+    assert.equal(after.status, 200);
+    assert.equal(after.data.workflowExecutionsLastHour, before.data.workflowExecutionsLastHour + 2);
+  });
+});
+
 describe('warehouse-backed usage summary', () => {
   it('merges hourly rollups with the live Postgres tail', async () => {
     // Leave a two-hour raw tail so the events ingested below are not inside

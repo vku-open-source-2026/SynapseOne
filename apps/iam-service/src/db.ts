@@ -2084,10 +2084,12 @@ export async function getPlatformOrganizationResources(orgId: string): Promise<a
         id: schema.apiKeys.id, accountId: schema.apiKeys.accountId, name: schema.apiKeys.name,
         prefix: schema.apiKeys.keyPrefix, scopes: schema.apiKeys.scopes, userId: schema.apiKeys.userId,
         expiresAt: schema.apiKeys.expiresAt, revokedAt: schema.apiKeys.revokedAt, lastUsedAt: schema.apiKeys.lastUsedAt,
+        createdAt: schema.apiKeys.createdAt,
       }).from(schema.apiKeys).where(inArray(schema.apiKeys.accountId, accountIds)).orderBy(desc(schema.apiKeys.createdAt));
       keys.push(...keyRows.map((r: any) => ({
         id: r.id, account_id: r.accountId, name: r.name, prefix: r.prefix, scopes: r.scopes || [],
         user_id: r.userId, expires_at: iso(r.expiresAt), revoked_at: iso(r.revokedAt), last_used_at: iso(r.lastUsedAt),
+        created_at: iso(r.createdAt),
       })));
       const saRows = await db.select().from(schema.serviceAccounts).where(inArray(schema.serviceAccounts.accountId, accountIds)).orderBy(asc(schema.serviceAccounts.slug));
       serviceAccounts.push(...saRows.map((r: any) => ({ id: r.id, account_id: r.accountId, slug: r.slug, description: r.description || '', revoked_at: iso(r.revokedAt) })));
@@ -2108,6 +2110,7 @@ export async function getPlatformOrganizationResources(orgId: string): Promise<a
           expires_at: k.expires_at || null,
           revoked_at: k.revoked_at || null,
           last_used_at: k.last_used_at || null,
+          created_at: k.created_at || null,
         })));
       serviceAccounts.push(...[...__mem.serviceAccounts.values()]
         .filter((s: any) => s.account_id === a.id)

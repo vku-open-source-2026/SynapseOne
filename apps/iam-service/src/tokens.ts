@@ -8,7 +8,7 @@
 import jwt from 'jsonwebtoken';
 import { randomBytes, randomUUID } from 'crypto';
 import { and, desc, eq, gt, isNull, or, sql } from 'drizzle-orm';
-import { ensureTables, getDb, useDb, __mem, hashSecret, hashCandidates, bumpAuthVersion } from './db';
+import { ensureTables, getDb, useDb, __mem, hashSecret, hashCandidates, bumpAuthVersion, withTransaction } from './db';
 import { apiKeys, executionDelegations, platformRunnerKeys, refreshTokens, users } from './schema';
 
 /** Fail fast on weak/default JWT secrets in production; warn loudly in dev. */
@@ -548,27 +548,70 @@ export async function findApiKeyById(id: string): Promise<ApiKeyRecord | null> {
  * 0 revokes it immediately. Returns null when the key is missing or retired.
  */
 export async function rotateApiKey(id: string, graceSeconds: number): Promise<{ id: string; value: string; prefix: string; oldKeyExpiresAt: string } | null> {
-  const old = await findApiKeyById(id);
-  if (!old || old.revoked_at) return null;
-  if (old.expires_at && new Date(old.expires_at).getTime() < Date.now()) return null;
-  const next = await createApiKeyRecord(old.account_id, old.user_id, old.name, old.scopes, old.expires_at ? new Date(old.expires_at) : null);
-  const retireAt = new Date(Date.now() + Math.max(0, graceSeconds) * 1000);
-  if (useDb()) {
-    const db = getDb()!;
-    await ensureTables();
-    if (graceSeconds > 0) {
-      await db.update(apiKeys).set({ expiresAt: retireAt }).where(eq(apiKeys.id, id));
-    } else {
-      await db.update(apiKeys).set({ revokedAt: sql`now()` }).where(and(eq(apiKeys.id, id), isNull(apiKeys.revokedAt)));
-    }
-  } else {
-    for (const rec of __mem.apiKeys.values()) {
-      if (rec.id !== id) continue;
-      if (graceSeconds > 0) rec.expires_at = retireAt.toISOString();
-      else rec.revoked_at = new Date().toISOString();
+  const grace = Math.min(Math.max(Math.floor(Number(graceSeconds) || 0), 0), 604800);
+  const now = new Date();
+  const requestedRetireAt = new Date(now.getTime() + grace * 1000);
+  if (!useDb()) {
+    const old = [...__mem.apiKeys.values()].find((rec) => rec.id === id);
+    if (!old || old.revoked_at || old.rotating || old.rotated_at) return null;
+    if (old.expires_at && new Date(old.expires_at).getTime() <= now.getTime()) return null;
+    // Claim synchronously before the first await so concurrent calls have exactly
+    // one winner. The old key remains usable during grace, hence a separate marker.
+    old.rotating = true;
+    old.rotated_at = now.toISOString();
+    const originalExpiry = old.expires_at ? new Date(old.expires_at) : null;
+    const retireAt = grace > 0
+      ? new Date(Math.min(requestedRetireAt.getTime(), originalExpiry?.getTime() ?? requestedRetireAt.getTime()))
+      : now;
+    if (grace > 0) old.expires_at = retireAt.toISOString();
+    else old.revoked_at = now.toISOString();
+    try {
+      const next = await createApiKeyRecord(old.account_id, old.user_id, old.name, old.scopes, originalExpiry);
+      return { ...next, oldKeyExpiresAt: retireAt.toISOString() };
+    } catch (error) {
+      old.rotating = false;
+      old.rotated_at = null;
+      throw error;
     }
   }
-  return { ...next, oldKeyExpiresAt: retireAt.toISOString() };
+
+  return withTransaction(async () => {
+    await ensureTables();
+    const db = getDb()!;
+    // Lock first so the original expiry is preserved before the grace update.
+    // A concurrent rotation waits here, then observes rotated_at and loses.
+    const selected = await db.select({
+      accountId: apiKeys.accountId,
+      userId: apiKeys.userId,
+      name: apiKeys.name,
+      scopes: apiKeys.scopes,
+      originalExpiresAt: apiKeys.expiresAt,
+      revokedAt: apiKeys.revokedAt,
+      rotatedAt: apiKeys.rotatedAt,
+    }).from(apiKeys).where(eq(apiKeys.id, id)).limit(1).for('update');
+    const original = selected[0];
+    if (!original || original.revokedAt || original.rotatedAt) return null;
+    if (original.originalExpiresAt && original.originalExpiresAt.getTime() <= now.getTime()) return null;
+    const successorExpiry = original.originalExpiresAt;
+    const rows = await db.update(apiKeys).set(grace > 0 ? {
+      rotatedAt: now,
+      expiresAt: sql`case when ${apiKeys.expiresAt} is null then ${requestedRetireAt} else least(${apiKeys.expiresAt}, ${requestedRetireAt}) end`,
+    } : {
+      rotatedAt: now,
+      revokedAt: now,
+    }).where(and(
+      eq(apiKeys.id, id),
+      isNull(apiKeys.revokedAt),
+      isNull(apiKeys.rotatedAt),
+      or(isNull(apiKeys.expiresAt), sql`${apiKeys.expiresAt} > ${now}`),
+    )).returning({ expiresAt: apiKeys.expiresAt });
+    if (!rows[0]) return null;
+    const next = await createApiKeyRecord(original.accountId, original.userId, original.name, original.scopes || [], successorExpiry);
+    return {
+      ...next,
+      oldKeyExpiresAt: grace > 0 ? rows[0].expiresAt!.toISOString() : now.toISOString(),
+    };
+  });
 }
 
 /** Safe key listing (id/prefix/metadata only — hashes and secret values NEVER leave the server). */

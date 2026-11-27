@@ -1,4 +1,6 @@
-# Database performance: PgBouncer, Postgres tuning, IAM audit reads and the Base read cache
+# Database performance: PgBouncer, Postgres tuning, IAM audit reads, quota metering and the Base read cache
+
+[Tiếng Việt](vi/database-performance.md) · English
 
 This guide covers the Phase 1/2 database performance work:
 
@@ -6,7 +8,8 @@ This guide covers the Phase 1/2 database performance work:
    and Postgres.
 2. **Postgres tuning** for the production host.
 3. **Optional IAM audit read replica** for tenant/platform audit list and count.
-4. **L2 document-read cache** in SynapseBase backed by Synapse Faststore
+4. **Atomic IAM quota metering** in Valkey for fixed request windows.
+5. **L2 document-read cache** in SynapseBase backed by Synapse Faststore
    (Valkey).
 
 It applies to the single-node Compose deployment. The app services still use
@@ -81,6 +84,35 @@ platform sessions and all mutations intentionally stay on primary.
 
 To disable the path, unset `DATABASE_READ_URL` (or set it empty) and recreate
 only the IAM service. No schema migration or data rollback is required.
+
+## Atomic organization quota metering
+
+`org_quotas` remains in Postgres because it is durable platform configuration;
+request counters live in Valkey under
+`quota:v1:<service>:<subject>:<window>:<bucket>`. IAM uses a dedicated lazy
+`ioredis` client (`IAM_QUOTA_VALKEY_URL`, falling back to `VALKEY_URL` then
+`REDIS_URL`) with offline queueing disabled, bounded retries, a 1 s connect
+timeout and a 1.5 s command timeout. It never uses the optional audit read
+replica.
+
+One Lua call reads the minute, five-hour and UTC-day counters, checks all three,
+and only then increments accepted requests and sets fixed-window TTLs. This
+prevents a rejected request from consuming another window and makes admission
+atomic across IAM replicas. The most constrained denied window (highest usage
+ratio, earliest reset on ties) supplies `window`, `count`, `limit`,
+`retryAfterSeconds` and `resetAt`.
+
+If Valkey is absent or unavailable, `/internal/quota/check` returns
+`503 quota_unavailable`; the gateway deliberately fails open to its existing
+in-memory minute limiter. Monitor that fallback: it is per gateway replica and
+does not enforce 5h/day limits. Do not put quota counters in the audit read
+replica or flush the whole Valkey database during rollback; keys expire by TTL.
+
+Migration `0018` creates `org_quotas`; its timestamp is above hackathon `0017`.
+The original live-worktree 0015 was never applied in production. Migration `0019`
+adds nullable `requests_per_5h` and `requests_per_day`. Both fresh and 0014-upgrade
+paths are supported. Keep the additive table/columns on rollback and restore
+previous application images/env instead.
 
 ## Postgres tuning
 

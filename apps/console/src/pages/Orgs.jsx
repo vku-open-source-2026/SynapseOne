@@ -5,9 +5,28 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
 import React, { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useAuth } from '../lib/auth.jsx';
 import { api } from '../lib/api.js';
 import { Badge, Btn, Card, Empty, Err, Field, Input, Modal, PageTitle, Pager, SearchBox, Table, TableSkeleton } from '../components/ui.jsx';
+
+export function OrganizationTable({ orgs, canAdmin, onRename }) {
+  return (
+    <Table head={['Slug', 'Display name', 'ID', 'Actions']}>
+      {orgs.map((o) => (
+        <tr key={o.id} className="border-t border-slate-100">
+          <td className="py-2 pr-4 font-medium text-main-text">{o.slug}</td>
+          <td className="py-2 pr-4">{o.display_name}</td>
+          <td className="py-2 pr-4 text-xs text-normal-text font-mono">{o.id?.slice(0, 8)}…</td>
+          <td className="py-2 pr-4">
+            <Link to="/quotas" className="text-xs text-main-blue hover:underline">Quotas</Link>
+            {canAdmin && <button type="button" className="ml-3 text-xs text-main-blue hover:underline" onClick={() => onRename(o)}>Rename</button>}
+          </td>
+        </tr>
+      ))}
+    </Table>
+  );
+}
 
 export default function Orgs() {
   const { headers, auth } = useAuth();
@@ -77,18 +96,7 @@ export default function Orgs() {
         {!loaded ? (
           <TableSkeleton rows={4} cols={3} />
         ) : orgs.length ? (
-          <Table head={['Slug', 'Display name', 'ID', 'Actions']}>
-            {orgs.map((o) => (
-              <tr key={o.id} className="border-t border-slate-100">
-                <td className="py-2 pr-4 font-medium text-main-text">{o.slug}</td>
-                <td className="py-2 pr-4">{o.display_name}</td>
-                <td className="py-2 pr-4 text-xs text-normal-text font-mono">{o.id?.slice(0, 8)}…</td>
-                <td className="py-2 pr-4">
-                  {canAdmin && <button type="button" className="text-xs text-main-blue hover:underline" onClick={() => rename(o)}>Rename</button>}
-                </td>
-              </tr>
-            ))}
-          </Table>
+          <OrganizationTable orgs={orgs} canAdmin={canAdmin} onRename={rename} />
         ) : (
           <Empty />
         )}

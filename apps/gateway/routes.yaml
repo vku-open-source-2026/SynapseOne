@@ -112,6 +112,14 @@ routes:
       - { method: POST, path: /v1/platform/step-up, action: platform:Write }
       - { method: POST, path: /v1/platform/admins, action: platform:Admin }
       - { method: DELETE, path: /v1/platform/admins/*, action: platform:Admin }
+      - { method: POST, path: /v1/platform/orgs/*/keys, action: platform:Write }
+      - { method: POST, path: /v1/platform/orgs/*/keys/*/rotate, action: platform:Write }
+      - { method: POST, path: /v1/platform/orgs/*/keys/*/revoke, action: platform:Write }
+      - { method: PUT, path: /v1/platform/orgs/*/quotas, action: platform:Write }
+      - { method: DELETE, path: /v1/platform/orgs/*/quotas/*, action: platform:Write }
+      - { method: GET, path: /v1/platform/quotas, action: platform:Read }
+      - { method: GET, path: /v1/platform/quotas/*, action: platform:Read }
+      - { method: GET, path: /v1/platform/orgs/*/quotas, action: platform:Read }
 
   - path: /v1/workflow-runners
     target: ${WORKFLOW_SERVICE_URL:http://workflow:4002}

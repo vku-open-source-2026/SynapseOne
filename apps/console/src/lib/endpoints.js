@@ -45,6 +45,8 @@ export const GROUPS = [
       { method: 'GET', path: '/v1/orgs', auth: 'either', desc: 'List organizations' },
       { method: 'POST', path: '/v1/orgs', auth: 'either', desc: 'Create an org', body: { slug: 'acme-2', displayName: 'ACME 2' } },
       { method: 'PATCH', path: '/v1/orgs/:orgId', auth: 'either', desc: 'Update the display name (org admin)', body: { displayName: 'ACME 2 Renamed' } },
+      { method: 'GET', path: '/v1/orgs/:orgId', auth: 'either', desc: 'Read your organization detail' },
+      { method: 'GET', path: '/v1/orgs/:orgId/quotas', auth: 'either', desc: 'Effective AI, inference and workflow quotas' },
       { method: 'GET', path: '/v1/orgs/:orgId/accounts', auth: 'either', desc: 'Accounts in the org' },
       { method: 'POST', path: '/v1/orgs/:orgId/accounts', auth: 'either', desc: 'Create an account', body: { slug: 'prod', displayName: 'Production' } },
       { method: 'GET', path: '/v1/orgs/:orgId/users', auth: 'either', desc: 'Users in the org' },

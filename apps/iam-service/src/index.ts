@@ -61,7 +61,12 @@ import {
   createHackathonRegistration, getHackathonRegistration, listHackathonRegistrations,
   reviewHackathonRegistration, markHackathonApiKeySent, suggestHackathonTeams,
 } from './hackathon';
-import { ingestUsageEvents, listUsageEvents, purgeUsage, usageSummary, type UsageFilter } from './usage';
+import { ingestUsageEvents, listUsageEvents, purgeUsage, usageMeter, usageSummary, type UsageFilter } from './usage';
+import {
+  quotaDefaults, isQuotaService, listOrgQuotas, getEffectiveQuota, effectiveQuotas,
+  upsertOrgQuota, deleteOrgQuota, listAllQuotas, type QuotaService,
+} from './quotas';
+import { getQuotaMeter, getQuotaMeterHealth, validateQuotaCheck, validateExecutionAdmission } from './quota-meter';
 import { startUsageRollup } from './usage-rollup';
 import { assertOidcConfig, isPublicHttpsUrl, createOidcState, exchangeCode, authorizationEndpoint, oidcSettings, OidcError } from './oidc';
 import {
@@ -430,7 +435,10 @@ const PLATFORM_STEP_UP_ACTIONS = new Set([
   'org:reactivate',
   'org:role:create',
   'org:policy:create',
+  'org:key:create',
   'org:key:revoke',
+  'org:key:rotate',
+  'org:quota:update',
   'org:service-account:revoke',
   'user:org-admin',
   'user:reset-mfa',
@@ -1355,7 +1363,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       );
   }
 
-  app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'iam', version: VERSION, ...(IS_PROD ? {} : { db: useDb() ? 'postgres' : 'memory' }), time: new Date().toISOString() }));
+  app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'iam', version: VERSION, ...(IS_PROD ? {} : { db: useDb() ? 'postgres' : 'memory' }), quota: getQuotaMeterHealth(), time: new Date().toISOString() }));
   // Readiness must reflect the auth store, not just the process. A DB outage
   // returns 503 so the gateway removes this instance from rotation.
   app.get('/ready', async (_req, res) => {
@@ -2728,7 +2736,14 @@ async function auditMutation(req: express.Request, action: string, resource: str
             return res.status(403).json({ valid: false, error: 'org_suspended', message: 'This organization is suspended.' });
           }
         }
-        return res.json({ valid: true, type: 'jwt', claims: decoded });
+        let verifiedOrgId = typeof decoded.org === 'string' ? decoded.org : null;
+        if (!verifiedOrgId && typeof decoded.account === 'string') {
+          verifiedOrgId = (await getAccountById(decoded.account))?.org_id || null;
+        }
+        if (!verifiedOrgId && typeof decoded.sub === 'string') {
+          verifiedOrgId = (await getUserById(decoded.sub))?.org_id || null;
+        }
+        return res.json({ valid: true, type: 'jwt', claims: decoded, ...(verifiedOrgId ? { org_id: verifiedOrgId } : {}) });
       } catch (e: any) {
         const message = String(e?.message || 'invalid token');
         return res.status(401).json({
@@ -2789,6 +2804,32 @@ async function auditMutation(req: express.Request, action: string, resource: str
     const page = sorted.slice(query.offset, query.offset + query.limit);
     res.json(pagePayload(query, sorted.length, page));
   });
+  app.get('/v1/orgs/:orgId', async (req, res) => {
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id', message: 'orgId must be a UUID' });
+    const org = await getOrgById(req.params.orgId);
+    if (!org) return res.status(404).json({ error: 'org_not_found' });
+    if (!(await canActForOrg(req, TRUST_STAMPED, req.params.orgId))) {
+      return res.status(403).json({ error: 'forbidden', message: 'organization belongs to another tenant' });
+    }
+    noStore(res);
+    res.json(org);
+  });
+
+  app.get('/v1/orgs/:orgId/quotas', async (req, res) => {
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id', message: 'orgId must be a UUID' });
+    const org = await getOrgById(req.params.orgId);
+    if (!org) return res.status(404).json({ error: 'org_not_found' });
+    if (!(await canActForOrg(req, TRUST_STAMPED, req.params.orgId))) {
+      return res.status(403).json({ error: 'forbidden', message: 'organization belongs to another tenant' });
+    }
+    const [quotas, overrides] = await Promise.all([
+      effectiveQuotas(req.params.orgId),
+      listOrgQuotas(req.params.orgId),
+    ]);
+    noStore(res);
+    res.json({ orgId: req.params.orgId, quotas, overrides, defaults: quotaDefaults() });
+  });
+
   app.patch('/v1/orgs/:orgId', async (req, res) => {
     if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id', message: 'orgId must be a UUID' });
     const org = await getOrgById(req.params.orgId);
@@ -3581,6 +3622,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       });
       return key;
     });
+    noStore(res);
     res.status(201).json({ id: k.id, apiKey: k.value, prefix: k.prefix, warning: 'Save this apiKey now — it is shown only once.' });
   });
 
@@ -4565,8 +4607,18 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id' });
     const out = await getPlatformOrganizationResources(req.params.orgId);
     if (!out) return res.status(404).json({ error: 'org_not_found' });
+    const [quotas, quotaEffective] = await Promise.all([
+      listOrgQuotas(req.params.orgId),
+      effectiveQuotas(req.params.orgId),
+    ]);
+    const owners = new Map<string, any>((out.users || []).map((user: any) => [user.id, user]));
+    for (const key of out.keys || []) {
+      const owner = owners.get(key.user_id);
+      key.owner_email = owner?.email || null;
+      key.owner_name = owner?.display_name || null;
+    }
     noStore(res);
-    res.json(out);
+    res.json({ ...out, quotas, quotaEffective, quotaDefaults: quotaDefaults() });
   });
 
   app.get('/v1/platform/orgs/:orgId/audit', async (req, res) => {
@@ -4676,6 +4728,207 @@ async function auditMutation(req: express.Request, action: string, resource: str
       return policy;
     });
     res.status(201).json(created);
+  });
+
+  // ---------- Super admin: tenant API-key issuance and rotation ----------
+  // Plaintext is returned only by create/rotate. Every listing is metadata-only.
+  const TENANT_SCOPE_ALLOWLIST = new Set([
+    '*', '*:read', '*:write',
+    'iam:read', 'iam:write', 'iam:*',
+    'base:read', 'base:write', 'base:*',
+    'search:read', 'search:*',
+    'lds:read', 'lds:write', 'lds:*',
+    'faststore:read', 'faststore:write', 'faststore:*',
+    'queue:read', 'queue:write', 'queue:*',
+    'stream:read', 'stream:write', 'stream:*',
+    'storage:read', 'storage:write', 'storage:*',
+    'ocs:read', 'ocs:write', 'ocs:*',
+    'warehouse:read', 'warehouse:write', 'warehouse:*',
+    'lakehouse:read', 'lakehouse:write', 'lakehouse:*',
+    'workflow:read', 'workflow:write', 'workflow:*', 'workflow:Execute',
+    'inference:read', 'inference:write', 'inference:*', 'inference:Invoke',
+    'ai:read', 'ai:write', 'ai:*', 'ai:Invoke',
+    'secrets:read', 'secrets:write', 'secrets:*',
+    'notifications:read', 'notifications:write', 'notifications:*',
+  ]);
+  function platformKeyScopesValid(scopes: unknown): scopes is string[] {
+    return Array.isArray(scopes) && scopes.length > 0 && scopes.length <= 20
+      && scopes.every((scope) => typeof scope === 'string' && TENANT_SCOPE_ALLOWLIST.has(scope));
+  }
+
+  app.post('/v1/platform/orgs/:orgId/keys', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id' });
+    const parsed = z.object({
+      accountId: z.string().uuid(),
+      name: z.string().trim().min(1).max(100).nullish(),
+      scopes: z.array(z.string().trim().min(1).max(200)).min(1).max(20),
+      expiresInDays: z.number().int().min(1).max(3650).nullish(),
+      expiresAt: z.string().trim().max(64).nullish(),
+      reason: z.string().trim().max(500).nullish(),
+    }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    const body = parsed.data;
+    if (!platformKeyScopesValid(body.scopes)) {
+      return res.status(400).json({ error: 'invalid_scopes', message: 'scopes must be known tenant service scopes; platform:* is never allowed' });
+    }
+    if (body.expiresAt && body.expiresInDays) return res.status(400).json({ error: 'invalid_expiry', message: 'use expiresAt or expiresInDays, not both' });
+    const org = await getOrgById(req.params.orgId);
+    if (!org || (org.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'org_not_found' });
+    if (org.status === 'suspended') return res.status(409).json({ error: 'org_suspended', message: 'suspended organizations cannot receive new keys' });
+    const account = await getAccountById(body.accountId);
+    if (!account || account.org_id !== req.params.orgId) return res.status(404).json({ error: 'account_not_found', message: 'account is not in this organization' });
+    if ((account.status || 'active') === 'retired') return res.status(409).json({ error: 'account_retired', message: 'retired accounts cannot receive new keys' });
+    let expiresAt: Date | null = null;
+    if (body.expiresAt) {
+      const timestamp = Date.parse(body.expiresAt);
+      if (!Number.isFinite(timestamp) || timestamp <= Date.now()) return res.status(400).json({ error: 'invalid_expiry', message: 'expiresAt must be a future ISO timestamp' });
+      expiresAt = new Date(timestamp);
+    } else if (body.expiresInDays) {
+      expiresAt = new Date(Date.now() + body.expiresInDays * 86_400_000);
+    }
+    if (!(await requirePlatformStepUp(req, res, ctx, 'org:key:create'))) return;
+    const created = await withTransaction(async () => {
+      const key = await createApiKeyRecord(account.id, null, body.name || 'platform-issued', body.scopes, expiresAt);
+      await auditPlatformAction(req, ctx.user.id, 'platform:org:key:create', req.params.orgId, {
+        accountId: account.id, keyId: key.id, scopes: body.scopes, ...(body.reason ? { reason: body.reason } : {}),
+      });
+      return key;
+    });
+    noStore(res);
+    res.status(201).json({
+      id: created.id, apiKey: created.value, prefix: created.prefix,
+      accountId: account.id, orgId: req.params.orgId, scopes: body.scopes,
+      expiresAt: expiresAt ? expiresAt.toISOString() : null,
+      warning: 'Save this apiKey now — it is shown only once.',
+    });
+  });
+
+  app.post('/v1/platform/orgs/:orgId/keys/:keyId/rotate', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId) || !isUuid(req.params.keyId)) return res.status(400).json({ error: 'invalid_id' });
+    const parsed = z.object({
+      graceSeconds: z.number().int().min(0).max(604800).nullish(),
+      reason: z.string().trim().max(500).nullish(),
+    }).safeParse(req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    const key = await findApiKeyById(req.params.keyId);
+    if (!key) return res.status(404).json({ error: 'key_not_found' });
+    const account = await getAccountById(key.account_id);
+    if (!account || account.org_id !== req.params.orgId) return res.status(404).json({ error: 'key_not_found' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'org:key:rotate'))) return;
+    const rotated = await withTransaction(async () => {
+      const next = await rotateApiKey(req.params.keyId, parsed.data.graceSeconds ?? 0);
+      if (next) {
+        await auditPlatformAction(req, ctx.user.id, 'platform:org:key:rotate', req.params.orgId, {
+          keyId: req.params.keyId, successorId: next.id, accountId: account.id,
+          graceSeconds: parsed.data.graceSeconds ?? 0, ...(parsed.data.reason ? { reason: parsed.data.reason } : {}),
+        });
+      }
+      return next;
+    });
+    if (!rotated) return res.status(409).json({ error: 'key_inactive', message: 'revoked or expired keys cannot be rotated' });
+    noStore(res);
+    res.status(201).json({
+      id: rotated.id, apiKey: rotated.value, prefix: rotated.prefix,
+      orgId: req.params.orgId, accountId: account.id,
+      rotatedFrom: req.params.keyId, oldKeyExpiresAt: rotated.oldKeyExpiresAt,
+      warning: 'Save this apiKey now — it is shown only once.',
+    });
+  });
+
+  // ---------- Super admin: organization service quotas ----------
+  app.get('/v1/platform/quotas/defaults', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'auditor');
+    if (!ctx) return;
+    noStore(res);
+    res.json({ defaults: quotaDefaults() });
+  });
+
+  app.get('/v1/platform/quotas', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'auditor');
+    if (!ctx) return;
+    const service = typeof req.query.service === 'string' ? req.query.service : undefined;
+    if (service && !isQuotaService(service)) return res.status(400).json({ error: 'invalid_service', message: 'service must be one of ai, inference, workflow' });
+    const limit = req.query.limit === undefined ? 50 : Number(req.query.limit);
+    const offset = req.query.offset === undefined ? 0 : Number(req.query.offset);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200 || !Number.isInteger(offset) || offset < 0 || offset > 100_000) {
+      return res.status(400).json({ error: 'invalid_page', message: 'limit must be 1..200 and offset 0..100000' });
+    }
+    const out = await listAllQuotas({
+      ...(service ? { service } : {}),
+      q: typeof req.query.q === 'string' ? req.query.q : undefined,
+      limit, offset,
+    });
+    noStore(res);
+    res.json({ ...out, limit, offset, nextOffset: offset + out.items.length < out.total ? offset + out.items.length : null });
+  });
+
+  app.get('/v1/platform/orgs/:orgId/quotas', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'auditor');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id' });
+    const org = await getOrgById(req.params.orgId);
+    if (!org || (org.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'org_not_found' });
+    const [quotas, overrides] = await Promise.all([effectiveQuotas(req.params.orgId), listOrgQuotas(req.params.orgId)]);
+    noStore(res);
+    res.json({ orgId: req.params.orgId, quotas, overrides, defaults: quotaDefaults() });
+  });
+
+  app.put('/v1/platform/orgs/:orgId/quotas', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id' });
+    const parsed = z.object({
+      service: z.string().trim().min(1).max(32),
+      requestsPerMin: z.number().int().min(1).max(100_000).nullish(),
+      requestsPer5h: z.number().int().min(1).max(1_000_000_000).nullish(),
+      requestsPerDay: z.number().int().min(1).max(1_000_000_000).nullish(),
+      tokensPerDay: z.number().int().min(1).max(1_000_000_000).nullish(),
+      executionsPerHour: z.number().int().min(1).max(1_000_000).nullish(),
+      concurrentExecutions: z.number().int().min(1).max(1000).nullish(),
+      reason: z.string().trim().max(500).nullish(),
+    }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    const body = parsed.data;
+    if (!isQuotaService(body.service)) return res.status(400).json({ error: 'invalid_service', message: 'service must be one of ai, inference, workflow' });
+    const quotaKeys = ['requestsPerMin', 'requestsPer5h', 'requestsPerDay', 'tokensPerDay', 'executionsPerHour', 'concurrentExecutions'] as const;
+    if (!quotaKeys.some((key) => body[key] != null)) return res.status(400).json({ error: 'empty_quota', message: 'at least one non-null quota field is required; use DELETE to reset the service' });
+    if (body.service === 'workflow' && body.tokensPerDay != null) return res.status(400).json({ error: 'invalid_field', message: 'tokensPerDay does not apply to workflow' });
+    if (body.service !== 'workflow' && (body.executionsPerHour != null || body.concurrentExecutions != null)) return res.status(400).json({ error: 'invalid_field', message: 'executionsPerHour/concurrentExecutions only apply to workflow' });
+    const org = await getOrgById(req.params.orgId);
+    if (!org || (org.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'org_not_found' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'org:quota:update'))) return;
+    const fields = Object.fromEntries(quotaKeys.map((key) => [key, body[key] ?? null]));
+    const saved = await withTransaction(async () => {
+      const row = await upsertOrgQuota(req.params.orgId, body.service as QuotaService, fields, ctx.user.id);
+      await auditPlatformAction(req, ctx.user.id, 'platform:org:quota:update', req.params.orgId, {
+        service: body.service, ...fields, ...(body.reason ? { reason: body.reason } : {}),
+      });
+      return row;
+    });
+    noStore(res);
+    res.json({ ok: true, quota: saved, effective: await getEffectiveQuota(req.params.orgId, body.service as QuotaService) });
+  });
+
+  app.delete('/v1/platform/orgs/:orgId/quotas/:service', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id' });
+    if (!isQuotaService(req.params.service)) return res.status(400).json({ error: 'invalid_service', message: 'service must be one of ai, inference, workflow' });
+    const org = await getOrgById(req.params.orgId);
+    if (!org || (org.kind || 'tenant') !== 'tenant') return res.status(404).json({ error: 'org_not_found' });
+    if (!(await requirePlatformStepUp(req, res, ctx, 'org:quota:update'))) return;
+    const removed = await withTransaction(async () => {
+      const ok = await deleteOrgQuota(req.params.orgId, req.params.service as QuotaService);
+      await auditPlatformAction(req, ctx.user.id, 'platform:org:quota:reset', req.params.orgId, { service: req.params.service });
+      return ok;
+    });
+    if (!removed) return res.status(404).json({ error: 'quota_not_found', message: 'no override set for this service' });
+    noStore(res);
+    res.json({ ok: true, effective: await getEffectiveQuota(req.params.orgId, req.params.service as QuotaService) });
   });
 
   app.post('/v1/platform/orgs/:orgId/keys/:keyId/revoke', async (req, res) => {
@@ -5400,6 +5653,72 @@ async function auditMutation(req: express.Request, action: string, resource: str
     const account = await getAccountById(req.params.accountId);
     if (!account) return res.status(404).json({ error: 'account_not_found' });
     res.json({ id: account.id, org_id: account.org_id, slug: account.slug, status: account.status || 'active' });
+  });
+
+  // ---------- Internal gateway quota contract ----------
+  // No /internal/* route exists at the public gateway. The global IAM middleware
+  // requires the shared internal secret whenever it is configured.
+  app.post('/internal/quota/check', async (req, res) => {
+    const input = validateQuotaCheck(req.body);
+    if (!input) return res.status(400).json({ error: 'invalid_body', message: 'subject, service and positive integer limits {minute,fiveHour,day} are required' });
+    noStore(res);
+    try {
+      res.json(await getQuotaMeter().check(input));
+    } catch {
+      res.status(503).json({ error: 'quota_unavailable', message: 'quota store unavailable' });
+    }
+  });
+
+  app.post('/internal/workflow/execution/check', async (req, res) => {
+    const input = validateExecutionAdmission(req.body);
+    if (!input) return res.status(400).json({ error: 'invalid_body', message: 'subject and positive integer limits {hour,concurrent} are required' });
+    noStore(res);
+    try {
+      res.json(await getQuotaMeter().admitExecution(input));
+    } catch {
+      res.status(503).json({ error: 'quota_unavailable', message: 'quota store unavailable' });
+    }
+  });
+
+  app.post('/internal/workflow/execution/release', async (req, res) => {
+    const subject = typeof req.body?.subject === 'string' ? req.body.subject : '';
+    const token = typeof req.body?.token === 'string' ? req.body.token : '';
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/.test(subject) || !/^[A-Za-z0-9-]{1,64}$/.test(token)) {
+      return res.status(400).json({ error: 'invalid_body' });
+    }
+    noStore(res);
+    try {
+      res.json({ released: await getQuotaMeter().releaseExecution(subject, token) });
+    } catch {
+      res.status(503).json({ error: 'quota_unavailable', message: 'quota store unavailable' });
+    }
+  });
+
+  app.get('/internal/quotas', async (req, res) => {
+    const orgId = String(req.query.orgId || '');
+    const service = String(req.query.service || '');
+    if (!isUuid(orgId)) return res.status(400).json({ error: 'invalid_orgId' });
+    if (!isQuotaService(service)) return res.status(400).json({ error: 'invalid_service', message: 'service must be one of ai, inference, workflow' });
+    const effective = await getEffectiveQuota(orgId, service);
+    noStore(res);
+    res.json({ ...effective, defaults: quotaDefaults()[service] });
+  });
+
+  app.get('/internal/quotas/org/:orgId', async (req, res) => {
+    if (!isUuid(req.params.orgId)) return res.status(400).json({ error: 'invalid_id' });
+    const [quotas, overrides] = await Promise.all([effectiveQuotas(req.params.orgId), listOrgQuotas(req.params.orgId)]);
+    noStore(res);
+    res.json({ orgId: req.params.orgId, quotas, overrides, defaults: quotaDefaults() });
+  });
+
+  // Legacy token/execution meter retained for existing quota dimensions. Request
+  // rate windows use /internal/quota/check instead of this eventually-consistent
+  // telemetry. Token propagation remains best-effort (documented limitation).
+  app.get('/internal/usage/meter', async (req, res) => {
+    const orgId = String(req.query.orgId || '');
+    if (!isUuid(orgId)) return res.status(400).json({ error: 'invalid_orgId' });
+    noStore(res);
+    res.json(await usageMeter(orgId));
   });
 
   app.post('/internal/platform/bootstrap', async (req, res) => {

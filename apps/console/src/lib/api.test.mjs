@@ -139,6 +139,8 @@ describe('console silent refresh', () => {
     await api.updateWorkflow('w1', { name: 'n' }, A);
     await api.deleteWorkflow('w1', A);
     await api.listKeys('a1', A);
+    await api.org('o1', A);
+    await api.orgQuotas('o1', A);
     await api.workflow('w1', A);
     await api.executions({ workflowId: 'w1', limit: 5 }, A);
     await api.execution('e1', A);
@@ -155,6 +157,8 @@ describe('console silent refresh', () => {
       'PUT /v1/workflows/w1',
       'DELETE /v1/workflows/w1',
       'GET /v1/accounts/a1/keys',
+      'GET /v1/orgs/o1',
+      'GET /v1/orgs/o1/quotas',
       'GET /v1/workflows/w1',
       'GET /v1/executions?workflowId=w1&limit=5',
       'GET /v1/executions/e1',

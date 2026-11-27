@@ -1,4 +1,6 @@
-# API reference (via Gateway :8080, or services directly)
+# API reference
+
+[Tiếng Việt](vi/api.md) · English (via Gateway :8080, or services directly)
 
 Base: `http://localhost:8080` (gateway) — every `/v1/*` route needs
 `Authorization: Bearer <JWT>` or `X-API-Key`, except `/v1/auth/*` and the public
@@ -112,6 +114,8 @@ with AES-256-GCM using `IAM_MFA_ENCRYPTION_KEY` (32 bytes, hex/base64; derived f
 ## Orgs / Accounts
 
 - `GET /v1/orgs` → `[{id, slug, display_name}]`
+- `GET /v1/orgs/:orgId` → the caller's organization detail (same-org only; cross-tenant `403`)
+- `GET /v1/orgs/:orgId/quotas` → `{orgId, quotas, overrides, defaults}` with effective `ai`, `inference` and `workflow` limits (same-org only)
 - `POST /v1/orgs {slug, displayName}` → org
 - `PATCH /v1/orgs/:orgId {displayName}` → org (org admin; slug/kind/status immutable; platform org protected)
 - `GET /v1/orgs/:orgId/accounts`
@@ -1120,7 +1124,14 @@ Tenant JWTs, API keys and service-account tokens are rejected.
 | POST | `/v1/platform/orgs/:orgId/reactivate` | Reactivate a suspended organization (step-up `org:reactivate`). |
 | POST | `/v1/platform/orgs/:orgId/roles` | Create a role in an organization account (step-up `org:role:create`). |
 | POST | `/v1/platform/orgs/:orgId/policies` | Create a policy in an organization account (step-up `org:policy:create`). |
+| POST | `/v1/platform/orgs/:orgId/keys` | Create a tenant API key: `{accountId, name?, scopes[], expiresInDays?|expiresAt?, reason?}` (step-up `org:key:create`). Plaintext is returned once with `Cache-Control: no-store`; `platform:*` is forbidden. |
+| POST | `/v1/platform/orgs/:orgId/keys/:keyId/rotate` | Rotate a tenant API key: `{graceSeconds?, reason?}` (step-up `org:key:rotate`). The successor secret is returned once; the old key is revoked immediately or after the grace period. |
 | POST | `/v1/platform/orgs/:orgId/keys/:keyId/revoke` | Revoke a tenant API key (step-up `org:key:revoke`). |
+| GET | `/v1/platform/quotas/defaults` | Global defaults for `ai`, `inference` and `workflow`. |
+| GET | `/v1/platform/quotas?service&q&limit&offset` | Paged per-organization quota overrides; search is applied before pagination. |
+| GET | `/v1/platform/orgs/:orgId/quotas` | Effective quotas, raw nullable overrides and global defaults for one tenant. |
+| PUT | `/v1/platform/orgs/:orgId/quotas` | Set an override: `{service, requestsPerMin?, requestsPer5h?, requestsPerDay?, tokensPerDay?, executionsPerHour?, concurrentExecutions?, reason?}` (step-up `org:quota:update`). Nullable fields inherit defaults. |
+| DELETE | `/v1/platform/orgs/:orgId/quotas/:service` | Reset a service override to global defaults (step-up `org:quota:update`). |
 | POST | `/v1/platform/orgs/:orgId/service-accounts/:id/revoke` | Revoke a tenant service account (step-up `org:service-account:revoke`). |
 | GET | `/v1/platform/users?q&orgId&active&isOrgAdmin&limit&offset` | Cross-tenant users. |
 | GET | `/v1/platform/users/:userId` | User, roles, policies, MFA and sessions. |
@@ -1147,6 +1158,103 @@ user's credential epoch; `/v1/auth/login`, `/v1/auth/refresh`,
 `/v1/auth/verify`, API-key verification and the gateway all fail closed while
 suspended. The reserved platform organization cannot be suspended
 (`403 platform_org_protected`). Reactivation requires a fresh tenant sign-in.
+
+### Organization visibility and API-key metadata
+
+Tenant users and tenant-scoped API keys can read only their own organization
+through `GET /v1/orgs/:orgId` and its effective quotas. IAM applies the existing
+`canActForOrg` check; another tenant receives `403`. Platform `/v1/platform/*`
+and `/internal/*` endpoints are never available to tenant credentials, and the
+gateway has no `/internal/*` route.
+
+API-key list/detail/resource responses contain metadata only: id, prefix, name,
+scopes, account, owner (when available), created/last-used/expiry/revocation
+timestamps and status. Hashes and plaintext secrets are never returned after the
+one-time create/rotate response. Rotation is the only recovery path for a lost
+secret. Both tenant and platform key creation/rotation set `Cache-Control:
+noStore`; platform mutations require step-up and write audit records.
+
+### Service quotas (AI / Inference / Workflow)
+
+`org_quotas` stores one nullable override row per `(org_id, service)`. NULL means
+"inherit the global default". Effective responses include `overridden` plus an
+`overrides` map identifying field-level sources. Request limits are:
+
+- `requestsPerMin` / `requests_per_min`
+- `requestsPer5h` / `requests_per_5h`
+- `requestsPerDay` / `requests_per_day`
+
+The existing `tokensPerDay`, `executionsPerHour` and `concurrentExecutions`
+fields remain supported. `tokensPerDay` applies to `ai`/`inference`;
+`executionsPerHour` and `concurrentExecutions` apply to `workflow`.
+
+**Windows are fixed, not sliding:**
+
+- minute: epoch-aligned 60-second buckets;
+- five-hour: epoch-aligned 18,000-second buckets;
+- day: UTC calendar-day buckets, resetting at `00:00:00Z`.
+
+When `AI_QUOTA_REQUESTS_PER_5H` / `AI_QUOTA_REQUESTS_PER_DAY` (and the
+`INFERENCE_*` / `WORKFLOW_*` equivalents) are unset, defaults derive as
+`requestsPerMin * 300` and `requestsPerMin * 1440`. Canonical minute names are
+`AI_QUOTA_REQUESTS_PER_MIN`, `INFERENCE_QUOTA_REQUESTS_PER_MIN` and
+`WORKFLOW_QUOTA_REQUESTS_PER_MIN`; legacy `AI_RATE_LIMIT` and
+`INFERENCE_RATE_LIMIT_PER_MIN` remain fallback inputs.
+
+The gateway fetches IAM effective limits (cached for `QUOTA_CACHE_TTL_MS`,
+default 30 seconds) and attributes traffic to the verified owning org,
+including service-account JWTs whose account is resolved by IAM. Tenant traffic
+uses internal `POST /internal/quota/check`:
+
+```json
+{
+  "subject": "org:<uuid>",
+  "service": "ai",
+  "limits": { "minute": 30, "fiveHour": 9000, "day": 43200 }
+}
+```
+
+The internal-secret-guarded IAM endpoint executes one Valkey Lua script under
+keys `quota:v1:<service>:<subject>:<window>:<bucket>`. It checks all three
+counters before incrementing any; a rejection consumes no budget. Accepted
+requests increment all three and set fixed-window TTLs atomically. Response:
+
+```json
+{
+  "allowed": false,
+  "window": "fiveHour",
+  "count": 9000,
+  "limit": 9000,
+  "retryAfterSeconds": 1234,
+  "resetAt": "2026-11-26T18:00:00.000Z"
+}
+```
+
+Gateway 429 responses include `service`, binding `window`, `limit`, retry fields,
+`resetAt` and the `Retry-After` header. Central authorization runs before shared
+quota admission, so policy-denied/authz-unavailable requests consume no budget.
+Normal execute/test-run/inference-job routes acquire an IAM execution lease before
+request admission. `/mcp` is request-metered at the edge; workflow-service admits
+every actual `tools/call` in a JSON-RPC batch through the same trusted IAM
+execution-hour/concurrency endpoint and `org:<id>` subject, so both paths share
+one hourly counter and one concurrency lease set.
+
+Service-account owning-org attribution is carried in `x-synapseone-quota-org`,
+not `x-synapseone-org`; authorization stays account-bound. API-key rotation uses
+an atomic `rotated_at` compare-and-swap, caps old-key grace at the original expiry,
+and preserves the original expiry on the successor key.
+
+If IAM effective lookup or Valkey request admission is unavailable, IAM returns
+503 and the gateway fails open to its in-memory minute limiter. Anonymous/IP
+traffic always uses that local limiter. Shared execution admission instead fails
+closed: normal routes return 503 and enforced MCP calls return a quota error when
+the execution quota store is unavailable.
+
+Token/day checks still use eventually consistent usage telemetry. Token
+propagation is best-effort: providers that omit usage can undercount tokens.
+Workflow execution leases cover the normal proxy request and the MCP tool run;
+queued backend completion is not a precise real-time concurrency signal. This
+feature does not redesign token propagation.
 
 Internal bootstrap/recovery endpoints (`/internal/platform/bootstrap`,
 `/internal/platform/recovery`) are reachable only over the service network and

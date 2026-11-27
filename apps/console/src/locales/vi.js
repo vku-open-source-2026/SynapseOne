@@ -230,6 +230,7 @@ export const vi = {
       policies: 'Chính sách',
       keys: 'Khóa API',
       serviceAccounts: 'Tài khoản dịch vụ',
+      quotas: 'Hạn mức',
       authorize: 'Kiểm tra quyền',
       audit: 'Nhật ký kiểm toán',
       security: 'Bảo mật',

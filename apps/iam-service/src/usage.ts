@@ -800,6 +800,81 @@ export async function purgeUsage(olderThanDays: number, batch = 1000): Promise<n
   return before - __mem.usage.length;
 }
 
+export interface UsageMeter {
+  orgId: string;
+  daySince: string;
+  hourSince: string;
+  tokensToday: { ai: number; inference: number };
+  workflowExecutionsLastHour: number;
+}
+
+function consumesWorkflowExecution(path: string): boolean {
+  return path === '/v1/workflows/test-run'
+    || path === '/v1/inference-jobs'
+    || /^\/v1\/workflows\/[^/]+\/(execute|test-run)$/.test(path);
+}
+
+/**
+ * Existing token/execution quota meter. Request rate limits do not use this
+ * eventually-consistent telemetry; they use the atomic Valkey check endpoint.
+ */
+export async function usageMeter(orgId: string): Promise<UsageMeter> {
+  const now = Date.now();
+  const dayStart = new Date(now);
+  dayStart.setUTCHours(0, 0, 0, 0);
+  const hourStart = new Date(now - 3_600_000);
+  const empty: UsageMeter = {
+    orgId,
+    daySince: dayStart.toISOString(),
+    hourSince: hourStart.toISOString(),
+    tokensToday: { ai: 0, inference: 0 },
+    workflowExecutionsLastHour: 0,
+  };
+  if (!UUID_RE.test(orgId)) return empty;
+
+  if (useDb()) {
+    await ensureTables();
+    const db = getDb()!;
+    const tokenRows = await db.select({
+      feature: usageEvents.feature,
+      total: sql<number>`coalesce(sum(${usageEvents.totalTokens}), 0)::bigint`,
+    }).from(usageEvents).where(and(
+      eq(usageEvents.orgId, orgId),
+      gte(usageEvents.createdAt, dayStart),
+      inArray(usageEvents.feature, ['ai', 'inference']),
+    )).groupBy(usageEvents.feature);
+    for (const row of tokenRows) {
+      if (row.feature === 'ai' || row.feature === 'inference') empty.tokensToday[row.feature] = Number(row.total) || 0;
+    }
+    const executionRows = await db.select({ n: sql<number>`count(*)::int` }).from(usageEvents).where(and(
+      eq(usageEvents.orgId, orgId),
+      gte(usageEvents.createdAt, hourStart),
+      eq(usageEvents.method, 'POST'),
+      lt(usageEvents.status, 400),
+      or(
+        eq(usageEvents.path, '/v1/workflows/test-run'),
+        eq(usageEvents.path, '/v1/inference-jobs'),
+        sql`${usageEvents.path} ~ '^/v1/workflows/[^/]+/(execute|test-run)$'`,
+      ),
+    ));
+    empty.workflowExecutionsLastHour = Number(executionRows[0]?.n) || 0;
+    return empty;
+  }
+
+  for (const event of __mem.usage as UsageEventRow[]) {
+    if (event.orgId !== orgId) continue;
+    const timestamp = new Date(event.createdAt).getTime();
+    if (!Number.isFinite(timestamp)) continue;
+    if (timestamp >= dayStart.getTime() && (event.feature === 'ai' || event.feature === 'inference')) {
+      empty.tokensToday[event.feature] += Number(event.totalTokens) || 0;
+    }
+    if (timestamp >= hourStart.getTime() && event.method === 'POST' && event.status < 400 && consumesWorkflowExecution(String(event.path))) {
+      empty.workflowExecutionsLastHour += 1;
+    }
+  }
+  return empty;
+}
+
 // ---- Warehouse-backed hybrid summary -------------------------------------
 // Raw Postgres rows remain the source of truth for the live tail; completed
 // hours live in DuckDB as hourly rollups. The wrapper below merges both so the

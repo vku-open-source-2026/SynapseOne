@@ -168,6 +168,7 @@ export const apiKeys = pgTable(
     scopes: text('scopes').array().notNull().default(sql`'{}'::text[]`),
     expiresAt: timestamp('expires_at', { withTimezone: true }),
     revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    rotatedAt: timestamp('rotated_at', { withTimezone: true }),
     lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -393,6 +394,32 @@ export const scimGroups = pgTable(
   (t) => [
     uniqueIndex('scim_groups_org_name_key').on(t.orgId, t.displayName),
     index('idx_scim_groups_org').on(t.orgId),
+  ],
+);
+
+/** Per-organization service quotas managed by platform (super) admins.
+ *  One row per (org, service). NULL = inherit the global default from env.
+ *  Services: 'ai' | 'inference' | 'workflow'. */
+export const orgQuotas = pgTable(
+  'org_quotas',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    orgId: uuid('org_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
+    service: text('service').notNull(),
+    requestsPerMin: integer('requests_per_min'),
+    requestsPer5h: integer('requests_per_5h'),
+    requestsPerDay: integer('requests_per_day'),
+    tokensPerDay: integer('tokens_per_day'),
+    executionsPerHour: integer('executions_per_hour'),
+    concurrentExecutions: integer('concurrent_executions'),
+    updatedBy: text('updated_by'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('org_quotas_org_service_key').on(t.orgId, t.service),
+    index('idx_org_quotas_org').on(t.orgId),
+    index('idx_org_quotas_service').on(t.service),
   ],
 );
 

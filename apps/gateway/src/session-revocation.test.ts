@@ -3,7 +3,7 @@
 import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { validateJwtSession, clearSessionCache } from './index';
+import { validateJwtSession, validateJwtSessionDetailed, clearSessionCache } from './index';
 
 let server: http.Server;
 let base = '';
@@ -16,7 +16,8 @@ before(async () => {
     if (req.url !== '/v1/auth/verify') { res.writeHead(404); return res.end(); }
     if (mode === 'down') { res.writeHead(503); return res.end('down'); }
     res.writeHead(mode === 'ok' ? 200 : 401, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(mode === 'ok' ? { valid: true } : { valid: false, error: 'token_revoked' }));
+    const token = String(req.headers.authorization || '').replace('Bearer ', '');
+    res.end(JSON.stringify(mode === 'ok' ? { valid: true, ...(token.startsWith('tok-sa') ? { org_id: 'org-sa' } : {}) } : { valid: false, error: 'token_revoked' }));
   });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
   const a = server.address();
@@ -45,10 +46,29 @@ describe('gateway JWT session revocation check', () => {
   });
 
   it('introspects machine service-account tokens for revocation and suspended orgs', async () => {
-    assert.equal(await validateJwtSession('tok-sa', { kind: 'service-account', sub: 'sa1' }, base), null);
+    const validation = await validateJwtSessionDetailed('tok-sa', { kind: 'service-account', sub: 'sa1' }, base);
+    assert.equal(validation.rejection, null);
+    assert.equal(validation.attributionOrg, 'org-sa');
     assert.equal(calls, 1);
     mode = 'revoked';
     const revoked = await validateJwtSession('tok-sa-2', { kind: 'service-account', sub: 'sa1' }, base);
     assert.deepEqual(revoked, { status: 401, error: 'token_revoked' });
+  });
+
+  it('returns service-account attribution directly when authorization cache TTL is zero', async () => {
+    const saved = process.env.GATEWAY_SESSION_CACHE_MS;
+    process.env.GATEWAY_SESSION_CACHE_MS = '0';
+    try {
+      for (let i = 0; i < 2; i++) {
+        const validation = await validateJwtSessionDetailed('tok-sa-zero', { kind: 'service-account', sub: 'sa1' }, base);
+        assert.equal(validation.rejection, null);
+        assert.equal(validation.attributionOrg, 'org-sa');
+      }
+      assert.equal(calls, 2, 'TTL=0 must not create an authorization cache entry');
+    } finally {
+      if (saved === undefined) delete process.env.GATEWAY_SESSION_CACHE_MS;
+      else process.env.GATEWAY_SESSION_CACHE_MS = saved;
+      clearSessionCache();
+    }
   });
 });

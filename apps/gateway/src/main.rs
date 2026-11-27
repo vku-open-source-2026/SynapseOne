@@ -9,6 +9,7 @@ mod config;
 mod headers;
 mod metrics;
 mod proxy;
+mod quotas;
 mod rate_limit;
 mod routes;
 mod scopes;

@@ -2772,6 +2772,74 @@ export function createApp(): express.Express {
     return next();
   };
 
+  function mcpExecutionQuotaEnabled(): boolean {
+    const configured = process.env.WORKFLOW_MCP_QUOTA_ENFORCEMENT;
+    if (configured !== undefined) return configured === 'true';
+    return IS_PROD_WF;
+  }
+
+  async function mcpQuotaFetch(path: string, init?: RequestInit): Promise<any> {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 2500);
+    try {
+      const response = await fetch(`${(process.env.IAM_SERVICE_URL || 'http://iam:4001').replace(/\/$/, '')}${path}`, {
+        ...init,
+        signal: ctl.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          ...(process.env.SYNAPSEONE_INTERNAL_SECRET ? { 'x-synapseone-internal': process.env.SYNAPSEONE_INTERNAL_SECRET } : {}),
+          ...(init?.headers || {}),
+        },
+      });
+      if (!response.ok) throw new Error(`quota_unavailable:${response.status}`);
+      return await response.json();
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function reserveMcpExecution(orgId: string): Promise<{ token: string } | null> {
+    const effective = await mcpQuotaFetch(`/internal/quotas?orgId=${encodeURIComponent(orgId)}&service=workflow`);
+    const hourValue = effective?.executionsPerHour;
+    const concurrentValue = effective?.concurrentExecutions;
+    if (hourValue == null && concurrentValue == null) return null;
+    const hour = Number(hourValue);
+    const concurrent = Number(concurrentValue);
+    if (!Number.isInteger(hour) || hour < 1 || !Number.isInteger(concurrent) || concurrent < 1) {
+      throw Object.assign(new Error('workflow quota configuration unavailable'), { rpcCode: -32004 });
+    }
+    const admitted = await mcpQuotaFetch('/internal/workflow/execution/check', {
+      method: 'POST',
+      body: JSON.stringify({ subject: `org:${orgId}`, limits: { hour, concurrent } }),
+    });
+    if (!admitted?.allowed) {
+      throw Object.assign(new Error(`workflow quota exceeded: ${admitted?.window || 'execution'}`), {
+        rpcCode: -32004,
+        quota: admitted,
+      });
+    }
+    return { token: String(admitted.token || '') };
+  }
+
+  async function releaseMcpExecution(orgId: string, token: string): Promise<void> {
+    if (!token) return;
+    try {
+      await mcpQuotaFetch('/internal/workflow/execution/release', {
+        method: 'POST',
+        body: JSON.stringify({ subject: `org:${orgId}`, token }),
+      });
+    } catch (e: any) {
+      console.warn(JSON.stringify({ event: 'workflow_mcp_quota_release_failed', message: String(e?.message || e).slice(0, 120) }));
+    }
+  }
+
+  function mcpQuotaOrg(req: express.Request, principal: Principal | null, workflow: StoredWorkflow): string | null {
+    const raw = req.headers['x-synapseone-quota-org'] ?? req.headers['x-synapsedx-quota-org'];
+    const stamped = Array.isArray(raw) ? raw[0] : raw;
+    if (typeof stamped === 'string' && stamped) return stamped;
+    return principal?.org || workflow.org_id || null;
+  }
+
   async function activeMcpTools(principal: Principal | null): Promise<Array<{ workflow: StoredWorkflow; tool: NonNullable<ReturnType<typeof findMcpTrigger>> }>> {
     const all = await listWorkflowRecs();
     const out: Array<{ workflow: StoredWorkflow; tool: NonNullable<ReturnType<typeof findMcpTrigger>> }> = [];
@@ -2809,7 +2877,7 @@ export function createApp(): express.Express {
     };
   };
 
-  const mcpToolCall = async (principal: Principal | null, name: string, args: any) => {
+  const mcpToolCall = async (req: express.Request, principal: Principal | null, name: string, args: any) => {
     const tools = await activeMcpTools(principal);
     const hit = tools.find((t) => t.tool.toolName === name);
     if (!hit) throw Object.assign(new Error(`Unknown MCP tool '${name}'`), { rpcCode: -32602 });
@@ -2821,6 +2889,19 @@ export function createApp(): express.Express {
       }
     }
     const input = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
+    const quotaOrg = mcpExecutionQuotaEnabled() ? mcpQuotaOrg(req, principal, wf) : null;
+    // Each actual tools/call is admitted independently, including every element
+    // of a JSON-RPC batch. This is the same IAM hourly counter and concurrency
+    // lease set used by normal gateway execution routes; the gateway cannot count
+    // batch elements without buffering the body.
+    let lease: { token: string } | null = null;
+    try {
+      lease = quotaOrg ? await reserveMcpExecution(quotaOrg) : null;
+    } catch (e: any) {
+      if (e?.rpcCode === -32004) throw e;
+      throw Object.assign(new Error('workflow quota unavailable'), { rpcCode: -32004, cause: e });
+    }
+    try {
     const runPrincipal = principal || workflowRunPrincipal(wf);
     const executionId = randomUUID();
     const startedAt = new Date().toISOString();
@@ -2873,6 +2954,9 @@ export function createApp(): express.Express {
       ...(safe && typeof safe === 'object' && !Array.isArray(safe) ? { structuredContent: safe } : {}),
       ...(r.status === 'error' ? { isError: true } : {}),
     };
+    } finally {
+      if (quotaOrg && lease) await releaseMcpExecution(quotaOrg, lease.token);
+    }
   };
 
   app.post('/mcp', mcpGate, async (req, res) => {
@@ -2909,7 +2993,7 @@ export function createApp(): express.Express {
         const name = String(params.name || '');
         if (!name) return { jsonrpc: '2.0', id, error: { code: -32602, message: 'tools/call requires params.name' } };
         try {
-          const result = await mcpToolCall(principal, name, params.arguments);
+          const result = await mcpToolCall(req, principal, name, params.arguments);
           return { jsonrpc: '2.0', id, result };
         } catch (e: any) {
           return { jsonrpc: '2.0', id, error: { code: e?.rpcCode || -32603, message: String(e?.message || e).slice(0, 1000) } };

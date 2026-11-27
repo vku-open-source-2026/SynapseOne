@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Server } from 'node:http';
+import { createServer } from 'node:http';
 import { buildTemplate, createApp, findMcpTrigger, validateDefinition } from './index';
 import { __clearMem } from './store';
 
@@ -17,6 +18,7 @@ const H = {
   'x-synapseone-internal': INTERNAL,
   'x-synapseone-user': 'mcp@example.com',
   'x-synapseone-org': 'org-mcp',
+  'x-synapseone-quota-org': 'org-mcp',
   'x-synapseone-account': 'acc-mcp',
   'x-synapseone-kind': 'user',
 };
@@ -33,15 +35,51 @@ async function rpc(base: string, method: string, params: any = {}, headers: Reco
 
 describe('MCP trigger', () => {
   let server: Server;
+  let iamServer: Server;
+  let iamBase = '';
   let base = '';
   let toolName = '';
+  let toolWorkflowId = '';
+  let quotaChecks = 0;
+  let quotaReleases = 0;
+  let denyNextCheck = false;
+  let quotaUnavailable = false;
 
   const saved: Record<string, string | undefined> = {};
   before(async () => {
-    for (const k of ['SYNAPSEONE_INTERNAL_SECRET', 'MCP_ALLOW_ANONYMOUS']) saved[k] = process.env[k];
+    for (const k of ['SYNAPSEONE_INTERNAL_SECRET', 'MCP_ALLOW_ANONYMOUS', 'IAM_SERVICE_URL', 'WORKFLOW_MCP_QUOTA_ENFORCEMENT']) saved[k] = process.env[k];
     process.env.SYNAPSEONE_INTERNAL_SECRET = INTERNAL;
-    // Anonymous MCP is an explicit opt-in for structurally read-only tools.
     process.env.MCP_ALLOW_ANONYMOUS = 'true';
+    process.env.WORKFLOW_MCP_QUOTA_ENFORCEMENT = 'true';
+    iamServer = createServer((req, res) => {
+      let raw = '';
+      req.on('data', (chunk) => { raw += chunk; });
+      req.on('end', () => {
+        assert.equal(req.headers['x-synapseone-internal'], INTERNAL);
+        const send = (status: number, body: any) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+        if (req.url?.startsWith('/internal/quotas?')) return send(200, { executionsPerHour: 1000, concurrentExecutions: 2 });
+        if (req.url === '/internal/workflow/execution/check') {
+          quotaChecks++;
+          const body = JSON.parse(raw || '{}');
+          assert.equal(body.subject, 'org:org-mcp');
+          if (quotaUnavailable) return send(503, { error: 'quota_unavailable' });
+          if (denyNextCheck) {
+            denyNextCheck = false;
+            return send(200, { allowed: false, window: 'hour', count: 1000, limit: 1000, retryAfterSeconds: 60, resetAt: new Date().toISOString() });
+          }
+          return send(200, { allowed: true, window: 'hour', count: quotaChecks, limit: 1000, retryAfterSeconds: 0, resetAt: new Date().toISOString(), token: `lease-${quotaChecks}` });
+        }
+        if (req.url === '/internal/workflow/execution/release') {
+          quotaReleases++;
+          return send(200, { released: true });
+        }
+        send(404, {});
+      });
+    });
+    await new Promise<void>((resolve) => iamServer.listen(0, '127.0.0.1', resolve));
+    const iamAddress = iamServer.address();
+    iamBase = `http://127.0.0.1:${typeof iamAddress === 'object' && iamAddress ? iamAddress.port : 0}`;
+    process.env.IAM_SERVICE_URL = iamBase;
     __clearMem();
     const app = createApp();
     await new Promise<void>((resolve) => {
@@ -58,7 +96,7 @@ describe('MCP trigger', () => {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
-    server.close(() => resolve());
+    server.close(() => iamServer.close(() => resolve()));
   }));
 
   it('ships a valid mcp-docs-reader template and matching git JSON', () => {
@@ -119,14 +157,77 @@ describe('MCP trigger', () => {
     assert.equal(tool.description, 'Echo the input path');
     assert.equal(tool.inputSchema.properties.path.type, 'string');
 
+    const checksBefore = quotaChecks;
+    const releasesBefore = quotaReleases;
     const called = await rpc(base, 'tools/call', { name: toolName, arguments: { path: 'docs/api.md' } });
     assert.equal(called.body.result.isError, undefined);
     assert.equal(called.body.result.content[0].text, 'read:docs/api.md');
+    assert.equal(quotaChecks, checksBefore + 1);
+    assert.equal(quotaReleases, releasesBefore + 1);
 
     const exec = await fetch(`${base}/v1/executions?workflowId=${encodeURIComponent(wf.id)}&triggeredBy=mcp`, { headers: H });
     const execBody: any = await exec.json();
     assert.equal(execBody.data.length, 1);
     assert.equal(execBody.data[0].status, 'success');
+    toolWorkflowId = execBody.data[0].workflowId;
+  });
+
+  it('admits and releases every actual tools/call in a JSON-RPC batch', async () => {
+    const beforeChecks = quotaChecks;
+    const beforeReleases = quotaReleases;
+    const beforeExec = await fetch(`${base}/v1/executions?workflowId=${encodeURIComponent(toolWorkflowId)}&triggeredBy=mcp`, { headers: H }).then((r) => r.json());
+    const messages = Array.from({ length: 3 }, (_, index) => ({ jsonrpc: '2.0', id: index + 1, method: 'tools/call', params: { name: toolName, arguments: { path: `batch-${index}` } } }));
+    const response = await fetch(`${base}/mcp`, { method: 'POST', headers: H, body: JSON.stringify(messages) });
+    const body: any = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(body.length, 3);
+    assert.ok(body.every((item: any) => item.result && !item.result.isError));
+    assert.equal(quotaChecks, beforeChecks + 3);
+    assert.equal(quotaReleases, beforeReleases + 3);
+    const afterExec = await fetch(`${base}/v1/executions?workflowId=${encodeURIComponent(toolWorkflowId)}&triggeredBy=mcp`, { headers: H }).then((r) => r.json());
+    assert.equal(afterExec.data.length, beforeExec.data.length + 3);
+  });
+
+  it('uses quota attribution for service-account MCP calls without granting org authorization', async () => {
+    const serviceAccountHeaders = {
+      'Content-Type': 'application/json',
+      'x-synapseone-internal': INTERNAL,
+      'x-synapseone-user': 'sa-mcp',
+      'x-synapseone-account': 'acc-mcp',
+      'x-synapseone-kind': 'service-account',
+      'x-synapseone-quota-org': 'org-mcp',
+    };
+    const beforeChecks = quotaChecks;
+    const called = await rpc(base, 'tools/call', { name: toolName, arguments: { path: 'service-account' } }, serviceAccountHeaders);
+    assert.equal(called.body.result?.isError, undefined, JSON.stringify(called.body));
+    assert.equal(quotaChecks, beforeChecks + 1);
+  });
+
+  it('denies only the actual over-budget tools/call in a JSON-RPC batch', async () => {
+    denyNextCheck = true;
+    const beforeExec = await fetch(`${base}/v1/executions?workflowId=${encodeURIComponent(toolWorkflowId)}&triggeredBy=mcp`, { headers: H }).then((r) => r.json());
+    const messages = Array.from({ length: 3 }, (_, index) => ({ jsonrpc: '2.0', id: index + 1, method: 'tools/call', params: { name: toolName, arguments: { path: `denied-${index}` } } }));
+    const response = await fetch(`${base}/mcp`, { method: 'POST', headers: H, body: JSON.stringify(messages) });
+    const body: any = await response.json();
+    assert.equal(body[0].error.code, -32004);
+    assert.match(body[0].error.message, /quota exceeded/);
+    assert.equal(body[1].result?.isError, undefined, 'later independent batch calls are still admitted');
+    assert.equal(body[2].result?.isError, undefined);
+    const afterExec = await fetch(`${base}/v1/executions?workflowId=${encodeURIComponent(toolWorkflowId)}&triggeredBy=mcp`, { headers: H }).then((r) => r.json());
+    assert.equal(afterExec.data.length, beforeExec.data.length + 2);
+  });
+
+  it('fails MCP execution closed when the trusted quota store is unavailable', async () => {
+    quotaUnavailable = true;
+    const beforeExec = await fetch(`${base}/v1/executions?workflowId=${encodeURIComponent(toolWorkflowId)}&triggeredBy=mcp`, { headers: H }).then((r) => r.json());
+    try {
+      const called = await rpc(base, 'tools/call', { name: toolName, arguments: { path: 'unavailable' } });
+      assert.equal(called.body.error.code, -32004);
+      const afterExec = await fetch(`${base}/v1/executions?workflowId=${encodeURIComponent(toolWorkflowId)}&triggeredBy=mcp`, { headers: H }).then((r) => r.json());
+      assert.equal(afterExec.data.length, beforeExec.data.length);
+    } finally {
+      quotaUnavailable = false;
+    }
   });
 
   it('allows anonymous MCP calls for public read-only tools only', async () => {

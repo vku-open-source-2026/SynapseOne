@@ -4,12 +4,12 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::{to_bytes, Bytes};
-use axum::extract::{Request, State};
+use axum::extract::{Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -35,6 +35,8 @@ use crate::config::{
 };
 use crate::headers::{propagate_principal, request_id, sanitize_request_id};
 use crate::metrics::Metrics;
+use crate::quotas::{QuotaDefaults, ServiceDefaults};
+use crate::quotas::{consumes_workflow_execution, quota_service_for_route, QuotaService};
 use crate::rate_limit::{LimitResult, RateLimiter};
 use crate::routes::{
     compile_route_path, expand_env, find_route, load_routes, parse_routes_yaml, AuthMode, RouteRule,
@@ -202,6 +204,7 @@ enum AuthzMock {
 
 struct MockIamState {
     verify: Mutex<VerifyMode>,
+    verify_org: Mutex<Option<String>>,
     verify_hits: AtomicUsize,
     key: Mutex<KeyMode>,
     key_hits: AtomicUsize,
@@ -214,6 +217,22 @@ struct MockIamState {
     session_hits: AtomicUsize,
     usage_events: Mutex<Vec<Value>>,
     usage_internal: Mutex<Option<String>>,
+    quota_overrides: Mutex<HashMap<String, Value>>,
+    quota_unavailable: AtomicBool,
+    quota_hits: AtomicUsize,
+    check_unavailable: AtomicBool,
+    check_result: Mutex<Option<Value>>,
+    check_counts: Mutex<HashMap<String, u64>>,
+    check_hits: AtomicUsize,
+    check_body: Mutex<Option<Value>>,
+    check_internal: Mutex<Option<String>>,
+    execution_unavailable: AtomicBool,
+    execution_hits: AtomicUsize,
+    execution_release_hits: AtomicUsize,
+    execution_body: Mutex<Option<Value>>,
+    execution_hour_counts: Mutex<HashMap<String, u64>>,
+    execution_leases: Mutex<HashMap<String, Vec<String>>>,
+    meter: Mutex<Value>,
 }
 
 #[derive(Clone)]
@@ -225,6 +244,7 @@ impl MockIam {
     async fn spawn() -> (TestServer, Self) {
         let state = Arc::new(MockIamState {
             verify: Mutex::new(VerifyMode::Ok),
+            verify_org: Mutex::new(None),
             verify_hits: AtomicUsize::new(0),
             key: Mutex::new(KeyMode::Invalid),
             key_hits: AtomicUsize::new(0),
@@ -237,12 +257,37 @@ impl MockIam {
             session_hits: AtomicUsize::new(0),
             usage_events: Mutex::new(Vec::new()),
             usage_internal: Mutex::new(None),
+            quota_overrides: Mutex::new(HashMap::new()),
+            quota_unavailable: AtomicBool::new(false),
+            quota_hits: AtomicUsize::new(0),
+            check_unavailable: AtomicBool::new(false),
+            check_result: Mutex::new(None),
+            check_counts: Mutex::new(HashMap::new()),
+            check_hits: AtomicUsize::new(0),
+            check_body: Mutex::new(None),
+            check_internal: Mutex::new(None),
+            execution_unavailable: AtomicBool::new(false),
+            execution_hits: AtomicUsize::new(0),
+            execution_release_hits: AtomicUsize::new(0),
+            execution_body: Mutex::new(None),
+            execution_hour_counts: Mutex::new(HashMap::new()),
+            execution_leases: Mutex::new(HashMap::new()),
+            meter: Mutex::new(json!({
+                "orgId": "",
+                "tokensToday": { "ai": 0, "inference": 0 },
+                "workflowExecutionsLastHour": 0,
+            })),
         });
         let router = Router::new()
             .route("/v1/auth/verify", get(mock_verify))
             .route("/v1/keys/verify", post(mock_keys))
             .route("/internal/authorize", post(mock_authorize))
             .route("/v1/usage/ingest", post(mock_usage))
+            .route("/internal/quotas", get(mock_quotas))
+            .route("/internal/quota/check", post(mock_quota_check))
+            .route("/internal/workflow/execution/check", post(mock_execution_check))
+            .route("/internal/workflow/execution/release", post(mock_execution_release))
+            .route("/internal/usage/meter", get(mock_meter))
             .route("/v1/platform/session", post(mock_platform_session))
             .route(
                 "/v1/platform/me",
@@ -262,6 +307,9 @@ impl MockIam {
 
     fn set_verify(&self, mode: VerifyMode) {
         *self.state.verify.lock().unwrap() = mode;
+    }
+    fn set_verify_org(&self, org: &str) {
+        *self.state.verify_org.lock().unwrap() = Some(org.to_string());
     }
 
     fn verify_hits(&self) -> usize {
@@ -311,6 +359,40 @@ impl MockIam {
     fn usage_internal(&self) -> Option<String> {
         self.state.usage_internal.lock().unwrap().clone()
     }
+
+    fn set_quota_override(&self, org: &str, service: &str, body: Value) {
+        self.state.quota_overrides.lock().unwrap().insert(format!("{service}:{org}"), body);
+    }
+    fn set_quota_unavailable(&self, unavailable: bool) {
+        self.state.quota_unavailable.store(unavailable, Ordering::SeqCst);
+    }
+    fn set_check_unavailable(&self, unavailable: bool) {
+        self.state.check_unavailable.store(unavailable, Ordering::SeqCst);
+    }
+    fn set_check_result(&self, body: Option<Value>) {
+        *self.state.check_result.lock().unwrap() = body;
+    }
+    fn check_body(&self) -> Option<Value> {
+        self.state.check_body.lock().unwrap().clone()
+    }
+    fn check_internal(&self) -> Option<String> {
+        self.state.check_internal.lock().unwrap().clone()
+    }
+    fn quota_hits(&self) -> usize {
+        self.state.quota_hits.load(Ordering::SeqCst)
+    }
+    fn check_hits(&self) -> usize {
+        self.state.check_hits.load(Ordering::SeqCst)
+    }
+    fn execution_hits(&self) -> usize {
+        self.state.execution_hits.load(Ordering::SeqCst)
+    }
+    fn execution_release_hits(&self) -> usize {
+        self.state.execution_release_hits.load(Ordering::SeqCst)
+    }
+    fn execution_body(&self) -> Option<Value> {
+        self.state.execution_body.lock().unwrap().clone()
+    }
 }
 
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -323,7 +405,12 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 async fn mock_verify(State(state): State<Arc<MockIamState>>) -> Response {
     state.verify_hits.fetch_add(1, Ordering::SeqCst);
     match *state.verify.lock().unwrap() {
-        VerifyMode::Ok => Json(json!({ "valid": true })).into_response(),
+        VerifyMode::Ok => {
+            let org = state.verify_org.lock().unwrap().clone();
+            let mut body = json!({ "valid": true });
+            if let Some(org_id) = org { body["org_id"] = json!(org_id); }
+            Json(body).into_response()
+        }
         VerifyMode::Revoked => (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "valid": false, "error": "token_revoked" })),
@@ -411,6 +498,129 @@ async fn mock_usage(
         }
     }
     StatusCode::OK.into_response()
+}
+
+async fn mock_quotas(
+    State(state): State<Arc<MockIamState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    state.quota_hits.fetch_add(1, Ordering::SeqCst);
+    if state.quota_unavailable.load(Ordering::SeqCst) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let org = params.get("orgId").cloned().unwrap_or_default();
+    let service = params.get("service").cloned().unwrap_or_default();
+    if let Some(body) = state.quota_overrides.lock().unwrap().get(&format!("{service}:{org}")) {
+        return Json(body.clone()).into_response();
+    }
+    let (rpm, tpd, eph, concurrent) = match service.as_str() {
+        "ai" => (30, Some(1_000_000), None, None),
+        "inference" => (60, Some(1_000_000), None, None),
+        "workflow" => (120, None, Some(1_000), Some(10)),
+        _ => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid_service" }))).into_response(),
+    };
+    Json(json!({
+        "service": service,
+        "orgId": org,
+        "requestsPerMin": rpm,
+        "requestsPer5h": rpm * 300,
+        "requestsPerDay": rpm * 1440,
+        "tokensPerDay": tpd,
+        "executionsPerHour": eph,
+        "concurrentExecutions": concurrent,
+        "overridden": false,
+    })).into_response()
+}
+
+async fn mock_quota_check(
+    State(state): State<Arc<MockIamState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    state.check_hits.fetch_add(1, Ordering::SeqCst);
+    *state.check_internal.lock().unwrap() = header_value(&headers, "x-synapseone-internal");
+    let parsed = serde_json::from_slice::<Value>(&body).ok();
+    *state.check_body.lock().unwrap() = parsed.clone();
+    if state.check_unavailable.load(Ordering::SeqCst) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if let Some(result) = state.check_result.lock().unwrap().clone() {
+        return Json(result).into_response();
+    }
+    let Some(parsed) = parsed else { return StatusCode::BAD_REQUEST.into_response() };
+    let subject = parsed.get("subject").and_then(Value::as_str).unwrap_or("").to_string();
+    let limit = parsed.pointer("/limits/minute").and_then(Value::as_u64).unwrap_or(100_000);
+    let mut counts = state.check_counts.lock().unwrap();
+    let count = counts.entry(subject).or_insert(0);
+    *count += 1;
+    let allowed = *count <= limit;
+    Json(json!({
+        "allowed": allowed,
+        "window": "minute",
+        "count": *count,
+        "limit": limit,
+        "retryAfterSeconds": if allowed { 0 } else { 60 },
+        "resetAt": "2026-11-26T12:35:00.000Z",
+    })).into_response()
+}
+
+async fn mock_execution_check(
+    State(state): State<Arc<MockIamState>>,
+    body: Bytes,
+) -> Response {
+    state.execution_hits.fetch_add(1, Ordering::SeqCst);
+    let parsed = serde_json::from_slice::<Value>(&body).ok();
+    *state.execution_body.lock().unwrap() = parsed.clone();
+    if state.execution_unavailable.load(Ordering::SeqCst) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let Some(parsed) = parsed else { return StatusCode::BAD_REQUEST.into_response() };
+    let subject = parsed.get("subject").and_then(Value::as_str).unwrap_or("").to_string();
+    let hour_limit = parsed.pointer("/limits/hour").and_then(Value::as_u64).unwrap_or(1_000);
+    let concurrent_limit = parsed.pointer("/limits/concurrent").and_then(Value::as_u64).unwrap_or(10);
+    let hour_count = state.execution_hour_counts.lock().unwrap().get(&subject).copied().unwrap_or(0);
+    if hour_count >= hour_limit {
+        return Json(json!({
+            "allowed": false, "window": "hour", "count": hour_count, "limit": hour_limit,
+            "retryAfterSeconds": 60, "resetAt": "2026-11-27T13:00:00.000Z", "token": null,
+        })).into_response();
+    }
+    let concurrent_count = state.execution_leases.lock().unwrap().get(&subject).map(Vec::len).unwrap_or(0) as u64;
+    if concurrent_count >= concurrent_limit {
+        return Json(json!({
+            "allowed": false, "window": "concurrent", "count": concurrent_count, "limit": concurrent_limit,
+            "retryAfterSeconds": 60, "resetAt": null, "token": null,
+        })).into_response();
+    }
+    let token = format!("lease-{}", state.execution_hits.load(Ordering::SeqCst));
+    *state.execution_hour_counts.lock().unwrap().entry(subject.clone()).or_insert(0) += 1;
+    state.execution_leases.lock().unwrap().entry(subject.clone()).or_default().push(token.clone());
+    Json(json!({
+        "allowed": true, "window": "hour", "count": hour_count + 1, "limit": hour_limit,
+        "retryAfterSeconds": 0, "resetAt": "2026-11-27T13:00:00.000Z", "token": token,
+    })).into_response()
+}
+
+async fn mock_execution_release(
+    State(state): State<Arc<MockIamState>>,
+    body: Bytes,
+) -> Response {
+    state.execution_release_hits.fetch_add(1, Ordering::SeqCst);
+    let parsed = serde_json::from_slice::<Value>(&body).ok();
+    let Some(parsed) = parsed else { return StatusCode::BAD_REQUEST.into_response() };
+    let subject = parsed.get("subject").and_then(Value::as_str).unwrap_or("");
+    let token = parsed.get("token").and_then(Value::as_str).unwrap_or("");
+    let released = if let Some(leases) = state.execution_leases.lock().unwrap().get_mut(subject) {
+        if let Some(index) = leases.iter().position(|value| value == token) {
+            leases.remove(index);
+            true
+        } else { false }
+    } else { false };
+    Json(json!({ "released": released })).into_response()
+}
+
+async fn mock_meter(State(state): State<Arc<MockIamState>>) -> Response {
+    Json(state.meter.lock().unwrap().clone()).into_response()
 }
 
 async fn mock_platform_session(State(state): State<Arc<MockIamState>>) -> Response {
@@ -537,6 +747,22 @@ impl UpstreamState {
 
 // ---------- config / routes ----------
 
+fn test_quota_defaults() -> QuotaDefaults {
+    let service = |rpm, tpd, eph, concurrent| ServiceDefaults {
+        rpm,
+        rp5h: rpm * 300,
+        rpd: rpm * 1_440,
+        tpd,
+        eph,
+        concurrent,
+    };
+    QuotaDefaults {
+        ai: service(30, Some(1_000_000), None, None),
+        inference: service(60, Some(1_000_000), None, None),
+        workflow: service(120, None, Some(1_000), Some(10)),
+    }
+}
+
 fn test_config(iam_base: &str) -> Config {
     Config {
         version: "0.9.0".into(),
@@ -551,7 +777,8 @@ fn test_config(iam_base: &str) -> Config {
         authz_audit_ack: String::new(),
         trust_proxy: TrustProxy::Disabled,
         proxy_timeout_ms: 30_000,
-        inference_rate_limit_per_min: 60,
+        quota_defaults: test_quota_defaults(),
+        quota_cache_ttl: Duration::from_millis(30_000),
         session_cache_ttl: Duration::from_secs(30),
         authz_cache_ttl: Duration::from_millis(30_000),
         cors_origins: vec![],
@@ -2377,8 +2604,12 @@ async fn inference_quota_per_tenant() {
         scopes: vec!["*"],
         owner: None,
     });
+    mock.set_quota_override("o1", "inference", quota_override("o1", "inference", json!({
+        "requestsPerMin": 2, "requestsPer5h": 600, "requestsPerDay": 2880,
+        "tokensPerDay": null, "executionsPerHour": null, "concurrentExecutions": null,
+    })));
     let mut config = test_config(&iam.base);
-    config.inference_rate_limit_per_min = 2;
+    config.quota_defaults.inference.rpm = 2;
     let routes = vec![with_actions(
         with_service(
             route("/v1/inference", upstream.base(), AuthMode::Either),
@@ -2413,6 +2644,354 @@ async fn inference_quota_per_tenant() {
     let body: Value = limited.json().await.unwrap();
     assert_eq!(body["error"], "quota_exceeded");
     assert!(body["retryAfter"].as_u64().unwrap() >= 1);
+}
+
+#[test]
+fn quota_service_routing_matches_typescript_reference() {
+    assert_eq!(quota_service_for_route("/v1/ai/agent"), Some(QuotaService::Ai));
+    assert_eq!(quota_service_for_route("/v1/inference/chat/completions"), Some(QuotaService::Inference));
+    assert_eq!(quota_service_for_route("/v1/workflows/w1/test-run"), Some(QuotaService::Workflow));
+    assert_eq!(quota_service_for_route("/mcp"), Some(QuotaService::Workflow));
+    assert!(!consumes_workflow_execution("POST", "/mcp"));
+    assert_eq!(quota_service_for_route("/v1/base/collections"), None);
+    assert!(consumes_workflow_execution("POST", "/v1/workflows/w1/execute"));
+    assert!(consumes_workflow_execution("POST", "/v1/workflows/w1/test-run"));
+    assert!(consumes_workflow_execution("POST", "/v1/workflows/test-run"));
+    assert!(consumes_workflow_execution("POST", "/v1/inference-jobs"));
+    assert!(!consumes_workflow_execution("POST", "/v1/inference-jobs/j1/complete"));
+    assert!(!consumes_workflow_execution("GET", "/v1/workflows/w1/execute"));
+}
+
+// ---------- shared IAM/Valkey quota admission ----------
+
+fn quota_override(org: &str, service: &str, body: Value) -> Value {
+    let mut full = body;
+    full["service"] = Value::from(service);
+    full["orgId"] = Value::from(org);
+    full["overridden"] = Value::from(true);
+    full
+}
+
+#[tokio::test]
+async fn ai_quota_override_uses_shared_minute_admission() {
+    let (iam, mock) = MockIam::spawn().await;
+    let upstream = Upstream::spawn().await;
+    mock.set_key(KeyMode::Valid { account: "a1", org: "o1", scopes: vec!["*"], owner: None });
+    mock.set_quota_override("o1", "ai", quota_override("o1", "ai", json!({
+        "requestsPerMin": 2,
+        "requestsPer5h": 600,
+        "requestsPerDay": 2880,
+        "tokensPerDay": null,
+        "executionsPerHour": null,
+        "concurrentExecutions": null,
+    })));
+    let gateway = spawn_gateway(test_config(&iam.base), vec![with_service(
+        route("/v1/ai", upstream.base(), AuthMode::Either), "ai",
+    )]).await;
+    let hit = || http().post(format!("{}/v1/ai/agent", gateway.base)).header("x-api-key", "k").json(&json!({})).send();
+    assert_eq!(hit().await.unwrap().status(), 200);
+    assert_eq!(hit().await.unwrap().status(), 200);
+    let limited = hit().await.unwrap();
+    assert_eq!(limited.status(), 429);
+    assert_eq!(limited.headers().get("retry-after").unwrap(), "60");
+    let body: Value = limited.json().await.unwrap();
+    assert_eq!(body["window"], "minute");
+    assert_eq!(body["limit"], 2);
+    assert_eq!(upstream.hits(), 2);
+    let check = mock.check_body().unwrap();
+    assert_eq!(check["subject"], "org:o1");
+    assert_eq!(check["limits"]["fiveHour"], 600);
+    assert_eq!(check["limits"]["day"], 2880);
+    assert_eq!(mock.check_internal().as_deref(), Some(TEST_INTERNAL));
+}
+
+#[tokio::test]
+async fn five_hour_and_day_denials_return_binding_window_and_retry_after() {
+    let (iam, mock) = MockIam::spawn().await;
+    let upstream = Upstream::spawn().await;
+    mock.set_key(KeyMode::Valid { account: "a1", org: "o5", scopes: vec!["*"], owner: None });
+    let gateway = spawn_gateway(test_config(&iam.base), vec![with_service(
+        route("/v1/inference", upstream.base(), AuthMode::Either), "inference",
+    )]).await;
+    for (window, retry) in [("fiveHour", 1234), ("day", 4321)] {
+        mock.set_check_result(Some(json!({
+            "allowed": false, "window": window, "count": 100, "limit": 100,
+            "retryAfterSeconds": retry, "resetAt": "2026-11-27T00:00:00.000Z",
+        })));
+        let response = http().post(format!("{}/v1/inference/chat/completions", gateway.base))
+            .header("x-api-key", "k").json(&json!({})).send().await.unwrap();
+        assert_eq!(response.status(), 429);
+        assert_eq!(response.headers().get("retry-after").unwrap().to_str().unwrap(), retry.to_string());
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["window"], window);
+        assert_eq!(body["retryAfterSeconds"], retry);
+        assert_eq!(body["resetAt"], "2026-11-27T00:00:00.000Z");
+    }
+    assert_eq!(upstream.hits(), 0);
+}
+
+#[tokio::test]
+async fn iam_and_valkey_outages_fall_back_to_local_minute_limiter() {
+    for valkey_outage in [false, true] {
+        let (iam, mock) = MockIam::spawn().await;
+        let upstream = Upstream::spawn().await;
+        mock.set_key(KeyMode::Valid { account: "a1", org: "o6", scopes: vec!["*"], owner: None });
+        if valkey_outage {
+            mock.set_quota_override("o6", "ai", quota_override("o6", "ai", json!({
+                "requestsPerMin": 2, "requestsPer5h": 600, "requestsPerDay": 2880,
+                "tokensPerDay": null, "executionsPerHour": null, "concurrentExecutions": null,
+            })));
+            mock.set_check_unavailable(true);
+        } else {
+            mock.set_quota_unavailable(true);
+        }
+        let mut config = test_config(&iam.base);
+        config.quota_defaults.ai.rpm = 2;
+        let gateway = spawn_gateway(config, vec![with_service(
+            route("/v1/ai", upstream.base(), AuthMode::Either), "ai",
+        )]).await;
+        let hit = || http().post(format!("{}/v1/ai/agent", gateway.base)).header("x-api-key", "k").json(&json!({})).send();
+        assert_eq!(hit().await.unwrap().status(), 200);
+        assert_eq!(hit().await.unwrap().status(), 200);
+        let limited = hit().await.unwrap();
+        assert_eq!(limited.status(), 429);
+        let body: Value = limited.json().await.unwrap();
+        assert_eq!(body["window"], "minute");
+        assert_eq!(body["limit"], 2);
+        assert_eq!(upstream.hits(), 2);
+    }
+}
+
+#[tokio::test]
+async fn policy_denied_and_authz_unavailable_requests_do_not_consume_quota() {
+    for unavailable in [false, true] {
+        let (iam, mock) = MockIam::spawn().await;
+        let upstream = Upstream::spawn().await;
+        mock.set_key(KeyMode::Valid { account: "a1", org: "o-authz", scopes: vec!["*"], owner: None });
+        mock.set_authz(if unavailable { AuthzMock::Error } else { AuthzMock::Deny("policy-deny") });
+        let mut config = test_config(&iam.base);
+        config.authz_mode = AuthzMode::Enforce;
+        let gateway = spawn_gateway(config, vec![with_service(
+            route("/v1/ai", upstream.base(), AuthMode::Either), "ai",
+        )]).await;
+        let response = http().post(format!("{}/v1/ai/agent", gateway.base))
+            .header("x-api-key", "k").json(&json!({})).send().await.unwrap();
+        assert_eq!(response.status(), if unavailable { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::FORBIDDEN });
+        assert_eq!(mock.quota_hits(), 0, "effective lookup must wait for authorization");
+        assert_eq!(mock.check_hits(), 0, "denied request must not increment shared counters");
+        assert_eq!(upstream.hits(), 0);
+    }
+}
+
+#[tokio::test]
+async fn service_account_jwt_resolves_owning_org_for_quota_attribution() {
+    let (iam, mock) = MockIam::spawn().await;
+    mock.set_verify_org("o-sa");
+    let upstream = Upstream::spawn().await;
+    mock.set_quota_override("o-sa", "ai", quota_override("o-sa", "ai", json!({
+        "requestsPerMin": 1, "requestsPer5h": 300, "requestsPerDay": 1440,
+        "tokensPerDay": null, "executionsPerHour": null, "concurrentExecutions": null,
+    })));
+    let gateway = spawn_gateway(test_config(&iam.base), vec![with_service(
+        route("/v1/ai", upstream.base(), AuthMode::Either), "ai",
+    )]).await;
+    let token = sign(json!({
+        "sub": "sa1", "kind": "service-account", "account": "a1", "scopes": ["*"],
+        "iss": TEST_ISSUER, "exp": now_ts() + 300,
+    }));
+    let hit = || http().post(format!("{}/v1/ai/agent", gateway.base)).bearer_auth(&token).json(&json!({})).send();
+    assert_eq!(hit().await.unwrap().status(), 200);
+    assert_eq!(hit().await.unwrap().status(), 429);
+    assert!(mock.quota_hits() >= 1);
+    assert_eq!(mock.check_body().unwrap()["subject"], "org:o-sa");
+    assert_eq!(upstream.header("x-synapseone-account").as_deref(), Some("a1"));
+    assert_eq!(upstream.header("x-synapseone-org"), None, "attribution must not widen service-account authorization");
+    assert_eq!(upstream.header("x-synapseone-quota-org").as_deref(), Some("o-sa"));
+}
+
+#[tokio::test]
+async fn service_account_quota_attribution_works_with_zero_session_cache_ttl() {
+    let (iam, mock) = MockIam::spawn().await;
+    mock.set_verify_org("o-sa");
+    let upstream = Upstream::spawn().await;
+    mock.set_quota_override("o-sa", "ai", quota_override("o-sa", "ai", json!({
+        "requestsPerMin": 1, "requestsPer5h": 300, "requestsPerDay": 1440,
+        "tokensPerDay": null, "executionsPerHour": null, "concurrentExecutions": null,
+    })));
+    let mut config = test_config(&iam.base);
+    config.session_cache_ttl = Duration::ZERO;
+    let gateway = spawn_gateway(config, vec![with_service(
+        route("/v1/ai", upstream.base(), AuthMode::Either), "ai",
+    )]).await;
+    let token = sign(json!({
+        "sub": "sa1", "kind": "service-account", "account": "a1", "scopes": ["*"],
+        "iss": TEST_ISSUER, "exp": now_ts() + 300,
+    }));
+    let hit = || http().post(format!("{}/v1/ai/agent", gateway.base)).bearer_auth(&token).json(&json!({})).send();
+    assert_eq!(hit().await.unwrap().status(), 200);
+    assert_eq!(hit().await.unwrap().status(), 429);
+    assert_eq!(mock.check_body().unwrap()["subject"], "org:o-sa");
+    assert_eq!(upstream.header("x-synapseone-org"), None);
+    assert_eq!(upstream.header("x-synapseone-quota-org").as_deref(), Some("o-sa"));
+}
+
+#[tokio::test]
+async fn mcp_batch_is_request_metered_without_buffering() {
+    let (iam, mock) = MockIam::spawn().await;
+    let upstream = Upstream::spawn().await;
+    mock.set_key(KeyMode::Valid { account: "a1", org: "o-mcp", scopes: vec!["*"], owner: None });
+    mock.set_quota_override("o-mcp", "workflow", quota_override("o-mcp", "workflow", json!({
+        "requestsPerMin": 1, "requestsPer5h": 300, "requestsPerDay": 1440,
+        "tokensPerDay": null, "executionsPerHour": null, "concurrentExecutions": null,
+    })));
+    let gateway = spawn_gateway(test_config(&iam.base), vec![with_service(
+        route("/mcp", upstream.base(), AuthMode::Either), "workflow",
+    )]).await;
+    let batch = json!([
+        { "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "one" } },
+        { "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "two" } },
+    ]);
+    let send = || http().post(format!("{}/mcp", gateway.base)).header("x-api-key", "k").json(&batch).send();
+    assert_eq!(send().await.unwrap().status(), 200);
+    assert_eq!(upstream.body(), serde_json::to_vec(&batch).unwrap(), "gateway must forward the batch body unchanged");
+    let limited = send().await.unwrap();
+    assert_eq!(limited.status(), 429);
+    let body: Value = limited.json().await.unwrap();
+    assert_eq!(body["window"], "minute");
+    assert_eq!(upstream.hits(), 1);
+}
+
+async fn admit_mcp_execution(iam: &TestServer, subject: &str, hour: u64, concurrent: u64) -> Value {
+    http().post(format!("{}/internal/workflow/execution/check", iam.base))
+        .json(&json!({ "subject": subject, "limits": { "hour": hour, "concurrent": concurrent } }))
+        .send().await.unwrap().json().await.unwrap()
+}
+
+async fn release_mcp_execution(iam: &TestServer, subject: &str, token: &str) -> Value {
+    http().post(format!("{}/internal/workflow/execution/release", iam.base))
+        .json(&json!({ "subject": subject, "token": token }))
+        .send().await.unwrap().json().await.unwrap()
+}
+
+#[tokio::test]
+async fn workflow_execution_lease_releases_after_proxy_response() {
+    let (iam, mock) = MockIam::spawn().await;
+    let upstream = Upstream::spawn().await;
+    upstream.set_delay(400);
+    mock.set_key(KeyMode::Valid { account: "a1", org: "o7", scopes: vec!["*"], owner: None });
+    mock.set_quota_override("o7", "workflow", quota_override("o7", "workflow", json!({
+        "requestsPerMin": 100, "requestsPer5h": 30000, "requestsPerDay": 144000,
+        "tokensPerDay": null, "executionsPerHour": null, "concurrentExecutions": 1,
+    })));
+    let gateway = spawn_gateway(test_config(&iam.base), vec![with_service(
+        route("/v1/workflows", upstream.base(), AuthMode::Either), "workflow",
+    )]).await;
+    let execute = || http().post(format!("{}/v1/workflows/w1/execute", gateway.base))
+        .header("x-api-key", "k").json(&json!({})).send();
+    let (first, second) = tokio::join!(execute(), execute());
+    let mut statuses = [first.unwrap().status(), second.unwrap().status()];
+    statuses.sort();
+    assert_eq!(statuses, [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS]);
+    assert_eq!(mock.check_hits(), 1, "concurrency denial must not consume request quota");
+    assert_eq!(mock.execution_body().unwrap()["subject"], "org:o7");
+    assert_eq!(mock.execution_body().unwrap()["limits"]["concurrent"], 1);
+    assert_eq!(execute().await.unwrap().status(), 200);
+    assert_eq!(mock.check_hits(), 2);
+    assert_eq!(mock.execution_release_hits(), 2);
+}
+
+#[tokio::test]
+async fn mcp_and_normal_executions_share_the_hour_budget() {
+    let (iam, mock) = MockIam::spawn().await;
+    let upstream = Upstream::spawn().await;
+    mock.set_key(KeyMode::Valid { account: "a1", org: "o-mixed", scopes: vec!["*"], owner: None });
+    mock.set_quota_override("o-mixed", "workflow", quota_override("o-mixed", "workflow", json!({
+        "requestsPerMin": 100, "requestsPer5h": 30000, "requestsPerDay": 144000,
+        "tokensPerDay": null, "executionsPerHour": 2, "concurrentExecutions": 10,
+    })));
+    let gateway = spawn_gateway(test_config(&iam.base), vec![with_service(
+        route("/v1/workflows", upstream.base(), AuthMode::Either), "workflow",
+    )]).await;
+
+    // This is the same IAM admission workflow-service makes for an MCP tools/call.
+    let mcp = admit_mcp_execution(&iam, "org:o-mixed", 2, 10).await;
+    assert_eq!(mcp["allowed"], true);
+    assert_eq!(mcp["count"], 1);
+    let execute = || http().post(format!("{}/v1/workflows/w1/execute", gateway.base))
+        .header("x-api-key", "k").json(&json!({})).send();
+    assert_eq!(execute().await.unwrap().status(), 200, "one MCP plus one normal execution reaches the shared cap");
+    let denied = execute().await.unwrap();
+    assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body: Value = denied.json().await.unwrap();
+    assert_eq!(body["window"], "hour");
+    assert_eq!(body["limit"], 2);
+    assert_eq!(upstream.hits(), 1);
+    assert_eq!(mock.check_hits(), 1, "the denied third execution must not consume request quota");
+    assert_eq!(mock.execution_hits(), 3);
+}
+
+#[tokio::test]
+async fn mcp_and_normal_executions_share_the_concurrency_budget() {
+    let (iam, mock) = MockIam::spawn().await;
+    let upstream = Upstream::spawn().await;
+    mock.set_key(KeyMode::Valid { account: "a1", org: "o-mixed", scopes: vec!["*"], owner: None });
+    mock.set_quota_override("o-mixed", "workflow", quota_override("o-mixed", "workflow", json!({
+        "requestsPerMin": 100, "requestsPer5h": 30000, "requestsPerDay": 144000,
+        "tokensPerDay": null, "executionsPerHour": 100, "concurrentExecutions": 1,
+    })));
+    let gateway = spawn_gateway(test_config(&iam.base), vec![with_service(
+        route("/v1/workflows", upstream.base(), AuthMode::Either), "workflow",
+    )]).await;
+
+    let mcp = admit_mcp_execution(&iam, "org:o-mixed", 100, 1).await;
+    assert_eq!(mcp["allowed"], true);
+    let execute = || http().post(format!("{}/v1/workflows/w1/execute", gateway.base))
+        .header("x-api-key", "k").json(&json!({})).send();
+    let denied = execute().await.unwrap();
+    assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body: Value = denied.json().await.unwrap();
+    assert_eq!(body["window"], "concurrent");
+    assert_eq!(upstream.hits(), 0);
+    assert_eq!(mock.check_hits(), 0, "mixed-path concurrency denial must not consume request quota");
+
+    let released = release_mcp_execution(&iam, "org:o-mixed", mcp["token"].as_str().unwrap()).await;
+    assert_eq!(released["released"], true);
+    assert_eq!(execute().await.unwrap().status(), 200);
+    assert_eq!(upstream.hits(), 1);
+    assert_eq!(mock.execution_release_hits(), 2);
+}
+
+#[tokio::test]
+async fn normal_execution_fails_closed_when_shared_execution_quota_is_unavailable() {
+    let (iam, mock) = MockIam::spawn().await;
+    let upstream = Upstream::spawn().await;
+    mock.set_key(KeyMode::Valid { account: "a1", org: "o7", scopes: vec!["*"], owner: None });
+    mock.state.execution_unavailable.store(true, Ordering::SeqCst);
+    let gateway = spawn_gateway(test_config(&iam.base), vec![with_service(
+        route("/v1/workflows", upstream.base(), AuthMode::Either), "workflow",
+    )]).await;
+    let response = http().post(format!("{}/v1/workflows/w1/execute", gateway.base))
+        .header("x-api-key", "k").json(&json!({})).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(upstream.hits(), 0);
+    assert_eq!(mock.check_hits(), 0);
+}
+
+#[tokio::test]
+async fn normal_execution_fails_closed_when_effective_execution_quota_is_unavailable() {
+    let (iam, mock) = MockIam::spawn().await;
+    let upstream = Upstream::spawn().await;
+    mock.set_key(KeyMode::Valid { account: "a1", org: "o7", scopes: vec!["*"], owner: None });
+    mock.set_quota_unavailable(true);
+    let gateway = spawn_gateway(test_config(&iam.base), vec![with_service(
+        route("/v1/workflows", upstream.base(), AuthMode::Either), "workflow",
+    )]).await;
+    let response = http().post(format!("{}/v1/workflows/w1/execute", gateway.base))
+        .header("x-api-key", "k").json(&json!({})).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(upstream.hits(), 0);
+    assert_eq!(mock.execution_hits(), 0, "defaults must not bypass an unavailable org override lookup");
+    assert_eq!(mock.check_hits(), 0);
 }
 
 #[tokio::test]

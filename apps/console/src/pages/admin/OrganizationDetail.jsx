@@ -14,14 +14,24 @@ const TABS = [
   ['roles', 'Roles'],
   ['policies', 'Policies'],
   ['keys', 'API Keys'],
+  ['quotas', 'Quotas'],
   ['serviceAccounts', 'Service Accounts'],
   ['audit', 'Audit'],
 ];
 
 const fmt = (v) => v ? new Date(v).toLocaleString() : '–';
+export const keyStatus = (key) => key.revoked_at ? 'revoked' : key.expires_at && Date.parse(key.expires_at) <= Date.now() ? 'expired' : 'active';
+export const quotaFieldSource = (quota, field) => quota?.overrides?.[field] === true ? 'override' : 'default';
 
+export const organizationDetailKey = (orgId) => String(orgId || '');
 export default function AdminOrganizationDetail() {
   const { orgId } = useParams();
+  // Remount on tenant navigation so one-time secrets/notices/forms can never be
+  // rendered under a different organization, even before effects run.
+  return <OrganizationDetailContent key={organizationDetailKey(orgId)} orgId={orgId} />;
+}
+
+function OrganizationDetailContent({ orgId }) {
   const location = useLocation();
   const userListFrom = `${location.pathname}${location.search}`;
   const platform = usePlatformAuth();
@@ -37,8 +47,13 @@ export default function AdminOrganizationDetail() {
   const [createAccountOpen, setCreateAccountOpen] = useState(false);
   const [createRoleOpen, setCreateRoleOpen] = useState(false);
   const [createPolicyOpen, setCreatePolicyOpen] = useState(false);
+  const [createKeyOpen, setCreateKeyOpen] = useState(false);
+  const [createdKey, setCreatedKey] = useState(null);
+  const [quotaService, setQuotaService] = useState('ai');
   const [form, setForm] = useState({ slug: '', displayName: '', reason: '', code: '' });
   const [roleForm, setRoleForm] = useState({ accountId: '', slug: '', description: '', code: '' });
+  const [keyForm, setKeyForm] = useState({ accountId: '', name: '', scopes: 'base:read', expiresInDays: '90', reason: '', code: '' });
+  const [quotaForm, setQuotaForm] = useState({ requestsPerMin: '', requestsPer5h: '', requestsPerDay: '', tokensPerDay: '', executionsPerHour: '', concurrentExecutions: '', reason: '', code: '' });
   const [policyForm, setPolicyForm] = useState({ accountId: '', slug: '', description: '', document: '{\n  "Version": "2026-01-01",\n  "Statement": [\n    { "Effect": "Deny", "Action": ["*"], "Resource": ["*"] }\n  ]\n}', code: '' });
   const canWrite = platform.role === 'owner' || platform.role === 'operator';
   const dataSeq = useRef(0);
@@ -68,8 +83,18 @@ export default function AdminOrganizationDetail() {
 
   // Route params can change without unmounting this component. Never show the
   // previous organization's data while the new request is in flight.
-  useEffect(() => { setData(null); setAudit([]); setErr(null); setAuditErr(null); setModalErr(null); setTab('overview'); }, [orgId]);
+  useEffect(() => {
+    setData(null); setAudit([]); setErr(null); setAuditErr(null); setModalErr(null);
+    setNotice(null); setCreatedKey(null); setConfirm(null); setTab('overview');
+    setCreateKeyOpen(false); setCreateAccountOpen(false); setCreateRoleOpen(false); setCreatePolicyOpen(false);
+    setKeyForm({ accountId: '', name: '', scopes: 'base:read', expiresInDays: '90', reason: '', code: '' });
+    setQuotaForm({ requestsPerMin: '', requestsPer5h: '', requestsPerDay: '', tokensPerDay: '', executionsPerHour: '', concurrentExecutions: '', reason: '', code: '' });
+  }, [orgId]);
   useEffect(() => { load(); loadAudit(); }, [load, loadAudit]);
+  const selectTab = (id) => {
+    if (tab === 'keys' && id !== 'keys') setCreatedKey(null);
+    setTab(id);
+  };
 
   const createAccount = async (e) => {
     e.preventDefault(); if (busy) return; setBusy(true); setErr(null); setModalErr(null);
@@ -114,6 +139,94 @@ export default function AdminOrganizationDetail() {
     } catch (ex) { setModalErr(ex); } finally { setBusy(false); }
   };
 
+  const createKey = async (e) => {
+    e.preventDefault(); if (busy) return; setBusy(true); setErr(null); setModalErr(null);
+    try {
+      const scopes = keyForm.scopes.split(',').map((s) => s.trim()).filter(Boolean);
+      if (!keyForm.accountId) throw { body: { error: 'invalid_body', message: 'Select an account for the new key' } };
+      if (!scopes.length) throw { body: { error: 'invalid_body', message: 'Enter at least one scope (e.g. base:read)' } };
+      const step = await platform.stepUp(keyForm.code.trim(), 'org:key:create');
+      const out = await platform.request(`/v1/platform/orgs/${encodeURIComponent(orgId)}/keys`, {
+        method: 'POST',
+        body: {
+          accountId: keyForm.accountId,
+          name: keyForm.name.trim() || undefined,
+          scopes,
+          ...(keyForm.expiresInDays.trim() ? { expiresInDays: Number(keyForm.expiresInDays) } : {}),
+          ...(keyForm.reason.trim() ? { reason: keyForm.reason.trim() } : {}),
+        },
+        stepUpToken: step.token,
+      });
+      setCreateKeyOpen(false);
+      setKeyForm({ accountId: '', name: '', scopes: 'base:read', expiresInDays: '90', reason: '', code: '' });
+      setCreatedKey(out);
+      setNotice('API key created. Copy the secret now — it is shown only once.');
+      await load(); await loadAudit();
+    } catch (ex) { setModalErr(ex); } finally { setBusy(false); }
+  };
+
+  const rotateKey = async (key) => {
+    if (busy) return;
+    const code = window.prompt(`Enter your authenticator code to rotate ${key.name || key.prefix}:`);
+    if (!code) return;
+    setBusy(true); setErr(null); setModalErr(null);
+    try {
+      const step = await platform.stepUp(code.trim(), 'org:key:rotate');
+      const out = await platform.request(`/v1/platform/orgs/${encodeURIComponent(orgId)}/keys/${encodeURIComponent(key.id)}/rotate`, {
+        method: 'POST',
+        body: { graceSeconds: 0 },
+        stepUpToken: step.token,
+      });
+      setCreatedKey(out);
+      setNotice('API key rotated. The previous key is revoked; copy the new secret now.');
+      await load(); await loadAudit();
+    } catch (ex) { setModalErr(ex); } finally { setBusy(false); }
+  };
+
+  const emptyToNull = (v) => (String(v ?? '').trim() === '' ? null : Number(String(v).trim()));
+
+  const saveQuota = async (e) => {
+    e.preventDefault(); if (busy) return; setBusy(true); setErr(null); setModalErr(null);
+    try {
+      for (const k of ['requestsPerMin', 'requestsPer5h', 'requestsPerDay', 'tokensPerDay', 'executionsPerHour', 'concurrentExecutions']) {
+        const raw = String(quotaForm[k] ?? '').trim();
+        if (raw !== '' && (!Number.isInteger(Number(raw)) || Number(raw) < 1)) {
+          throw { body: { error: 'invalid_body', message: `${k} must be a positive integer or empty (empty = global default)` } };
+        }
+      }
+      const step = await platform.stepUp(quotaForm.code.trim(), 'org:quota:update');
+      await platform.request(`/v1/platform/orgs/${encodeURIComponent(orgId)}/quotas`, {
+        method: 'PUT',
+        body: {
+          service: quotaService,
+          requestsPerMin: emptyToNull(quotaForm.requestsPerMin),
+          requestsPer5h: emptyToNull(quotaForm.requestsPer5h),
+          requestsPerDay: emptyToNull(quotaForm.requestsPerDay),
+          tokensPerDay: emptyToNull(quotaForm.tokensPerDay),
+          executionsPerHour: emptyToNull(quotaForm.executionsPerHour),
+          concurrentExecutions: emptyToNull(quotaForm.concurrentExecutions),
+          ...(quotaForm.reason.trim() ? { reason: quotaForm.reason.trim() } : {}),
+        },
+        stepUpToken: step.token,
+      });
+      setQuotaForm({ requestsPerMin: '', requestsPer5h: '', requestsPerDay: '', tokensPerDay: '', executionsPerHour: '', concurrentExecutions: '', reason: '', code: '' });
+      setNotice(`Quota override saved for ${quotaService}. Effective at the edge within ~30 seconds.`);
+      await load(); await loadAudit();
+    } catch (ex) { setModalErr(ex); } finally { setBusy(false); }
+  };
+
+  const resetQuota = async (service, code) => {
+    if (busy) return; setBusy(true); setErr(null); setModalErr(null);
+    try {
+      const step = await platform.stepUp(String(code || '').trim(), 'org:quota:update');
+      await platform.request(`/v1/platform/orgs/${encodeURIComponent(orgId)}/quotas/${encodeURIComponent(service)}`, {
+        method: 'DELETE',
+        stepUpToken: step.token,
+      });
+      setNotice(`Quota override for ${service} reset to global defaults.`);
+      await load(); await loadAudit();
+    } catch (ex) { setModalErr(ex); } finally { setBusy(false); }
+  };
   const runConfirm = async ({ reason, stepUpToken }) => {
     const a = confirm;
     if (!a) return;
@@ -156,8 +269,72 @@ export default function AdminOrganizationDetail() {
     if (tab === 'admins') return <Card><h3 className="font-semibold mb-3">Organization administrators</h3>{data.admins?.length ? <ul className="space-y-2 text-sm">{data.admins.map((u) => <li key={u.id}><Link className="text-main-blue" to={`/admin/users/${u.id}`} state={{ from: userListFrom }}>{u.email}</Link> <span className="text-normal-text">({u.display_name || '–'})</span></li>)}</ul> : <Empty text="No organization administrator" />}</Card>;
     if (tab === 'roles') return <Card><div className="flex justify-between mb-3"><h3 className="font-semibold">Roles</h3>{canWrite && <Btn kind="secondary" onClick={() => { setModalErr(null); setCreateRoleOpen(true); }}>+ New role</Btn>}</div>{data.roles?.length ? <Table head={['Account', 'Slug', 'Description']}>{data.roles.map((r) => <tr key={r.id} className="border-t border-slate-100"><td className="py-2 pr-4">{r.account_slug}</td><td className="py-2 pr-4 font-mono">{r.slug}</td><td className="py-2 pr-4">{r.description || '–'}</td></tr>)}</Table> : <Empty text="No roles" />}</Card>;
     if (tab === 'policies') return <Card><div className="flex justify-between mb-3"><h3 className="font-semibold">Policies</h3>{canWrite && <Btn kind="secondary" onClick={() => { setModalErr(null); setCreatePolicyOpen(true); }}>+ New policy</Btn>}</div>{data.policies?.length ? <Table head={['Account', 'Slug', 'Description']}>{data.policies.map((p) => <tr key={p.id} className="border-t border-slate-100"><td className="py-2 pr-4">{p.account_slug}</td><td className="py-2 pr-4 font-mono">{p.slug}</td><td className="py-2 pr-4">{p.description || '–'}</td></tr>)}</Table> : <Empty text="No policies" />}</Card>;
-    if (tab === 'keys') return <Card><h3 className="font-semibold mb-3">API keys</h3>{data.keys?.length ? <Table head={['Account', 'Name', 'Prefix', 'Scopes', 'Expires', 'Status', '']}>{data.keys.map((k) => <tr key={k.id} className="border-t border-slate-100"><td className="py-2 pr-4">{k.account_slug}</td><td className="py-2 pr-4">{k.name}</td><td className="py-2 pr-4 font-mono">{k.prefix}</td><td className="py-2 pr-4 text-xs">{k.scopes?.join(', ')}</td><td className="py-2 pr-4">{fmt(k.expires_at)}</td><td className="py-2 pr-4">{k.revoked_at ? <Badge tone="red">revoked</Badge> : <Badge tone="green">active</Badge>}</td><td>{canWrite && !k.revoked_at && <Btn kind="danger" onClick={() => setConfirm({ path: `/v1/platform/orgs/${orgId}/keys/${k.id}/revoke`, action: 'org:key:revoke', title: 'Revoke API key', message: `Revoke ${k.name}? This cannot be undone.`, requireReason: true, success: 'API key revoked.' })}>Revoke</Btn>}</td></tr>)}</Table> : <Empty text="No API keys" />}</Card>;
-    if (tab === 'serviceAccounts') return <Card><h3 className="font-semibold mb-3">Service accounts</h3>{data.serviceAccounts?.length ? <Table head={['Account', 'Slug', 'Description', 'Status', '']}>{data.serviceAccounts.map((s) => <tr key={s.id} className="border-t border-slate-100"><td className="py-2 pr-4">{s.account_slug}</td><td className="py-2 pr-4 font-mono">{s.slug}</td><td className="py-2 pr-4">{s.description || '–'}</td><td className="py-2 pr-4">{s.revoked_at ? <Badge tone="red">revoked</Badge> : <Badge tone="green">active</Badge>}</td><td>{canWrite && !s.revoked_at && <Btn kind="danger" onClick={() => setConfirm({ path: `/v1/platform/orgs/${orgId}/service-accounts/${s.id}/revoke`, action: 'org:service-account:revoke', title: 'Revoke service account', message: `Revoke ${s.slug}? New tokens are blocked; existing short-lived tokens are checked against org status.`, requireReason: true, success: 'Service account revoked.' })}>Revoke</Btn>}</td></tr>)}</Table> : <Empty text="No service accounts" />}</Card>;
+    if (tab === 'keys') return (<Card>
+      <div className="flex justify-between mb-3"><h3 className="font-semibold">API keys</h3>{canWrite && <Btn kind="secondary" onClick={() => { setModalErr(null); setCreatedKey(null); setCreateKeyOpen(true); }}>+ New key</Btn>}</div>
+      {createdKey && (
+        <div className="mb-3 rounded-2xl bg-emerald-500/10 p-3 text-sm">
+          <p className="font-medium text-emerald-700">New secret issued — copy it now, it is shown only once.</p>
+          <div className="mt-2 rounded-2xl bg-white p-3 break-all font-mono text-xs">{createdKey.apiKey}</div>
+          <div className="flex gap-2 mt-2">
+            <Btn kind="secondary" onClick={() => navigator.clipboard?.writeText(createdKey.apiKey)}>Copy secret</Btn>
+            <Btn kind="secondary" onClick={() => setCreatedKey(null)}>Dismiss</Btn>
+          </div>
+        </div>
+      )}
+      {data.keys?.length ? <Table head={['Account', 'Name / prefix', 'Owner', 'Scopes', 'Created', 'Last used', 'Expires', 'Status', '']}>{data.keys.map((k) => { const status = keyStatus(k); return <tr key={k.id} className="border-t border-slate-100"><td className="py-2 pr-4">{k.account_slug}</td><td className="py-2 pr-4"><p>{k.name || '–'}</p><p className="font-mono text-xs text-normal-text">{k.prefix}</p></td><td className="py-2 pr-4 text-xs">{k.owner_email || k.owner_name || 'Account key'}</td><td className="py-2 pr-4 text-xs">{k.scopes?.join(', ')}</td><td className="py-2 pr-4 text-xs">{fmt(k.created_at)}</td><td className="py-2 pr-4 text-xs">{fmt(k.last_used_at)}</td><td className="py-2 pr-4 text-xs">{fmt(k.expires_at)}</td><td className="py-2 pr-4">{status === 'revoked' ? <Badge tone="red">revoked</Badge> : status === 'expired' ? <Badge tone="amber">expired</Badge> : <Badge tone="green">active</Badge>}</td><td>{canWrite && status === 'active' && <div className="flex gap-2"><Btn kind="secondary" loading={busy} onClick={() => rotateKey(k)}>Rotate</Btn><Btn kind="danger" onClick={() => setConfirm({ path: `/v1/platform/orgs/${orgId}/keys/${k.id}/revoke`, action: 'org:key:revoke', title: 'Revoke API key', message: `Revoke ${k.name}? This cannot be undone.`, confirmLabel: 'Revoke key', requireReason: true, success: 'API key revoked.' })}>Revoke</Btn></div>}</td></tr>; })}</Table> : <Empty text="No API keys" />}
+      <p className="mt-2 text-xs text-normal-text">Only metadata is listed. Existing plaintext secrets cannot be retrieved; rotate a key to issue a replacement.</p>
+    </Card>);
+    if (tab === 'quotas') {
+      const eff = data.quotaEffective || {};
+      const services = ['ai', 'inference', 'workflow'];
+      const current = eff[quotaService] || {};
+      return (<>
+        <Card>
+          <div className="flex justify-between mb-3"><h3 className="font-semibold">Effective quotas</h3><Link to="/admin/quotas" className="text-xs text-main-blue hover:underline">All overrides →</Link></div>
+          {services.length ? <Table head={['Service', 'Requests/min', 'Requests/5h', 'Requests/day', 'Tokens/day', 'Flow exec/hour', 'Concurrent']}>{services.map((s) => {
+            const q = eff[s] || {};
+            const cell = (v, field) => {
+              const applicable = !((field === 'tokensPerDay' && s === 'workflow') || ((field === 'executionsPerHour' || field === 'concurrentExecutions') && s !== 'workflow'));
+              if (!applicable) return <span className="text-normal-text">not applicable</span>;
+              return <div><p className="tabular-nums">{v == null ? 'unlimited' : Number(v).toLocaleString()}</p><p className="text-[11px] text-normal-text">{quotaFieldSource(q, field)}</p></div>;
+            };
+            return <tr key={s} className="border-t border-slate-100"><td className="py-2 pr-4 font-mono">{s}</td><td className="py-2 pr-4">{cell(q.requestsPerMin, 'requestsPerMin')}</td><td className="py-2 pr-4">{cell(q.requestsPer5h, 'requestsPer5h')}</td><td className="py-2 pr-4">{cell(q.requestsPerDay, 'requestsPerDay')}</td><td className="py-2 pr-4">{cell(q.tokensPerDay, 'tokensPerDay')}</td><td className="py-2 pr-4">{cell(q.executionsPerHour, 'executionsPerHour')}</td><td className="py-2 pr-4">{cell(q.concurrentExecutions, 'concurrentExecutions')}</td></tr>;
+          })}</Table> : <Empty text="No quota data" />}
+          <p className="mt-2 text-xs text-normal-text">Request windows are fixed: minute epoch buckets, five-hour epoch buckets and UTC calendar days. Tokens/day applies to AI &amp; Inference; flow executions/hour and concurrency apply to Workflow. Effective within ~30 seconds.</p>
+        </Card>
+        {canWrite && (
+          <Card className="mt-4">
+            <h3 className="font-semibold mb-3">Set override</h3>
+            <Err e={modalErr} />
+            <form onSubmit={saveQuota}>
+              <Field label="Service">
+                <select value={quotaService} onChange={(e) => setQuotaService(e.target.value)} className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm">
+                  {services.map((s) => <option key={s} value={s}>{s}</option>)}
+                </select>
+              </Field>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="Requests/min (empty = default)"><Input value={quotaForm.requestsPerMin} onChange={(e) => setQuotaForm({ ...quotaForm, requestsPerMin: e.target.value })} placeholder={String(data.quotaDefaults?.[quotaService]?.requestsPerMin ?? '')} inputMode="numeric" /></Field>
+                <Field label="Requests/5h (empty = default)"><Input value={quotaForm.requestsPer5h} onChange={(e) => setQuotaForm({ ...quotaForm, requestsPer5h: e.target.value })} placeholder={String(data.quotaDefaults?.[quotaService]?.requestsPer5h ?? '')} inputMode="numeric" /></Field>
+                <Field label="Requests/day (empty = default)"><Input value={quotaForm.requestsPerDay} onChange={(e) => setQuotaForm({ ...quotaForm, requestsPerDay: e.target.value })} placeholder={String(data.quotaDefaults?.[quotaService]?.requestsPerDay ?? '')} inputMode="numeric" /></Field>
+                {(quotaService === 'ai' || quotaService === 'inference') && <Field label="Tokens/day (empty = default)"><Input value={quotaForm.tokensPerDay} onChange={(e) => setQuotaForm({ ...quotaForm, tokensPerDay: e.target.value })} placeholder={String(data.quotaDefaults?.[quotaService]?.tokensPerDay ?? '')} inputMode="numeric" /></Field>}
+                {quotaService === 'workflow' && <Field label="Flow executions/hour (empty = default)"><Input value={quotaForm.executionsPerHour} onChange={(e) => setQuotaForm({ ...quotaForm, executionsPerHour: e.target.value })} placeholder={String(data.quotaDefaults?.workflow?.executionsPerHour ?? '')} inputMode="numeric" /></Field>}
+                {quotaService === 'workflow' && <Field label="Concurrent flows (empty = default)"><Input value={quotaForm.concurrentExecutions} onChange={(e) => setQuotaForm({ ...quotaForm, concurrentExecutions: e.target.value })} placeholder={String(data.quotaDefaults?.workflow?.concurrentExecutions ?? '')} inputMode="numeric" /></Field>}
+              </div>
+              <Field label="Reason (audit log)"><Input value={quotaForm.reason} onChange={(e) => setQuotaForm({ ...quotaForm, reason: e.target.value })} placeholder="Campaign launch" /></Field>
+              <Field label="Authenticator code"><Input value={quotaForm.code} onChange={(e) => setQuotaForm({ ...quotaForm, code: e.target.value })} autoComplete="one-time-code" required /></Field>
+              <div className="flex gap-2">
+                <Btn type="submit" loading={busy}>Save override</Btn>
+                {current.overridden && <Btn type="button" kind="secondary" loading={busy} onClick={() => {
+                  const code = window.prompt('Enter your authenticator code to reset this override to global defaults:');
+                  if (code) resetQuota(quotaService, code);
+                }}>Reset to default</Btn>}
+              </div>
+            </form>
+          </Card>
+        )}
+      </>);
+    }
+    if (tab === 'serviceAccounts') return <Card><h3 className="font-semibold mb-3">Service accounts</h3>{data.serviceAccounts?.length ? <Table head={['Account', 'Slug', 'Description', 'Status', '']}>{data.serviceAccounts.map((s) => <tr key={s.id} className="border-t border-slate-100"><td className="py-2 pr-4">{s.account_slug}</td><td className="py-2 pr-4 font-mono">{s.slug}</td><td className="py-2 pr-4">{s.description || '–'}</td><td className="py-2 pr-4">{s.revoked_at ? <Badge tone="red">revoked</Badge> : <Badge tone="green">active</Badge>}</td><td>{canWrite && !s.revoked_at && <Btn kind="danger" onClick={() => setConfirm({ path: `/v1/platform/orgs/${orgId}/service-accounts/${s.id}/revoke`, action: 'org:service-account:revoke', title: 'Revoke service account', message: `Revoke ${s.slug}? New tokens are blocked; existing short-lived tokens are checked against org status.`, confirmLabel: 'Revoke service account', requireReason: true, success: 'Service account revoked.' })}>Revoke</Btn>}</td></tr>)}</Table> : <Empty text="No service accounts" />}</Card>;
     if (tab === 'audit') return <Card><h3 className="font-semibold mb-3">Organization audit</h3><Err e={auditErr} />{audit.length ? <Table head={['Time', 'Action', 'Actor', 'Decision']}>{audit.map((e) => <tr key={e.id} className="border-t border-slate-100"><td className="py-2 pr-4 text-xs">{fmt(e.created_at)}</td><td className="py-2 pr-4 font-mono text-xs">{e.action}</td><td className="py-2 pr-4 text-xs">{e.actor_id?.slice(0, 8)}…</td><td className="py-2 pr-4">{e.decision ? 'allow' : 'deny'}</td></tr>)}</Table> : <Empty text="No audit records" />}</Card>;
     return null;
   };
@@ -168,16 +345,18 @@ export default function AdminOrganizationDetail() {
       <Err e={err} />
       {notice && <div className="mb-4 px-4 py-2.5 rounded-2xl bg-emerald-500/10 text-emerald-700 text-sm">{notice}</div>}
       {org?.status === 'suspended' && <div className="mb-4 px-4 py-2.5 rounded-2xl bg-amber-500/10 text-amber-700 text-sm">This organization is suspended. Tenant access is blocked until reactivation.</div>}
-      <div className="flex flex-wrap gap-2 mb-4">
-        {TABS.map(([id, label]) => <button key={id} type="button" onClick={() => setTab(id)} className={`px-3 py-1.5 rounded-xl text-xs ${tab === id ? 'bg-main-blue text-white' : 'bg-white text-main-text border border-slate-200'}`}>{label}</button>)}
+      <div className="flex flex-wrap gap-2 mb-4" role="tablist" aria-label="Organization resources">
+        {TABS.map(([id, label]) => <button key={id} type="button" role="tab" aria-selected={tab === id} onClick={() => selectTab(id)} className={`px-3 py-1.5 rounded-xl text-xs ${tab === id ? 'bg-main-blue text-white' : 'bg-white text-main-text border border-slate-200'}`}>{label}</button>)}
       </div>
-      {tabBody()}
+      <div role="tabpanel">{tabBody()}</div>
 
       {createAccountOpen && <Modal title="New tenant account" onClose={() => { setCreateAccountOpen(false); setModalErr(null); }}><form onSubmit={createAccount}><Err e={modalErr} /><Field label="Slug"><Input value={form.slug} onChange={(e) => setForm({ ...form, slug: e.target.value })} required /></Field><Field label="Display name"><Input value={form.displayName} onChange={(e) => setForm({ ...form, displayName: e.target.value })} required /></Field><Field label="Reason"><Input value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })} /></Field><Field label="Authenticator code"><Input value={form.code} onChange={(e) => setForm({ ...form, code: e.target.value })} autoComplete="one-time-code" required /></Field><Btn type="submit" loading={busy}>Create account</Btn></form></Modal>}
 
       {createRoleOpen && <Modal title="New organization role" onClose={() => { setCreateRoleOpen(false); setModalErr(null); }}><form onSubmit={createRole}><Err e={modalErr} /><Field label="Account"><select value={roleForm.accountId} onChange={(e) => setRoleForm({ ...roleForm, accountId: e.target.value })} required className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm">{<option value="">Select account</option>}{data?.accounts?.map((a) => <option key={a.id} value={a.id}>{a.slug}</option>)}</select></Field><Field label="Role slug"><Input value={roleForm.slug} onChange={(e) => setRoleForm({ ...roleForm, slug: e.target.value })} required /></Field><Field label="Description"><Input value={roleForm.description} onChange={(e) => setRoleForm({ ...roleForm, description: e.target.value })} /></Field><Field label="Authenticator code"><Input value={roleForm.code} onChange={(e) => setRoleForm({ ...roleForm, code: e.target.value })} autoComplete="one-time-code" required /></Field><Btn type="submit" loading={busy}>Create role</Btn></form></Modal>}
 
       {createPolicyOpen && <Modal title="New organization policy" onClose={() => { setCreatePolicyOpen(false); setModalErr(null); }}><form onSubmit={createPolicy}><Err e={modalErr} /><Field label="Account"><select value={policyForm.accountId} onChange={(e) => setPolicyForm({ ...policyForm, accountId: e.target.value })} required className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm">{<option value="">Select account</option>}{data?.accounts?.map((a) => <option key={a.id} value={a.id}>{a.slug}</option>)}</select></Field><Field label="Policy slug"><Input value={policyForm.slug} onChange={(e) => setPolicyForm({ ...policyForm, slug: e.target.value })} required /></Field><Field label="Description"><Input value={policyForm.description} onChange={(e) => setPolicyForm({ ...policyForm, description: e.target.value })} /></Field><Field label="Policy JSON"><textarea value={policyForm.document} onChange={(e) => setPolicyForm({ ...policyForm, document: e.target.value })} rows={10} className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-xs font-mono" /></Field><Field label="Authenticator code"><Input value={policyForm.code} onChange={(e) => setPolicyForm({ ...policyForm, code: e.target.value })} autoComplete="one-time-code" required /></Field><Btn type="submit" loading={busy}>Create policy</Btn></form></Modal>}
+
+      {createKeyOpen && <Modal title="New tenant API key" onClose={() => { setCreateKeyOpen(false); setModalErr(null); }}><form onSubmit={createKey}><Err e={modalErr} /><p className="text-xs text-normal-text mb-3">Minted by a platform super admin on behalf of this tenant. The secret is shown once — send it through a trusted channel.</p><Field label="Account"><select value={keyForm.accountId} onChange={(e) => setKeyForm({ ...keyForm, accountId: e.target.value })} required className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm">{<option value="">Select account</option>}{data?.accounts?.map((a) => <option key={a.id} value={a.id}>{a.slug}</option>)}</select></Field><Field label="Key name"><Input value={keyForm.name} onChange={(e) => setKeyForm({ ...keyForm, name: e.target.value })} placeholder="support-breakglass" /></Field><Field label="Scopes (comma-separated, platform:* never allowed)"><Input value={keyForm.scopes} onChange={(e) => setKeyForm({ ...keyForm, scopes: e.target.value })} placeholder="base:read, workflow:Execute" required /></Field><Field label="Expires in days (empty = never)"><Input value={keyForm.expiresInDays} onChange={(e) => setKeyForm({ ...keyForm, expiresInDays: e.target.value })} inputMode="numeric" placeholder="90" /></Field><Field label="Reason"><Input value={keyForm.reason} onChange={(e) => setKeyForm({ ...keyForm, reason: e.target.value })} /></Field><Field label="Authenticator code"><Input value={keyForm.code} onChange={(e) => setKeyForm({ ...keyForm, code: e.target.value })} autoComplete="one-time-code" required /></Field><Btn type="submit" loading={busy}>Create key</Btn></form></Modal>}
 
       {confirm && <AdminActionDialog open title={confirm.title} message={confirm.message} action={confirm.action} confirmLabel={confirm.confirmLabel || 'Confirm'} requireReason={!!confirm.requireReason} minReasonLength={confirm.minReasonLength || 1} onClose={() => setConfirm(null)} onConfirm={runConfirm} />}
     </>

@@ -19,7 +19,11 @@ pub const MAX_SESSION_CACHE_MS: u64 = 30_000;
 pub const DEFAULT_AUTHZ_CACHE_MS: u64 = 30_000;
 pub const MAX_AUTHZ_CACHE_MS: u64 = 300_000;
 pub const DEFAULT_INFERENCE_LIMIT: u32 = 60;
-pub const MAX_INFERENCE_LIMIT: u32 = 100_000;
+pub const DEFAULT_AI_LIMIT: u32 = 30;
+pub const DEFAULT_WORKFLOW_LIMIT: u32 = 120;
+pub const MAX_RATE_LIMIT: u32 = 100_000;
+pub const DEFAULT_QUOTA_CACHE_MS: u64 = 30_000;
+pub const MAX_QUOTA_CACHE_MS: u64 = 300_000;
 
 /// Accepted during the SynapseDX -> SynapseOne rebrand window.
 pub const JWT_ISSUERS: [&str; 2] = ["synapseone-iam", "synapsedx-iam"];
@@ -47,7 +51,8 @@ pub struct Config {
     pub authz_audit_ack: String,
     pub trust_proxy: TrustProxy,
     pub proxy_timeout_ms: u64,
-    pub inference_rate_limit_per_min: u32,
+    pub quota_defaults: crate::quotas::QuotaDefaults,
+    pub quota_cache_ttl: Duration,
     pub session_cache_ttl: Duration,
     pub authz_cache_ttl: Duration,
     pub cors_origins: Vec<String>,
@@ -139,15 +144,26 @@ impl Config {
             _ => DEFAULT_PROXY_TIMEOUT_MS,
         };
 
-        let inference_rate_limit_per_min = match std::env::var("INFERENCE_RATE_LIMIT_PER_MIN")
-            .ok()
-            .and_then(|value| value.trim().parse::<f64>().ok())
-        {
-            Some(value) if value.is_finite() => {
-                (value.floor() as i64).clamp(1, MAX_INFERENCE_LIMIT as i64) as u32
-            }
-            _ => DEFAULT_INFERENCE_LIMIT,
-        };
+        let mut ai = service_quota_defaults("AI", DEFAULT_AI_LIMIT, Some("AI_RATE_LIMIT"));
+        ai.tpd = Some(clamped_quota(std::env::var("AI_QUOTA_TOKENS_PER_DAY").ok().as_deref(), 1_000_000));
+        let mut inference = service_quota_defaults("INFERENCE", DEFAULT_INFERENCE_LIMIT, Some("INFERENCE_RATE_LIMIT_PER_MIN"));
+        inference.tpd = Some(clamped_quota(std::env::var("INFERENCE_QUOTA_TOKENS_PER_DAY").ok().as_deref(), 1_000_000));
+        let mut workflow = service_quota_defaults("WORKFLOW", DEFAULT_WORKFLOW_LIMIT, None);
+        workflow.eph = Some(clamped_quota_max(
+            std::env::var("WORKFLOW_QUOTA_EXECUTIONS_PER_HOUR").ok().as_deref(),
+            1_000,
+            1_000_000,
+        ));
+        workflow.concurrent = Some(clamped_quota(
+            std::env::var("WORKFLOW_QUOTA_CONCURRENT").ok().as_deref(),
+            10,
+        ).min(1_000));
+        let quota_defaults = crate::quotas::QuotaDefaults { ai, inference, workflow };
+        let quota_cache_ttl = Duration::from_millis(clamped_ms(
+            std::env::var("QUOTA_CACHE_TTL_MS").ok().as_deref(),
+            DEFAULT_QUOTA_CACHE_MS,
+            MAX_QUOTA_CACHE_MS,
+        ));
 
         let session_cache_ttl = Duration::from_millis(clamped_ms(
             std::env::var("GATEWAY_SESSION_CACHE_MS").ok().as_deref(),
@@ -177,7 +193,8 @@ impl Config {
             authz_audit_ack: audit_ack,
             trust_proxy,
             proxy_timeout_ms,
-            inference_rate_limit_per_min,
+            quota_defaults,
+            quota_cache_ttl,
             session_cache_ttl,
             authz_cache_ttl,
             cors_origins,
@@ -197,6 +214,43 @@ fn env_or(name: &str, fallback: &str) -> String {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| fallback.to_string())
+}
+
+fn service_quota_defaults(prefix: &str, fallback_rpm: u32, legacy_rpm: Option<&str>) -> crate::quotas::ServiceDefaults {
+    let preferred = std::env::var(format!("{prefix}_QUOTA_REQUESTS_PER_MIN")).ok();
+    let legacy = legacy_rpm.and_then(|name| std::env::var(name).ok());
+    let fallback = clamped_rate_limit(legacy.as_deref(), fallback_rpm);
+    let rpm = u64::from(clamped_rate_limit(preferred.as_deref(), fallback));
+    crate::quotas::ServiceDefaults {
+        rpm,
+        rp5h: clamped_quota(std::env::var(format!("{prefix}_QUOTA_REQUESTS_PER_5H")).ok().as_deref(), rpm * 300),
+        rpd: clamped_quota(std::env::var(format!("{prefix}_QUOTA_REQUESTS_PER_DAY")).ok().as_deref(), rpm * 1_440),
+        tpd: None,
+        eph: None,
+        concurrent: None,
+    }
+}
+
+fn clamped_rate_limit(raw: Option<&str>, fallback: u32) -> u32 {
+    match raw.and_then(|value| value.trim().parse::<f64>().ok()) {
+        Some(value) if value.is_finite() => {
+            (value.floor() as i64).clamp(1, MAX_RATE_LIMIT as i64) as u32
+        }
+        _ => fallback,
+    }
+}
+
+fn clamped_quota(raw: Option<&str>, fallback: u64) -> u64 {
+    clamped_quota_max(raw, fallback, 1_000_000_000)
+}
+
+fn clamped_quota_max(raw: Option<&str>, fallback: u64, max: u64) -> u64 {
+    match raw.and_then(|value| value.trim().parse::<f64>().ok()) {
+        Some(value) if value.is_finite() => {
+            (value.floor() as i64).clamp(1, max as i64) as u64
+        }
+        _ => fallback,
+    }
 }
 
 fn clamped_ms(raw: Option<&str>, fallback: u64, max: u64) -> u64 {
@@ -601,4 +655,15 @@ fn prefix_bits_match(base: &[u8], candidate: &[u8], prefix: u32) -> bool {
     }
     let mask = 0xffu8 << (8 - rest);
     (base[full] & mask) == (candidate[full] & mask)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamped_quota_max;
+
+    #[test]
+    fn workflow_execution_clamp_matches_iam_and_typescript() {
+        assert_eq!(clamped_quota_max(Some("5000000"), 1_000, 1_000_000), 1_000_000);
+        assert_eq!(clamped_quota_max(Some("500"), 1_000, 1_000_000), 500);
+    }
 }

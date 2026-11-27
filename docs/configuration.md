@@ -1,5 +1,7 @@
 # Configuration (env reference)
 
+[Tiếng Việt](vi/configuration.md) · English
+
 Copy `.env.example` → `.env` and replace every `*_change_me_*` value. Which service
 reads which key (audited from source):
 
@@ -41,7 +43,12 @@ reads which key (audited from source):
 | `SYNAPSEONE_INTERNAL_SECRET` | — (dev) | gateway → service credential (`x-synapseone-internal` header); **identical** on every service in production |
 | `HSTS_ENABLED` | `false` | `true` → send `Strict-Transport-Security` (only behind TLS) |
 | `TRUST_PROXY` | `false` | Express trust-proxy: unset/`0` = direct exposure; `1` behind one nginx/Ingress hop; or a CIDR/name list. `true` is rejected (XFF spoofing). |
-| `INFERENCE_RATE_LIMIT_PER_MIN` | `60` | per-tenant AI/inference quota; `429` + `Retry-After` when exceeded |
+| `AI_QUOTA_REQUESTS_PER_MIN` / `INFERENCE_QUOTA_REQUESTS_PER_MIN` / `WORKFLOW_QUOTA_REQUESTS_PER_MIN` | 30 / 60 / 120 | canonical per-tenant request/minute defaults; legacy `AI_RATE_LIMIT` and `INFERENCE_RATE_LIMIT_PER_MIN` remain fallback inputs |
+| `AI_QUOTA_REQUESTS_PER_5H` / `INFERENCE_QUOTA_REQUESTS_PER_5H` / `WORKFLOW_QUOTA_REQUESTS_PER_5H` | minute × 300 | fixed epoch-five-hour request defaults |
+| `AI_QUOTA_REQUESTS_PER_DAY` / `INFERENCE_QUOTA_REQUESTS_PER_DAY` / `WORKFLOW_QUOTA_REQUESTS_PER_DAY` | minute × 1440 | fixed UTC-calendar-day request defaults |
+| `AI_QUOTA_TOKENS_PER_DAY` / `INFERENCE_QUOTA_TOKENS_PER_DAY` | 1000000 / 1000000 | existing best-effort daily token budgets |
+| `WORKFLOW_QUOTA_EXECUTIONS_PER_HOUR` / `WORKFLOW_QUOTA_CONCURRENT` | 1000 / 10 | shared workflow execution/hour and in-flight lease defaults for normal routes and MCP calls |
+| `QUOTA_CACHE_TTL_MS` | 30000 | IAM effective-quota/meter cache (0–300000 ms) |
 | `GATEWAY_SESSION_CACHE_MS` | `2000` | session/credential revalidation cache (1–30000 ms). Suspension, disable, account retirement and key revocation take effect within this window; 403 results are cached for the same window. |
 | `AUTHZ_CACHE_TTL_MS` | `30000` | policy decision cache per principal/action/resource (0 disables, max 300000). Role/policy edits take effect within this window; lifecycle state is checked by the 2 s session cache first. |
 | `VALKEY_URL` / `REDIS_URL` | — (memory) | `redis://...` → Redis-protocol backend for services that opt in (legacy name `REDIS_URL` still honoured). The gateway's edge limiter is in-memory. |
@@ -53,6 +60,12 @@ reads which key (audited from source):
 |---|---|---|
 | `PORT` | 4001 | listen port |
 | `DATABASE_URL` | — (memory) | `postgres://...` → enables the Postgres backend |
+| `IAM_QUOTA_VALKEY_URL` | falls back to `VALKEY_URL`, then `REDIS_URL` | Valkey used by atomic `/internal/quota/check`; unavailable/empty → 503 so the gateway uses its local minute fallback |
+| `AI_QUOTA_REQUESTS_PER_MIN` / `AI_QUOTA_REQUESTS_PER_5H` / `AI_QUOTA_REQUESTS_PER_DAY` | 30 / 9000 / 43200 | AI global request defaults; 5h/day derive from the effective minute value when unset |
+| `INFERENCE_QUOTA_REQUESTS_PER_MIN` / `INFERENCE_QUOTA_REQUESTS_PER_5H` / `INFERENCE_QUOTA_REQUESTS_PER_DAY` | 60 / 18000 / 86400 | inference global request defaults; 5h/day derive when unset |
+| `WORKFLOW_QUOTA_REQUESTS_PER_MIN` / `WORKFLOW_QUOTA_REQUESTS_PER_5H` / `WORKFLOW_QUOTA_REQUESTS_PER_DAY` | 120 / 36000 / 172800 | workflow global request defaults; 5h/day derive when unset |
+| `AI_QUOTA_TOKENS_PER_DAY` / `INFERENCE_QUOTA_TOKENS_PER_DAY` | 1000000 / 1000000 | nullable-inherited effective token defaults |
+| `WORKFLOW_QUOTA_EXECUTIONS_PER_HOUR` / `WORKFLOW_QUOTA_CONCURRENT` | 1000 / 10 | workflow execution and concurrency defaults |
 | `IAM_JWT_SECRET` | — | HS256 for access/service JWTs (≥32 random chars); boot fails in `NODE_ENV=production` when weak/default |
 | `IAM_JWT_EXPIRES_IN` / `IAM_REFRESH_EXPIRES_IN` | 3600 / 2592000 (seconds) | token TTLs (clamped 60–86400 / 3600–315360000; garbage env falls back to default) |
 | `IAM_API_KEY_PEPPER` | — (plain SHA-256) | HMAC pepper for API-key/refresh-token hashes at rest; keys created before the pepper still verify (legacy fallback) |
@@ -74,6 +87,21 @@ reads which key (audited from source):
 | `IAM_EXPOSE_LIFECYCLE_TOKENS` | `false` | **opt-in** dev convenience for self-service **password-reset and email-verify** tokens when no mailer is wired. Always off in production (`NODE_ENV=production`, or `SYNAPSEONE_ENV`/`SYNAPSEDX_ENV`/`APP_ENV`/`ENVIRONMENT` = `production`/`prod`). Organization/user activation codes are returned only by authorized admin/platform routes (platform owner/operator + step-up where required), never by public recovery endpoints. |
 | `IAM_RESET_TOKEN_TTL_SECONDS` / `IAM_VERIFY_TOKEN_TTL_SECONDS` | `3600` / `86400` | single-use token TTLs (clamped) |
 | `OIDC_ALLOWED_ORGS` | — (any slug) | comma-separated org **slugs** allowed through OIDC → `403 org_not_allowed` otherwise. A new slug is self-service (org is created on first login); joining an **existing** org always requires an existing membership (`403 org_membership_required`) |
+
+## Quota enforcement and rollout
+
+Use the same canonical `*_QUOTA_*` values on IAM and gateway. Request windows are
+fixed epoch-minute, epoch-five-hour and UTC-day buckets; they are not sliding.
+IAM's Valkey Lua operation checks all three before incrementing any and applies
+TTLs atomically. A Valkey outage produces `503 quota_unavailable`, and the
+gateway fails open to its in-memory minute limiter. Anonymous traffic always
+uses that local limiter. Production should keep `IAM_QUOTA_VALKEY_URL` (or
+`VALKEY_URL`) reachable and monitor 503s; a local-only fallback is per replica
+and is not a substitute for shared quota enforcement.
+
+For rollback, restore previous images/env first and keep the additive
+`org_quotas` table plus migration journal. Old images ignore the new columns.
+Counters expire by fixed-window TTL; do not flush unrelated Valkey namespaces.
 
 ## Workflow (`apps/workflow-service`)
 
@@ -97,6 +125,7 @@ reads which key (audited from source):
 | `WORKFLOW_SYSTEM_QUEUE_TENANT_MAX` | 100 | max queued+running system-runner executions per tenant (0 disables the admission cap) |
 | `MCP_ALLOW_ANONYMOUS` | `false` | opt-in anonymous MCP; only structurally read-only public tools are exposed. The gateway still requires authentication for `/mcp` |
 | `MCP_ANONYMOUS_RATE_LIMIT_PER_MIN` | 30 | per-source-IP anonymous MCP request limit when the opt-in above is enabled |
+| `WORKFLOW_MCP_QUOTA_ENFORCEMENT` | true in production / false in dev | MCP-only switch for the shared IAM execution-hour/concurrency admission on every actual `tools/call`, including batches; normal gateway execution routes always enforce it and quota-store failure fails closed |
 | `SYNAPSEONE_PUBLIC_URL` | `https://api.synapseone.space` | gateway URL embedded in runner commands |
 | `WORKFLOW_RUNNER_IMAGE` | `ghcr.io/.../synapseone-workflow-runner:latest` | runner image embedded in commands |
 | `WORKFLOW_RUNNER_HEARTBEAT_SECONDS` | 15 | connector heartbeat interval (5–300) |
