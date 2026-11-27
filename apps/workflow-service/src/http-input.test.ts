@@ -40,7 +40,7 @@ const definition = (parameters: Record<string, unknown>) => ({
 describe('httpRequest includeInput', () => {
   it('default keeps the historical {statusCode, body} shape', async () => {
     fakeFetch({ ok: true });
-    const result = await runWorkflow(definition({}), { alpha: 1 });
+    const result = await runWorkflow(definition({}), { alpha: 1 }, { hostResolver: async () => ['93.184.216.34'] });
     assert.equal(result.status, 'success');
     assert.deepEqual(result.output, { statusCode: 200, body: { ok: true } });
     assert.equal(Object.prototype.hasOwnProperty.call(result.output, 'input'), false);
@@ -49,7 +49,7 @@ describe('httpRequest includeInput', () => {
   it('includeInput:true returns a cloned copy of the incoming node value', async () => {
     fakeFetch({ ok: true });
     const input = { alpha: 1, nested: { deep: true }, list: [1, 2, 3] };
-    const result = await runWorkflow(definition({ includeInput: true }), input);
+    const result = await runWorkflow(definition({ includeInput: true }), input, { hostResolver: async () => ['93.184.216.34'] });
     assert.equal(result.status, 'success');
     assert.equal(result.output.statusCode, 200);
     assert.deepEqual(result.output.body, { ok: true });
@@ -62,7 +62,7 @@ describe('httpRequest includeInput', () => {
   it('counts input and body together against the output limit', async () => {
     const big = 'x'.repeat(300_000);
     fakeFetch({ big });
-    const result = await runWorkflow(definition({ includeInput: true }), { big });
+    const result = await runWorkflow(definition({ includeInput: true }), { big }, { hostResolver: async () => ['93.184.216.34'] });
     assert.equal(result.status, 'error');
     assert.match(String(result.error || ''), /exceeds 500KB/);
   });
@@ -70,7 +70,7 @@ describe('httpRequest includeInput', () => {
   it('a body-only response within the limit still passes with includeInput', async () => {
     const big = 'x'.repeat(300_000);
     fakeFetch({ big });
-    const result = await runWorkflow(definition({ includeInput: true }), { small: true });
+    const result = await runWorkflow(definition({ includeInput: true }), { small: true }, { hostResolver: async () => ['93.184.216.34'] });
     assert.equal(result.status, 'success');
     assert.equal(result.output.body.big.length, 300_000);
     assert.deepEqual(result.output.input, { small: true });

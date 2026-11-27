@@ -21,7 +21,8 @@ import {
   fitRunnerResources,
   sanitizeResourceSample,
 } from './runner-resources';
-import { credentials, cronClaims, executions, humanTasks, inferenceJobs, runnerUsageHourly, secrets, secretVersions, webhookDeliveries, webhookRateBuckets, workflowRunnerInstances, workflowRunners, workflows } from './schema';
+import { credentials, cronClaims, executions, humanTasks, inferenceJobs, runnerUsageHourly, secrets, secretVersions, webhookDeliveries, webhookRateBuckets, workflowReservations, workflowRunnerInstances, workflowRunners, workflows } from './schema';
+import { assertNoWorkflowReservationConflicts, reservationsForWorkflow, WorkflowReservationConflict } from './reservations';
 
 /** Caller principal stamped by the gateway (P0-2). Anonymous when called
  *  directly with only the internal secret (dev/tests). */
@@ -33,6 +34,8 @@ export interface Principal {
   /** Verified credential scopes at the time the run was queued. A platform
    *  runner uses these to mint the per-execution delegated token. */
   scopes?: string[];
+  /** Verified API-key id stamped by the gateway (runner protocol binding). */
+  keyId?: string;
   /** Bound runner registration (platform-runner machine credentials only). */
   runnerId?: string;
   /** Organization administrator snapshot from the verified IAM session. */
@@ -212,7 +215,7 @@ function getDirectPool(): Pool | null {
   }
   return directPool;
 }
-const db = pool ? drizzle(pool, { schema: { credentials, cronClaims, executions, humanTasks, inferenceJobs, runnerUsageHourly, secrets, secretVersions, webhookDeliveries, webhookRateBuckets, workflowRunnerInstances, workflowRunners, workflows } }) : null;
+const db = pool ? drizzle(pool, { schema: { credentials, cronClaims, executions, humanTasks, inferenceJobs, runnerUsageHourly, secrets, secretVersions, webhookDeliveries, webhookRateBuckets, workflowReservations, workflowRunnerInstances, workflowRunners, workflows } }) : null;
 
 export function useDb(): boolean {
   return !!db;
@@ -526,7 +529,7 @@ export async function ensureTables(): Promise<void> {
       try {
         // Hold the advisory lock on the same dedicated session that runs the
         // migration (pool connections are not guaranteed to be reused).
-        const migrationDb = drizzle(client, { schema: { credentials, executions, inferenceJobs, runnerUsageHourly, workflowRunnerInstances, workflowRunners, workflows } });
+        const migrationDb = drizzle(client, { schema: { credentials, executions, inferenceJobs, runnerUsageHourly, workflowReservations, workflowRunnerInstances, workflowRunners, workflows } });
         await migrationDb.execute(sql`select pg_advisory_lock(hashtext('synapseone_workflow_migrations'))`);
         try {
           await migrate(migrationDb, {
@@ -659,21 +662,35 @@ export async function createWorkflowRec(data: {
   };
   if (db) {
     await ensureTables();
-    const rows = await db.insert(workflows).values({
-      id: rec.id,
-      name: rec.name,
-      nodes: rec.nodes,
-      connections: rec.connections,
-      settings: rec.settings,
-      active: rec.active,
-      orgId: rec.org_id,
-      accountId: rec.account_id,
-      ownerSub: rec.owner_sub,
-      runAs: rec.run_as,
-      revision: 1,
-    }).returning();
-    return rowToWorkflow(rows[0]);
+    try {
+      return await db.transaction(async (tx: any) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtext('synapseone_workflow_reservations'))`);
+        if (rec.active) {
+          const activeRows = await tx.select().from(workflows).where(eq(workflows.active, true));
+          assertNoWorkflowReservationConflicts(rec, activeRows.map(rowToWorkflow));
+        }
+        const rows = await tx.insert(workflows).values({
+          id: rec.id,
+          name: rec.name,
+          nodes: rec.nodes,
+          connections: rec.connections,
+          settings: rec.settings,
+          active: rec.active,
+          orgId: rec.org_id,
+          accountId: rec.account_id,
+          ownerSub: rec.owner_sub,
+          runAs: rec.run_as,
+          revision: 1,
+        }).returning();
+        const created = rowToWorkflow(rows[0]);
+        await replaceReservationsTx(tx, created);
+        return created;
+      });
+    } catch (error: any) {
+      reservationWriteError(error);
+    }
   }
+  assertNoWorkflowReservationConflicts(rec, [...memWorkflows.values()]);
   memWorkflows.set(rec.id, rec);
   return rec;
 }
@@ -703,38 +720,10 @@ export async function listWorkflowRecs(filter?: { orgId?: string; accountId?: st
   return arr;
 }
 
-export async function updateWorkflowRec(
-  id: string,
-  patch: { name?: string; nodes?: any[]; connections?: Record<string, any>; settings?: Record<string, any>; active?: boolean; org_id?: string | null; account_id?: string | null; run_as?: string | null },
-): Promise<StoredWorkflow | null> {
-  if (db) {
-    await ensureTables();
-    const cur = await getWorkflowRec(id);
-    if (!cur) return null;
-    const next = {
-      name: patch.name ?? cur.name,
-      nodes: patch.nodes ?? cur.nodes,
-      connections: patch.connections ?? cur.connections,
-      settings: patch.settings ?? cur.settings,
-      active: patch.active ?? cur.active,
-      orgId: patch.org_id !== undefined ? cleanTenant(patch.org_id) : cur.org_id,
-      accountId: patch.account_id !== undefined ? cleanTenant(patch.account_id) : cur.account_id,
-      runAs: patch.run_as !== undefined ? cleanTenant(patch.run_as) : cur.run_as,
-    };
-    // Only the executable graph is revisioned. Activation, rename, settings
-    // and tenant metadata edits must not invalidate already-queued executions.
-    const graphChanged = JSON.stringify(cur.nodes) !== JSON.stringify(next.nodes)
-      || JSON.stringify(cur.connections) !== JSON.stringify(next.connections);
-    const rows = await db.update(workflows).set({
-      ...next,
-      ...(graphChanged ? { revision: sql`${workflows.revision} + 1` } : {}),
-      updatedAt: new Date(),
-    }).where(eq(workflows.id, id)).returning();
-    return rows[0] ? rowToWorkflow(rows[0]) : null;
-  }
-  const cur = memWorkflows.get(id);
-  if (!cur) return null;
-  const next: StoredWorkflow = {
+function nextWorkflow(cur: StoredWorkflow, patch: {
+  name?: string; nodes?: any[]; connections?: Record<string, any>; settings?: Record<string, any>; active?: boolean; org_id?: string | null; account_id?: string | null; run_as?: string | null;
+}): StoredWorkflow {
+  return {
     ...cur,
     name: patch.name ?? cur.name,
     nodes: patch.nodes ?? cur.nodes,
@@ -750,6 +739,74 @@ export async function updateWorkflowRec(
     ),
     updated_at: nowIso(),
   };
+}
+
+async function replaceReservationsTx(tx: any, workflow: StoredWorkflow): Promise<void> {
+  await tx.delete(workflowReservations).where(eq(workflowReservations.workflowId, workflow.id));
+  const reservations = reservationsForWorkflow(workflow);
+  if (reservations.length) {
+    await tx.insert(workflowReservations).values(reservations.map((reservation) => ({
+      kind: reservation.kind,
+      reservationKey: reservation.key,
+      workflowId: workflow.id,
+    })));
+  }
+}
+
+function reservationWriteError(error: any): never {
+  const constraint = String(error?.constraint || '');
+  if (String(error?.code) === '23505' && constraint.includes('synapseone_workflow_reservations')) {
+    const webhook = /webhook/i.test(String(error?.message || error?.detail || ''));
+    throw new WorkflowReservationConflict(
+      webhook ? 'webhook_path_conflict' : 'mcp_tool_conflict',
+      webhook ? 'webhook path is already reserved by another active workflow' : 'MCP tool name is already reserved by another active workflow',
+    );
+  }
+  throw error;
+}
+
+export async function updateWorkflowRec(
+  id: string,
+  patch: { name?: string; nodes?: any[]; connections?: Record<string, any>; settings?: Record<string, any>; active?: boolean; org_id?: string | null; account_id?: string | null; run_as?: string | null },
+): Promise<StoredWorkflow | null> {
+  if (db) {
+    await ensureTables();
+    try {
+      return await db.transaction(async (tx: any) => {
+        // Serialize conflict-check + workflow update + reservation replacement
+        // across replicas. The reservation PK is a second, database-enforced
+        // guard; neither check is best-effort.
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtext('synapseone_workflow_reservations'))`);
+        const currentRows = await tx.select().from(workflows).where(eq(workflows.id, id)).limit(1);
+        if (!currentRows[0]) return null;
+        const cur = rowToWorkflow(currentRows[0]);
+        const next = nextWorkflow(cur, patch);
+        const activeRows = await tx.select().from(workflows).where(eq(workflows.active, true));
+        assertNoWorkflowReservationConflicts(next, activeRows.map(rowToWorkflow));
+        const rows = await tx.update(workflows).set({
+          name: next.name,
+          nodes: next.nodes,
+          connections: next.connections,
+          settings: next.settings,
+          active: next.active,
+          orgId: next.org_id,
+          accountId: next.account_id,
+          runAs: next.run_as,
+          ...(next.revision !== cur.revision ? { revision: sql`${workflows.revision} + 1` } : {}),
+          updatedAt: new Date(),
+        }).where(eq(workflows.id, id)).returning();
+        const updated = rowToWorkflow(rows[0]);
+        await replaceReservationsTx(tx, updated);
+        return updated;
+      });
+    } catch (error: any) {
+      reservationWriteError(error);
+    }
+  }
+  const cur = memWorkflows.get(id);
+  if (!cur) return null;
+  const next = nextWorkflow(cur, patch);
+  assertNoWorkflowReservationConflicts(next, [...memWorkflows.values()]);
   memWorkflows.set(id, next);
   return next;
 }
@@ -757,8 +814,11 @@ export async function updateWorkflowRec(
 export async function deleteWorkflowRec(id: string): Promise<boolean> {
   if (db) {
     await ensureTables();
-    const rows = await db.delete(workflows).where(eq(workflows.id, id)).returning({ id: workflows.id });
-    return rows.length > 0;
+    return db.transaction(async (tx: any) => {
+      await tx.delete(workflowReservations).where(eq(workflowReservations.workflowId, id));
+      const rows = await tx.delete(workflows).where(eq(workflows.id, id)).returning({ id: workflows.id });
+      return rows.length > 0;
+    });
   }
   return memWorkflows.delete(id);
 }

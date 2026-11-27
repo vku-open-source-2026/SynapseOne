@@ -72,6 +72,7 @@ async function runHttp(
         resolves += 1;
         return credential || { kind: 'api-key', secret: 'credential-secret-value' };
       },
+      hostResolver: async () => ['93.184.216.34'],
     },
   );
   return { result, resolves };

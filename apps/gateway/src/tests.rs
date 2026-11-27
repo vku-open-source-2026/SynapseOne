@@ -922,6 +922,11 @@ fn routes_yaml_loads_and_validates() {
         find_route(&routes, "/v1/workflows/x/execute").unwrap().timeout_ms,
         Some(300_000)
     );
+    // Runner job protocols accept machine credentials only, never user JWTs.
+    assert_eq!(
+        find_route(&routes, "/v1/runner/jobs/x/claim").unwrap().auth,
+        AuthMode::ApiKey
+    );
     // Anonymous MCP is disabled at the edge; the gateway requires a credential.
     assert_eq!(
         find_route(&routes, "/mcp").unwrap().auth,
@@ -1028,6 +1033,7 @@ fn propagate_principal_anonymous_marker_and_stamping() {
 
     let api_key = Principal {
         r#type: "apikey".into(),
+        key_id: Some("key-7".into()),
         org: Some("o1".into()),
         account: Some("a1".into()),
         scopes: vec!["x".into(), "y".into()],
@@ -1050,6 +1056,14 @@ fn propagate_principal_anonymous_marker_and_stamping() {
     assert_eq!(
         header_value(&headers, "x-synapseone-scopes").as_deref(),
         Some("x,y")
+    );
+    assert_eq!(
+        header_value(&headers, "x-synapseone-key-id").as_deref(),
+        Some("key-7")
+    );
+    assert_eq!(
+        header_value(&headers, "x-synapsedx-key-id").as_deref(),
+        Some("key-7")
     );
 }
 
@@ -1244,6 +1258,10 @@ fn propagate_principal_strips_spoofs_and_mirrors_legacy() {
     headers.insert("x-synapseone-user", HeaderValue::from_static("mallory"));
     headers.insert("x-synapseone-kind", HeaderValue::from_static("user"));
     headers.insert("x-synapseone-internal", HeaderValue::from_static("forged"));
+    headers.insert(
+        "x-synapseone-key-id",
+        HeaderValue::from_static("forged-key"),
+    );
     headers.insert("x-synapseone-evil", HeaderValue::from_static("1"));
     headers.insert("x-synapsedx-user", HeaderValue::from_static("mallory"));
     headers.insert("x-synapsedx-org", HeaderValue::from_static("spoofed"));
@@ -1253,6 +1271,7 @@ fn propagate_principal_strips_spoofs_and_mirrors_legacy() {
     assert!(headers.get("x-synapseone-user").is_none());
     assert!(headers.get("x-synapseone-kind").is_none());
     assert!(headers.get("x-synapseone-internal").is_none());
+    assert!(headers.get("x-synapseone-key-id").is_none());
     assert!(headers.get("x-synapseone-evil").is_none());
     assert!(headers.get("x-synapsedx-evil").is_none());
     assert_eq!(
@@ -2277,10 +2296,25 @@ async fn api_key_verification_and_fail_closed() {
         upstream.header("x-synapseone-scopes").as_deref(),
         Some("faststore:*")
     );
+    assert_eq!(
+        upstream.header("x-synapseone-key-id").as_deref(),
+        Some("key-1")
+    );
     assert!(upstream.header("x-synapseone-user").is_none());
     assert_eq!(mock.key_internal().as_deref(), Some(TEST_INTERNAL));
     assert_eq!(mock.key_body().unwrap()["apiKey"], "good-key");
     assert!(mock.key_hits() >= 1);
+
+    // API-key-only routes accept the runner's Bearer <api-key> spelling, but
+    // still verify it as a machine key and stamp its immutable key id.
+    let response = client
+        .get(format!("{}/v1/apikey", gateway.base))
+        .header("authorization", "Bearer good-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(upstream.header("x-synapseone-key-id").as_deref(), Some("key-1"));
 
     // A user-bound key (verified IAM `user_id`) must reach the upstream as the
     // real user with `kind=apikey` preserved, on both header spellings, and any
@@ -2386,6 +2420,22 @@ async fn api_key_verification_and_fail_closed() {
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["error"], "missing_api_key");
     assert_eq!(body["message"], "X-API-Key required");
+
+    // Even a valid user JWT is not a runner machine credential.
+    let response = client
+        .get(format!("{}/v1/apikey", gateway.base))
+        .header(
+            "authorization",
+            format!("Bearer {}", user_token("u1", "o1")),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"],
+        "invalid_api_key"
+    );
 
     let dead_config = test_config("http://127.0.0.1:1");
     let dead_gateway = spawn_gateway(

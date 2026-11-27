@@ -14,6 +14,7 @@ import path from 'path';
 import os from 'os';
 import { isIP } from 'net';
 import { promises as dns } from 'dns';
+import { Agent } from 'undici';
 
 // ---------- SSRF guard (P0-1) ----------
 // Hostnames are never enough: the host string is normalized (IPv4-mapped
@@ -157,28 +158,89 @@ async function defaultResolveHost(host: string): Promise<string[]> {
   return recs.map((r) => r.address);
 }
 
-/** Runtime SSRF check: sync host guard + DNS resolution of the hostname.
- *  Throws when the URL (or any address it resolves to) is private/reserved.
- *  Unresolvable names are allowed through — fetch would fail on them too,
- *  and this keeps the guard deterministic for mocked/offline tests. */
-export async function assertUrlAllowed(raw: string, resolveHost: HostResolver = defaultResolveHost): Promise<void> {
+/** Runtime SSRF check: validate a URL and return the exact addresses that the
+ *  transport is allowed to connect to. The caller must use these addresses for
+ *  the connection; validating first and then letting fetch resolve again is a
+ *  DNS-rebinding vulnerability. Unresolvable names fail closed. */
+export interface ResolvedAllowedUrl {
+  url: URL;
+  addresses: string[];
+}
+
+export async function resolveAllowedUrl(
+  raw: string,
+  resolveHost: HostResolver = defaultResolveHost,
+): Promise<ResolvedAllowedUrl> {
   if (isBlockedUrl(raw)) throw new Error(`blocked internal URL (${String(raw).slice(0, 120)})`);
   let u: URL;
   try { u = new URL(String(raw)); } catch { throw new Error(`invalid URL (${String(raw).slice(0, 120)})`); }
-  if (isAllowedSelfUrl(u)) return;
   const host = stripHost(u.hostname);
-  if (isIP(host)) return; // literal checked by isBlockedUrl above
+  const allowedSelf = isAllowedSelfUrl(u);
+  if (isIP(host)) {
+    return { url: u, addresses: allowedSelf || !isBlockedHost(host) ? [host] : [] };
+  }
   let addresses: string[];
   try {
     addresses = await resolveHost(host);
   } catch {
-    return; // NXDOMAIN/offline: fetch will fail the same way
+    throw new Error(`URL hostname could not be resolved (${host})`);
   }
-  for (const a of addresses) {
-    const ip = stripHost(a);
-    if (isIP(ip) === 0 || isBlockedHost(ip)) {
+  const pinned = [...new Set(addresses.map((address) => stripHost(address)))];
+  if (!pinned.length) throw new Error(`URL hostname resolved to no addresses (${host})`);
+  for (const ip of pinned) {
+    if (isIP(ip) === 0 || (!allowedSelf && isBlockedHost(ip))) {
       throw new Error(`blocked internal URL (${host} resolved to ${ip})`);
     }
+  }
+  return { url: u, addresses: pinned };
+}
+
+/** Backwards-compatible guard used by callers/tests that only need validation. */
+export async function assertUrlAllowed(raw: string, resolveHost: HostResolver = defaultResolveHost): Promise<void> {
+  await resolveAllowedUrl(raw, resolveHost);
+}
+
+/** Build a dispatcher whose DNS lookup can only return validated addresses.
+ *  The request URL keeps the original hostname, so undici preserves the Host
+ *  header and TLS SNI while the socket is pinned to a checked address. */
+export function createPinnedDispatcher(
+  addresses: string[],
+  connectOptions: Record<string, unknown> = {},
+): Agent {
+  const pinned = [...new Set(addresses.map((address) => stripHost(address)))];
+  if (!pinned.length || pinned.some((address) => isIP(address) === 0)) {
+    throw new Error('pinned transport requires at least one valid IP address');
+  }
+  const lookup = (hostname: string, options: any, callback: any) => {
+    if (typeof options === 'function') { callback = options; options = {}; }
+    const records = pinned.map((address) => ({ address, family: isIP(address) }));
+    if (options?.all) callback(null, records);
+    else callback(null, records[0].address, records[0].family);
+  };
+  return new Agent({
+    connect: {
+      ...connectOptions,
+      lookup,
+    },
+  } as any);
+}
+
+/** Fetch through a validated-address dispatcher. `close` must be called after
+ *  the response body is consumed or cancelled. */
+export async function fetchWithPinnedAddress(
+  raw: string | URL,
+  addresses: string[],
+  init: RequestInit,
+  connectOptions: Record<string, unknown> = {},
+): Promise<{ response: Response; close: () => void }> {
+  const dispatcher = createPinnedDispatcher(addresses, connectOptions);
+  const close = () => { void dispatcher.close().catch(() => undefined); };
+  try {
+    const response = await globalThis.fetch(raw, { ...init, dispatcher } as any);
+    return { response, close };
+  } catch (error) {
+    close();
+    throw error;
   }
 }
 
@@ -271,6 +333,9 @@ export interface RunOpts {
   principal?: RunPrincipal | null;
   credentialResolver?: CredentialResolver;
   synapseoneCall?: SynapseOneCall;
+  /** Test/integration hook; production uses the system DNS resolver. The
+   *  returned addresses are pinned for the actual socket connection. */
+  hostResolver?: HostResolver;
   /** Durable human-task bridge (#44). When a humanTask node is reached the
    *  engine creates the task and pauses; the caller persists the checkpoint. */
   humanTask?: {
@@ -421,6 +486,7 @@ const TRIGGER_TYPES = new Set([
 
 const MAX_CODE_BYTES = 50 * 1024;
 const MAX_OUTPUT_BYTES = 500 * 1024;
+const MAX_REDIRECT_DRAIN_BYTES = 64 * 1024;
 const CODE_TIMEOUT_MS = 5000;
 const HTTP_TIMEOUT_MS = 15000;
 const MAX_HTTP_TIMEOUT_MS = 30000;
@@ -444,6 +510,51 @@ function safeJsonSize(v: any): number {
   } catch {
     return Number.MAX_SAFE_INTEGER;
   }
+}
+
+/** Consume an upstream body with a hard byte cap. The stream is cancelled and
+ *  the request aborted on overflow instead of allocating the complete body and
+ *  checking its size afterwards. The small fallback is only for fetch mocks;
+ *  real Node fetch responses always expose a web ReadableStream. */
+export async function readCappedResponseBody(
+  response: Response,
+  maxBytes: number,
+  label: string,
+  signal?: AbortSignal,
+  abort?: () => void,
+): Promise<Buffer> {
+  const rejectOversize = async (): Promise<never> => {
+    abort?.();
+    try { await response.body?.cancel(); } catch { /* already closed */ }
+    throw new Error(`${label}: response exceeds ${maxBytes} bytes`);
+  };
+  const declared = Number(response.headers?.get?.('content-length'));
+  if (Number.isFinite(declared) && declared > maxBytes) return rejectOversize();
+  if (!response.body) {
+    const bytes = typeof response.arrayBuffer === 'function'
+      ? new Uint8Array(await response.arrayBuffer())
+      : typeof response.text === 'function'
+        ? new TextEncoder().encode(await response.text())
+        : new TextEncoder().encode(JSON.stringify(await response.json()));
+    if (bytes.byteLength > maxBytes) return rejectOversize();
+    return Buffer.from(bytes);
+  }
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = Buffer.from(value);
+      if (total + chunk.byteLength > maxBytes) return rejectOversize();
+      total += chunk.byteLength;
+      chunks.push(chunk);
+    }
+  } finally {
+    try { reader.releaseLock(); } catch { /* cancelled */ }
+  }
+  return Buffer.concat(chunks, total);
 }
 
 function clone<T>(v: T): T {
@@ -979,14 +1090,15 @@ function assertCredentialOrigin(url: string, origins: Set<string>): void {
   }
 }
 
-async function execHttp(node: EngineNode, input: any, ctx?: { principal?: RunPrincipal | null; credentialResolver?: CredentialResolver }): Promise<any> {
+async function execHttp(node: EngineNode, input: any, ctx?: { principal?: RunPrincipal | null; credentialResolver?: CredentialResolver; hostResolver?: HostResolver }): Promise<any> {
   const p = node.parameters || {};
   let url = String(p.url ?? p.uri ?? '');
   // support "={{ $json.url }}" templating
   if (/^\s*=?\{\{/.test(url)) url = String(toValue(url, input) ?? '');
   if (!url) throw new Error('httpRequest: missing url');
+  let firstHop: ResolvedAllowedUrl;
   try {
-    await assertUrlAllowed(url);
+    firstHop = await resolveAllowedUrl(url, ctx?.hostResolver);
   } catch (e: any) {
     throw new Error(`httpRequest: ${e?.message || e}`);
   }
@@ -1096,13 +1208,16 @@ async function execHttp(node: EngineNode, input: any, ctx?: { principal?: RunPri
     let curUrl = url;
     let curMethod = method;
     let curBody: string | undefined = body;
+    let resolved: ResolvedAllowedUrl = firstHop;
     const MAX_HOPS = 5;
     for (let hop = 0; ; hop++) {
       if (hop > MAX_HOPS) throw new Error(`httpRequest: too many redirects (>${MAX_HOPS})`);
-      try {
-        await assertUrlAllowed(curUrl);
-      } catch (e: any) {
-        throw new Error(`httpRequest: ${e?.message || e}`);
+      if (!resolved) {
+        try {
+          resolved = await resolveAllowedUrl(curUrl, ctx?.hostResolver);
+        } catch (e: any) {
+          throw new Error(`httpRequest: redirect ${e?.message || e}`);
+        }
       }
       if (allowedOrigins) {
         try {
@@ -1111,51 +1226,58 @@ async function execHttp(node: EngineNode, input: any, ctx?: { principal?: RunPri
           throw new Error(`httpRequest: redirect ${e?.message || e}`);
         }
       }
-      const r = await fetch(curUrl, { method: curMethod, headers, body: curBody, signal: ctl.signal, redirect: 'manual' as any });
-      if (r.status >= 300 && r.status < 400) {
-        const loc = r.headers.get('location');
-        await r.arrayBuffer().catch(() => undefined); // drain before hop
-        if (!loc) throw new Error(`httpRequest: ${curMethod} ${curUrl} -> ${r.status} (redirect without location)`);
-        let next: string;
-        try {
-          next = new URL(loc, curUrl).toString();
-        } catch {
-          throw new Error('httpRequest: redirect has invalid location');
-        }
-        try {
-          await assertUrlAllowed(next);
-        } catch (e: any) {
-          throw new Error(`httpRequest: redirect ${e?.message || e}`);
-        }
-        if (new URL(next).origin !== new URL(curUrl).origin) {
-          // An allowlisted service may redirect to an external origin. Neither
-          // its platform secret nor custom credential headers may follow it.
-          const publicHeaders = new Set(['accept', 'accept-language', 'content-type', 'user-agent']);
-          for (const key of Object.keys(headers)) {
-            if (!publicHeaders.has(key.toLowerCase())) delete headers[key];
-          }
-        }
-        curUrl = next;
-        // 301/302/303 downgrade to GET without body (fetch semantics).
-        if (r.status === 303 || ((r.status === 301 || r.status === 302) && curMethod === 'POST')) {
-          curMethod = 'GET';
-          curBody = undefined;
-        }
-        continue;
-      }
-      const text = await r.text();
-      let parsed: any = text;
+      const connection = await fetchWithPinnedAddress(resolved.url, resolved.addresses, {
+        method: curMethod, headers, body: curBody, signal: ctl.signal, redirect: 'manual' as any,
+      });
       try {
-        parsed = text ? JSON.parse(text) : null;
-      } catch {
-        /* keep text */
+        const r = connection.response;
+        if (r.status >= 300 && r.status < 400) {
+          const loc = r.headers.get('location');
+          await readCappedResponseBody(r, MAX_REDIRECT_DRAIN_BYTES, 'httpRequest: redirect body', ctl.signal, () => ctl.abort());
+          if (!loc) throw new Error(`httpRequest: ${curMethod} ${curUrl} -> ${r.status} (redirect without location)`);
+          let next: string;
+          try {
+            next = new URL(loc, curUrl).toString();
+          } catch {
+            throw new Error('httpRequest: redirect has invalid location');
+          }
+          try {
+            resolved = await resolveAllowedUrl(next, ctx?.hostResolver);
+          } catch (e: any) {
+            throw new Error(`httpRequest: redirect ${e?.message || e}`);
+          }
+          if (new URL(next).origin !== new URL(curUrl).origin) {
+            // An allowlisted service may redirect to an external origin. Neither
+            // its platform secret nor custom credential headers may follow it.
+            const publicHeaders = new Set(['accept', 'accept-language', 'content-type', 'user-agent']);
+            for (const key of Object.keys(headers)) {
+              if (!publicHeaders.has(key.toLowerCase())) delete headers[key];
+            }
+          }
+          curUrl = next;
+          // 301/302/303 downgrade to GET without body (fetch semantics).
+          if (r.status === 303 || ((r.status === 301 || r.status === 302) && curMethod === 'POST')) {
+            curMethod = 'GET';
+            curBody = undefined;
+          }
+          continue;
+        }
+        const text = (await readCappedResponseBody(r, MAX_OUTPUT_BYTES, 'httpRequest', ctl.signal, () => ctl.abort())).toString('utf8');
+        let parsed: any = text;
+        try {
+          parsed = text ? JSON.parse(text) : null;
+        } catch {
+          /* keep text */
+        }
+        if (!r.ok) throw new Error(`httpRequest: ${curMethod} ${curUrl} -> ${r.status}`);
+        const out = p.includeInput === true
+          ? { statusCode: r.status, body: parsed, input: clone(input) }
+          : { statusCode: r.status, body: parsed };
+        if (safeJsonSize(out) > MAX_OUTPUT_BYTES) throw new Error('httpRequest: response exceeds 500KB');
+        return out;
+      } finally {
+        connection.close();
       }
-      if (!r.ok) throw new Error(`httpRequest: ${curMethod} ${curUrl} -> ${r.status}`);
-      const out = p.includeInput === true
-        ? { statusCode: r.status, body: parsed, input: clone(input) }
-        : { statusCode: r.status, body: parsed };
-      if (safeJsonSize(out) > MAX_OUTPUT_BYTES) throw new Error('httpRequest: response exceeds 500KB');
-      return out;
     }
   } catch (e: any) {
     if (e?.name === 'AbortError') throw new Error(`httpRequest: timed out after ${timeoutMs}ms`);
@@ -1721,6 +1843,7 @@ export async function execAiAgentNode(
     principal?: RunPrincipal | null;
     credentialResolver?: CredentialResolver;
     synapseoneCall?: SynapseOneCall;
+    hostResolver?: HostResolver;
     /** Nodes wired into the agent's Tools socket — callable as tools. */
     toolNodes?: EngineNode[];
     /** Node wired into the agent's Model socket — overrides core/model. */
@@ -2102,6 +2225,7 @@ export async function execAiAgentNode(
         return await execHttp(fakeNode, data, {
           principal: ctx?.principal,
           credentialResolver: ctx?.credentialResolver,
+          hostResolver: ctx?.hostResolver,
         });
       }
       default:
@@ -2130,8 +2254,9 @@ export async function execAiAgentNode(
     // SSRF: baseUrl is workflow-controlled. Save-time scanning only catches
     // literal private hosts, so resolve + check at request time (this also
     // catches DNS names like 127.0.0.1.nip.io and literals in redirects).
+    let firstHop: ResolvedAllowedUrl;
     try {
-      await assertUrlAllowed(url);
+      firstHop = await resolveAllowedUrl(url, ctx?.hostResolver);
     } catch (e: any) {
       throw new Error(`AI Agent LLM: ${e?.message || e}`);
     }
@@ -2168,48 +2293,63 @@ export async function execAiAgentNode(
       let curUrl = url;
       let curMethod = 'POST';
       let curBody: string | undefined = JSON.stringify(payload);
+      let resolved: ResolvedAllowedUrl = firstHop;
       for (let hop = 0; ; hop++) {
         if (hop > MAX_HOPS) throw new Error(`AI Agent LLM: too many redirects (>${MAX_HOPS})`);
-        try {
-          await assertUrlAllowed(curUrl);
-        } catch (e: any) {
-          throw new Error(`AI Agent LLM redirect: ${e?.message || e}`);
+        if (!resolved) {
+          try {
+            resolved = await resolveAllowedUrl(curUrl, ctx?.hostResolver);
+          } catch (e: any) {
+            throw new Error(`AI Agent LLM redirect: ${e?.message || e}`);
+          }
         }
-        const resp = await fetch(curUrl, {
+        const connection = await fetchWithPinnedAddress(resolved.url, resolved.addresses, {
           method: curMethod,
           headers,
           body: curBody,
           signal: ctl.signal,
           redirect: 'manual' as any,
         });
-        if (resp.status >= 300 && resp.status < 400) {
-          const loc = resp.headers.get('location');
-          await resp.arrayBuffer().catch(() => undefined); // drain before hop
-          if (!loc) throw new Error(`AI Agent LLM: HTTP ${resp.status} redirect without location`);
-          let next: string;
-          try {
-            next = new URL(loc, curUrl).toString();
-          } catch {
-            throw new Error('AI Agent LLM: redirect has invalid location');
+        try {
+          const resp = connection.response;
+          if (resp.status >= 300 && resp.status < 400) {
+            const loc = resp.headers.get('location');
+            await readCappedResponseBody(resp, MAX_REDIRECT_DRAIN_BYTES, 'AI Agent LLM: redirect body', ctl.signal, () => ctl.abort());
+            if (!loc) throw new Error(`AI Agent LLM: HTTP ${resp.status} redirect without location`);
+            let next: string;
+            try {
+              next = new URL(loc, curUrl).toString();
+            } catch {
+              throw new Error('AI Agent LLM: redirect has invalid location');
+            }
+            try {
+              resolved = await resolveAllowedUrl(next, ctx?.hostResolver);
+            } catch (e: any) {
+              throw new Error(`AI Agent LLM redirect: ${e?.message || e}`);
+            }
+            if (new URL(next).origin !== new URL(curUrl).origin) {
+              // Credentials never cross an origin boundary.
+              delete headers['Authorization'];
+              delete headers['x-synapseone-internal'];
+            }
+            if (resp.status === 303 || ((resp.status === 301 || resp.status === 302) && curMethod === 'POST')) {
+              curMethod = 'GET';
+              curBody = undefined;
+              delete headers['Content-Type'];
+            }
+            curUrl = next;
+            continue;
           }
-          if (new URL(next).origin !== new URL(curUrl).origin) {
-            // Credentials never cross an origin boundary.
-            delete headers['Authorization'];
-            delete headers['x-synapseone-internal'];
+          const bodyBytes = await readCappedResponseBody(resp, MAX_OUTPUT_BYTES, 'AI Agent LLM', ctl.signal, () => ctl.abort());
+          if (!resp.ok) {
+            const errText = bodyBytes.toString('utf8');
+            throw new Error(`AI Agent LLM returned HTTP ${resp.status}: ${errText.slice(0, 200)}`);
           }
-          if (resp.status === 303 || ((resp.status === 301 || resp.status === 302) && curMethod === 'POST')) {
-            curMethod = 'GET';
-            curBody = undefined;
-            delete headers['Content-Type'];
-          }
-          curUrl = next;
-          continue;
+          const text = bodyBytes.toString('utf8');
+          return text ? JSON.parse(text) : null;
+        } finally {
+          connection.close();
         }
-        if (!resp.ok) {
-          const errText = await resp.text();
-          throw new Error(`AI Agent LLM returned HTTP ${resp.status}: ${errText.slice(0, 200)}`);
-        }
-        return await resp.json();
       }
     } finally {
       clearTimeout(to);
@@ -2643,7 +2783,7 @@ export async function runWorkflow(
       try {
         const output =
           kind === 'http'
-            ? await execHttp(node, data, { principal: opts?.principal, credentialResolver: opts?.credentialResolver })
+            ? await execHttp(node, data, { principal: opts?.principal, credentialResolver: opts?.credentialResolver, hostResolver: opts?.hostResolver })
             : kind === 'synapseone'
               ? await execSynapseOne(node, data, { principal: opts?.principal, synapseoneCall: opts?.synapseoneCall })
               : kind === 'integration'
@@ -2703,6 +2843,7 @@ export async function runWorkflow(
       principal: opts?.principal,
       credentialResolver: opts?.credentialResolver,
       synapseoneCall: opts?.synapseoneCall,
+      hostResolver: opts?.hostResolver,
       toolNodes,
       modelNode: modelNode ? byName.get(modelNode) || null : null,
       runToolNode: execToolNode,

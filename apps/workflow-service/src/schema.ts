@@ -31,6 +31,20 @@ export const workflows = pgTable(
   ],
 );
 
+export const workflowReservations = pgTable(
+  'synapseone_workflow_reservations',
+  {
+    kind: text('kind').notNull(),
+    reservationKey: text('reservation_key').notNull(),
+    workflowId: text('workflow_id').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.kind, t.reservationKey] }),
+    index('idx_synapseone_workflow_reservations_workflow').on(t.workflowId),
+  ],
+);
+
 export const executions = pgTable(
   'synapseone_executions',
   {

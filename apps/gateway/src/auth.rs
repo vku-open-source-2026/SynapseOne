@@ -261,11 +261,13 @@ impl AuthService {
                 self.authenticate_api_key(route, &api_key).await
             }
             AuthMode::ApiKey => {
-                let api_key = headers
-                    .get("x-api-key")
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or("");
-                self.authenticate_api_key(route, api_key).await
+                // Runner/CLI credentials may be presented as Bearer <api-key>.
+                // This remains API-key-only: a JWT is sent to IAM key
+                // verification and rejected, never accepted as a user session.
+                if api_key.is_empty() {
+                    api_key = bearer.to_string();
+                }
+                self.authenticate_api_key(route, &api_key).await
             }
         }
     }

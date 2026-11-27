@@ -1415,6 +1415,7 @@ export function principalFromHeaders(req: express.Request): import('./store').Pr
       sub: `platform-runner:${runnerHeader}`,
       kind: 'platform-runner',
       runnerId: runnerHeader,
+      keyId: clean(h('x-synapseone-key-id')),
       scopes: scopes(h('x-synapseone-scopes')),
     };
   }
@@ -1426,6 +1427,7 @@ export function principalFromHeaders(req: express.Request): import('./store').Pr
       org: clean(h('x-synapseone-org')),
       account: clean(h('x-synapseone-account')),
       kind: kindHeader,
+      keyId: clean(h('x-synapseone-key-id')),
       scopes: scopes(h('x-synapseone-scopes')),
       isOrgAdmin: h('x-synapseone-org-admin') === 'true',
       roles: roles(h('x-synapseone-roles')),
@@ -1446,6 +1448,7 @@ export function principalFromHeaders(req: express.Request): import('./store').Pr
       org,
       account,
       kind: kind || 'apikey',
+      keyId: clean(h('x-synapseone-key-id')),
       scopes: scopes(h('x-synapseone-scopes')),
     };
   }
@@ -3336,12 +3339,21 @@ function tenantBinding(
     if (size > 200 * 1024) return res.status(400).json({ error: 'payload_too_large', message: 'definition ≤200KB' });
     const tenant = tenantBinding(req, req.body || {}, cur);
     if (!tenant.ok) return res.status(tenant.status).json({ error: tenant.error, message: tenant.message });
-    const updated = await updateWorkflowRec(id, {
-      ...(name != null ? { name } : {}),
-      ...(settings != null ? { settings } : {}),
-      ...tenant.value,
-      nodes, connections,
-    });
+    let updated: StoredWorkflow | null;
+    try {
+      updated = await updateWorkflowRec(id, {
+        ...(name != null ? { name } : {}),
+        ...(settings != null ? { settings } : {}),
+        ...tenant.value,
+        nodes, connections,
+      });
+    } catch (e: any) {
+      if (e?.status === 409 && e?.code) {
+        return res.status(409).json({ error: String(e.code), message: String(e.message || e.code) });
+      }
+      console.error('[workflow] reservation check failed during update:', e?.message || e);
+      return res.status(503).json({ error: 'reservation_check_failed', message: 'cannot verify trigger reservations' });
+    }
     res.json(toApiWorkflow(updated!));
   });
 
@@ -3462,48 +3474,19 @@ function tenantBinding(
     // webhook misconfigurations must fail loudly here, not silently.
     const defErr = validateDefinition({ nodes: cur.nodes, connections: cur.connections });
     if (defErr) return res.status(400).json({ error: 'invalid_definition', message: defErr });
-    // M7: two active workflows sharing a webhook path make /webhook/:path
-    // routing ambiguous — refuse with 409 so the clash is explicit.
+    // Activation, conflict checking and reservation replacement are one
+    // persistence transaction. A failed check can never fall through to an
+    // unguarded activation.
+    let w: StoredWorkflow | null;
     try {
-      const trig = findWebhookTrigger({ nodes: cur.nodes });
-      if (trig) {
-        const all = await listWorkflowRecs();
-        const clash = all.find((w) => {
-          if (w.id === id || !w.active) return false;
-          return (w.nodes || []).some((n: any) => {
-            if (!isWebhookType((n as any)?.type)) return false;
-            return String((n as any)?.parameters?.path || '').replace(/^\/+|\/+$/g, '') === trig.path;
-          });
-        });
-        if (clash) {
-          return res.status(409).json({
-            error: 'webhook_path_conflict',
-            message: `webhook path '${trig.path}' already serves active workflow '${clash.name}' (${clash.id}) — change the path or deactivate it first`,
-          });
-        }
+      w = await updateWorkflowRec(id, { active: true });
+    } catch (e: any) {
+      if (e?.status === 409 && e?.code) {
+        return res.status(409).json({ error: String(e.code), message: String(e.message || e.code) });
       }
-      const mcp = findMcpTrigger({ nodes: cur.nodes });
-      if (mcp) {
-        const all = await listWorkflowRecs();
-        const caller = principalFromHeaders(req);
-        const clash = all.find((w) => {
-          if (w.id === id || !w.active) return false;
-          const other = findMcpTrigger({ nodes: w.nodes });
-          if (!other || other.toolName !== mcp.toolName) return false;
-          // Public tools are globally unique (anonymous lookup). Private tools
-          // may reuse a name only inside a different tenant.
-          if (mcp.public || other.public) return true;
-          return canAccessWorkflow(w, caller);
-        });
-        if (clash) {
-          return res.status(409).json({
-            error: 'mcp_tool_conflict',
-            message: `MCP tool '${mcp.toolName}' already serves active workflow '${clash.name}' (${clash.id}) — change the tool name or deactivate it first`,
-          });
-        }
-      }
-    } catch { /* conflict scan is best-effort */ }
-    const w = await updateWorkflowRec(id, { active: true });
+      console.error('[workflow] reservation check failed during activation:', e?.message || e);
+      return res.status(503).json({ error: 'reservation_check_failed', message: 'cannot verify trigger reservations' });
+    }
     if (!w) return res.status(404).json({ error: 'not_found', message: 'workflow not found' });
     res.json(toApiWorkflow(w));
   });
@@ -3659,8 +3642,11 @@ function tenantBinding(
     if (inferenceQueue !== null && !isQueueName(inferenceQueue)) {
       return res.status(400).json({ error: 'invalid_queue', message: 'inferenceQueue must match [A-Za-z][A-Za-z0-9_-]{0,63}' });
     }
-    const apiKeyId = b.apiKeyId ? String(b.apiKeyId).slice(0, 128) : null;
-    const keyPrefix = b.keyPrefix ? String(b.keyPrefix).slice(0, 32) : null;
+    const apiKeyId = b.apiKeyId ? String(b.apiKeyId).trim().slice(0, 128) : null;
+    if (b.apiKeyId != null && b.apiKeyId !== '' && (!apiKeyId || /[\r\n]/.test(apiKeyId))) {
+      return res.status(400).json({ error: 'invalid_api_key_id', message: 'apiKeyId must be 1..128 chars' });
+    }
+    const keyPrefix = b.keyPrefix ? String(b.keyPrefix).trim().slice(0, 32) : null;
     const scopes = Array.isArray(b.scopes) && b.scopes.length
       ? b.scopes.map(String).filter((s: string) => s && s.length <= 200).slice(0, 100)
       : RUNNER_KEY_SCOPES;
@@ -3748,7 +3734,21 @@ function tenantBinding(
     const runner = await loadRunnerForRequest(req, res);
     if (!runner) return;
     const b = (req.body || {}) as any;
-    const patch: { name?: string; kind?: 'workflow' | 'inference' | 'hybrid'; mode?: 'custom' | 'hybrid'; queue?: string; inference_queue?: string | null; metadata?: Record<string, any> } = {};
+    const patch: { name?: string; kind?: 'workflow' | 'inference' | 'hybrid'; mode?: 'custom' | 'hybrid'; queue?: string; inference_queue?: string | null; api_key_id?: string | null; key_prefix?: string | null; metadata?: Record<string, any> } = {};
+    if (b.apiKeyId !== undefined) {
+      const value = b.apiKeyId === null || b.apiKeyId === '' ? null : String(b.apiKeyId).trim();
+      if (value !== null && (!value || value.length > 128 || /[\r\n]/.test(value))) {
+        return res.status(400).json({ error: 'invalid_api_key_id', message: 'apiKeyId must be 1..128 chars' });
+      }
+      patch.api_key_id = value;
+    }
+    if (b.keyPrefix !== undefined) {
+      const value = b.keyPrefix === null || b.keyPrefix === '' ? null : String(b.keyPrefix).trim();
+      if (value !== null && (!value || value.length > 32 || /[\r\n]/.test(value))) {
+        return res.status(400).json({ error: 'invalid_key_prefix', message: 'keyPrefix must be 1..32 chars' });
+      }
+      patch.key_prefix = value;
+    }
     if (b.name !== undefined) {
       const name = String(b.name).trim();
       if (!RUNNER_NAME_RE.test(name)) return res.status(400).json({ error: 'invalid_name', message: 'name must be 1..100 printable chars' });
@@ -5038,9 +5038,24 @@ function tenantBinding(
         res.status(404).json({ error: 'not_found', message: 'runner not found' });
         return null;
       }
+      // The gateway stamps platform-runner only after verifying its dedicated
+      // key. When it also stamps the key id, enforce the registration binding.
+      if (principal.keyId && runner.api_key_id && principal.keyId !== runner.api_key_id) {
+        res.status(404).json({ error: 'not_found', message: 'runner not found' });
+        return null;
+      }
       return runner;
     }
-    if (!canAccessRunner(runner, principal)) {
+    // Tenant membership is not a runner credential. Every job operation must
+    // present the API key bound to this registration; user JWTs and unrelated
+    // same-tenant keys are deliberately indistinguishable from a missing row.
+    if (
+      principal?.kind !== 'apikey'
+      || !principal.keyId
+      || !runner.api_key_id
+      || principal.keyId !== runner.api_key_id
+      || !canAccessRunner(runner, principal)
+    ) {
       res.status(404).json({ error: 'not_found', message: 'runner not found' });
       return null;
     }

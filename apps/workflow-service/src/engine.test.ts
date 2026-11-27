@@ -190,8 +190,8 @@ describe('engine: http + ssrf + cycle + cron', () => {
     await assert.rejects(assertUrlAllowed('https://rebind.example/', async () => ['::ffff:127.0.0.1']), /blocked internal URL/);
     await assert.rejects(assertUrlAllowed('https://rebind.example/', async () => ['/tmp/socket']), /blocked internal URL/);
     await assert.doesNotReject(assertUrlAllowed('https://public.example/', async () => ['93.184.216.34']));
-    // Unresolvable names pass the guard and simply fail at fetch time.
-    await assert.doesNotReject(assertUrlAllowed('https://nxdomain.example/', async () => { throw new Error('ENOTFOUND'); }));
+    // Unresolvable names fail closed: there is no validated address to pin.
+    await assert.rejects(assertUrlAllowed('https://nxdomain.example/', async () => { throw new Error('ENOTFOUND'); }), /could not be resolved/);
   });
   it('detects cycles', () => {
     const cyc = detectCycle(
@@ -233,7 +233,7 @@ describe('engine: http + ssrf + cycle + cron', () => {
       const r = await runWorkflow({
         nodes: [N('Start', 'n8n-nodes-base.manualTrigger'), N('H', 'n8n-nodes-base.httpRequest', { url: 'https://api.example.com/x', method: 'POST' })],
         connections: { Start: { main: [[{ node: 'H' }]] } } as any,
-      }, { secret: 'should-not-send' });
+      }, { secret: 'should-not-send' }, { hostResolver: async () => ['93.184.216.34'] });
       assert.equal(r.status, 'success');
       assert.equal(seenBody, undefined);
     } finally {
@@ -252,7 +252,7 @@ describe('engine: http + ssrf + cycle + cron', () => {
       const r = await runWorkflow({
         nodes: [N('Start', 'n8n-nodes-base.manualTrigger'), N('H', 'n8n-nodes-base.httpRequest', { url: 'https://api.example.com/go', method: 'GET' })],
         connections: { Start: { main: [[{ node: 'H' }]] } } as any,
-      }, {});
+      }, {}, { hostResolver: async () => ['93.184.216.34'] });
       assert.equal(r.status, 'error');
       assert.match(String(r.error), /blocked internal/);
     } finally {
@@ -273,7 +273,7 @@ describe('engine: http + ssrf + cycle + cron', () => {
       const r = await runWorkflow({
         nodes: [N('Start', 'n8n-nodes-base.manualTrigger'), N('H', 'n8n-nodes-base.httpRequest', { url: 'https://api.example.com/go', method: 'GET' })],
         connections: { Start: { main: [[{ node: 'H' }]] } } as any,
-      }, {});
+      }, {}, { hostResolver: async () => ['93.184.216.34'] });
       assert.equal(r.status, 'success');
       assert.deepEqual(seen, ['https://api.example.com/go', 'https://api.example.com/done']);
     } finally {
@@ -373,7 +373,7 @@ describe('engine: disabled, retry, onError, credentials, principal (P0/P2)', () 
       const r = await runWorkflow({
         nodes: [N('Start', 'n8n-nodes-base.manualTrigger'), N('H', 'n8n-nodes-base.httpRequest', { url: 'https://api.example.com/x', method: 'GET', retry: { attempts: 3, delayMs: 1 } })],
         connections: { Start: { main: [[{ node: 'H' }]] } } as any,
-      }, {});
+      }, {}, { hostResolver: async () => ['93.184.216.34'] });
       assert.equal(r.status, 'success');
       assert.equal(calls, 3);
       assert.equal(r.nodeRuns.find((x) => x.node === 'H')!.attempts, 3);
@@ -406,7 +406,7 @@ describe('engine: disabled, retry, onError, credentials, principal (P0/P2)', () 
       const r = await runWorkflow({
         nodes: [N('Start', 'n8n-nodes-base.manualTrigger'), N('H', 'n8n-nodes-base.httpRequest', { url: 'https://api.example.com/x', method: 'GET', auth: { credentialId: 'cred-1', allowedOrigins: ['https://api.example.com'] } })],
         connections: { Start: { main: [[{ node: 'H' }]] } } as any,
-      }, {}, { credentialResolver: async (id) => (id === 'cred-1' ? { kind: 'bearer', secret: 's3cr3t' } : null) });
+      }, {}, { credentialResolver: async (id) => (id === 'cred-1' ? { kind: 'bearer', secret: 's3cr3t' } : null), hostResolver: async () => ['93.184.216.34'] });
       assert.equal(r.status, 'success');
       assert.equal(seenAuth, 'Bearer s3cr3t');
       const dump = JSON.stringify(r.nodeRuns);
@@ -427,7 +427,7 @@ describe('engine: disabled, retry, onError, credentials, principal (P0/P2)', () 
       const r = await runWorkflow({
         nodes: [N('Start', 'n8n-nodes-base.manualTrigger'), N('H', 'n8n-nodes-base.httpRequest', { url: 'http://gateway:8080/v1/orgs', method: 'GET' })],
         connections: { Start: { main: [[{ node: 'H' }]] } } as any,
-      }, {}, { principal: { sub: 'u1', org: 'acme', account: 'prod', kind: 'user' } });
+      }, {}, { principal: { sub: 'u1', org: 'acme', account: 'prod', kind: 'user' }, hostResolver: async () => ['93.184.216.34'] });
       assert.equal(r.status, 'success');
       assert.equal(seen['X-SynapseOne-User'], 'u1');
       assert.equal(seen['X-SynapseOne-Org'], 'acme');
@@ -1193,7 +1193,7 @@ describe('engine: decision fallback and agent sockets', () => {
         }),
         {},
         // Deliberately unwired: no synapseoneCall on the ctx.
-        undefined,
+        { hostResolver: async () => ['93.184.216.34'] },
       );
       assert.equal(out.agent.tools_used.length, unwiredTools.length);
       for (const action of out.agent.actions_taken) {

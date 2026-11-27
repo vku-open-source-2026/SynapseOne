@@ -94,6 +94,9 @@ pub fn propagate_principal(
             if let Some(runner_id) = &principal.runner_id {
                 insert(headers, "x-synapseone-runner", runner_id);
             }
+            if let Some(key_id) = &principal.key_id {
+                insert(headers, "x-synapseone-key-id", key_id);
+            }
             // A user-bound API key (verified IAM `user_id`) acts **for that
             // user**: stamp the owner so workflow/audit/data-plane attribution
             // and owner-only policies see the real user. `kind` stays `apikey`
@@ -116,7 +119,7 @@ pub fn propagate_principal(
     // Mirror canonical headers onto the legacy prefix for rolling deploys.
     // Values were stripped above, so this cannot amplify client identity.
     for name in [
-        "user", "org", "account", "scopes", "kind", "runner", "internal", "anon", "quota-org",
+        "user", "org", "account", "scopes", "kind", "runner", "key-id", "internal", "anon", "quota-org",
     ] {
         if let Some(value) = headers.get(format!("x-synapseone-{name}")).cloned() {
             headers.insert(HeaderName::from_static(legacy_static(name)), value);
@@ -132,6 +135,7 @@ fn legacy_static(name: &str) -> &'static str {
         "scopes" => "x-synapsedx-scopes",
         "kind" => "x-synapsedx-kind",
         "runner" => "x-synapsedx-runner",
+        "key-id" => "x-synapsedx-key-id",
         "internal" => "x-synapsedx-internal",
         "anon" => "x-synapsedx-anon",
         "quota-org" => "x-synapsedx-quota-org",

@@ -127,10 +127,11 @@ routes:
     service: workflow
 
   # Self-hosted runner job protocol (claim/complete/heartbeat/credentials).
-  # API-key authenticated; never exposed without the gateway's key verification.
+  # Machine credentials only: ordinary user JWTs must never claim jobs or read
+  # runner-delivered secrets. Platform-runner keys are API keys too.
   - path: /v1/runner
     target: ${WORKFLOW_SERVICE_URL:http://workflow:4002}
-    auth: either
+    auth: apikey
     service: workflow
 
   - path: /v1/workflows

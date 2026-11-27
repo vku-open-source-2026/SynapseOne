@@ -32,6 +32,7 @@ const RUNNER_AUTH = {
   'x-synapseone-org': 'org-1',
   'x-synapseone-account': 'acc-1',
 };
+const runnerAuth = (keyId: string) => ({ ...RUNNER_AUTH, 'x-synapseone-key-id': keyId });
 
 interface MockMessage {
   id: string;
@@ -193,6 +194,7 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
         'x-synapseone-kind': 'apikey',
         'x-synapseone-org': 'org-1',
         'x-synapseone-account': 'acc-1',
+        'x-synapseone-key-id': 'key-e2e',
       };
       if (req.headers['x-workflow-runner-id']) headers['x-workflow-runner-id'] = String(req.headers['x-workflow-runner-id']);
       const r = await fetch(`${target}${req.originalUrl}`, {
@@ -293,7 +295,7 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
 
   it('account runner cannot claim another account execution in the same org', async () => {
     const created = await fetch(`${base}/v1/workflow-runners`, {
-      method: 'POST', headers: USER, body: JSON.stringify({ name: 'account-runner', mode: 'custom' }),
+      method: 'POST', headers: USER, body: JSON.stringify({ name: 'account-runner', mode: 'custom', apiKeyId: 'key-account' }),
     });
     assert.equal(created.status, 201);
     const { runner } = await created.json();
@@ -313,7 +315,7 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
       startedAt: new Date().toISOString(),
     });
     const claim = await fetch(`${base}/v1/runner/jobs/${foreign.id}/claim`, {
-      method: 'POST', headers: RUNNER_AUTH,
+      method: 'POST', headers: runnerAuth(runner.apiKeyId),
       body: JSON.stringify({ runnerId: runner.id, instanceId: 'account-connector', leaseSeconds: 60 }),
     });
     assert.equal(claim.status, 403);
@@ -323,7 +325,7 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
   it('custom runner never receives a graph changed after enqueue', async () => {
     const wf = await createWorkflow('custom', 'custom-revision-drift');
     const created = await fetch(`${base}/v1/workflow-runners`, {
-      method: 'POST', headers: USER, body: JSON.stringify({ name: 'revision-runner', mode: 'custom' }),
+      method: 'POST', headers: USER, body: JSON.stringify({ name: 'revision-runner', mode: 'custom', apiKeyId: 'key-revision' }),
     });
     assert.equal(created.status, 201);
     const { runner } = await created.json();
@@ -332,7 +334,7 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
     })).json();
     await updateWorkflowRec(wf.id, { nodes: [...wf.nodes, { name: 'Unreviewed node', type: 'n8n-nodes-base.noOp', parameters: {} }] });
     const claim = await fetch(`${base}/v1/runner/jobs/${queued.executionId}/claim`, {
-      method: 'POST', headers: RUNNER_AUTH,
+      method: 'POST', headers: runnerAuth(runner.apiKeyId),
       body: JSON.stringify({ runnerId: runner.id, instanceId: 'connector-rev', leaseSeconds: 60 }),
     });
     assert.equal(claim.status, 409);
@@ -514,7 +516,7 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
   it('lets a custom runner claim and complete a custom-mode execution', async () => {
     const created = await fetch(`${base}/v1/workflow-runners`, {
       method: 'POST', headers: USER,
-      body: JSON.stringify({ name: 'worker-b', mode: 'custom' }),
+      body: JSON.stringify({ name: 'worker-b', mode: 'custom', apiKeyId: 'key-worker-b' }),
     });
     const runner: any = (await created.json()).runner;
 
@@ -532,7 +534,7 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
     assert.equal(still.status, 'queued');
 
     const claim = await fetch(`${base}/v1/runner/jobs/${queued.executionId}/claim`, {
-      method: 'POST', headers: RUNNER_AUTH,
+      method: 'POST', headers: runnerAuth(runner.apiKeyId),
       body: JSON.stringify({ runnerId: runner.id, instanceId: 'connector-http', leaseSeconds: 60 }),
     });
     const claimText = await claim.text();
@@ -542,7 +544,7 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
     assert.deepEqual(job.input, { value: 5 });
 
     const done = await fetch(`${base}/v1/runner/jobs/${queued.executionId}/complete`, {
-      method: 'POST', headers: RUNNER_AUTH,
+      method: 'POST', headers: runnerAuth(runner.apiKeyId),
       body: JSON.stringify({
         runnerId: runner.id,
         instanceId: 'connector-http',
@@ -566,10 +568,11 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
       'x-synapseone-kind': 'apikey',
       'x-synapseone-org': 'org-2',
       'x-synapseone-account': 'acc-2',
+      'x-synapseone-key-id': 'key-other',
     };
     const created = await fetch(`${base}/v1/workflow-runners`, {
       method: 'POST', headers: { ...USER, 'x-synapseone-org': 'org-2', 'x-synapseone-account': 'acc-2' },
-      body: JSON.stringify({ name: 'other-worker', mode: 'custom' }),
+      body: JSON.stringify({ name: 'other-worker', mode: 'custom', apiKeyId: 'key-other' }),
     });
     const runner: any = (await created.json()).runner;
     const wf = await createWorkflow('custom', 'queue-foreign');
@@ -637,7 +640,7 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
   it('queues and completes an inference job for a hybrid runner', async () => {
     const created = await fetch(`${base}/v1/workflow-runners`, {
       method: 'POST', headers: USER,
-      body: JSON.stringify({ name: 'hybrid-inference', kind: 'hybrid', mode: 'custom', inferenceQueue: 'synapseone-inference' }),
+      body: JSON.stringify({ name: 'hybrid-inference', kind: 'hybrid', mode: 'custom', inferenceQueue: 'synapseone-inference', apiKeyId: 'key-hybrid' }),
     });
     const runner: any = (await created.json()).runner;
     assert.equal(runner.kind, 'hybrid');
@@ -653,7 +656,7 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
     assert.ok(queued.jobId);
 
     const claim = await fetch(`${base}/v1/runner/inference/jobs/${queued.jobId}/claim`, {
-      method: 'POST', headers: RUNNER_AUTH,
+      method: 'POST', headers: runnerAuth(runner.apiKeyId),
       body: JSON.stringify({ runnerId: runner.id, instanceId: 'connector-inf', leaseSeconds: 60 }),
     });
     assert.equal(claim.status, 200);
@@ -662,7 +665,7 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
     assert.equal(job.request.messages[0].content, 'ping');
 
     const complete = await fetch(`${base}/v1/runner/inference/jobs/${queued.jobId}/complete`, {
-      method: 'POST', headers: RUNNER_AUTH,
+      method: 'POST', headers: runnerAuth(runner.apiKeyId),
       body: JSON.stringify({
         runnerId: runner.id,
         instanceId: 'connector-inf',
@@ -685,7 +688,7 @@ describe('queue-backed workflow execution + self-hosted runners', () => {
     mock.queues.get('synapseone-wf-custom')?.clear();
     const created = await fetch(`${base}/v1/workflow-runners`, {
       method: 'POST', headers: USER,
-      body: JSON.stringify({ name: 'e2e-runner', mode: 'custom' }),
+      body: JSON.stringify({ name: 'e2e-runner', mode: 'custom', apiKeyId: 'key-e2e' }),
     });
     const runner: any = (await created.json()).runner;
     const wf = await createWorkflow('custom', 'runner-e2e');

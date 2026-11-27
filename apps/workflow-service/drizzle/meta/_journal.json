@@ -113,6 +113,13 @@
       "when": 1800000800000,
       "tag": "0015_first_callisto",
       "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1800000900000,
+      "tag": "0016_spooky_hellfire_club",
+      "breakpoints": true
     }
   ]
 }
