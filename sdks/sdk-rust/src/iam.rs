@@ -146,15 +146,24 @@ impl IamService {
             .await
     }
 
-    pub async fn regenerate_recovery_codes(&self) -> Result<Value> {
+    pub async fn regenerate_recovery_codes(&self, code: &str) -> Result<Value> {
         self.client
-            .post("/v1/auth/mfa/recovery-codes", json!({}))
+            .post("/v1/auth/mfa/recovery-codes", json!({ "code": code }))
             .await
     }
 
     pub async fn disable_mfa(&self, code: &str) -> Result<Value> {
         self.client
             .post("/v1/auth/mfa/disable", json!({ "code": code }))
+            .await
+    }
+
+    pub async fn disable_mfa_with_recovery_code(&self, recovery_code: &str) -> Result<Value> {
+        self.client
+            .post(
+                "/v1/auth/mfa/disable",
+                json!({ "recoveryCode": recovery_code }),
+            )
             .await
     }
 

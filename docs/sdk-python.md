@@ -2,7 +2,7 @@
 
 Apache-2.0. Part of [SynapseOne](../README.md) Tier-1 PaaS.
 
-Requires Python 3.10+. Single runtime dependency: `requests>=2.28`.
+Requires Python 3.9+. Single runtime dependency: `requests>=2.28`.
 
 ## Install
 
@@ -82,6 +82,16 @@ HTTP layer and exposes:
 | `c.base` | SynapseBase | `create_collection`, `create_document`, `query_documents`, `changes` |
 | `c.faststore` | Synapse Faststore | `set`, `get`, `incr`, `hash_set`, `list_push`, `lock_acquire` |
 | `c.queue` | SynapseQueue | `publish`, `consume`, `ack`, `nack`, `dead_letters` |
+| `c.stream` | SynapseStream | `create_topic`, `publish`, `read_group`, `ack` |
+| `c.storage` / `c.ocs` | SynapseOCS | `put_object`, `get_object`, `presign`, multipart |
+| `c.notifications` | SynapseNotifications | `send`, `retry`, templates, preferences |
+| `c.warehouse` | Synapse Warehouse | datasets, read-only SQL, ETL jobs |
+| `c.lakehouse` | Synapse Lakehouse | namespaces, tables, snapshots, schema evolution |
+| `c.ai` / `c.inference` | AI and inference | `agent`, chat/SSE, embeddings, decision, route |
+| `c.health` / `c.readiness` | Gateway health | `health`, `ready`, `status` |
+
+Search is exposed through `c.base.search`, `search_fulltext`, `search_semantic`,
+`search_hybrid`, `reindex_search` and `search_status`.
 
 The legacy flat methods (`c.login(...)`, `c.list_templates(...)`,
 `c.list_lds_licenses(...)`, ...) still work but emit a `DeprecationWarning` and
@@ -90,8 +100,9 @@ forward to the namespaced call. The LDS namespace **drops the `lds_` prefix**:
 `c.ingest_lds_records(...)` → `c.lds.ingest_records(...)`.
 
 The API reference below documents the legacy flat surface (kept for existing
-code). For new code prefer the namespace equivalents; the dedicated service
-guides show both.
+code). For new code prefer the namespace equivalents; the dedicated
+[service guides](services/README.md) show all four SDK languages and the
+[parity matrix](sdk-parity.md) lists convenience-method differences.
 
 ## API reference
 
@@ -341,7 +352,7 @@ entries = c.list_audit(20, user_id)
 ```python
 def create_api_key(self, account_id: str, name: str = "default", scopes: list | None = None) -> dict
 ```
-Creates an API key. `name` defaults to `"default"`, `scopes` defaults to `["*"]`.
+Creates an API key. `name` defaults to `"default"`, `scopes` defaults to `["*:read"]` (least privilege).
 
 ```python
 result = c.create_api_key(account_id, "ci-deploy", ["workflow:Execute"])
@@ -398,7 +409,7 @@ result = c.service_account_token(sa_id, ["workflow:Execute"])
 token = result["accessToken"]
 ```
 
-### Credentials (PROPOSED — backend in progress)
+### Credentials (implemented, account-scoped)
 
 Account-scoped secrets for workflow nodes (webhook auth, DB passwords, OAuth
 tokens...). Secrets are encrypted at rest and **never returned**: `create`/`rotate`
@@ -449,7 +460,7 @@ def rotate_credential(self, cred_id: str, secret: str) -> dict
 def call(self, method: str, path: str, body: Any | None = None) -> Any
 ```
 Calls any gateway endpoint directly — forward-compat with endpoints added after
-this SDK (e.g. the proposed credentials API). Same auth + `status+path+body` errors.
+this SDK (for example a newly added endpoint). Same auth + `status+path+body` errors.
 
 ```python
 creds = c.call("GET", f"/v1/accounts/{account_id}/credentials")
@@ -795,21 +806,24 @@ Also: `list_queues`, `get_queue`, `delete_queue`, `purge_queue`, `ack_many`,
 ### Webhooks (public, no auth)
 
 `ANY /webhook/:path` triggers the ACTIVE workflow whose webhook node declares
-that `path`. The gateway does **not** proxy `/webhook/*` — call the
-workflow-service origin directly (e.g. `http://localhost:4002`).
+that `path`. The gateway proxies `/webhook/*` with `auth: none` and a 300-second
+budget, so production callers use the public API origin
+(`https://api.synapseone.space`) rather than a private service port.
 
 ```python
-from synapseone_sdk import trigger_webhook
-
-# Copy-paste: fire the code-transform template's webhook after activating it.
-out = trigger_webhook("http://localhost:4002", "transform", {"value": 21})
+# Namespace helper: uses the configured client and its auth/tenant headers.
+out = c.workflow.trigger_webhook("transform", {"value": 21})
 print(out["output"])
+
+# Standalone helper: always unauthenticated, suitable for a public webhook.
+from synapseone_sdk import trigger_webhook
+public_out = trigger_webhook("https://api.synapseone.space", "transform", {"value": 21})
 ```
 
 Raw curl equivalent:
 
 ```bash
-curl -X POST http://localhost:4002/webhook/transform \
+curl -X POST http://localhost:8080/webhook/transform \
   -H 'Content-Type: application/json' \
   -d '{"value":21}'
 ```

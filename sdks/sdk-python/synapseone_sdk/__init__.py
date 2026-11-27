@@ -19,6 +19,14 @@ talk to:
 ``client.faststore``    Synapse Faststore cache/KV, hashes, lists, sets,
                         sorted sets, locks
 ``client.queue``        SynapseQueue publish/consume/ack, dead letters
+``client.stream``       SynapseStream topics, groups and acknowledgements
+``client.storage``      SynapseOCS objects (``client.ocs`` is an alias)
+``client.notifications`` SynapseNotifications outbox and preferences
+``client.warehouse``    Synapse Warehouse datasets, SQL and ETL
+``client.lakehouse``    Synapse Lakehouse Iceberg tables and snapshots
+``client.ai``           API documentation assistant
+``client.inference``    chat, embeddings, decisions and routing
+``client.health``       gateway health and readiness
 ======================  =============================================
 
 The old flat methods on :class:`SynapseOneClient` still work but are deprecated:

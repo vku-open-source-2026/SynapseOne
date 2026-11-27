@@ -32,6 +32,10 @@ Format based on Keep a Changelog; versioning follows SemVer.
   standby after primary-side authorization. Reads use short timeouts and
   automatically fall back to primary; auth, quotas, writes, exports and
   mutations remain primary-only.
+- **SDK 0.10.2 release channel:** all four SDKs share one version gate; the Go
+  SDK publishes through the real public monorepo module path and a
+  `sdks/sdk-go/v*` proxy/release workflow. Service documentation now includes
+  separate JavaScript/TypeScript, Python, Go and Rust examples.
 - **SDK 0.10.1 release channel:** `sdk-v*` tags publish the JavaScript and Python
   SDK release assets/packages without building platform container images;
   `sdk-rust-v*` continues to publish the Rust crate.
@@ -61,6 +65,11 @@ Format based on Keep a Changelog; versioning follows SemVer.
 
 ### Fixed
 
+- **SDK 0.10.2 release defects:** restored the missing JavaScript
+  `ocs/search/warehouse/lakehouse` package exports, aligned legacy flat types
+  with runtime wrappers, made Python Search callable, forwarded workflow
+  credential expiry in JavaScript/Python, added the complete Go Lakehouse
+  lifecycle wrappers and corrected Rust MFA recovery-code requests.
 - **SynapseCity client identity at the shared edge.** SynapseCity proxy locations
   now overwrite `X-Forwarded-For` with `$remote_addr` instead of appending the
   nginx peer, preserving independent per-client rate-limit buckets.

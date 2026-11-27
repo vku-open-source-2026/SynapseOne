@@ -24,7 +24,7 @@ No lock-in: Authentik/Keycloak runs as an optional external IdP over
 standard OIDC. Everything else is SynapseOne code, pure Apache-2.0.
 
 - 🌐 **Live demo:** [synapseone.space](https://synapseone.space) · Console: [cloud.synapseone.space](https://cloud.synapseone.space) · API: `https://api.synapseone.space/health`
-- 📦 **Install:** `npm i @synapseone/sdk` · `pip install synapseone-sdk` · `npx @synapseone/cli` · Go and Rust SDKs via the monorepo (see below)
+- 📦 **Install:** `npm i @synapseone/sdk` · `pip install synapseone-sdk` · `go get github.com/vku-open-source-2026/SynapseOne/sdks/sdk-go@latest` · `cargo add synapseone` · `npx @synapseone/cli`
 - 🚀 **Self-host:** public GHCR images (`docker compose pull`) or build from source (`docker compose up -d --build`) — see [Self-host](#self-host)
 
 ## Why SynapseOne
@@ -46,7 +46,7 @@ standard OIDC. Everything else is SynapseOne code, pure Apache-2.0.
 | **Workflows** | Built-in workflow engine (Apache-2.0): queue-backed DAG runner, versioned templates, activate/deactivate/execute (real webhook & cron triggers), sandboxed code execution, execution history, visual graph editor, and self-hosted runner image for hybrid/private execution |
 | **Linked Data (SynapseLDS)** | Licence-picked NGSI-LD datasources: structural-allowlist projection (`_core` never serialized), per-attribute visibility (public/restricted/internal), default-deny schema registry, workflow publish node (`lds.publish-record`) |
 | **AI assistant** | Chatbot on the API Docs page: decision model picks the endpoint, LLM pre-fills the try-it form (server-side key, guidance-only, never public) |
-| **Clients** | TypeScript, Python, Go and Rust SDKs with full API parity, zero-dependency CLI, admin Console |
+| **Clients** | TypeScript, Python, Go and Rust SDKs covering every service group, with documented per-language differences, zero-dependency CLI, admin Console |
 
 ## Try it in 30 seconds
 
@@ -87,10 +87,11 @@ npm install @synapseone/sdk
 # Python (3.9+)
 pip install synapseone-sdk
 
-# Go (1.22+) — the SDK lives in this monorepo (sdks/sdk-go); wire it with a
-# replace directive (a standalone module repo is planned — the monorepo path
-# contains uppercase letters, which Go module paths forbid):
-#   go mod edit -replace github.com/synapseone/synapseone-sdk-go=<checkout>/sdks/sdk-go
+# Go (1.22+)
+go get github.com/vku-open-source-2026/SynapseOne/sdks/sdk-go@latest
+
+# Rust (1.82+)
+cargo add synapseone
 
 # CLI — one-line installer (Node 18+, no clone needed)
 curl -fsSL https://synapseone.space/install.sh | sh
@@ -114,14 +115,18 @@ The TypeScript, Python and Go clients cover the full API (`docs/api.md`): passwo
 refresh/logout, delegated token exchange, orgs/accounts/users, roles/policies,
 authorize + dry-run, audit, API keys, service accounts, workflows/templates/
 executions, LDS, Base, Faststore, Queue, Stream, Object Storage, Notifications,
-AI and inference (streaming). A Rust SDK (`sdks/sdk-rust`, crate `synapseone`,
-version `0.9.0`) covers the same service namespaces and is ready for crates.io
-publication.
+AI and inference (streaming), plus Warehouse and Lakehouse. The Rust SDK
+(`sdks/sdk-rust`, crate `synapseone`) covers the same service namespaces and is
+published on [crates.io](https://crates.io/crates/synapseone). The Go SDK is a
+public multi-module release at
+`github.com/vku-open-source-2026/SynapseOne/sdks/sdk-go`.
 The SDKs are split per service namespace
 (`c.iam`, `c.workflow`, `c.lds`, `c.base`, `c.faststore`, `c.queue`,
 `c.stream`, `c.storage`, `c.notifications`, `c.ai`, `c.inference`, `c.health`);
-legacy flat methods still work with a deprecation warning. See the parity
-matrix in `docs/sdk-js.md` for the few intentional differences.
+legacy flat methods still work with a deprecation warning. See the parity matrix in `docs/sdk-js.md` for the few intentional differences.
+See [sdk-parity.md](docs/sdk-parity.md) for the exact per-language coverage matrix
+and generic-request escape hatches. Release/install details:
+[docs/sdk-0.10.2.md](docs/sdk-0.10.2.md).
 
 ## Self-host
 
@@ -154,13 +159,16 @@ The release publishes these public images (same names as the Compose services):
 | `synapseone-iam`, `synapseone-workflow`, `synapseone-ai` | identity, workflows, docs assistant |
 | `synapseone-lds`, `synapseone-base`, `synapseone-faststore` | linked data, documents, cache |
 | `synapseone-queue`, `synapseone-stream`, `synapseone-notifications` | messaging, event log, outbox |
+| `synapseone-warehouse`, `synapseone-lakehouse` | OLAP/ETL and Apache Iceberg analytics |
+| `synapseone-workflow-runner` | self-hosted workflow/inference worker |
 | `synapseone-ocs`, `synapseone-inference` | object storage, LLM/embeddings/decision |
 | `synapseone-postgres`, `synapseone-edge` | Postgres 16 + pgvector/PostGIS, TLS edge |
 
-> If `docker pull` returns `unauthorized`, the GHCR packages have not been
-> switched to public yet. An organization admin must add a `GHCR_PAT` secret
-> (package admin) and run the `packages-public` workflow once; releases also try
-> to flip visibility automatically when that secret exists.
+> If `docker pull` returns `unauthorized`, the GHCR package has not been made
+> public yet. GitHub exposes no API to change package visibility: an organization
+> owner must use **Organization → Packages → package → Settings → Change visibility
+> → Public**. The `packages-visibility` workflow audits the current state; its
+> optional `GHCR_PAT` does not change visibility.
 
 ### 2. Build from source
 

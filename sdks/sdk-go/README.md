@@ -7,20 +7,23 @@ Zero external dependencies (standard library only). Requires Go >= 1.22.
 ## Install
 
 ```bash
-# via the monorepo replace directive
-go mod edit -replace github.com/synapseone/synapseone-sdk-go=./sdks/sdk-go
-go mod tidy
+# install the tagged module from the public Go proxy
+go get github.com/vku-open-source-2026/SynapseOne/sdks/sdk-go@latest
+```
 
-# or from the registry
-go get github.com/synapseone/synapseone-sdk-go@latest
+For local development, run this from a checkout and then tidy your application:
+
+```bash
+go mod edit -replace github.com/vku-open-source-2026/SynapseOne/sdks/sdk-go=./sdks/sdk-go
+go mod tidy
 ```
 
 ## Quick start
 
 ```go
-import synapseone "github.com/synapseone/synapseone-sdk-go"
+import synapseone "github.com/vku-open-source-2026/SynapseOne/sdks/sdk-go"
 
-c := synapseone.New("") // defaults to https://synapseone.space (or $SYNAPSEONE_BASE_URL)
+c := synapseone.New("") // defaults to https://api.synapseone.space (or $SYNAPSEONE_BASE_URL)
 out, err := c.Login("demo@acme.local", "acme")
 if err != nil { panic(err) }
 c.SetToken(out["accessToken"].(string))
@@ -43,6 +46,19 @@ Data services & AI:
 - **Synapse AI Assistant** — `Client.AIAgent` for natural language API endpoint guidance.
 - **Synapse Inference Engine** — `Client.Inference*` for LLM chat proxy,
   self-hosted embeddings, Decision-2.0-Eos-0.8B structured questions and semantic routing.
+- **SynapseStream** — `Client.*Stream*` for topics, publish/read, consumer groups,
+  acknowledgements and retention.
+- **SynapseOCS** — `Client.*Ocs*` and `Client.*Storage*` for buckets, binary
+  objects, presign and multipart upload.
+- **SynapseNotifications** — `Client.*Notification*` for outbox, templates,
+  preferences, unsubscribe and delivery status.
+- **Synapse Warehouse** — `Client.*Warehouse*` for datasets, read-only SQL, ETL
+  jobs and pipeline status.
+- **Synapse Lakehouse** — `Client.*Lakehouse*` for namespaces, tables, append/query,
+  snapshots and additive schema evolution.
+- **Search and gateway health** — `Client.Search*` and `Client.*Health*`.
+- **Runner Engine** — use `Client.Call` against `/v1/workflow-runners` until the
+  Go namespace reaches parity with JavaScript, Python and Rust.
 
 Platform callers of Faststore/Queue set the tenant explicitly:
 
@@ -75,8 +91,10 @@ MFA: `SetupTOTP`, `EnableTOTP`, `VerifyMFA` (after a `401 mfa_required` login),
 
 ## Full documentation
 
-See **[docs/sdk-go.md](../../docs/sdk-go.md)** for the complete API reference —
-client construction, auth, all methods with signatures, parameters, return types, and examples.
+See **[docs/sdk-go.md](../../docs/sdk-go.md)** for the language guide — client
+construction, auth, method families, parameters, return types, and examples.
+For copyable per-service examples in all four SDK languages, see
+[`docs/services/`](../../docs/services/).
 
-Forks: change the `github.com/synapseone/synapseone-sdk-go` module path in `go.mod` to your repo
+Forks: change the `github.com/vku-open-source-2026/SynapseOne/sdks/sdk-go` module path in `go.mod` to your repo
 (Go resolves packages via git tags, no separate registry publish needed).

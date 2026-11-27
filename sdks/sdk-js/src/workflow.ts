@@ -20,6 +20,8 @@ export interface CredentialInput {
   type?: CredentialKind | string;
   /** Write-only: never returned by any endpoint. */
   secret: string;
+  /** Optional ISO-8601 expiry for the stored credential. */
+  expiresAt?: string;
 }
 
 export interface CredentialMetadata {
@@ -163,12 +165,14 @@ export class WorkflowService {
           name: opts?.name,
           kind: opts?.kind || opts?.type || 'bearer',
           secret: opts?.secret,
+          ...(opts?.expiresAt ? { expiresAt: opts.expiresAt } : {}),
         }
       : {
           accountId: inputOrAccountId.accountId,
           name: inputOrAccountId.name,
           kind: inputOrAccountId.kind || inputOrAccountId.type || 'bearer',
           secret: inputOrAccountId.secret,
+          ...(inputOrAccountId.expiresAt ? { expiresAt: inputOrAccountId.expiresAt } : {}),
         };
     return this.http.req('/v1/credentials', {
       method: 'POST',

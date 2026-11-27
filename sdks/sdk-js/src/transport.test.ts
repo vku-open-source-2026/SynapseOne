@@ -377,7 +377,7 @@ describe('transport', () => {
 
   it('all documented package subpaths resolve', () => {
     const pkg = requireCjs(path.join(__dirname, '..', 'package.json'));
-    const expected = ['.', './iam', './workflow', './ai', './lds', './base', './faststore', './queue', './stream', './inference', './health', './storage', './notifications'];
+    const expected = ['.', './iam', './workflow', './ai', './lds', './base', './faststore', './queue', './stream', './inference', './health', './storage', './ocs', './notifications', './search', './warehouse', './lakehouse'];
     for (const sub of expected) {
       assert.ok(pkg.exports[sub], `missing exports entry ${sub}`);
       const target = path.join(__dirname, '..', pkg.exports[sub].require);

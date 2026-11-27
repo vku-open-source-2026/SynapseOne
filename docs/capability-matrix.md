@@ -160,13 +160,13 @@ routes are intentionally outside that catalog.
 |---|---|
 | Tenant Console | 45 routes; all resource pages listed in `apps/console/src/App.jsx`; account/org/user rename, SA role management, notification retry/preferences and warehouse rename wired |
 | Super Admin | overview, orgs, accounts, users, admins, audit, usage, health, runner fleet |
-| JS / Python / Go / Rust SDKs | JS, Python and Rust include the new IAM metadata, notification retry and Warehouse dataset/job methods. Go includes the IAM metadata/notification methods added here but its Warehouse surface remains the older Base→Lakehouse/OCS helpers; a full Go Warehouse client was not added because this host has no Go toolchain to compile it. |
+| JS / Python / Go / Rust SDKs | All four cover IAM, Workflow, LDS, Base/Search, Faststore, Queue, Stream, OCS, Notifications, Warehouse, Lakehouse, AI, Inference and health. Convenience-method differences are documented in `docs/sdk-parity.md`; the generic request method covers unwrapped endpoints. |
 | CLI | 45 top-level commands, including `orgs/accounts/users update`, `keys get`, `service-accounts get`, `notifications retry`, `warehouse dataset|job update`, `etl-base`, `etl-lakehouse` |
 
 ## Explicit limitations
 
 - Hard organization/account/user deletion is not supported.
-- Notifications does not store reusable templates.
+- Notifications delivers through configured providers; no real provider is required for local outbox/template tests.
 - Warehouse has no reports/dashboards/BI subsystem.
 - OCS supports CSV/JSONL/Parquet structured ingestion only.
 - Stream retention gaps are reported as errors; recovery requires rebuild/reset.

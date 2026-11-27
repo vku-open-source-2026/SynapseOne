@@ -31,6 +31,10 @@
 | [sdk-js.md](sdk-js.md) | JavaScript/TypeScript SDK — install, auth, full API reference | — |
 | [sdk-python.md](sdk-python.md) | Python SDK — install, auth, full API reference | — |
 | [sdk-go.md](sdk-go.md) | Go SDK — install, auth, full API reference | — |
+| [sdk-rust.md](sdk-rust.md) | Rust SDK — install, authentication, namespaces, retries and errors | — |
+| [sdk-parity.md](sdk-parity.md) | Honest per-language service coverage, generic escape hatches and limitations | — |
+| [services/](services/) | Per-service guides with JavaScript, Python, Go and Rust SDK examples | — |
+| [sdk-0.10.2.md](sdk-0.10.2.md) | SDK 0.10.2 packages, language-specific guides, Go module path and release tags | [vi/sdk-0.10.2.md](vi/sdk-0.10.2.md) |
 | [sdk-0.10.1.md](sdk-0.10.1.md) | SDK 0.10.1 packages, release tags and audit consistency | — |
 | [cli.md](cli.md) | CLI — install, configuration, all commands | — |
 | [adr/](adr/) | Architecture decisions (Lakehouse, search, runtime parity, workflow security) | — |

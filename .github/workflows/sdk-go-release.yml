@@ -1,0 +1,92 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 VKU.VIC
+name: Go SDK release
+
+# Go modules are published by the public Go module proxy when a multi-module
+# tag is pushed. No registry token is needed. The gate verifies the tag,
+# formatting, tests and proxy availability before creating the GitHub release.
+on:
+  push:
+    tags:
+      - 'sdks/sdk-go/v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdk-go-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: sdks/sdk-go/go.mod
+          cache-dependency-path: sdks/sdk-go/go.sum
+
+      - name: Verify SDK version and tag
+        run: node tools/sdk-version-check.cjs "${GITHUB_REF_NAME}"
+
+      - name: Check formatting
+        working-directory: sdks/sdk-go
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [ -n "${unformatted}" ]; then
+            printf 'Go files need gofmt:\n%s\n' "${unformatted}" >&2
+            exit 1
+          fi
+
+      - name: Vet and test
+        working-directory: sdks/sdk-go
+        run: |
+          set -euo pipefail
+          go mod verify
+          go vet ./...
+          go test ./...
+
+      - name: Verify public module proxy
+        env:
+          MODULE: github.com/vku-open-source-2026/SynapseOne/sdks/sdk-go
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#sdks/sdk-go/}"
+          for attempt in $(seq 1 12); do
+            if go mod download -json "${MODULE}@${VERSION}" > /tmp/synapseone-go-module.json; then
+              jq -e --arg path "${MODULE}" --arg version "${VERSION}" \
+                '.Path == $path and .Version == $version' \
+                /tmp/synapseone-go-module.json >/dev/null
+              echo "Published ${MODULE}@${VERSION} to the public Go proxy."
+              exit 0
+            fi
+            echo "Proxy not ready (attempt ${attempt}/12); retrying in 10 seconds."
+            sleep 10
+          done
+          echo "::error::Go module proxy did not expose ${MODULE}@${VERSION}."
+          exit 1
+
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            Go SDK `${GITHUB_REF_NAME#sdks/sdk-go/v}` is available from the public Go module proxy.
+
+            ```bash
+            go get github.com/vku-open-source-2026/SynapseOne/sdks/sdk-go@v${GITHUB_REF_NAME#sdks/sdk-go/v}
+            ```
+
+            Documentation: https://synapseone.space/docs?tab=go

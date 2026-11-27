@@ -2056,6 +2056,11 @@ func (c *Client) CancelExecution(id, reason string) (map[string]any, error) {
 	return out, nil
 }
 
+// LakehouseUsage returns the tenant's Iceberg catalog usage and quotas.
+func (c *Client) LakehouseUsage() (map[string]any, error) {
+	return c.getJSON("/v1/lakehouse/usage")
+}
+
 // LakehouseNamespaces lists tenant-scoped Iceberg namespaces.
 func (c *Client) LakehouseNamespaces() (map[string]any, error) {
 	return c.getJSON("/v1/lakehouse/namespaces")
@@ -2066,9 +2071,30 @@ func (c *Client) LakehouseCreateNamespace(name string) (map[string]any, error) {
 	return c.postJSON("/v1/lakehouse/namespaces", map[string]any{"name": name})
 }
 
+// LakehouseDeleteNamespace removes an empty Iceberg namespace.
+func (c *Client) LakehouseDeleteNamespace(namespace string) (map[string]any, error) {
+	return c.deleteJSON("/v1/lakehouse/namespaces/" + pathEscape(namespace))
+}
+
 // LakehouseTables lists tables in one namespace.
 func (c *Client) LakehouseTables(namespace string) (map[string]any, error) {
 	return c.getJSON("/v1/lakehouse/namespaces/" + pathEscape(namespace) + "/tables")
+}
+
+// LakehouseCreateTable creates an Iceberg table from a name/schema contract.
+func (c *Client) LakehouseCreateTable(namespace string, input map[string]any) (map[string]any, error) {
+	return c.postJSON("/v1/lakehouse/namespaces/"+pathEscape(namespace)+"/tables", input)
+}
+
+// LakehouseTable fetches one Iceberg table's metadata.
+func (c *Client) LakehouseTable(namespace, table string) (map[string]any, error) {
+	return c.getJSON("/v1/lakehouse/namespaces/" + pathEscape(namespace) + "/tables/" + pathEscape(table))
+}
+
+// LakehouseDeleteTable removes an Iceberg table; data files follow the
+// service's explicit retention/cleanup policy.
+func (c *Client) LakehouseDeleteTable(namespace, table string) (map[string]any, error) {
+	return c.deleteJSON("/v1/lakehouse/namespaces/" + pathEscape(namespace) + "/tables/" + pathEscape(table))
 }
 
 // LakehouseAppend appends rows to an Iceberg table. idempotencyKey may be empty.
@@ -2090,6 +2116,16 @@ func (c *Client) LakehouseQuery(namespace, table string, limit int, snapshotID s
 		body["snapshotId"] = snapshotID
 	}
 	return c.postJSON("/v1/lakehouse/namespaces/"+pathEscape(namespace)+"/tables/"+pathEscape(table)+"/query", body)
+}
+
+// LakehouseSnapshots lists the table's Iceberg snapshots.
+func (c *Client) LakehouseSnapshots(namespace, table string) (map[string]any, error) {
+	return c.getJSON("/v1/lakehouse/namespaces/" + pathEscape(namespace) + "/tables/" + pathEscape(table) + "/snapshots")
+}
+
+// LakehouseEvolveSchema applies additive schema evolution to a table.
+func (c *Client) LakehouseEvolveSchema(namespace, table string, add map[string]any) (map[string]any, error) {
+	return c.postJSON("/v1/lakehouse/namespaces/"+pathEscape(namespace)+"/tables/"+pathEscape(table)+"/schema", map[string]any{"add": add})
 }
 
 // WarehouseBaseToLakehouse creates a durable Base→Stream→Iceberg change-log job.
@@ -2121,6 +2157,18 @@ func (c *Client) getJSON(path string) (map[string]any, error) {
 
 func (c *Client) postJSON(path string, body any) (map[string]any, error) {
 	b, err := c.do("POST", path, body)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *Client) deleteJSON(path string) (map[string]any, error) {
+	b, err := c.do("DELETE", path, nil)
 	if err != nil {
 		return nil, err
 	}

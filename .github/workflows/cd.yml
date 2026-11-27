@@ -38,23 +38,31 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 24, registry-url: https://registry.npmjs.org }
 
-      # Version dev dong tu root package.json + run number (khong commit tro lai).
+      # Moi package lay dev version tu manifest cua chinh no (khong commit tro lai).
       - name: Compute dev versions
         id: ver
         run: |
-          BASE=$(node -p "require('./package.json').version")
-          echo "base=$BASE" >> "$GITHUB_OUTPUT"
-          echo "npm=$BASE-dev.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          SDK_BASE=$(node -p "require('./sdks/sdk-js/package.json').version")
+          CLI_BASE=$(node -p "require('./tools/cli/package.json').version")
+          echo "sdk_version=${SDK_BASE}-dev.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "cli_version=${CLI_BASE}-dev.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Stamp dev versions (workspace only, no commit)
+        env:
+          SDK_DEV: ${{ steps.ver.outputs.sdk_version }}
+          CLI_DEV: ${{ steps.ver.outputs.cli_version }}
         run: |
           node -e "
             const fs = require('fs');
-            for (const f of ['sdks/sdk-js/package.json', 'tools/cli/package.json']) {
-              const p = JSON.parse(fs.readFileSync(f, 'utf8'));
-              p.version = '${{ steps.ver.outputs.npm }}';
-              fs.writeFileSync(f, JSON.stringify(p, null, 2) + '\n');
+            const versions = {
+              'sdks/sdk-js/package.json': process.env.SDK_DEV,
+              'tools/cli/package.json': process.env.CLI_DEV,
+            };
+            for (const [file, version] of Object.entries(versions)) {
+              const p = JSON.parse(fs.readFileSync(file, 'utf8'));
+              p.version = version;
+              fs.writeFileSync(file, JSON.stringify(p, null, 2) + '\n');
             }
           "
           grep -H '"version":' sdks/sdk-js/package.json tools/cli/package.json
@@ -63,15 +71,21 @@ jobs:
       - run: cp LICENSE sdks/sdk-js/LICENSE
       # Idempotent: skip packages whose exact version already exists (re-runs stay green).
       - name: Publish npm (sdk + cli, tag dev)
+        env:
+          SDK_DEV: ${{ steps.ver.outputs.sdk_version }}
+          CLI_DEV: ${{ steps.ver.outputs.cli_version }}
         run: |
-          DEV="${{ steps.ver.outputs.npm }}"
-          for PKG in sdk cli; do
-            if npm view "@synapseone/$PKG@$DEV" version >/dev/null 2>&1; then
-              echo "npm: @synapseone/$PKG@$DEV already published — skipping."
+          set -euo pipefail
+          publish_dev() {
+            local pkg="$1" workspace="$2" version="$3"
+            if npm view "@synapseone/${pkg}@${version}" version >/dev/null 2>&1; then
+              echo "npm: @synapseone/${pkg}@${version} already published — skipping."
             else
-              npm publish --workspace=$( [ "$PKG" = cli ] && echo tools/cli || echo sdks/sdk-js ) --tag dev --access public
+              npm publish --workspace="${workspace}" --tag dev --access public
             fi
-          done
+          }
+          publish_dev sdk sdks/sdk-js "${SDK_DEV}"
+          publish_dev cli tools/cli "${CLI_DEV}"
 
       - name: Login GHCR
         uses: docker/login-action@v3
@@ -115,7 +129,7 @@ jobs:
         run: |
           {
             echo "## CD (dev channel) — ${{ github.sha }}";
-            echo "- npm: \`@synapseone/sdk@${{ steps.ver.outputs.npm }}\`, \`@synapseone/cli@${{ steps.ver.outputs.npm }}\` (tag \`dev\`)";
+            echo "- npm: \`@synapseone/sdk@${{ steps.ver.outputs.sdk_version }}\`, \`@synapseone/cli@${{ steps.ver.outputs.cli_version }}\` (tag \`dev\`)";
             echo "- GHCR: \`ghcr.io/${{ github.repository_owner }}/synapseone-{gateway,iam,workflow,console}:main(-${{ steps.ver.outputs.sha }})\`";
             echo "- warehouse/workflow-runner: published by the tagged release pipeline.";
           } >> "$GITHUB_STEP_SUMMARY"

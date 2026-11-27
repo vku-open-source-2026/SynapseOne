@@ -240,7 +240,23 @@ def _client(srv):
 def test_facade_exposes_service_namespaces():
     c = SynapseOneClient("http://localhost:8080/")
     assert c.base_url == "http://localhost:8080"
-    for name in ("iam", "workflow", "lds", "base", "faststore", "queue"):
+    for name in (
+        "iam",
+        "workflow",
+        "lds",
+        "base",
+        "faststore",
+        "queue",
+        "stream",
+        "storage",
+        "ocs",
+        "notifications",
+        "warehouse",
+        "lakehouse",
+        "ai",
+        "inference",
+        "health",
+    ):
         assert getattr(c, name) is not None, name
     assert isinstance(c.base.collection("parks"), BaseCollection)
 
@@ -277,6 +293,35 @@ def test_deprecated_wrappers_warn_and_forward():
 # ---------------------------------------------------------------------------
 # SynapseBase
 # ---------------------------------------------------------------------------
+
+
+def test_base_search_methods_are_callable_and_target_search_routes():
+    srv = _server()
+    try:
+        c = _client(srv)
+        c.base.search_fulltext(
+            "park",
+            collection="parks",
+            filters={"city_synced": True},
+            limit=5,
+            cursor="next",
+        )
+        assert _seen["path"] == "/v1/search" and _seen["method"] == "POST"
+        assert json.loads(_seen["body"]) == {
+            "query": "park",
+            "mode": "fulltext",
+            "limit": 5,
+            "filters": {"city_synced": True},
+            "collection": "parks",
+            "cursor": "next",
+        }
+        c.base.reindex_search(["parks"])
+        assert _seen["path"] == "/v1/search/reindex"
+        assert json.loads(_seen["body"]) == {"collections": ["parks"]}
+        c.base.search_status()
+        assert _seen["path"] == "/v1/search/status" and _seen["method"] == "GET"
+    finally:
+        srv.shutdown()
 
 
 def test_base_collection_lifecycle_paths_and_bodies():

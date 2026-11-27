@@ -145,7 +145,7 @@ export default function Topbar({ servicesOpen = true, onToggleServices }) {
                   servicesOpen ? 'bg-white/25 text-white' : 'bg-slate-100 text-normal-text'
                 }`}
               >
-                5
+                {PLATFORM_SERVICES.length}
               </span>
             </button>
           )}

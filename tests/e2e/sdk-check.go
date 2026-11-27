@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	synapseone "github.com/synapseone/synapseone-sdk-go"
+	synapseone "github.com/vku-open-source-2026/SynapseOne/sdks/sdk-go"
 )
 
 func generateTestJWT(secret string) string {

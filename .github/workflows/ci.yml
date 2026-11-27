@@ -28,12 +28,14 @@ jobs:
         with: { python-version: "3.11" }
       - uses: actions/setup-go@v5
         with: { go-version: "1.22" }
-      - run: npm install --workspaces
+      - run: npm ci --workspaces
       - run: npm run build --workspaces --if-present
       - run: npm run workflows:validate
       - run: npm run test --workspaces --if-present
       # Release identity: package/Cargo/image tags must match the workspace.
       - run: node tools/version-check.cjs
+      - run: node tools/sdk-version-check.cjs
+      - run: node --test tools/sdk-version-check.test.cjs
       # API catalog drift gate (console try-it + AI agent + docs/api.md).
       - run: node tools/migration-check.mjs
       - run: node tools/catalog-check.mjs
@@ -178,7 +180,7 @@ jobs:
       - run: bash tests/e2e/api-check.sh
       - run: pip install ./sdks/sdk-python -q && SYNAPSEONE_BASE_URL=http://localhost:8080 python tests/e2e/sdk-check.py
       - name: Install workspaces
-        run: npm install --workspaces --no-audit --no-fund -q
+        run: npm ci --workspaces --no-audit --no-fund -q
       - name: Build workflow runner and JS SDK
         run: npm run build --workspace=apps/workflow-service --workspace=sdks/sdk-js -q
       - name: JS SDK e2e

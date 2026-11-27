@@ -8,9 +8,10 @@ and response body.
 
 ```toml
 [dependencies]
-synapseone = "0.9"
+synapseone = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
+http = "1"
 ```
 
 > The crate is published on crates.io as `synapseone` (`cargo add synapseone`).
@@ -75,6 +76,7 @@ let templates = client.workflow().list_templates().await?;
 | `inference()` | chat, embeddings, decision, route |
 | `ocs()` / `storage()` | buckets, objects, presign, multipart |
 | `warehouse()` | OLAP datasets, SQL, ETL jobs and pipeline status |
+| `lakehouse()` | Iceberg namespaces, tables, snapshots and schema evolution |
 | `health()` | `/health`, `/ready`, projected status |
 
 Methods that are not wrapped yet can use the raw escape hatch:
@@ -90,6 +92,10 @@ let value = client.request(Method::GET, "/v1/whatever", None).await?;
 * `Credentials::api_key(key)` → `X-API-Key: <key>`
 * `tenant` → `x-synapseone-tenant` (platform callers of Faststore/Queue)
 * Both token and API key can be supplied; the gateway decides which to verify.
+
+MFA recovery-code rotation requires the current TOTP code:
+`regenerate_recovery_codes("492039")`. Disable MFA with either
+`disable_mfa("492039")` or `disable_mfa_with_recovery_code("...")`.
 
 ## Retries and errors
 
@@ -150,13 +156,13 @@ CI (recommended): add the `CARGO_REGISTRY_TOKEN` repository secret and push a
 tag that matches `Cargo.toml`:
 
 ```bash
-git tag sdk-rust-v0.9.0
-git push origin sdk-rust-v0.9.0
+git tag sdk-rust-v0.10.2
+git push origin sdk-rust-v0.10.2
 ```
 
 `.github/workflows/sdk-rust-publish.yml` runs format/clippy/tests, verifies the
 tag, checks whether that exact version already exists and publishes only when
 needed. Re-running a release tag is a no-op.
 
-If the name `synapseone` is unavailable, rename the package in `Cargo.toml`
-(the library name can stay `synapseone` via `[lib] name = "synapseone"`).
+Full method reference: <https://docs.rs/synapseone>. Service-by-service examples:
+[`docs/services/`](../../docs/services/).

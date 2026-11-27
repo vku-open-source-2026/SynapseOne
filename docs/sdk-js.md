@@ -86,6 +86,14 @@ shares one `HttpClient` across:
 | `c.base` | SynapseBase | `@synapseone/sdk/base` |
 | `c.faststore` | Synapse Faststore | `@synapseone/sdk/faststore` |
 | `c.queue` | SynapseQueue | `@synapseone/sdk/queue` |
+| `c.stream` | SynapseStream | `@synapseone/sdk/stream` |
+| `c.storage` / `c.ocs` | SynapseOCS | `@synapseone/sdk/storage`, `@synapseone/sdk/ocs` |
+| `c.notifications` | SynapseNotifications | `@synapseone/sdk/notifications` |
+| `c.search` | Search | `@synapseone/sdk/search` |
+| `c.warehouse` | Synapse Warehouse | `@synapseone/sdk/warehouse` |
+| `c.lakehouse` | Synapse Lakehouse | `@synapseone/sdk/lakehouse` |
+| `c.ai` / `c.inference` | AI and inference | `@synapseone/sdk/ai`, `@synapseone/sdk/inference` |
+| `c.health` / `c.readiness` | Gateway health | `@synapseone/sdk/health` |
 
 ```ts
 import { SynapseOneClient } from '@synapseone/sdk';
@@ -100,8 +108,9 @@ namespaced call. The LDS namespace **drops the `lds` prefix**:
 `c.ldsLicenses()` → `c.lds.licenses()`.
 
 The API reference below documents the legacy flat surface (kept for existing
-code); new code should use the namespace equivalents. The new services are
-documented below in their own sections.
+code); new code should use the namespace equivalents. The
+[service guides](services/README.md) provide current examples in all four SDK
+languages, and the [parity matrix](sdk-parity.md) lists intentional differences.
 
 ## API reference
 
@@ -351,7 +360,7 @@ const entries = await c.listAudit(20, userId);
 ```ts
 createApiKey(accountId: string, name?: string, scopes?: string[]): Promise<{ apiKey: string }>
 ```
-Creates an API key. `name` defaults to `'default'`, `scopes` defaults to `['*']`.
+Creates an API key. `name` defaults to `'default'`, `scopes` defaults to `['*:read']` (least privilege).
 
 ```ts
 const { apiKey } = await c.createApiKey(accountId, 'ci-deploy', ['workflow:Execute']);
@@ -407,7 +416,7 @@ scopes unless the caller holds `*`.
 const { accessToken } = await c.serviceAccountToken(saId, ['workflow:Execute']);
 ```
 
-### Credentials (PROPOSED — backend in progress)
+### Credentials (implemented, account-scoped)
 
 Account-scoped secrets for workflow nodes (webhook auth, DB passwords, OAuth
 tokens...). Secrets are encrypted at rest and **never returned**: `create`/`rotate`
@@ -455,7 +464,7 @@ rotateCredential(id: string, secret: string): Promise<any>
 call(method: string, path: string, body?: unknown): Promise<any>
 ```
 Calls any gateway endpoint directly — forward-compat with endpoints added after
-this SDK (e.g. the proposed credentials API). Same auth + `status+path+body` errors.
+this SDK (for example a newly added endpoint). Same auth + `status+path+body` errors.
 
 ```ts
 const creds = await c.call('GET', `/v1/accounts/${accountId}/credentials`);
@@ -795,21 +804,24 @@ Also: `listQueues`, `getQueue`, `deleteQueue`, `purgeQueue`,
 ### Webhooks (public, no auth)
 
 `ANY /webhook/:path` triggers the ACTIVE workflow whose webhook node declares
-that `path`. The gateway does **not** proxy `/webhook/*` — call the
-workflow-service origin directly (e.g. `http://localhost:4002`).
+that `path`. The gateway proxies `/webhook/*` with `auth: none` and a 300-second
+budget, so production callers use the public API origin
+(`https://api.synapseone.space`) rather than a private service port.
 
 ```ts
-import { triggerWebhook } from '@synapseone/sdk';
-
-// Copy-paste: fire the code-transform template's webhook after activating it.
-const out = await triggerWebhook('http://localhost:4002', 'transform', { value: 21 });
+// Namespace helper: uses the configured client and its auth/tenant headers.
+const out = await c.workflow.triggerWebhook('transform', { value: 21 });
 console.log(out.output);
+
+// Standalone helper: always unauthenticated, suitable for a public webhook.
+import { triggerWebhook } from '@synapseone/sdk';
+const publicOut = await triggerWebhook('https://api.synapseone.space', 'transform', { value: 21 });
 ```
 
 Raw curl equivalent:
 
 ```bash
-curl -X POST http://localhost:4002/webhook/transform \
+curl -X POST http://localhost:8080/webhook/transform \
   -H 'Content-Type: application/json' \
   -d '{"value":21}'
 ```

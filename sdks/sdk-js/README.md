@@ -15,7 +15,7 @@ npm install @synapseone/sdk
 ```ts
 import { SynapseOneClient } from '@synapseone/sdk';
 
-const c = new SynapseOneClient(); // defaults to https://synapseone.space (or $SYNAPSEONE_BASE_URL)
+const c = new SynapseOneClient(); // defaults to https://api.synapseone.space (or $SYNAPSEONE_BASE_URL)
 const { accessToken, user } = await c.iam.login('demo@acme.local');
 c.setToken(accessToken);
 
@@ -68,7 +68,14 @@ The SDK is split per service, with matching subpath exports:
 | `c.base` | SynapseBase | `@synapseone/sdk/base` |
 | `c.faststore` | Synapse Faststore | `@synapseone/sdk/faststore` |
 | `c.queue` | SynapseQueue | `@synapseone/sdk/queue` |
+| `c.stream` | SynapseStream | `@synapseone/sdk/stream` |
+| `c.storage` / `c.ocs` | SynapseOCS | `@synapseone/sdk/storage`, `@synapseone/sdk/ocs` |
+| `c.notifications` | SynapseNotifications | `@synapseone/sdk/notifications` |
+| `c.search` | Base search | `@synapseone/sdk/search` |
+| `c.warehouse` | Synapse Warehouse | `@synapseone/sdk/warehouse` |
+| `c.lakehouse` | Synapse Lakehouse | `@synapseone/sdk/lakehouse` |
 | `c.inference` | Inference Engine | `@synapseone/sdk/inference` |
+| `c.health` | Gateway health/readiness | `@synapseone/sdk/health` |
 
 ```ts
 await c.base.createCollection({ name: 'parks', mapping: { name: 'profile.name' } });
@@ -107,5 +114,7 @@ Enrol with `c.iam.setupTotp()` + `c.iam.enableTotp(code)`; also `mfaStatus`,
 
 ## Full documentation
 
-See **[docs/sdk-js.md](../../docs/sdk-js.md)** for the complete API reference —
-constructor, auth, all methods with signatures, parameters, return types, and examples.
+See **[docs/sdk-js.md](../../docs/sdk-js.md)** for the language guide —
+constructor, auth, method signatures, parameters, return types, and examples.
+For copyable per-service examples in all four SDK languages, see
+[`docs/services/`](../../docs/services/).

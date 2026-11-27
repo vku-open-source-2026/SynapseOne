@@ -3,14 +3,19 @@
 name: Publish Rust SDK
 
 # Operator-gated: add the CARGO_REGISTRY_TOKEN repository secret, then push a
-# tag `sdk-rust-v<version>` (for example `sdk-rust-v0.9.0`). The tag version
-# must match sdks/sdk-rust/Cargo.toml. Re-running an already-published tag is a
-# no-op, so release retries stay green.
+# tag `sdk-rust-v<version>` (for example `sdk-rust-v0.10.2`). The tag version
+# must match every SDK manifest. Re-running an already-published tag is a no-op,
+# so release retries stay green.
 on:
   push:
     tags:
       - 'sdk-rust-v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing SDK release tag matching this checkout (for example sdk-rust-v0.10.2)
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -31,6 +36,11 @@ jobs:
       CRATE: synapseone
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -49,19 +59,29 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-      - name: Verify version and tag
+      - name: Verify shared SDK version and tag
+        working-directory: .
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
           if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
-            TAG_VERSION="${GITHUB_REF_NAME#sdk-rust-v}"
-            if [ "${TAG_VERSION}" != "${VERSION}" ]; then
-              echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${VERSION}"
-              exit 1
-            fi
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${RELEASE_TAG_INPUT}"
           fi
+          TAG_COMMIT=$(git rev-parse --verify "${TAG}^{commit}")
+          HEAD_COMMIT=$(git rev-parse HEAD)
+          if [ "${TAG_COMMIT}" != "${HEAD_COMMIT}" ]; then
+            echo "::error::${TAG} points to ${TAG_COMMIT}, not checkout ${HEAD_COMMIT}."
+            exit 1
+          fi
+          node tools/sdk-version-check.cjs "${TAG}"
+          VERSION=$(cargo metadata --manifest-path sdks/sdk-rust/Cargo.toml \
+            --no-deps --format-version 1 | jq -r '.packages[0].version')
           echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
-          echo "Publishing ${CRATE} ${VERSION}"
+          echo "RELEASE_TAG=${TAG}" >> "${GITHUB_ENV}"
+          echo "Publishing ${CRATE} ${VERSION} from ${TAG}"
 
       - name: Check whether this version already exists
         id: check

@@ -295,6 +295,8 @@ class WorkflowService:
             "kind": kind or type or "bearer",
             "secret": secret,
         }
+        if expires_at:
+            body["expiresAt"] = expires_at
         return self._req("POST", "/v1/credentials", body)
 
     def list_credentials(self, account_id: str | None = None) -> list:

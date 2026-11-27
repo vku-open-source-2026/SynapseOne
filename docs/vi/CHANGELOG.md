@@ -26,6 +26,9 @@ của từng bản phát hành nằm trong `CHANGELOG.md` tiếng Anh.
   list/count audit tenant/nền tảng tới PostgreSQL hot standby read-only sau khi
   authorization trên primary. Read có timeout ngắn và tự fallback primary;
   auth, quota, write, export và mutation vẫn ở primary.
+- **Kênh phát hành SDK 0.10.2:** bốn SDK dùng chung version gate; Go publish
+  từ module path monorepo thật qua tag `sdks/sdk-go/v*`. Tài liệu dịch vụ có ví dụ
+  tách riêng JavaScript/TypeScript, Python, Go và Rust.
 - **Kênh phát hành SDK 0.10.1:** tag `sdk-v*` publish asset/gói JS và Python mà
   không build container platform; `sdk-rust-v*` tiếp tục publish Rust crate.
 
@@ -42,6 +45,10 @@ của từng bản phát hành nằm trong `CHANGELOG.md` tiếng Anh.
 
 ### Sửa
 
+- **Lỗi phát hành SDK 0.10.2:** khôi phục package export JS
+  `ocs/search/warehouse/lakehouse`, đồng bộ type/runtime của flat alias, sửa
+  Python Search, chuyển expiry credential workflow trong JS/Python, thêm đủ bộ
+  wrapper Lakehouse của Go và sửa request MFA recovery-code của Rust.
 - **Ba blocker re-review quota:** execution workflow thường và MCP call dùng
   chung hourly counter/lease concurrency IAM nguyên tử; rotation grace PostgreSQL
   giữ expiry gốc của key kế nhiệm; snapshot quota rebase lên snapshot hackathon

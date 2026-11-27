@@ -92,7 +92,6 @@ def _is_timeout_error(exc: BaseException) -> bool:
     return False
 
 
-
 class SynapseOneError(Exception):
     """All SDK errors surface as SynapseOneError (network or HTTP).
 
@@ -178,7 +177,6 @@ class HttpClient:
             if origin is not None
         }
         self._base_origin = _origin(self.base_url)
-
 
     def headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         h = {"Content-Type": "application/json"}
@@ -289,7 +287,10 @@ class HttpClient:
                 )
 
             next_origin = _origin(next_url)
-            if next_origin != _origin(url) and next_origin not in self.trusted_redirect_origins:
+            if (
+                next_origin != _origin(url)
+                and next_origin not in self.trusted_redirect_origins
+            ):
                 response.close()
                 raise SynapseOneError(
                     f"synapseone refused a cross-origin redirect from {_origin(url)} to "
@@ -437,9 +438,7 @@ class HttpClient:
                     timeout=to,
                 )
                 try:
-                    raw = self._read_body(
-                        response, self.max_json_bytes, path, deadline
-                    )
+                    raw = self._read_body(response, self.max_json_bytes, path, deadline)
                     status = response.status_code
                     text = self._decode_text(response, raw)
                 finally:
@@ -455,7 +454,11 @@ class HttpClient:
                 raise last from exc
             except SynapseOneError as exc:
                 last = exc
-                if exc.code in {"network_error", "timeout"} and retryable and attempt < attempts:
+                if (
+                    exc.code in {"network_error", "timeout"}
+                    and retryable
+                    and attempt < attempts
+                ):
                     time.sleep(self.retry_base * (2 ** (attempt - 1)))
                     continue
                 raise
@@ -491,7 +494,6 @@ class HttpClient:
             f"synapseone {path}: retries exhausted", base_url=self.base_url
         )
 
-
     def request_binary(
         self,
         method: str,
@@ -512,9 +514,7 @@ class HttpClient:
                 timeout=to,
             )
             try:
-                raw = self._read_body(
-                    response, self.max_binary_bytes, path, deadline
-                )
+                raw = self._read_body(response, self.max_binary_bytes, path, deadline)
                 status = response.status_code
                 text = self._decode_text(response, raw)
             finally:
@@ -558,9 +558,7 @@ class HttpClient:
                 timeout=to,
             )
             try:
-                raw = self._read_body(
-                    response, self.max_json_bytes, path, deadline
-                )
+                raw = self._read_body(response, self.max_json_bytes, path, deadline)
                 status = response.status_code
                 text = self._decode_text(response, raw)
             finally:
@@ -678,7 +676,6 @@ class HttpClient:
             ) from exc
         finally:
             response.close()
-
 
 
 def parse_chat_delta(data: str) -> str | None:

@@ -15,7 +15,7 @@ pip install synapseone-sdk
 ```python
 from synapseone_sdk import SynapseOneClient
 
-c = SynapseOneClient()  # defaults to https://synapseone.space (or $SYNAPSEONE_BASE_URL)
+c = SynapseOneClient()  # defaults to https://api.synapseone.space (or $SYNAPSEONE_BASE_URL)
 login = c.iam.login("demo@acme.local")
 c.set_token(login["accessToken"])
 
@@ -37,6 +37,12 @@ The SDK is split per service. Use the namespace that matches the service:
 | `c.base` | SynapseBase | collections, documents, queries, batch, increment, change feed, typed object<->data mapping |
 | `c.faststore` | Synapse Faststore | KV with TTL/NX/XX, incr, hashes, lists, sets, sorted sets, scans, batches, distributed locks |
 | `c.queue` | SynapseQueue | queues, publish (delay/dedupe), consume leases, ack/nack/heartbeat, dead letters, replay |
+| `c.stream` | SynapseStream | topics, publish/read, consumer groups, acknowledgements, retention |
+| `c.storage` / `c.ocs` | SynapseOCS | buckets, binary objects, presign, multipart, quotas |
+| `c.notifications` | SynapseNotifications | outbox, templates, preferences, unsubscribe, delivery |
+| `c.warehouse` | Synapse Warehouse | datasets, read-only SQL, batch/stream ETL, jobs |
+| `c.lakehouse` | Synapse Lakehouse | Iceberg namespaces/tables, snapshots, schema evolution |
+| `c.health` | Gateway health | health, readiness and projected status |
 | `c.inference` | Inference Engine | LLM proxy, local embeddings, Decision-2.0-Eos-0.8B structured decision & routing |
 
 ### SynapseBase with typed objects
@@ -151,6 +157,6 @@ and `synapsedx_sdk` packages are packaged.
 
 ## Full documentation
 
-See **[docs/sdk-python.md](../../docs/sdk-python.md)** for the complete API
-reference — constructor, auth, all methods with signatures, parameters, return
-types, and examples.
+See **[docs/sdk-python.md](../../docs/sdk-python.md)** for the language guide —
+constructor, auth, method signatures, parameters, return types, and examples. For copyable per-service examples in all four SDK languages,
+see [`docs/services/`](../../docs/services/).

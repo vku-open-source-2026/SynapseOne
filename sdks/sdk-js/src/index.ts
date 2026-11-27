@@ -139,8 +139,13 @@ export class SynapseOneClient {
 }
 
 // The legacy flat methods are installed at runtime; this merge teaches the
-// type system about them so existing call sites keep compiling.
-export interface SynapseOneClient extends Pick<IamService, keyof IamService>, Pick<WorkflowService, keyof WorkflowService>, LdsLegacyMethods {}
+// type system about exactly that supported alias set. Do not use Pick<...,
+// keyof ...> here: namespaced methods without a legacy wrapper must not appear
+// as callable flat methods.
+export interface SynapseOneClient
+  extends Pick<IamService, (typeof IAM_METHODS)[number]>,
+    Pick<WorkflowService, (typeof WORKFLOW_METHODS)[number]>,
+    LdsLegacyMethods {}
 
 const IAM_METHODS = [
   'login', 'register', 'loginWithPassword', 'changePassword', 'requestPasswordReset',

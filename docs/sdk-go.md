@@ -6,22 +6,27 @@ Zero external dependencies (standard library only). Requires Go >= 1.22.
 
 ## Install
 
-### From the monorepo (replace directive)
+### From the Go module proxy
 
 ```bash
-go mod edit -replace github.com/synapseone/synapseone-sdk-go=./sdks/sdk-go
-go mod tidy
+go get github.com/vku-open-source-2026/SynapseOne/sdks/sdk-go@latest
 ```
 
-### As a published module
+Releases use the multi-module tag `sdks/sdk-go/v<version>`; the Go proxy and
+`pkg.go.dev` resolve the version automatically.
+
+### Local monorepo development
+
+From the repository root:
 
 ```bash
-go get github.com/synapseone/synapseone-sdk-go@latest
+go mod edit -replace github.com/vku-open-source-2026/SynapseOne/sdks/sdk-go=./sdks/sdk-go
+go mod tidy
 ```
 
 ### Forks
 
-Change the `github.com/synapseone/synapseone-sdk-go` module path in `go.mod` to your repo (Go resolves packages via git tags, no separate registry publish needed).
+Change the `github.com/vku-open-source-2026/SynapseOne/sdks/sdk-go` module path in `go.mod` to your repo (Go resolves packages via git tags, no separate registry publish needed).
 
 ## Quick start
 
@@ -30,7 +35,7 @@ package main
 
 import (
     "fmt"
-    synapseone "github.com/synapseone/synapseone-sdk-go"
+    synapseone "github.com/vku-open-source-2026/SynapseOne/sdks/sdk-go"
 )
 
 func main() {
@@ -331,7 +336,7 @@ entries, err := c.ListAudit(20, userID)
 ```go
 func (c *Client) CreateAPIKey(accountID, name string, scopes []string) (map[string]any, error)
 ```
-Creates an API key. `name` defaults to `"default"`, `scopes` defaults to `["*"]`.
+Creates an API key. `name` defaults to `"default"`, `scopes` defaults to `["*:read"]` (least privilege).
 
 ```go
 result, err := c.CreateAPIKey(accountID, "ci-deploy", []string{"workflow:Execute"})
@@ -388,7 +393,7 @@ result, err := c.ServiceAccountToken(saID, []string{"workflow:Execute"})
 token := result["accessToken"].(string)
 ```
 
-### Credentials (PROPOSED — backend in progress)
+### Credentials (implemented, account-scoped)
 
 Account-scoped secrets for workflow nodes (webhook auth, DB passwords, OAuth
 tokens...). Secrets are encrypted at rest and **never returned**: `Create`/`Rotate`
@@ -432,7 +437,7 @@ func (c *Client) RotateCredential(id, secret string) (map[string]any, error)
 func (c *Client) Call(method, path string, body any) (any, error)
 ```
 Calls any gateway endpoint directly — forward-compat with endpoints added after
-this SDK (e.g. the proposed credentials API). Same auth + `status path: body` errors.
+this SDK (for example a newly added endpoint). Same auth + `status path: body` errors.
 
 ```go
 creds, err := c.Call("GET", "/v1/accounts/"+accountID+"/credentials", nil)
@@ -834,19 +839,21 @@ route, err := c.InferenceRoute("Create and assign a new IAM policy", map[string]
 ### Webhooks (public, no auth)
 
 `ANY /webhook/:path` triggers the ACTIVE workflow whose webhook node declares
-that `path`. The gateway does **not** proxy `/webhook/*` — call the
-workflow-service origin directly (e.g. `http://localhost:4002`).
+that `path`. The gateway proxies `/webhook/*` with `auth: none` and a 300-second
+budget. The Go helper is deliberately unauthenticated; point it at the public
+API origin in production.
 
 ```go
 // Copy-paste: fire the code-transform template's webhook after activating it.
-out, err := synapseone.TriggerWebhook("http://localhost:4002", "transform", map[string]any{"value": 21})
+out, err := synapseone.TriggerWebhook("https://api.synapseone.space", "transform", map[string]any{"value": 21})
+if err != nil { log.Fatal(err) }
 fmt.Println(out["output"])
 ```
 
 Raw curl equivalent:
 
 ```bash
-curl -X POST http://localhost:4002/webhook/transform \
+curl -X POST http://localhost:8080/webhook/transform \
   -H 'Content-Type: application/json' \
   -d '{"value":21}'
 ```
@@ -874,7 +881,7 @@ import (
     "fmt"
     "log"
 
-    synapseone "github.com/synapseone/synapseone-sdk-go"
+    synapseone "github.com/vku-open-source-2026/SynapseOne/sdks/sdk-go"
 )
 
 func main() {
@@ -942,6 +949,25 @@ func main() {
 }
 ```
 
+
+## Current service APIs
+
+The Go client uses flat `Client.*` methods. The main families are:
+
+| Service | Methods |
+| --- | --- |
+| Search | `Search`, `ReindexSearch`, `SearchStatus` |
+| Stream | `*StreamTopic*`, `PublishStreamEvent`, `PublishStreamBatch`, `ReadStreamEvents`, `QueryStreamRange`, `*StreamGroup*`, `AckStreamEvents` |
+| OCS | `*OcsBucket*`, `*OcsObject*`, `*OcsMultipart*`, `UploadOcsPart`, `PresignOcs` |
+| Notifications | `SendNotification`, `GetNotification`, `ListNotifications`, `CancelNotification`, `RetryNotification`, `*NotificationTemplate*`, `*NotificationPreference*`, `Unsubscribe` |
+| Warehouse | `*WarehouseDataset*`, `IngestWarehouseRows`, `QueryWarehouse`, `*WarehouseJob*`, `WarehouseETL*`, `RunWarehouseBatch`, `EnsureWarehouseStream`, `WarehousePipelineStatus`, `WarehouseBaseToLakehouse`, `WarehousePreviewOCS`, `WarehouseImportOCS` |
+| Lakehouse | `LakehouseUsage`, `Lakehouse*Namespace*`, `Lakehouse*Table*`, `LakehouseAppend`, `LakehouseQuery`, `LakehouseSnapshots`, `LakehouseEvolveSchema` |
+| Workflow additions | `*Secret*`, `*ScimToken*`, `CreateHumanTask`, `ListHumanTasks`, `ClaimHumanTask`, `CompleteHumanTask`, `RejectHumanTask`, `ExpireHumanTask`, `CancelExecution` |
+
+Runner management does not yet have Go convenience wrappers; use
+`Client.Call("GET", "/v1/workflow-runners", nil)` or the documented runner routes.
+See [per-service Go examples](services/README.md) and the
+[parity matrix](sdk-parity.md).
 
 ## 0.7.x additions
 

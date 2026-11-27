@@ -684,7 +684,7 @@ class BaseService:
         """Poll the change feed for documents updated since an ISO timestamp.
 
         Returns ``{changes, nextSince, hasMore}``; pass ``nextSince`` back in
-        on the next call. Deletes are not emitted.
+        on the next call. Deletes are represented by tombstones.
         """
         params: dict[str, Any] = {"since": since}
         if limit is not None:
@@ -695,20 +695,6 @@ class BaseService:
             "GET",
             f"{self._root()}/{quote(collection, safe='')}/changes?{urlencode(params)}",
         )
-
-
-def _write_body(data: Any, object: Any) -> dict:
-    has_data = data is not UNSET
-    has_object = object is not UNSET
-    if has_data and has_object:
-        raise ValueError("provide exactly one of data or object")
-    if not has_data and not has_object:
-        raise ValueError("provide exactly one of data or object")
-    return {"data": data} if has_data else {"object": object}
-
-    # ---------------------------------------------------------------------------
-    # typed collection
-    # ---------------------------------------------------------------------------
 
     # ---- tenant-scoped search (#46) ----
     def search(
@@ -755,6 +741,16 @@ def _write_body(data: Any, object: Any) -> dict:
 
     def search_status(self) -> dict:
         return self._req("GET", "/v1/search/status")
+
+
+def _write_body(data: Any, object: Any) -> dict:
+    has_data = data is not UNSET
+    has_object = object is not UNSET
+    if has_data and has_object:
+        raise ValueError("provide exactly one of data or object")
+    if not has_data and not has_object:
+        raise ValueError("provide exactly one of data or object")
+    return {"data": data} if has_data else {"object": object}
 
 
 class BaseCollection:

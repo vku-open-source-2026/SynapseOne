@@ -6,9 +6,17 @@ on:
   push:
     tags: ["v*", "sdk-v*"]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions: { contents: write, packages: write }
     steps:
       - uses: actions/checkout@v4
@@ -16,15 +24,32 @@ jobs:
         with: { node-version: 24, registry-url: https://registry.npmjs.org }
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
-      - run: npm install --workspaces
-      - run: npm run build --workspaces --if-present
+      - name: Verify SDK release tag
+        if: startsWith(github.ref_name, 'sdk-v')
+        run: node tools/sdk-version-check.cjs "${GITHUB_REF_NAME}"
+      - name: Install and test SDK release
+        if: startsWith(github.ref_name, 'sdk-v')
+        run: |
+          set -euo pipefail
+          npm ci --workspace=sdks/sdk-js
+          npm run build --workspace=sdks/sdk-js
+          npm run test --workspace=sdks/sdk-js
+          pip install "./sdks/sdk-python[dev]"
+          pytest sdks/sdk-python -q
+      - name: Install and build platform release
+        if: "!startsWith(github.ref_name, 'sdk-v')"
+        run: |
+          npm ci --workspaces
+          npm run build --workspaces --if-present
       # Open-format release assets (tar.gz / whl / npm tgz — no zip/rar).
       - name: Build release assets
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p release-assets
           npm pack --workspace=sdks/sdk-js --pack-destination release-assets
-          npm pack --workspace=tools/cli --pack-destination release-assets
+          if [[ "${GITHUB_REF_NAME}" == v* ]]; then
+            npm pack --workspace=tools/cli --pack-destination release-assets
+          fi
           pip install build >/dev/null
           python -m build sdks/sdk-python --outdir release-assets
           sha256sum release-assets/* > release-assets/SHA256SUMS
@@ -94,7 +119,7 @@ jobs:
         run: |
           set -euo pipefail
           OWNER="$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')"
-          for name in gateway iam workflow workflow-runner ai lds base faststore queue stream inference ocs notifications console postgres edge; do
+          for name in gateway iam workflow workflow-runner ai lds base faststore queue stream warehouse lakehouse inference ocs notifications console postgres edge; do
             cosign sign --yes "ghcr.io/${OWNER}/synapseone-${name}:${TAG}"
             cosign sign --yes "ghcr.io/${OWNER}/synapseone-${name}:latest"
           done
@@ -104,6 +129,7 @@ jobs:
 
 
   publish-sdk-js:
+    if: startsWith(github.ref_name, 'sdk-v')
     runs-on: ubuntu-latest
     needs: release
     permissions:
@@ -113,7 +139,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 24, registry-url: https://registry.npmjs.org }
-      - run: npm install --workspace=sdks/sdk-js && npm run build --workspace=sdks/sdk-js
+      - run: npm ci --workspace=sdks/sdk-js && npm run build --workspace=sdks/sdk-js
       - run: cp LICENSE sdks/sdk-js/LICENSE
       # Idempotent: skip when this exact version already exists (re-runs stay green).
       - run: |
@@ -147,7 +173,8 @@ jobs:
 
   publish-sdk-python:
     # Stable PyPI releases only. The PyPI Trusted Publisher is configured for
-    # this workflow (release.yml); cd.yml must not publish to PyPI.
+    # this workflow (release.yml); cd.yml and platform tags must not publish it.
+    if: startsWith(github.ref_name, 'sdk-v')
     runs-on: ubuntu-latest
     needs: release
     permissions:

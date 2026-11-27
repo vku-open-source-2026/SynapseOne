@@ -23,195 +23,56 @@ import {
   faWarehouse,
   faLayerGroup,
   faBell,
+  faUserShield,
 } from '@fortawesome/free-solid-svg-icons';
 import { useI18n } from '../lib/i18n-context.js';
+import { SERVICE_CATALOG, matchesService } from '../lib/service-catalog.js';
 
-export const PLATFORM_SERVICES = [
-  {
-    to: '/workflows',
-    label: 'SynapseFlow',
-    category: 'Automation & AI Agents',
-    desc: 'Visual pipelines, AI agents, decision routing & DAGs',
-    icon: faBolt,
-    iconColor: 'from-amber-400 to-amber-500',
-    bgGradient: 'linear-gradient(135deg, #f59e0b 0%, #d97706 100%)',
-    shadowColor: 'rgba(245, 158, 11, 0.28)',
-    match: (p) => p.startsWith('/workflows'),
-    keywords: ['synapseflow', 'workflow', 'ai agent', 'decision', 'dag', 'automation', 'cron', 'trigger', 'pipeline', 'execution'],
-  },
-  {
-    to: '/runner-engine',
-    label: 'Runner Engine',
-    category: 'Automation & AI Agents',
-    desc: 'Queue-backed platform or self-hosted DAG workers',
-    icon: faServer,
-    iconColor: 'from-orange-400 to-amber-500',
-    bgGradient: 'linear-gradient(135deg, #fb923c 0%, #d97706 100%)',
-    shadowColor: 'rgba(251, 146, 60, 0.28)',
-    match: (p) => p.startsWith('/runner-engine') || p.startsWith('/workflow-runners'),
-    keywords: ['runner', 'runner engine', 'worker', 'self-hosted', 'queue', 'synapsequeue', 'docker', 'api key', 'hybrid', 'workflow', 'inference', 'connector'],
-  },
-  {
-    to: '/base',
-    label: 'SynapseBase',
-    category: 'Document Database',
-    desc: 'JSON documents with object ↔ data mapping & queries',
-    icon: faDatabase,
-    iconColor: 'from-blue-500 to-indigo-600',
-    bgGradient: 'linear-gradient(135deg, #3b82f6 0%, #4338ca 100%)',
-    shadowColor: 'rgba(59, 130, 246, 0.28)',
-    match: (p) => p.startsWith('/base'),
-    keywords: ['base', 'document', 'database', 'json', 'nosql', 'mapping', 'query', 'collections'],
-  },
-  {
-    to: '/search',
-    label: 'Search',
-    category: 'Document Database',
-    desc: 'Tenant-scoped full-text, semantic & hybrid search',
-    icon: faMagnifyingGlass,
-    iconColor: 'from-indigo-400 to-blue-600',
-    bgGradient: 'linear-gradient(135deg, #818cf8 0%, #2563eb 100%)',
-    shadowColor: 'rgba(99, 102, 241, 0.28)',
-    match: (p) => p.startsWith('/search'),
-    keywords: ['search', 'full-text', 'semantic', 'hybrid', 'facets', 'index', 'reindex', 'base'],
-  },
-  {
-    to: '/queue',
-    label: 'SynapseQueue',
-    category: 'Message Queue',
-    desc: 'At-least-once message queues, leases & dead letters',
-    icon: faInbox,
-    iconColor: 'from-emerald-400 to-teal-500',
-    bgGradient: 'linear-gradient(135deg, #10b981 0%, #0d9488 100%)',
-    shadowColor: 'rgba(16, 185, 129, 0.28)',
-    match: (p) => p.startsWith('/queue'),
-    keywords: ['queue', 'message', 'broker', 'dlq', 'dead letter', 'visibility', 'lease', 'pubsub'],
-  },
-  {
-    to: '/stream',
-    label: 'SynapseStream',
-    category: 'Event Streaming',
-    desc: 'Distributed event stream log, consumer groups & time-series replay',
-    icon: faStream,
-    iconColor: 'from-amber-500 to-rose-500',
-    bgGradient: 'linear-gradient(135deg, #f59e0b 0%, #f43f5e 100%)',
-    shadowColor: 'rgba(244, 63, 94, 0.28)',
-    match: (p) => p.startsWith('/stream'),
-    keywords: ['stream', 'streaming', 'kafka', 'events', 'consumer group', 'replay', 'telemetry', 'topic', 'log'],
-  },
-  {
-    to: '/warehouse',
-    label: 'Synapse Warehouse',
-    category: 'OLAP & ETL',
-    desc: 'DuckDB datasets, read-only SQL studio, batch & stream ETL jobs',
-    icon: faWarehouse,
-    iconColor: 'from-lime-500 to-emerald-600',
-    bgGradient: 'linear-gradient(135deg, #84cc16 0%, #059669 100%)',
-    shadowColor: 'rgba(16, 185, 129, 0.28)',
-    match: (p) => p.startsWith('/warehouse'),
-    keywords: ['warehouse', 'olap', 'duckdb', 'sql', 'dataset', 'etl', 'analytics', 'batch', 'stream', 'aggregate', 'rollup'],
-  },
-  {
-    to: '/lakehouse',
-    label: 'Synapse Lakehouse',
-    category: 'OLAP & ETL',
-    desc: 'Apache Iceberg tables, snapshots, schema evolution and object storage',
-    icon: faLayerGroup,
-    iconColor: 'from-teal-400 to-cyan-600',
-    bgGradient: 'linear-gradient(135deg, #2dd4bf 0%, #0891b2 100%)',
-    shadowColor: 'rgba(20, 184, 166, 0.28)',
-    match: (p) => p.startsWith('/lakehouse'),
-    keywords: ['lakehouse', 'iceberg', 'parquet', 'snapshot', 'time travel', 'schema evolution', 'catalog', 's3', 'analytics', 'table'],
-  },
-  {
-    to: '/ocs',
-    label: 'SynapseOCS',
-    category: 'Object Cloud Storage',
-    desc: 'Buckets, objects, signed URLs, multipart upload & tenant quotas',
-    icon: faCloud,
-    iconColor: 'from-sky-400 to-blue-600',
-    bgGradient: 'linear-gradient(135deg, #0ea5e9 0%, #2563eb 100%)',
-    shadowColor: 'rgba(14, 165, 233, 0.28)',
-    match: (p) => p.startsWith('/ocs'),
-    keywords: ['ocs', 'object storage', 'bucket', 'minio', 's3', 'file', 'upload', 'download', 'presign', 'multipart'],
-  },
-  {
-    to: '/faststore',
-    label: 'Synapse Faststore',
-    category: 'Cache & KV Store',
-    desc: 'Redis-backed cache, counters, hashes & distributed locks',
-    icon: faGaugeHigh,
-    iconColor: 'from-cyan-400 to-blue-500',
-    bgGradient: 'linear-gradient(135deg, #06b6d4 0%, #2563eb 100%)',
-    shadowColor: 'rgba(6, 182, 212, 0.28)',
-    match: (p) => p.startsWith('/faststore'),
-    keywords: ['faststore', 'cache', 'redis', 'key-value', 'kv', 'ttl', 'counter', 'hash', 'lock'],
-  },
-  {
-    to: '/lds',
-    label: 'SynapseLDS',
-    category: 'Linked Data',
-    desc: 'NGSI-LD datasources, entity schemas & open-data licenses',
-    icon: faLink,
-    iconColor: 'from-purple-500 to-indigo-500',
-    bgGradient: 'linear-gradient(135deg, #8b5cf6 0%, #6366f1 100%)',
-    shadowColor: 'rgba(139, 92, 246, 0.28)',
-    match: (p) => p.startsWith('/lds'),
-    keywords: ['lds', 'linked data', 'ngsi-ld', 'datasource', 'license', 'schema', 'entities'],
-  },
-  {
-    to: '/notifications',
-    label: 'SynapseNotifications',
-    category: 'Messaging',
-    desc: 'Tenant notification outbox, preferences, delivery and cancellation',
-    icon: faBell,
-    iconColor: 'from-rose-400 to-pink-600',
-    bgGradient: 'linear-gradient(135deg, #fb7185 0%, #db2777 100%)',
-    shadowColor: 'rgba(244, 63, 94, 0.28)',
-    match: (p) => p.startsWith('/notifications'),
-    keywords: ['notifications', 'email', 'sms', 'push', 'webhook', 'outbox', 'delivery', 'unsubscribe'],
-  },
-  {
-    to: '/inference',
-    label: 'SynapseInference',
-    category: 'AI & Inference',
-    desc: 'LLM proxy, local embeddings & Decision-2.0 routing',
-    icon: faBrain,
-    iconColor: 'from-violet-500 to-purple-600',
-    bgGradient: 'linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%)',
-    shadowColor: 'rgba(139, 92, 246, 0.28)',
-    match: (p) => p.startsWith('/inference'),
-    keywords: ['inference', 'ai', 'llm', 'embedding', 'decision', 'openrouter', 'routing', 'agent', 'model'],
-  },
-];
+const SERVICE_ICONS = {
+  gateway: faServer,
+  iam: faUserShield,
+  workflow: faBolt,
+  runner: faServer,
+  ai: faBrain,
+  inference: faBrain,
+  lds: faLink,
+  base: faDatabase,
+  search: faMagnifyingGlass,
+  faststore: faGaugeHigh,
+  queue: faInbox,
+  stream: faStream,
+  ocs: faCloud,
+  notifications: faBell,
+  warehouse: faWarehouse,
+  lakehouse: faLayerGroup,
+};
+
+// Kept as a named export for Topbar and existing imports.
+export const PLATFORM_SERVICES = SERVICE_CATALOG;
 
 export default function ServicesSidebar({ open = true, onToggle }) {
   const { pathname } = useLocation();
   const [query, setQuery] = useState('');
   const { m } = useI18n();
-  // Localised category/description, falling back to the English fields above.
-  const copy = (svc) => m.services[svc.to.slice(1)] || svc;
+  const copy = (svc) => m.services[svc.id] || svc;
 
   if (!open) return null;
 
   const q = query.trim().toLowerCase();
-  const filtered = PLATFORM_SERVICES.filter((svc) => {
+  const filtered = SERVICE_CATALOG.filter((svc) => {
     if (!q) return true;
-    if (svc.label.toLowerCase().includes(q)) return true;
-    if (svc.category.toLowerCase().includes(q)) return true;
-    if (svc.desc.toLowerCase().includes(q)) return true;
-    if (copy(svc).category.toLowerCase().includes(q)) return true;
-    if (copy(svc).desc.toLowerCase().includes(q)) return true;
-    return svc.keywords.some((k) => k.includes(q));
+    const localized = copy(svc);
+    return [svc.label, localized.label, svc.category, localized.category, svc.desc, localized.desc, ...svc.keywords]
+      .filter(Boolean)
+      .some((value) => value.toLowerCase().includes(q));
   });
 
   return (
     <aside
-      aria-label="Services Navigation"
+      aria-label={m.console.servicesSection}
       className="fixed right-3 xl:right-5 top-0 h-screen w-64 xl:w-72 hidden lg:flex flex-col z-30 pt-4 pb-6"
     >
       <div className="w-full bg-white rounded-3xl p-4 shadow-md max-h-[85vh] flex flex-col">
-        {/* Header */}
         <div className="flex items-center justify-between pb-3 border-b border-slate-100">
           <div className="flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
@@ -234,7 +95,6 @@ export default function ServicesSidebar({ open = true, onToggle }) {
           </div>
         </div>
 
-        {/* Search Input */}
         <div className="relative mt-3 mb-3">
           <FontAwesomeIcon
             icon={faMagnifyingGlass}
@@ -258,7 +118,6 @@ export default function ServicesSidebar({ open = true, onToggle }) {
           )}
         </div>
 
-        {/* Services List */}
         <nav className="flex-1 overflow-y-auto space-y-2 pr-1 s1-thin-scroll">
           {filtered.length === 0 ? (
             <div className="py-8 text-center text-xs text-normal-text">
@@ -273,11 +132,12 @@ export default function ServicesSidebar({ open = true, onToggle }) {
             </div>
           ) : (
             filtered.map((svc) => {
-              const active = svc.match(pathname);
+              const active = matchesService(svc, pathname);
+              const localized = copy(svc);
+              const label = localized.label || svc.label;
               return (
-                <Link
-                  key={svc.to}
-                  to={svc.to}
+                <div
+                  key={svc.id}
                   className={`group block p-2.5 rounded-2xl border transition-all ${
                     active
                       ? 'border-main-blue bg-main-blue/10 shadow-sm'
@@ -292,31 +152,38 @@ export default function ServicesSidebar({ open = true, onToggle }) {
                       }}
                       className="w-8 h-8 rounded-xl flex items-center justify-center text-white shrink-0 group-hover:scale-105 transition-transform"
                     >
-                      <FontAwesomeIcon icon={svc.icon} className="w-3.5 h-3.5" />
+                      <FontAwesomeIcon icon={SERVICE_ICONS[svc.id]} className="w-3.5 h-3.5" />
                     </div>
                     <div className="min-w-0 flex-1">
-                      <div className="flex items-center justify-between">
-                        <span
+                      <div className="flex items-center justify-between gap-2">
+                        <Link
+                          to={svc.consoleRoute}
                           className={`text-xs font-semibold truncate ${
                             active ? 'text-main-blue' : 'text-main-text group-hover:text-main-blue'
                           }`}
                         >
-                          {svc.label}
-                        </span>
-                        {active && (
-                          <span className="w-1.5 h-1.5 rounded-full bg-main-blue shrink-0" />
-                        )}
+                          {label}
+                        </Link>
+                        {active && <span className="w-1.5 h-1.5 rounded-full bg-main-blue shrink-0" />}
                       </div>
-                      <p className="text-[10px] text-normal-text truncate">{copy(svc).category}</p>
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-[10px] text-normal-text truncate">{localized.category}</p>
+                        <Link
+                          to={`/docs?tab=${svc.docsTab}`}
+                          className="shrink-0 text-[10px] font-medium text-main-blue hover:underline"
+                          title={`${m.nav.docs}: ${label}`}
+                        >
+                          {m.nav.docs}
+                        </Link>
+                      </div>
                     </div>
                   </div>
-                </Link>
+                </div>
               );
             })
           )}
         </nav>
 
-        {/* Footer info */}
         <div className="mt-3 pt-3 border-t border-slate-100 text-[11px] text-normal-text flex items-center justify-between">
           <span>{m.console.servicesFooter}</span>
           <Link to="/api-docs" className="text-main-blue hover:underline flex items-center gap-1">

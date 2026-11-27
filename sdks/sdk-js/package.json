@@ -1,6 +1,6 @@
 {
   "name": "@synapseone/sdk",
-  "version": "0.10.1",
+  "version": "0.10.2",
   "license": "Apache-2.0",
   "description": "synapseone SDK for JavaScript/TypeScript",
   "homepage": "https://synapseone.space",
@@ -90,10 +90,30 @@
       "require": "./dist/storage.js",
       "default": "./dist/storage.js"
     },
+    "./ocs": {
+      "types": "./dist/ocs.d.ts",
+      "require": "./dist/ocs.js",
+      "default": "./dist/ocs.js"
+    },
     "./notifications": {
       "types": "./dist/notifications.d.ts",
       "require": "./dist/notifications.js",
       "default": "./dist/notifications.js"
+    },
+    "./search": {
+      "types": "./dist/search.d.ts",
+      "require": "./dist/search.js",
+      "default": "./dist/search.js"
+    },
+    "./warehouse": {
+      "types": "./dist/warehouse.d.ts",
+      "require": "./dist/warehouse.js",
+      "default": "./dist/warehouse.js"
+    },
+    "./lakehouse": {
+      "types": "./dist/lakehouse.d.ts",
+      "require": "./dist/lakehouse.js",
+      "default": "./dist/lakehouse.js"
     }
   },
   "files": [

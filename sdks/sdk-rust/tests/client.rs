@@ -34,6 +34,40 @@ async fn sends_auth_tenant_and_accept_headers() {
 }
 
 #[tokio::test]
+async fn mfa_recovery_code_regeneration_sends_current_totp() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/mfa/recovery-codes"))
+        .and(body_partial_json(json!({ "code": "492039" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .mount(&server)
+        .await;
+
+    client(&server)
+        .iam()
+        .regenerate_recovery_codes("492039")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn mfa_can_be_disabled_with_a_recovery_code() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/mfa/disable"))
+        .and(body_partial_json(json!({ "recoveryCode": "recovery-123" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .mount(&server)
+        .await;
+
+    client(&server)
+        .iam()
+        .disable_mfa_with_recovery_code("recovery-123")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn base_query_sends_filter_order_and_cursor() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

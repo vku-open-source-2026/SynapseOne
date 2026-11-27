@@ -302,12 +302,18 @@ def test_call_passes_any_method_path_body_through():
         srv.shutdown()
 
 
-def test_credentials_crud_proposed_contract():
+def test_credentials_crud_contract():
     srv = _server()
     try:
         base = f"http://127.0.0.1:{srv.server_port}"
         c = SynapseOneClient(base)
-        c.create_credential("a1", "stripe-live", "bearer", "s3cr3t")
+        c.workflow.create_credential(
+            "a1",
+            "stripe-live",
+            "bearer",
+            "s3cr3t",
+            expires_at="2027-01-01T00:00:00Z",
+        )
         assert _seen["path"] == "/v1/credentials", _seen
         assert _seen["method"] == "POST", _seen
         assert json.loads(_seen["body"]) == {
@@ -315,6 +321,7 @@ def test_credentials_crud_proposed_contract():
             "name": "stripe-live",
             "kind": "bearer",
             "secret": "s3cr3t",
+            "expiresAt": "2027-01-01T00:00:00Z",
         }, _seen
         c.list_credentials("a1")
         assert _seen["path"] == "/v1/credentials?accountId=a1", _seen

@@ -4,7 +4,7 @@
  * Copyright 2026 SynapseOne Contributors
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
-// SSR smoke test: render every route's default state to a string (no browser).
+// SSR smoke test: render every route's default state and every Docs tab in en/vi.
 // Catches module-eval crashes, missing providers (useScope outside ScopeProvider),
 // unbound identifiers on default branches, and broken imports — without jsdom.
 // State-dependent branches (modals, suggestion panels) are covered by reviews;
@@ -15,9 +15,14 @@ import { renderToString } from 'react-dom/server';
 import { MemoryRouter } from 'react-router-dom';
 import { AuthProvider } from './lib/auth.jsx';
 import App from './App.jsx';
+import Docs from './pages/Docs.jsx';
+import { LanguageProvider } from './lib/i18n.jsx';
 import WorkflowEditor from './components/WorkflowEditor.jsx';
 import { OrganizationTable } from './pages/Orgs.jsx';
 import { keyStatus as apiKeyStatus, quotaFieldSource, organizationDetailKey } from './pages/admin/OrganizationDetail.jsx';
+import { DOC_TABS, SERVICE_CATALOG } from './lib/service-catalog.js';
+import { en } from './locales/en.js';
+import { vi } from './locales/vi.js';
 
 const ROUTES = [
   '/',
@@ -43,10 +48,15 @@ const ROUTES = [
   '/warehouse',
   '/lakehouse',
   '/queue',
+  '/stream',
+  '/ocs',
+  '/notifications',
+  '/inference',
   '/faststore',
   '/lds',
   '/authorize',
   '/audit',
+  '/security',
   '/api-docs',
   '/docs',
   '/nope-not-a-route',
@@ -85,10 +95,15 @@ const GUARDED = new Set([
   '/warehouse',
   '/lakehouse',
   '/queue',
+  '/stream',
+  '/ocs',
+  '/notifications',
+  '/inference',
   '/faststore',
   '/lds',
   '/authorize',
   '/audit',
+  '/security',
   '/admin/overview',
   '/admin/orgs',
   '/admin/users',
@@ -130,6 +145,44 @@ for (const [label, session] of Object.entries(SESSIONS)) {
     }
   }
 }
+
+const SERVICE_IDS = new Set(SERVICE_CATALOG.map((service) => service.id));
+for (const [lang, dict] of [['en', en], ['vi', vi]] as const) {
+  (globalThis as any).localStorage = {
+    getItem: (k: string) => (k === 'synapseone.lang' ? lang : null),
+    setItem: () => undefined,
+    removeItem: () => undefined,
+  };
+  for (const { id } of DOC_TABS) {
+    const path = `/docs?tab=${id}`;
+    try {
+      const html = renderToString(
+        <MemoryRouter initialEntries={[path]}>
+          <AuthProvider>
+            <LanguageProvider>
+              <Docs />
+            </LanguageProvider>
+          </AuthProvider>
+        </MemoryRouter>,
+      );
+      if (typeof html !== 'string' || html.length === 0) throw new Error('empty render');
+      if (SERVICE_IDS.has(id)) {
+        const panels = (html.match(/data-sdk-panel=/g) || []).length;
+        if (panels !== 4) throw new Error(`expected 4 SDK panels, received ${panels}`);
+        for (const language of ['javascript', 'python', 'go', 'rust']) {
+          if (!html.includes(`data-sdk-panel="${language}"`)) throw new Error(`missing ${language} SDK panel`);
+        }
+        const localizedHeading = lang === 'vi' ? 'Sử dụng SDK' : 'SDK usage';
+        if (!html.includes(localizedHeading)) throw new Error(`missing ${lang} SDK heading`);
+      }
+      console.log(`ok [docs-${lang}] ${path} (${html.length} chars)`);
+    } catch (e: any) {
+      failures++;
+      console.error(`FAIL [docs-${lang}] ${path}: ${e?.message || e}`);
+    }
+  }
+}
+
 if (failures > 0) {
   console.error(`${failures} route(s) failed to render`);
   process.exit(1);

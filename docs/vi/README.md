@@ -30,6 +30,10 @@
 | sdk-js.md | SDK JavaScript/TypeScript: cài đặt, auth, API | — |
 | sdk-python.md | SDK Python: cài đặt, auth, API | — |
 | sdk-go.md | SDK Go: cài đặt, auth, API | — |
+| sdk-rust.md | SDK Rust: cài đặt, auth, namespace và lỗi | — |
+| sdk-parity.md | Ma trận bao phủ bốn ngôn ngữ và generic request | — |
+| services/ | Hướng dẫn từng dịch vụ với ví dụ JS/Python/Go/Rust | — |
+| [sdk-0.10.2.md](sdk-0.10.2.md) | Gói SDK 0.10.2, tag phát hành và module path Go | [../sdk-0.10.2.md](../sdk-0.10.2.md) |
 | sdk-0.10.1.md | Gói SDK 0.10.1, tag phát hành và audit | — |
 | cli.md | CLI: cài đặt, cấu hình và lệnh | — |
 | adr/ | Quyết định kiến trúc: Lakehouse, search, runtime parity, bảo mật workflow | — |

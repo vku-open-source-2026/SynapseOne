@@ -10,7 +10,7 @@ new optional IAM audit read-replica behavior introduced in the platform.
 | JavaScript/TypeScript | `@synapseone/sdk` | `0.10.1` | `sdk-v0.10.1` |
 | Python | `synapseone-sdk` | `0.10.1` | `sdk-v0.10.1` |
 | Rust | `synapseone` | `0.10.1` | `sdk-rust-v0.10.1` |
-| Go | `github.com/synapseone/synapseone-sdk-go` | module revision | `sdk-v0.10.1` |
+| Go | legacy `github.com/synapseone/synapseone-sdk-go` declaration | repository-only | `sdk-v0.10.1` (not a valid public Go module release; corrected in 0.10.2) |
 
 ## IAM audit consistency
 
