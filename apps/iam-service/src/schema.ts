@@ -107,6 +107,26 @@ export const passwordResetTokens = pgTable(
   ],
 );
 
+/** Single-use OIDC authorization state. The signed browser state carries only
+ *  the row id; nonce + encrypted PKCE verifier stay server-side. browserHash
+ *  binds consumption to the initiating Secure/HttpOnly cookie. */
+export const oidcLoginStates = pgTable(
+  'oidc_login_states',
+  {
+    id: uuid('id').primaryKey(),
+    orgSlug: text('org_slug').notNull(),
+    nonce: text('nonce').notNull(),
+    verifierEnc: text('verifier_enc').notNull(),
+    browserHash: text('browser_hash').notNull(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('oidc_login_states_nonce_key').on(t.nonce),
+    index('idx_oidc_login_states_expiry').on(t.expiresAt),
+  ],
+);
+
 export const roles = pgTable(
   'roles',
   {

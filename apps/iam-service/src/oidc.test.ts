@@ -10,7 +10,7 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import http from 'node:http';
-import { generateKeyPairSync, createPublicKey, createHmac } from 'node:crypto';
+import { generateKeyPairSync, createPublicKey, createHmac, createHash, randomBytes } from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import { createApp } from './index';
 import { __clearOidcCache, assertOidcConfig, isPublicHttpsUrl } from './oidc';
@@ -55,10 +55,13 @@ before(
 
 after(() => new Promise<void>((resolve) => (server ? server.close(() => resolve()) : resolve())));
 
-async function call(method: string, path: string, body?: any) {
+async function call(method: string, path: string, body?: any, cookie?: string) {
   const r = await fetch(base + path, {
     method,
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(cookie ? { Cookie: `synapseone_oidc=${cookie}` } : {}),
+    },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const text = await r.text();
@@ -68,12 +71,19 @@ async function call(method: string, path: string, body?: any) {
   } catch {
     data = text;
   }
-  return { status: r.status, data };
+  return { status: r.status, data, setCookie: r.headers.get('set-cookie') };
+}
+
+function browserCookie(setCookie: string | null): string {
+  const match = /^synapseone_oidc=([^;]+)/.exec(setCookie || '');
+  assert.ok(match, `expected OIDC browser cookie, got ${setCookie}`);
+  return match[1];
 }
 
 interface Stub {
   url: string;
   close: () => Promise<void>;
+  stats: { tokenRequests: number; pkceFailures: number };
 }
 
 /** Minimal OIDC provider: discovery + JWKS + token endpoint signing `alg`. */
@@ -87,7 +97,8 @@ async function startStubIdp(
   pubJwk.kid = 'stub-k1';
   pubJwk.alg = 'RS256';
   pubJwk.use = 'sig';
-  let lastNonce = '';
+  const nonceByChallenge = new Map<string, string>();
+  const stats = { tokenRequests: 0, pkceFailures: 0 };
   const srv = http.createServer((req, res) => {
     const send = (code: number, obj: any) => {
       res.writeHead(code, { 'Content-Type': 'application/json' });
@@ -95,7 +106,9 @@ async function startStubIdp(
     };
     if (String(req.url || '').startsWith('/authorize')) {
       const u = new URL(String(req.url), 'http://stub.local');
-      lastNonce = u.searchParams.get('nonce') || '';
+      const lastNonce = u.searchParams.get('nonce') || '';
+      const challenge = u.searchParams.get('code_challenge') || '';
+      if (challenge) nonceByChallenge.set(challenge, lastNonce);
       return send(200, { ok: true });
     }
     if (req.url === '/.well-known/openid-configuration') {
@@ -116,13 +129,23 @@ async function startStubIdp(
       req.on('data', (c) => (body += c));
       req.on('end', () => {
         const iss = `http://127.0.0.1:${(srv.address() as any).port}/`;
+        const params = new URLSearchParams(body);
+        const verifier = params.get('code_verifier') || '';
+        const challenge = createHash('sha256').update(verifier).digest('base64url');
+        const flowNonce = nonceByChallenge.get(challenge);
+        stats.tokenRequests++;
+        if (!flowNonce) {
+          stats.pkceFailures++;
+          return send(400, { error: 'invalid_grant' });
+        }
+        nonceByChallenge.delete(challenge);
         const signOpts: any =
           alg === 'RS256'
             ? { algorithm: 'RS256', keyid: 'stub-k1', expiresIn: 300 }
             : { algorithm: 'HS256', expiresIn: 300 };
         // jsonwebtoken v9: sign(payload, secretOrPrivateKey, options)
         const key = alg === 'RS256' ? privPem : 'weak-shared-secret';
-        const claims: any = { iss, aud: 'test-client', sub: opts.sub || 'stub-sub-1', name: 'Stub User', nonce: opts.wrongNonce ? 'wrong-nonce' : lastNonce };
+        const claims: any = { iss, aud: 'test-client', sub: opts.sub || `stub-${randomBytes(8).toString('hex')}`, name: 'Stub User', nonce: opts.wrongNonce ? 'wrong-nonce' : flowNonce };
         if (!opts.noEmail) claims.email = opts.email || 'SSO@Example.COM';
         const idToken = (jwt as any).sign(claims, key, signOpts);
         send(200, { id_token: idToken, token_type: 'Bearer', expires_in: 300 });
@@ -133,7 +156,7 @@ async function startStubIdp(
   });
   await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', resolve));
   const url = `http://127.0.0.1:${(srv.address() as any).port}`;
-  return { url, close: () => new Promise<void>((resolve) => srv.close(() => resolve())) };
+  return { url, close: () => new Promise<void>((resolve) => srv.close(() => resolve())), stats };
 }
 
 async function begin(stub: Stub, org: string) {
@@ -142,7 +165,7 @@ async function begin(stub: Stub, org: string) {
   // Simulate the browser hitting the IdP authorize endpoint so the stub can
   // carry the nonce into the ID token (real IdPs echo it from the request).
   await fetch(String(start.data.authorizeUrl));
-  return start;
+  return { ...start, cookie: browserCookie(start.setCookie) };
 }
 
 describe('oidc authorization code flow (stub IdP)', () => {
@@ -160,6 +183,14 @@ describe('oidc authorization code flow (stub IdP)', () => {
       assert.ok(u.searchParams.get('nonce'));
       const parts = String(r.data.state).split('.');
       assert.equal(parts.length, 2); // payload.hmac (unsigned legacy states are rejected)
+      assert.match(String(r.setCookie), /HttpOnly/i);
+      assert.match(String(r.setCookie), /Secure/i);
+      assert.match(String(r.setCookie), /SameSite=Lax/i);
+      assert.match(String(r.setCookie), /Path=\/v1\/auth\/oidc/i);
+      const statePayload = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+      assert.equal(statePayload.nonce, undefined);
+      assert.equal(statePayload.v, undefined);
+      assert.match(statePayload.sid, /^[0-9a-f-]{36}$/i);
     } finally {
       await stub.close();
     }
@@ -170,11 +201,13 @@ describe('oidc authorization code flow (stub IdP)', () => {
     try {
       setIdp(stub.url);
       const start = await begin(stub, 'ssoorg');
-      const cb = await call('POST', '/v1/auth/oidc/callback', { code: 'opaque-code', state: start.data.state });
+      const cb = await call('POST', '/v1/auth/oidc/callback', { code: 'opaque-code', state: start.data.state }, start.cookie);
       assert.equal(cb.status, 200);
       assert.ok(cb.data.accessToken);
       assert.ok(cb.data.refreshToken);
       assert.equal(cb.data.user.email, 'sso@example.com'); // normalized from IdP claim
+      assert.equal(stub.stats.tokenRequests, 1);
+      assert.equal(stub.stats.pkceFailures, 0, 'server-side PKCE verifier must match the authorize challenge');
       // The minted token actually authenticates.
       const me = await fetch(`${base}/v1/auth/me`, {
         headers: { Authorization: `Bearer ${cb.data.accessToken}` },
@@ -185,12 +218,76 @@ describe('oidc authorization code flow (stub IdP)', () => {
     }
   });
 
+  it('rejects a callback from another client with no initiating cookie', async () => {
+    const stub = await startStubIdp('RS256', { email: 'attacker@example.com', sub: 'attacker-sub' });
+    try {
+      setIdp(stub.url);
+      const start = await begin(stub, 'csrf-no-cookie');
+      const foreign = await call('POST', '/v1/auth/oidc/callback', { code: 'opaque-code', state: start.data.state });
+      assert.equal(foreign.status, 400);
+      assert.equal(foreign.data.error, 'oidc_browser_required');
+      assert.equal(foreign.data.accessToken, undefined);
+      assert.equal(foreign.data.refreshToken, undefined);
+      assert.equal(stub.stats.tokenRequests, 0, 'unbound callback must not reach the IdP');
+      // A failed foreign attempt does not consume the initiating client's state.
+      const legitimate = await call('POST', '/v1/auth/oidc/callback', { code: 'opaque-code', state: start.data.state }, start.cookie);
+      assert.equal(legitimate.status, 200);
+      assert.equal(legitimate.data.user.email, 'attacker@example.com');
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it('rejects another client cookie even when both clients started login', async () => {
+    const stub = await startStubIdp('RS256');
+    try {
+      setIdp(stub.url);
+      const clientA = await begin(stub, 'csrf-two-clients');
+      const clientB = await begin(stub, 'csrf-two-clients');
+      assert.notEqual(clientA.cookie, clientB.cookie);
+      const foreign = await call('POST', '/v1/auth/oidc/callback', {
+        code: 'opaque-code', state: clientA.data.state,
+      }, clientB.cookie);
+      assert.equal(foreign.status, 400);
+      assert.equal(foreign.data.error, 'oidc_bad_state');
+      assert.equal(foreign.data.accessToken, undefined);
+      assert.equal(stub.stats.tokenRequests, 0);
+      const legitimate = await call('POST', '/v1/auth/oidc/callback', {
+        code: 'opaque-code', state: clientA.data.state,
+      }, clientA.cookie);
+      assert.equal(legitimate.status, 200);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it('atomically consumes OIDC state once under concurrent callbacks', async () => {
+    const stub = await startStubIdp('RS256');
+    try {
+      setIdp(stub.url);
+      const start = await begin(stub, 'csrf-one-time');
+      const results = await Promise.all([
+        call('POST', '/v1/auth/oidc/callback', { code: 'opaque-code', state: start.data.state }, start.cookie),
+        call('POST', '/v1/auth/oidc/callback', { code: 'opaque-code', state: start.data.state }, start.cookie),
+      ]);
+      assert.deepEqual(results.map((r) => r.status).sort(), [200, 400]);
+      assert.equal(results.filter((r) => r.data.accessToken).length, 1);
+      assert.equal(stub.stats.tokenRequests, 1);
+      const replay = await call('POST', '/v1/auth/oidc/callback', { code: 'opaque-code', state: start.data.state }, start.cookie);
+      assert.equal(replay.status, 400);
+      assert.equal(replay.data.error, 'oidc_bad_state');
+      assert.equal(stub.stats.tokenRequests, 1);
+    } finally {
+      await stub.close();
+    }
+  });
+
   it('a different IdP identity cannot join an existing org (#9)', async () => {
     const stubA = await startStubIdp('RS256');
     try {
       setIdp(stubA.url);
       const startA = await begin(stubA, 'joinsorg');
-      const cbA = await call('POST', '/v1/auth/oidc/callback', { code: 'opaque-code', state: startA.data.state });
+      const cbA = await call('POST', '/v1/auth/oidc/callback', { code: 'opaque-code', state: startA.data.state }, startA.cookie);
       assert.equal(cbA.status, 200); // first login founds the org
     } finally {
       await stubA.close();
@@ -199,7 +296,7 @@ describe('oidc authorization code flow (stub IdP)', () => {
     try {
       setIdp(stubB.url);
       const startB = await begin(stubB, 'joinsorg');
-      const cbB = await call('POST', '/v1/auth/oidc/callback', { code: 'opaque-code', state: startB.data.state });
+      const cbB = await call('POST', '/v1/auth/oidc/callback', { code: 'opaque-code', state: startB.data.state }, startB.cookie);
       assert.equal(cbB.status, 403);
       assert.equal(cbB.data.error, 'org_membership_required');
     } finally {
@@ -217,7 +314,7 @@ describe('oidc authorization code flow (stub IdP)', () => {
         assert.equal(blocked.status, 403);
         assert.equal(blocked.data.error, 'org_not_allowed');
         const allowed = await begin(stub, 'allowedorg');
-        const ok = await call('POST', '/v1/auth/oidc/callback', { code: 'opaque-code', state: allowed.data.state });
+        const ok = await call('POST', '/v1/auth/oidc/callback', { code: 'opaque-code', state: allowed.data.state }, allowed.cookie);
         assert.equal(ok.status, 200);
       } finally {
         await stub.close();
@@ -238,7 +335,7 @@ describe('oidc authorization code flow (stub IdP)', () => {
       assert.ok(start);
       const codes = await enableTotp(user.id);
       const callback = await begin(stub, org.slug);
-      const cb = await call('POST', '/v1/auth/oidc/callback', { code: 'opaque-code', state: callback.data.state });
+      const cb = await call('POST', '/v1/auth/oidc/callback', { code: 'opaque-code', state: callback.data.state }, callback.cookie);
       assert.equal(cb.status, 401);
       assert.equal(cb.data.error, 'mfa_required');
       assert.ok(cb.data.mfaToken);
@@ -300,7 +397,7 @@ describe('oidc authorization code flow (stub IdP)', () => {
     try {
       setIdp(stub.url);
       const start = await begin(stub, 'ssoorg');
-      const r = await call('POST', '/v1/auth/oidc/callback', { code: 'x', state: start.data.state });
+      const r = await call('POST', '/v1/auth/oidc/callback', { code: 'x', state: start.data.state }, start.cookie);
       assert.equal(r.status, 502);
       assert.equal(r.data.error, 'oidc_bad_nonce');
     } finally {
@@ -313,7 +410,7 @@ describe('oidc authorization code flow (stub IdP)', () => {
     try {
       setIdp(stub.url);
       const start = await begin(stub, 'ssoorg');
-      const r = await call('POST', '/v1/auth/oidc/callback', { code: 'x', state: start.data.state });
+      const r = await call('POST', '/v1/auth/oidc/callback', { code: 'x', state: start.data.state }, start.cookie);
       assert.equal(r.status, 502);
       assert.equal(r.data.error, 'oidc_bad_id_token');
     } finally {
@@ -353,7 +450,7 @@ describe('oidc authorization code flow (stub IdP)', () => {
     try {
       setIdp(stub.url);
       const start = await begin(stub, 'ssoorg');
-      const r = await call('POST', '/v1/auth/oidc/callback', { code: 'x', state: start.data.state });
+      const r = await call('POST', '/v1/auth/oidc/callback', { code: 'x', state: start.data.state }, start.cookie);
       assert.equal(r.status, 502);
       assert.equal(r.data.error, 'oidc_unknown_kid');
     } finally {
@@ -366,7 +463,7 @@ describe('oidc authorization code flow (stub IdP)', () => {
     try {
       setIdp(stub.url);
       const start = await begin(stub, 'ssoorg');
-      const r = await call('POST', '/v1/auth/oidc/callback', { code: 'x', state: start.data.state });
+      const r = await call('POST', '/v1/auth/oidc/callback', { code: 'x', state: start.data.state }, start.cookie);
       assert.equal(r.status, 502);
       assert.equal(r.data.error, 'oidc_no_email');
     } finally {

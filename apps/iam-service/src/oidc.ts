@@ -8,8 +8,15 @@
  * signature verification via JWKS + node:crypto JWK import + jsonwebtoken.
  */
 import jwt from 'jsonwebtoken';
-import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, createPublicKey, timingSafeEqual } from 'crypto';
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, randomUUID, createPublicKey, timingSafeEqual } from 'crypto';
 import { getJwtSecret } from './tokens';
+import {
+  OIDC_BROWSER_COOKIE_MAX_AGE_MS,
+  consumeOidcLoginState,
+  hashOidcBrowserToken,
+  storeOidcLoginState,
+  __clearOidcStateMemory,
+} from './oidc-state';
 
 export interface OidcSettings {
   issuer: string;
@@ -171,23 +178,31 @@ function openVerifier(sealed: string): string {
   }
 }
 
-/** Create signed state carrying org + nonce + encrypted PKCE verifier. */
-export function createOidcState(org: string): { state: string; nonce: string; codeChallenge: string } {
+/** Create signed state pointing at a one-time server-side record. The OIDC
+ *  nonce and encrypted PKCE verifier never rely on browser-held state. */
+export async function createOidcState(org: string, browserToken: string): Promise<{ state: string; nonce: string; codeChallenge: string }> {
+  if (!/^[A-Za-z0-9_-]{43,128}$/.test(browserToken || '')) {
+    throw new OidcError('oidc_bad_browser_state', 'Invalid OIDC browser binding.', 400);
+  }
+  const id = randomUUID();
   const nonce = randomBytes(16).toString('hex');
   const verifier = randomBytes(32).toString('base64url');
   const codeChallenge = createHash('sha256').update(verifier).digest('base64url');
-  const payload = b64u({
-    org,
-    t: Date.now(),
-    n: randomBytes(16).toString('hex'),
+  const now = Date.now();
+  await storeOidcLoginState({
+    id,
+    orgSlug: org,
     nonce,
-    v: sealVerifier(verifier),
+    verifierEnc: sealVerifier(verifier),
+    browserHash: hashOidcBrowserToken(browserToken),
+    expiresAt: new Date(now + OIDC_BROWSER_COOKIE_MAX_AGE_MS),
   });
+  const payload = b64u({ org, t: now, sid: id });
   const sig = createHmac('sha256', stateSecret()).update(payload).digest('hex');
   return { state: `${payload}.${sig}`, nonce, codeChallenge };
 }
 
-export function verifyState(state: string): { org: string; nonce: string; verifier: string } {
+export function verifyState(state: string): { org: string; stateId: string } {
   const parts = String(state || '').split('.');
   if (parts.length !== 2 || !parts[0] || !parts[1]) {
     throw new OidcError('oidc_bad_state', 'Invalid OIDC state (format).', 400);
@@ -214,14 +229,10 @@ export function verifyState(state: string): { org: string; nonce: string; verifi
   if (typeof payload.t !== 'number' || Date.now() - payload.t > STATE_TTL_MS || payload.t > Date.now() + 60_000) {
     throw new OidcError('oidc_state_expired', 'OIDC state expired — restart login.', 400);
   }
-  if (typeof payload.nonce !== 'string' || !/^[a-f0-9]{16,128}$/.test(payload.nonce)) {
-    throw new OidcError('oidc_bad_state', 'Invalid OIDC state (nonce).', 400);
+  if (typeof payload.sid !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(payload.sid)) {
+    throw new OidcError('oidc_bad_state', 'Invalid OIDC state (server nonce reference).', 400);
   }
-  const verifier = openVerifier(payload.v);
-  if (!/^[A-Za-z0-9_-]{43,128}$/.test(verifier)) {
-    throw new OidcError('oidc_bad_state', 'Invalid OIDC state (verifier).', 400);
-  }
-  return { org: payload.org, nonce: payload.nonce, verifier };
+  return { org: payload.org, stateId: payload.sid };
 }
 
 // ---------- discovery + JWKS (short-TTL caches) ----------
@@ -301,6 +312,7 @@ async function getJwks(jwksUri: string): Promise<any[]> {  const hit = jwksCache
 export function __clearOidcCache(): void {
   discovery = null;
   jwksCache.clear();
+  __clearOidcStateMemory();
 }
 
 // ---------- ID-token verification ----------
@@ -356,10 +368,23 @@ async function verifyIdToken(idToken: string, doc: any, clientId: string, issuer
 
 // ---------- full exchange ----------
 
-export async function exchangeCode(code: string, state: string): Promise<VerifiedIdentity> {
-  const { org, nonce, verifier } = verifyState(state);
+export async function exchangeCode(code: string, state: string, browserToken: string): Promise<VerifiedIdentity> {
+  const signed = verifyState(state);
+  if (!browserToken) {
+    throw new OidcError('oidc_browser_required', 'OIDC login cookie is missing — restart sign-in.', 400);
+  }
+  // This is the security boundary: verify the signed reference, then atomically
+  // delete the server-side nonce/PKCE record only for the initiating browser.
+  const stored = await consumeOidcLoginState(signed.stateId, browserToken);
+  if (!stored || stored.orgSlug !== signed.org) {
+    throw new OidcError('oidc_bad_state', 'OIDC state is invalid, expired, already used, or belongs to another browser.', 400);
+  }
   if (!code || typeof code !== 'string' || code.length > 4096) {
     throw new OidcError('oidc_code_required', 'Authorization `code` is required.', 400);
+  }
+  const verifier = openVerifier(stored.verifierEnc);
+  if (!/^[A-Za-z0-9_-]{43,128}$/.test(verifier)) {
+    throw new OidcError('oidc_bad_state', 'Invalid OIDC state (verifier).', 400);
   }
   const cfg = oidcSettings();
   if (!cfg.clientSecret) {
@@ -386,7 +411,7 @@ export async function exchangeCode(code: string, state: string): Promise<Verifie
   if (!tok || typeof tok.id_token !== 'string') {
     throw new OidcError('oidc_token_failed', 'IdP did not return an ID token.', 502);
   }
-  const claims: any = await verifyIdToken(tok.id_token, doc, cfg.clientId, cfg.issuer, nonce);
+  const claims: any = await verifyIdToken(tok.id_token, doc, cfg.clientId, cfg.issuer, stored.nonce);
   const email = String(claims.email || '').trim().toLowerCase();
   if (!email || email.length > 320 || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
     throw new OidcError('oidc_no_email', 'IdP did not release an email claim (check client scopes).', 502);
@@ -405,5 +430,5 @@ export async function exchangeCode(code: string, state: string): Promise<Verifie
   const rawName = String(claims.name || claims.preferred_username || email).trim();
   // Strip control chars / angle brackets (stored-XSS hardening for console rendering).
   const displayName = rawName.replace(/[\u0000-\u001f\u007f<>]/g, '').slice(0, 200) || email;
-  return { org, email, sub, displayName };
+  return { org: signed.org, email, sub, displayName };
 }

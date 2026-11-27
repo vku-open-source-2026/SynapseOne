@@ -134,6 +134,13 @@
       "when": 1798001000006,
       "tag": "0020_api_key_rotation_marker",
       "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1798001000007,
+      "tag": "0021_vengeful_shocker",
+      "breakpoints": true
     }
   ]
 }

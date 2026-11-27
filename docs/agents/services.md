@@ -102,6 +102,8 @@ accessors + seed), `src/tokens.ts` (JWT/refresh/API keys), `src/policy.ts`
   `DELETE /v1/users/:userId/roles/:roleId`), plus
   `GET /v1/roles/:roleId/policies`, `GET /v1/users/:userId/policies|roles`.
 - Authz: `POST /v1/authorize`, `POST /v1/authorize/dry-run`, `GET /v1/audit`.
+- SCIM: `/scim/v2/Users` and `/scim/v2/Groups` provisioning; scoped bearer
+  tokens are managed through `/v1/scim/tokens`.
 - Keys: `POST/GET /v1/accounts/:accountId/keys`, `POST /v1/keys/verify`,
   `DELETE /v1/keys/:id`; service accounts
   `POST/GET /v1/accounts/:accountId/service-accounts`,
@@ -140,7 +142,12 @@ Migrations seed demo org `acme` and account `prod`; the memory fallback seeds
   bootstrap; service-account tokens are account-bound (no org fallback).
 - `canActForOrg`: same org only.
 - Policy evaluation: explicit Deny > Allow > default deny; conditions
-  `StringEquals`/`StringLike` (+`IfExists`); action/resource patterns capped.
+  `StringEquals`/`StringLike` (+`IfExists`); linear-time glob matching with
+  collapsed wildcard runs and a 16-wildcard cap.
+- OIDC authorization state is single-use and server-side, bound to the
+  initiating browser's Secure/HttpOnly/SameSite cookie; PKCE and nonce are preserved.
+- SCIM requires `scim:read` for GET/HEAD and `scim:write` for mutations;
+  `scim:write` does not imply read access.
 - Audit reads are tenant-scoped; `actor_type=dry-run` rows use `callerOrg`.
 - Production boot rejects dev login, demo OIDC callback, missing internal
   secret, missing `DATABASE_URL`.

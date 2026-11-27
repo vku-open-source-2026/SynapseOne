@@ -7,7 +7,8 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { evaluatePolicies, matchPattern, matchCondition, adminPolicy, workflowRunnerPolicy, validatePolicyDocument } from './policy';
+import { performance } from 'node:perf_hooks';
+import { evaluatePolicies, matchPattern, matchCondition, adminPolicy, workflowRunnerPolicy, validatePolicyDocument, MAX_GLOB_WILDCARDS } from './policy';
 
 describe('matchPattern', () => {
   it('star matches all', () => {
@@ -19,6 +20,7 @@ describe('matchPattern', () => {
     // No over-match: prefix:* must not match a longer service name without ':'.
     assert.equal(matchPattern('workflow:*', 'workflowEvil:Execute'), false);
     assert.equal(matchPattern('workflow:*', 'workflow'), true);
+    assert.equal(matchPattern('workflow:**', 'workflow'), true);
   });
   it('exact matches only itself', () => {
     assert.equal(matchPattern('iam:Create', 'iam:Create'), true);
@@ -28,6 +30,34 @@ describe('matchPattern', () => {
     const doc = { Version: '1', Statement: [{ Effect: 'Allow' as const, Action: 'workflow:Execute', Resource: 'arn:synapseone:acme:prod:workflow:*' }] };
     assert.equal(evaluatePolicies([doc], { action: 'workflow:Execute', resource: 'arn:synapseone:acme:prod:workflow:etl' }).allowed, true);
     assert.equal(evaluatePolicies([doc], { action: 'workflow:Execute', resource: 'arn:synapseone:acme:staging:workflow:etl' }).allowed, false);
+  });
+  it('treats regex metacharacters as literals', () => {
+    assert.equal(matchPattern('a.b*[x]', 'a.bZZ[x]'), true);
+    assert.equal(matchPattern('a.b*[x]', 'axbZZx'), false);
+  });
+  it('collapses consecutive wildcards before applying the cap', () => {
+    const pattern = `a${'*'.repeat(200)}b*c`;
+    assert.equal(matchPattern(pattern, 'a---b---c'), true);
+    assert.equal(matchPattern(pattern, 'a---c'), false);
+    assert.equal(validatePolicyDocument({ Statement: [{ Effect: 'Allow', Action: pattern, Resource: '*' }] }), null);
+  });
+  it('fails closed above the wildcard-count cap', () => {
+    const atCap = '*a'.repeat(MAX_GLOB_WILDCARDS);
+    const overCap = `${atCap}*`;
+    assert.equal(matchPattern(atCap, 'a'.repeat(MAX_GLOB_WILDCARDS)), true);
+    assert.equal(matchPattern(overCap, 'a'.repeat(MAX_GLOB_WILDCARDS)), false);
+    assert.ok(validatePolicyDocument({ Statement: [{ Effect: 'Allow', Action: overCap, Resource: '*' }] }));
+  });
+  it('evaluates catastrophic regex shapes within a strict linear-time budget', () => {
+    const cases = [10, 12, 14, 16, 126].map((n) => ({
+      pattern: `${'*a'.repeat(n)}*c*`,
+      value: 'a'.repeat(n),
+    }));
+    const started = performance.now();
+    for (let i = 0; i < 200; i++) {
+      for (const { pattern, value } of cases) assert.equal(matchPattern(pattern, value), false);
+    }
+    assert.ok(performance.now() - started < 500, `glob regression took ${performance.now() - started}ms`);
   });
 });
 
@@ -91,6 +121,16 @@ describe('conditions', () => {
   it('overlong StringLike pattern never matches (ReDoS guard)', () => {
     const evil = 'a*'.repeat(200); // 400 chars > 256 cap
     assert.equal(matchCondition({ StringLike: { email: evil } }, { email: 'a@acme.local' }), false);
+  });
+  it('caps StringLike wildcards after collapsing runs and stays linear', () => {
+    const collapsed = { StringLike: { email: `*${'*'.repeat(200)}@acme.local` } };
+    assert.equal(matchCondition(collapsed, { email: 'a@acme.local' }), true);
+    const evil = `${'*a'.repeat(126)}*c*`;
+    const value = 'a'.repeat(126);
+    const started = performance.now();
+    for (let i = 0; i < 500; i++) assert.equal(matchCondition({ StringLike: { email: evil } }, { email: value }), false);
+    assert.ok(performance.now() - started < 500, `StringLike regression took ${performance.now() - started}ms`);
+    assert.ok(validatePolicyDocument(docWith({ StringLike: { email: evil } })));
   });
   it('oversized context value never matches', () => {
     const doc = docWith({ StringLike: { note: '*' } });

@@ -89,8 +89,10 @@ headers and are dev/test-only in that mode.
 ### OIDC
 
 - Authorization Code flow in IAM: discovery + JWKS ID-token verification
-  (`RS256/384/512`, `ES256/384`), HMAC-signed short-TTL `state` for
-  CSRF/replay protection, console `/oidc/callback` page. No PKCE/nonce today.
+  (`RS256/384/512`, `ES256/384`), PKCE `S256` + OIDC nonce, and signed short-TTL
+  `state` referencing a one-time server-side record. The record is bound to the
+  initiating browser's `Secure`, `HttpOnly`, `SameSite=Lax` cookie and consumed
+  atomically at callback; console `/oidc/callback` page.
 - IAM stores a shadow user keyed by `(org, email)` and optional `external_sub`.
 - Existing org requires an existing membership (`org_membership_required`);
   a brand-new slug is self-service unless `OIDC_ALLOWED_ORGS` restricts it.
@@ -102,9 +104,10 @@ headers and are dev/test-only in that mode.
 - AWS-style JSON policies: explicit `Deny` wins, then `Allow`, default deny.
 - Action strings like `workflow:Execute`; resources like
   `arn:synapseone:<org>:<account>:<service>:<id>` or `*`.
-- `*` wildcard matcher keeps `:` literal, so `workflow:*` does not match
-  `workflowEvil:x`; conditions support `StringEquals` / `StringLike`
-  (`IfExists` variants). Policy docs are validated and size-capped on write.
+- `*` uses a linear-time glob matcher and keeps `:` literal, so `workflow:*`
+  does not match `workflowEvil:x`; consecutive wildcards collapse and patterns
+  are capped at 16 wildcard runs. Conditions support `StringEquals` /
+  `StringLike` (`IfExists` variants). Policy docs are validated and size-capped on write.
 - `/v1/authorize` evaluates policies for a `userId` and audits the decision;
   server injects `user/org/email` into the condition context (caller cannot
   override). `/v1/authorize/dry-run` evaluates inline documents without a user.

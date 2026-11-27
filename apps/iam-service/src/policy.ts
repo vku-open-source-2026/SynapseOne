@@ -11,17 +11,97 @@ function toArr(x: string | string[]): string[] {
   return Array.isArray(x) ? x : [x];
 }
 
-// minimatch-lite: '*' matches any sequence (including ':'), exact otherwise.
-// 'prefix:*' therefore requires the ':' boundary — no over-match of 'prefixEvil'.
+// Linear-time glob matcher: '*' matches any sequence (including ':'), exact
+// otherwise. Literal segments are found with KMP, so adversarial patterns cannot
+// trigger regex backtracking. 'prefix:*' still requires the ':' boundary — no
+// over-match of 'prefixEvil'.
+export const MAX_GLOB_WILDCARDS = 16;
+const MAX_PATTERN_LEN = 512;
+
+/** Count wildcard runs, not raw '*' characters: consecutive stars are one glob
+ *  wildcard and must not consume the anti-abuse budget. */
+function countGlobWildcards(pattern: string): number {
+  let count = 0;
+  let previousStar = false;
+  for (const ch of pattern) {
+    if (ch === '*') {
+      if (!previousStar) count++;
+      previousStar = true;
+    } else {
+      previousStar = false;
+    }
+  }
+  return count;
+}
+
+function globSegments(pattern: string): string[] {
+  const segments: string[] = [];
+  let literal = '';
+  for (const ch of pattern) {
+    if (ch === '*') {
+      if (literal) segments.push(literal);
+      literal = '';
+    } else {
+      literal += ch;
+    }
+  }
+  if (literal) segments.push(literal);
+  return segments;
+}
+
+/** KMP substring search. Each successful search resumes after its match, so a
+ *  complete glob match scans the value at most once (plus literal comparisons). */
+function findLiteral(value: string, literal: string, from: number): number {
+  if (!literal) return from;
+  const failure = new Array<number>(literal.length).fill(0);
+  for (let i = 1, matched = 0; i < literal.length; i++) {
+    while (matched > 0 && literal[i] !== literal[matched]) matched = failure[matched - 1];
+    if (literal[i] === literal[matched]) matched++;
+    failure[i] = matched;
+  }
+  for (let i = from, matched = 0; i < value.length; i++) {
+    while (matched > 0 && value[i] !== literal[matched]) matched = failure[matched - 1];
+    if (value[i] === literal[matched]) matched++;
+    if (matched === literal.length) return i - literal.length + 1;
+  }
+  return -1;
+}
+
 export function matchPattern(pattern: string, value: string): boolean {
+  if (typeof pattern !== 'string' || typeof value !== 'string') return false;
+  if (pattern.length > MAX_PATTERN_LEN || countGlobWildcards(pattern) > MAX_GLOB_WILDCARDS) return false;
   if (pattern === '*') return true;
   if (!pattern.includes('*')) return pattern === value;
-  // Bare service prefix still matches 'service:*' (legacy behavior).
-  if (pattern.endsWith(':*') && value === pattern.slice(0, -2)) return true;
-  // Escape regex specials except '*' (which becomes '.*'); ':' stays literal so
-  // 'workflow:*' -> ^workflow:.*$ does NOT match 'workflowEvil:x'.
-  const re = new RegExp('^' + pattern.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$');
-  try { return re.test(value); } catch { return false; }
+  // Bare service prefix still matches 'service:*' (legacy behavior). Treat a
+  // consecutive trailing wildcard run as the collapsed single wildcard.
+  if (pattern.endsWith('*')) {
+    let beforeStars = pattern.length - 1;
+    while (beforeStars >= 0 && pattern[beforeStars] === '*') beforeStars--;
+    if (beforeStars >= 0 && pattern[beforeStars] === ':' && value === pattern.slice(0, beforeStars)) return true;
+  }
+
+  const segments = globSegments(pattern);
+  const startsWildcard = pattern.startsWith('*');
+  const endsWildcard = pattern.endsWith('*');
+  let segmentIndex = 0;
+  let valueIndex = 0;
+  if (!startsWildcard) {
+    const first = segments[segmentIndex++];
+    if (!value.startsWith(first)) return false;
+    valueIndex = first.length;
+  }
+  const searchEnd = endsWildcard ? segments.length : segments.length - 1;
+  while (segmentIndex < searchEnd) {
+    const literal = segments[segmentIndex++];
+    const found = findLiteral(value, literal, valueIndex);
+    if (found < 0) return false;
+    valueIndex = found + literal.length;
+  }
+  if (!endsWildcard) {
+    const last = segments[segmentIndex];
+    return last.length <= value.length - valueIndex && value.endsWith(last);
+  }
+  return true;
 }
 
 export interface AuthzRequest {
@@ -33,10 +113,9 @@ export type ConditionContext = Record<string, string | number | boolean | undefi
 
 // AWS-style conditions (subset): StringEquals (+ IfExists variants), StringLike.
 // Condition chưa thỏa → statement bị bỏ qua (không match).
-// ReDoS guard: StringLike patterns compile thành RegExp — giới hạn độ dài/số lượng
-// để policy độc hại không thể đốt CPU mỗi lần authorize (xem validatePolicyDocument:
-// cùng giới hạn áp lúc ghi; ở đây fail-closed theo hướng "không match" để 1 statement
-// xấu không thể tự biến thành Allow/Deny trên input bất ngờ).
+// ReDoS guard: StringLike dùng linear-time glob matcher — giới hạn độ dài/số
+// wildcard để policy độc hại không thể đốt CPU mỗi lần authorize. Cùng giới hạn
+// áp lúc ghi; ở đây fail-closed ("không match") cho document bất ngờ.
 const MAX_LIKE_PATTERN_LEN = 256;
 const MAX_LIKE_PATTERNS_PER_KEY = 100;
 
@@ -64,12 +143,7 @@ export function matchCondition(cond: any, ctx: ConditionContext): boolean {
       } else if (op === 'StringLike') {
         const patterns = (Array.isArray(v) ? v : [v]).map(String);
         if (patterns.length > MAX_LIKE_PATTERNS_PER_KEY) return false;
-        const ok = patterns.some((p) => {
-          if (p.length > MAX_LIKE_PATTERN_LEN) return false;
-          // '*' wildcard both sides-safe: escape regex specials trừ '*'
-          const re = new RegExp('^' + p.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$');
-          return re.test(a);
-        });
+        const ok = patterns.some((p) => p.length <= MAX_LIKE_PATTERN_LEN && matchPattern(p, a));
         if (!ok) return false;
       } else {
         return false; // operator lạ → conservative: không match
@@ -125,7 +199,6 @@ export function workflowRunnerPolicy(accountSlug: string): PolicyDoc {
  * oversized documents (DoS via 1mb JSON body full of statements).
  */
 const MAX_STATEMENTS = 100;
-const MAX_PATTERN_LEN = 512;
 const MAX_CONDITION_BYTES = 8192;
 
 function validateCondition(cond: any, statementIndex: number): string | null {
@@ -155,6 +228,9 @@ function validateCondition(cond: any, statementIndex: number): string | null {
         if (String(item).length > MAX_LIKE_PATTERN_LEN) {
           return `${where}.${opRaw}.${key} value exceeds ${MAX_LIKE_PATTERN_LEN} chars`;
         }
+        if (op === 'StringLike' && countGlobWildcards(String(item)) > MAX_GLOB_WILDCARDS) {
+          return `${where}.${opRaw}.${key} value exceeds ${MAX_GLOB_WILDCARDS} wildcards`;
+        }
       }
     }
   }
@@ -177,6 +253,9 @@ export function validatePolicyDocument(doc: any): string | null {
       for (const p of arr) {
         if (typeof p !== 'string' || p.length === 0) return `Statement[${i}].${key} entries must be non-empty strings`;
         if (p.length > MAX_PATTERN_LEN) return `Statement[${i}].${key} pattern exceeds ${MAX_PATTERN_LEN} chars`;
+        if (countGlobWildcards(p) > MAX_GLOB_WILDCARDS) {
+          return `Statement[${i}].${key} pattern exceeds ${MAX_GLOB_WILDCARDS} wildcards`;
+        }
       }
     }
     if (st.Condition !== undefined) {

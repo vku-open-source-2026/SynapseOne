@@ -70,6 +70,10 @@ import { getQuotaMeter, getQuotaMeterHealth, validateQuotaCheck, validateExecuti
 import { startUsageRollup } from './usage-rollup';
 import { assertOidcConfig, isPublicHttpsUrl, createOidcState, exchangeCode, authorizationEndpoint, oidcSettings, OidcError } from './oidc';
 import {
+  OIDC_BROWSER_COOKIE, OIDC_BROWSER_COOKIE_MAX_AGE_MS, OIDC_BROWSER_COOKIE_PATH,
+  newOidcBrowserToken, readOidcBrowserCookie,
+} from './oidc-state';
+import {
   hashPassword, verifyPassword, passwordPolicyError, newOneTimeToken,
   resetTokenExpiry, verifyTokenExpiry, inviteTokenExpiry, PASSWORD_MAX,
 } from './passwords';
@@ -1427,6 +1431,12 @@ async function auditMutation(req: express.Request, action: string, resource: str
   });
 
   // ---------- OIDC discovery (Authentik, Keycloak, or any OIDC IdP) ----------
+  const oidcCookieOptions = {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'lax' as const,
+    path: OIDC_BROWSER_COOKIE_PATH,
+  };
   app.get('/v1/auth/oidc/config', (_req, res) => {
     const cfg = oidcSettings();
     res.json({
@@ -1463,9 +1473,11 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (allowed.length && !allowed.includes(org)) {
       return res.status(403).json({ error: 'org_not_allowed', message: `organization '${org}' is not allowed for SSO` });
     }
-    // Signed state binds org + nonce + encrypted PKCE verifier + 10-minute expiry.
-    const { state, nonce, codeChallenge } = createOidcState(org);
+    // Signed state references a one-time server-side nonce + encrypted PKCE
+    // verifier, bound to the initiating browser's Secure/HttpOnly cookie.
+    const browserToken = readOidcBrowserCookie(req.headers.cookie) || newOidcBrowserToken();
     try {
+      const { state, nonce, codeChallenge } = await createOidcState(org, browserToken);
       // Use the IdP's discovery document instead of guessing `<issuer>/authorize`;
       // this validates the endpoint (https + issuer origin in production).
       const endpoint = await authorizationEndpoint(cfg.issuer);
@@ -1480,12 +1492,17 @@ async function auditMutation(req: express.Request, action: string, resource: str
         code_challenge_method: 'S256',
       });
       const sep = endpoint.includes('?') ? '&' : '?';
+      noStore(res);
+      res.cookie(OIDC_BROWSER_COOKIE, browserToken, {
+        ...oidcCookieOptions,
+        maxAge: OIDC_BROWSER_COOKIE_MAX_AGE_MS,
+      });
       res.json({ authorizeUrl: `${endpoint}${sep}${params.toString()}`, state, nonce });
     } catch (e: any) {
       if (e instanceof OidcError) {
         return res.status(e.status).json({ error: e.code, message: e.message, issuer: cfg.issuer });
       }
-      res.status(502).json({ error: 'oidc_discovery_failed', message: e?.message || String(e), issuer: cfg.issuer });
+      res.status(502).json({ error: 'oidc_start_failed', message: e?.message || String(e), issuer: cfg.issuer });
     }
   });
 
@@ -1497,6 +1514,11 @@ async function auditMutation(req: express.Request, action: string, resource: str
   //    impersonation-prone. Disable in production with
   //    IAM_ALLOW_OIDC_DEMO_CALLBACK=false.
   app.post('/v1/auth/oidc/callback', async (req, res) => {
+    // Clear the short-lived binding on every callback attempt. The raw value is
+    // captured first; the server-side record is consumed atomically by exchange.
+    const browserToken = readOidcBrowserCookie(req.headers.cookie) || '';
+    noStore(res);
+    res.clearCookie(OIDC_BROWSER_COOKIE, oidcCookieOptions);
     try {
       const demoAllowed = isDemoCallbackEnabled();
       const { email, sub, displayName, orgSlug, code, state } = (req.body || {}) as any;
@@ -1505,7 +1527,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
           return res.status(400).json({ error: 'oidc_state_required', message: 'Signed `state` from /v1/auth/oidc/start is required with `code`.' });
         }
         try {
-          const id = await exchangeCode(code, state);
+          const id = await exchangeCode(code, state, browserToken);
           // #9: new org → self-service; existing org → membership required.
           const resolved = await resolveOidcIdentity(id.org, id.email, id.displayName, id.sub);
           if ('error' in resolved) {
@@ -1576,7 +1598,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
   //  2. email only when IAM_ALLOW_DEV_LOGIN=true (dev/test passwordless),
   //  3. OIDC code exchange (see /v1/auth/oidc/callback).
   // ---------- SCIM 2.0 provisioning (#48) ----------
-  async function scimContext(req: express.Request, res: express.Response, write = false) {
+  async function scimContext(req: express.Request, res: express.Response) {
     const h = firstHeader(req.headers.authorization as any);
     if (!h.startsWith('Bearer ')) {
       res.status(401).json({ schemas: ['urn:ietf:params:scim:api:messages:2.0:Error'], detail: 'SCIM bearer token required', status: '401' });
@@ -1587,8 +1609,12 @@ async function auditMutation(req: express.Request, action: string, resource: str
       res.status(401).json({ schemas: ['urn:ietf:params:scim:api:messages:2.0:Error'], detail: 'invalid or expired SCIM token', status: '401' });
       return null;
     }
-    if (write && !token.scopes.includes('scim:write')) {
-      res.status(403).json({ schemas: ['urn:ietf:params:scim:api:messages:2.0:Error'], detail: 'scim:write scope required', status: '403' });
+    // Read and write are independent privileges. In particular, scim:write
+    // never implies scim:read: provisioning-only credentials cannot enumerate
+    // user/group PII. HEAD follows Express's GET handlers and needs read too.
+    const requiredScope = req.method === 'GET' || req.method === 'HEAD' ? 'scim:read' : 'scim:write';
+    if (!token.scopes.includes(requiredScope)) {
+      res.status(403).json({ schemas: ['urn:ietf:params:scim:api:messages:2.0:Error'], detail: `${requiredScope} scope required`, status: '403' });
       return null;
     }
     const scimOrg = await getOrgById(token.orgId);
@@ -1648,7 +1674,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
   });
 
   app.post('/scim/v2/Users', async (req, res) => {
-    const token = await scimContext(req, res, true);
+    const token = await scimContext(req, res);
     if (!token) return;
     const b = (req.body || {}) as any;
     const email = String(b.userName || b.emails?.[0]?.value || '').trim().toLowerCase();
@@ -1664,7 +1690,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
   });
 
   app.put('/scim/v2/Users/:id', async (req, res) => {
-    const token = await scimContext(req, res, true);
+    const token = await scimContext(req, res);
     if (!token) return;
     if (!isUuid(req.params.id)) return scimError(res, 404, 'user not found');
     const user = await getUserById(req.params.id);
@@ -1699,7 +1725,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
   });
 
   app.patch('/scim/v2/Users/:id', async (req, res) => {
-    const token = await scimContext(req, res, true);
+    const token = await scimContext(req, res);
     if (!token) return;
     if (!isUuid(req.params.id)) return scimError(res, 404, 'user not found');
     const user = await getUserById(req.params.id);
@@ -1752,7 +1778,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
   });
 
   app.delete('/scim/v2/Users/:id', async (req, res) => {
-    const token = await scimContext(req, res, true);
+    const token = await scimContext(req, res);
     if (!token) return;
     if (!isUuid(req.params.id)) return scimError(res, 404, 'user not found');
     const user = await getUserById(req.params.id);
@@ -1830,7 +1856,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
   });
 
   app.post('/scim/v2/Groups', async (req, res) => {
-    const token = await scimContext(req, res, true);
+    const token = await scimContext(req, res);
     if (!token) return;
     const b = (req.body || {}) as any;
     const displayName = sanitizeName(b.displayName, 200);
@@ -1857,7 +1883,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
   });
 
   app.patch('/scim/v2/Groups/:id', async (req, res) => {
-    const token = await scimContext(req, res, true);
+    const token = await scimContext(req, res);
     if (!token) return;
     const group = isUuid(req.params.id) ? await getScimGroup(token.orgId, req.params.id) : null;
     if (!group) return scimError(res, 404, 'group not found');
@@ -1898,7 +1924,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
   });
 
   app.delete('/scim/v2/Groups/:id', async (req, res) => {
-    const token = await scimContext(req, res, true);
+    const token = await scimContext(req, res);
     if (!token) return;
     const group = isUuid(req.params.id) ? await getScimGroup(token.orgId, req.params.id) : null;
     if (!group) return scimError(res, 404, 'group not found');

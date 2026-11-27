@@ -188,6 +188,50 @@ describe('SCIM 2.0 (#48)', () => {
     assert.equal(gone.status, 404);
   });
 
+  it('enforces an independent scim:read/scim:write scope matrix', async () => {
+    const readToken = (await createScimToken({ orgId, description: 'read-only', scopes: ['scim:read'] })).token;
+    const writeToken = (await createScimToken({ orgId, description: 'write-only', scopes: ['scim:write'] })).token;
+    const noScimScopeToken = (await createScimToken({ orgId, description: 'no-scim', scopes: ['other'] })).token;
+    const reads: Array<[string, string]> = [
+      ['GET', '/scim/v2/Users'],
+      ['GET', `/scim/v2/Users/${createdUserId}`],
+      ['GET', '/scim/v2/Groups'],
+      ['GET', '/scim/v2/Groups/00000000-0000-4000-8000-000000000001'],
+      ['HEAD', '/scim/v2/Users'],
+    ];
+    const mutations: Array<[string, string, any?]> = [
+      ['POST', '/scim/v2/Users', {}],
+      ['PUT', '/scim/v2/Users/not-a-uuid', {}],
+      ['PATCH', '/scim/v2/Users/not-a-uuid', {}],
+      ['DELETE', '/scim/v2/Users/not-a-uuid'],
+      ['POST', '/scim/v2/Groups', {}],
+      ['PATCH', '/scim/v2/Groups/not-a-uuid', {}],
+      ['DELETE', '/scim/v2/Groups/not-a-uuid'],
+    ];
+
+    for (const [method, path] of reads) {
+      const read = await scim(method, path, undefined, readToken);
+      assert.notEqual(read.status, 403, `${method} ${path} must allow scim:read`);
+      const write = await scim(method, path, undefined, writeToken);
+      assert.equal(write.status, 403, `${method} ${path} must not be implied by scim:write`);
+      if (method !== 'HEAD') assert.equal(write.json.detail, 'scim:read scope required');
+      const none = await scim(method, path, undefined, noScimScopeToken);
+      assert.equal(none.status, 403);
+    }
+    for (const [method, path, body] of mutations) {
+      const read = await scim(method, path, body, readToken);
+      assert.equal(read.status, 403, `${method} ${path} must require scim:write`);
+      assert.equal(read.json.detail, 'scim:write scope required');
+      const write = await scim(method, path, body, writeToken);
+      assert.notEqual(write.status, 403, `${method} ${path} must allow scim:write`);
+      const none = await scim(method, path, body, noScimScopeToken);
+      assert.equal(none.status, 403);
+    }
+    // Tokens with both scopes retain the existing provisioning behavior.
+    assert.notEqual((await scim('GET', '/scim/v2/Users')).status, 403);
+    assert.notEqual((await scim('POST', '/scim/v2/Users', {})).status, 403);
+  });
+
   it('issues and revokes scoped SCIM bearer tokens', async () => {
     const created = await fetch(`${base}/v1/scim/tokens`, {
       method: 'POST',
