@@ -181,7 +181,8 @@ services:
   # TLS terminator + Certbot webroot (renew khong downtime).
   nginx:
     build:
-      context: ./infra/prod
+      context: .
+      dockerfile: infra/prod/Dockerfile
     image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-edge:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:

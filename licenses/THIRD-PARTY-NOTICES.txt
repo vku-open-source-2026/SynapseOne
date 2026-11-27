@@ -1,0 +1,37 @@
+SynapseOne third-party notices
+==============================
+
+SynapseOne source is Apache-2.0. This bundle accompanies every first-party
+container image at /usr/share/licenses/synapseone/. See LICENSE, NOTICE,
+THIRD-PARTY.md, SOURCE-OFFER.md, inventory.json and the CycloneDX SBOM for the
+complete machine-readable inventory and exact versions.
+
+Notable components and obligations
+----------------------------------
+
+* Font Awesome Free icons — (CC-BY-4.0 AND MIT). Attribution: Font Awesome Free
+  by Fonticons, Inc. and contributors. Canonical license:
+  https://fontawesome.com/license/free and
+  https://creativecommons.org/licenses/by/4.0/. Full CC-BY-4.0 notice is in
+  CC-BY-4.0.txt.
+* DuckDB 2.0.0 — MIT. The Warehouse image bundles the official
+  libduckdb.so shared library. Full text is in MIT-DuckDB.txt.
+* Python certifi — MPL-2.0, unmodified CA bundle. Python tqdm — MPL-2.0 AND MIT.
+  Full MPL-2.0 text is in MPL-2.0.txt; source locations are in SOURCE-OFFER.md.
+* Rust crates — permissive SPDX expressions (MIT, Apache-2.0, BSD, ISC, Zlib,
+  Unicode-3.0, CDLA-Permissive-2.0, CC0-1.0 or a permissive alternative in an
+  OR expression). Exact versions and license files are in inventory.json.
+* npm packages — permissive SPDX expressions. The resolved production and
+  development trees are in inventory.json and the SBOM.
+* Go SDK — Go standard library only, BSD-3-Clause (Go itself).
+* pgbouncer image — pgbouncer is distributed under its upstream BSD-style
+  license; the Alpine package retains its license metadata in the image.
+* Base images (Debian, Alpine, nginx, Node.js, Python, PostgreSQL/pgvector) —
+  each retains its upstream license and copyright files under /usr/share/doc
+  in the image layers. They are consumed as unmodified runtime bases.
+
+The generated file THIRD-PARTY-NOTICES.generated.txt contains the license texts
+found in the installed npm, Cargo and Python packages. Where an upstream package
+does not retain a separate license file, the generated file records its SPDX
+expression and source URL. This concise notice is not a substitute for those
+upstream copyright notices.

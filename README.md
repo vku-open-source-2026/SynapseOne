@@ -287,7 +287,7 @@ docs                       Start at docs/README.md
 
 - Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md) · Code of conduct: [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) · Governance: [`GOVERNANCE.md`](GOVERNANCE.md) · Roadmap: [`ROADMAP.md`](ROADMAP.md) · Changelog: [`CHANGELOG.md`](CHANGELOG.md)
 - Security: please **do not** open public issues for vulnerabilities — see [`SECURITY.md`](SECURITY.md).
-- License: Apache-2.0 ([`LICENSE`](LICENSE)), third-party notices: [`NOTICE`](NOTICE), [`THIRD-PARTY.md`](THIRD-PARTY.md).
+- License: Apache-2.0 ([`LICENSE`](LICENSE)), third-party notices: [`NOTICE`](NOTICE), [`THIRD-PARTY.md`](THIRD-PARTY.md), machine-readable inventory/SBOM: [`licenses/`](licenses/). Every published image carries the same bundle at `/usr/share/licenses/synapseone/`; corresponding-source and provenance details are in [`licenses/SOURCE-OFFER.md`](licenses/SOURCE-OFFER.md).
 
 ## PoF project checklist
 

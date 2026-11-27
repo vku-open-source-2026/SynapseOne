@@ -5,7 +5,8 @@ name: synapseone
 services:
   postgres:
     build:
-      context: ./infra/postgres
+      context: .
+      dockerfile: infra/postgres/Dockerfile
     image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-postgres:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     # Tuned for the production host (15 GiB RAM, 4 vCPU, SSD). Values are
@@ -71,7 +72,8 @@ services:
   # DATABASE_DIRECT_URL so they keep a stable Postgres session.
   pgbouncer:
     build:
-      context: ./infra/pgbouncer
+      context: .
+      dockerfile: infra/pgbouncer/Dockerfile
     image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-pgbouncer:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
@@ -212,7 +214,8 @@ services:
   # For local IdP debugging, publish Authentik and point OIDC_ISSUER at it.
   iam:
     build:
-      context: ./apps/iam-service
+      context: .
+      dockerfile: apps/iam-service/Dockerfile
     image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-iam:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
@@ -314,7 +317,8 @@ services:
 
   workflow:
     build:
-      context: ./apps/workflow-service
+      context: .
+      dockerfile: apps/workflow-service/Dockerfile
     image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-workflow:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
@@ -375,7 +379,8 @@ services:
 
   ai:
     build:
-      context: ./apps/ai-service
+      context: .
+      dockerfile: apps/ai-service/Dockerfile
     image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-ai:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
@@ -404,7 +409,8 @@ services:
 
   lds:
     build:
-      context: ./apps/lds-service
+      context: .
+      dockerfile: apps/lds-service/Dockerfile
     image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-lds:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
@@ -435,7 +441,8 @@ services:
 
   base:
     build:
-      context: ./apps/base-service
+      context: .
+      dockerfile: apps/base-service/Dockerfile
     image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-base:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
@@ -482,7 +489,8 @@ services:
 
   faststore:
     build:
-      context: ./apps/faststore-service
+      context: .
+      dockerfile: apps/faststore-service/Dockerfile
     image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-faststore:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
@@ -510,7 +518,8 @@ services:
 
   queue:
     build:
-      context: ./apps/queue-service
+      context: .
+      dockerfile: apps/queue-service/Dockerfile
     image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-queue:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
@@ -539,7 +548,8 @@ services:
 
   stream:
     build:
-      context: ./apps/stream-service
+      context: .
+      dockerfile: apps/stream-service/Dockerfile
     image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-stream:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
@@ -568,7 +578,8 @@ services:
 
   warehouse:
     build:
-      context: ./apps/warehouse-service
+      context: .
+      dockerfile: apps/warehouse-service/Dockerfile
     image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-warehouse:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
@@ -600,7 +611,8 @@ services:
 
   lakehouse:
     build:
-      context: ./apps/lakehouse-service
+      context: .
+      dockerfile: apps/lakehouse-service/Dockerfile
     image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-lakehouse:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
@@ -639,7 +651,8 @@ services:
 
   inference:
     build:
-      context: ./apps/inference-service
+      context: .
+      dockerfile: apps/inference-service/Dockerfile
       args:
         INSTALL_MODELS: ${INFERENCE_INSTALL_MODELS:-1}
         INSTALL_TORCH: ${INFERENCE_INSTALL_TORCH:-1}
@@ -686,7 +699,8 @@ services:
 
   ocs:
     build:
-      context: ./apps/ocs-service
+      context: .
+      dockerfile: apps/ocs-service/Dockerfile
     image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-ocs:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
@@ -758,7 +772,8 @@ services:
   # the OCS image. Restore: docker compose run --rm --no-deps s3-backup restore latest
   s3-backup:
     build:
-      context: ./apps/ocs-service
+      context: .
+      dockerfile: apps/ocs-service/Dockerfile
     image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-ocs:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     # The backup volume was created by the legacy root-run sidecar. The Rust
@@ -791,7 +806,8 @@ services:
 
   notifications:
     build:
-      context: ./apps/notifications-service
+      context: .
+      dockerfile: apps/notifications-service/Dockerfile
     image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-notifications:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
@@ -836,7 +852,8 @@ services:
 
   gateway:
     build:
-      context: ./apps/gateway
+      context: .
+      dockerfile: apps/gateway/Dockerfile
     image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-gateway:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:
@@ -918,7 +935,8 @@ services:
 
   console:
     build:
-      context: ./apps/console
+      context: .
+      dockerfile: apps/console/Dockerfile
     image: ghcr.io/${SYNAPSEONE_IMAGE_OWNER:-vku-open-source-2026}/synapseone-console:${SYNAPSEONE_VERSION:-latest}
     restart: unless-stopped
     environment:

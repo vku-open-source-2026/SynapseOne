@@ -101,8 +101,27 @@ COPY apps/inference-service/src/config.py \
      apps/inference-service/src/onnx_embedding.py \
      /app/local-inference/synapse_local_models/
 
+ARG SOURCE_COMMIT=unknown
+LABEL org.opencontainers.image.title="SynapseOne self-hosted workflow runner" \
+      org.opencontainers.image.source="https://github.com/vku-open-source-2026/SynapseOne" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+      org.opencontainers.image.licenses="Apache-2.0"
+COPY LICENSE NOTICE THIRD-PARTY.md /usr/share/licenses/synapseone/
+COPY licenses /usr/share/licenses/synapseone/licenses
+
 # Only the worker entrypoint needs the execute bit; do not chown -R /app.
-RUN chmod 0755 /app/local-inference/worker.py
+RUN chmod 0755 /app/local-inference/worker.py \
+    && set -eux; \
+    test -s /usr/share/licenses/synapseone/LICENSE; \
+    test -s /usr/share/licenses/synapseone/NOTICE; \
+    test -s /usr/share/licenses/synapseone/THIRD-PARTY.md; \
+    test -s /usr/share/licenses/synapseone/licenses/SOURCE-OFFER.md; \
+    test -s /usr/share/licenses/synapseone/licenses/THIRD-PARTY-NOTICES.txt; \
+    test -s /usr/share/licenses/synapseone/licenses/THIRD-PARTY-NOTICES.generated.txt; \
+    test -s /usr/share/licenses/synapseone/licenses/MPL-2.0.txt; \
+    test -s /usr/share/licenses/synapseone/licenses/sbom/synapseone.cdx.json; \
+    sed -i "s/SOURCE_COMMIT/${SOURCE_COMMIT}/g" /usr/share/licenses/synapseone/licenses/SOURCE-OFFER.md; \
+    cp /usr/share/licenses/synapseone/licenses/SOURCE-OFFER.md /usr/share/licenses/synapseone/SOURCE-OFFER.txt
 
 USER runner
 

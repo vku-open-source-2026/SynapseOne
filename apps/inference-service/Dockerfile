@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt requirements-models.txt requirements-torch.txt ./
+COPY apps/inference-service/requirements.txt apps/inference-service/requirements-models.txt apps/inference-service/requirements-torch.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # CPU model stack: ONNX Runtime + tokenizer (small, no torch/CUDA).
@@ -34,7 +34,7 @@ RUN if [ "$INSTALL_TORCH" = "1" ]; then \
       fi; \
     fi
 
-COPY src ./src
+COPY apps/inference-service/src ./src
 
 # Create non-root user
 RUN useradd -m -u 1000 appuser \
@@ -56,6 +56,29 @@ RUN if [ "$INSTALL_TORCH" = "1" ] && [ "$PREFETCH_DECISION" = "1" ]; then \
       python -m src.prefetch_decision; \
     fi
 
+# The license bundle is owned by root and rendered at build time; switch back
+# to the non-root runtime user after the build-time notice check.
+USER root
+ARG SOURCE_COMMIT=unknown
+LABEL org.opencontainers.image.title="SynapseOne Inference service" \
+      org.opencontainers.image.source="https://github.com/vku-open-source-2026/SynapseOne" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+      org.opencontainers.image.licenses="Apache-2.0"
+COPY LICENSE NOTICE THIRD-PARTY.md /usr/share/licenses/synapseone/
+COPY licenses /usr/share/licenses/synapseone/licenses
+RUN set -eux; \
+    test -s /usr/share/licenses/synapseone/LICENSE; \
+    test -s /usr/share/licenses/synapseone/NOTICE; \
+    test -s /usr/share/licenses/synapseone/THIRD-PARTY.md; \
+    test -s /usr/share/licenses/synapseone/licenses/SOURCE-OFFER.md; \
+    test -s /usr/share/licenses/synapseone/licenses/THIRD-PARTY-NOTICES.txt; \
+    test -s /usr/share/licenses/synapseone/licenses/THIRD-PARTY-NOTICES.generated.txt; \
+    test -s /usr/share/licenses/synapseone/licenses/MPL-2.0.txt; \
+    test -s /usr/share/licenses/synapseone/licenses/sbom/synapseone.cdx.json; \
+    sed -i "s/SOURCE_COMMIT/${SOURCE_COMMIT}/g" /usr/share/licenses/synapseone/licenses/SOURCE-OFFER.md; \
+    cp /usr/share/licenses/synapseone/licenses/SOURCE-OFFER.md /usr/share/licenses/synapseone/SOURCE-OFFER.txt
+
+USER appuser
 EXPOSE 4008
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=15s --retries=3 \

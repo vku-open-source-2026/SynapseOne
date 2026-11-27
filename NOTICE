@@ -30,7 +30,18 @@ Third-party components (each under its own license — see also THIRD-PARTY.md):
 - Node.js runtime dependencies (Express, jsonwebtoken, http-proxy-middleware, …) — MIT/ISC/Apache-2.0;
   see each package.json + package-lock.json for the exact resolved tree.
 - React + Vite + Tailwind (console) — MIT; FontAwesome free icons —
-  CC-BY-4.0 (attribution: Fonticons, Inc., https://fontawesome.com/license/free).
-- Python `requests` (sdk-python) — Apache-2.0 (incl. `certifi` MPL-2.0 CA bundle). Go stdlib only (sdk-go) — BSD-3-Clause.
+  CC-BY-4.0 AND MIT (attribution: Fonticons, Inc. and contributors,
+  https://fontawesome.com/license/free). Full CC-BY-4.0 notice in
+  `licenses/CC-BY-4.0.txt`.
+- DuckDB 2.0.0 — MIT. The Warehouse image bundles the official `libduckdb.so`;
+  full text in `licenses/MIT-DuckDB.txt`.
+- Python `requests` (sdk-python) — Apache-2.0. `certifi` (MPL-2.0, unmodified CA
+  bundle) and `tqdm` (MPL-2.0 AND MIT) are reviewed exceptions; full MPL text in
+  `licenses/MPL-2.0.txt`. Go stdlib only (sdk-go) — BSD-3-Clause.
 - Monitoring images: Prometheus — Apache-2.0; PG/Valkey exporters —
   Apache-2.0/MIT. Optional MinIO backend — AGPL-3.0 (opt-in only).
+
+Every first-party image ships this NOTICE, the Apache-2.0 LICENSE, the generated
+CycloneDX SBOM and the third-party notice bundle under
+`/usr/share/licenses/synapseone/`. Corresponding-source and image-provenance
+details are in `licenses/SOURCE-OFFER.md`.

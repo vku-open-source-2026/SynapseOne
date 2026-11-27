@@ -111,8 +111,9 @@ Postgres · Valkey · S3-compatible object storage · notification relays
    keys and ack/nack receipts.
 7. **Do not buffer the gateway body.** No global `express.json()` in the gateway;
    it proxies raw streams.
-8. **Dependencies must stay permissive** (MIT/ISC/Apache-2.0/BSD). The copyleft
-   gate (`make license-check`) fails on GPL/AGPL/LGPL.
+8. **Dependencies must stay permissive** (MIT/ISC/Apache-2.0/BSD). The
+   `make license-check` gate is fail-closed across npm, Cargo, Python and
+   first-party images and regenerates the SBOM/notice bundle in `licenses/`.
 9. **New public paths need a gateway route** in `apps/gateway/routes.yaml`,
    otherwise the gateway returns 404 before the upstream sees the request.
    New services in this version: stream (`/v1/stream`), storage
@@ -141,7 +142,8 @@ make build                     # tsc/build all workspaces (needed before tests)
 make test                      # node --test on compiled dist/*.test.js
 # Rust services (ai, stream, lds, notifications): test inside the toolchain image
 docker run --rm -v "$PWD/apps/stream-service":/app -w /app rust:1-bookworm cargo test
-make license-check             # copyleft gate + SBOM
+make license-check             # permissive license gate + SBOM/notices
+make manifest-check            # static K8s image/env/secret/probe gate
 make compose-up                # full platform (docker compose)
 make compose-down
 make e2e                       # smoke + API e2e (needs a clean stack)

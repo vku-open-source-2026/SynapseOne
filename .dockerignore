@@ -9,4 +9,9 @@ node_modules
 .env
 .env.*
 *.log
-*.test.ts
+**/*.test.ts
+**/*.test.js
+**/*.test.d.ts
+**/tests
+**/.venv
+**/__pycache__

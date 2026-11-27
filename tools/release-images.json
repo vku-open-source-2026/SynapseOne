@@ -1,0 +1,135 @@
+[
+  {
+    "name": "gateway",
+    "dockerfile": "apps/gateway/Dockerfile",
+    "context": ".",
+    "published": true,
+    "baseImage": "debian:bookworm-slim (builder rust:1-bookworm)"
+  },
+  {
+    "name": "iam",
+    "dockerfile": "apps/iam-service/Dockerfile",
+    "context": ".",
+    "published": true,
+    "baseImage": "node:20-alpine"
+  },
+  {
+    "name": "workflow",
+    "dockerfile": "apps/workflow-service/Dockerfile",
+    "context": ".",
+    "published": true,
+    "baseImage": "node:20-alpine"
+  },
+  {
+    "name": "workflow-runner",
+    "dockerfile": "apps/workflow-runner/Dockerfile",
+    "context": ".",
+    "published": true,
+    "baseImage": "node:20-slim + python:3.11-slim-bookworm"
+  },
+  {
+    "name": "ai",
+    "dockerfile": "apps/ai-service/Dockerfile",
+    "context": ".",
+    "published": true,
+    "baseImage": "debian:bookworm-slim (builder rust:1-bookworm)"
+  },
+  {
+    "name": "lds",
+    "dockerfile": "apps/lds-service/Dockerfile",
+    "context": ".",
+    "published": true,
+    "baseImage": "debian:bookworm-slim (builder rust:1-bookworm)"
+  },
+  {
+    "name": "base",
+    "dockerfile": "apps/base-service/Dockerfile",
+    "context": ".",
+    "published": true,
+    "baseImage": "debian:bookworm-slim (builder rust:1-bookworm)"
+  },
+  {
+    "name": "faststore",
+    "dockerfile": "apps/faststore-service/Dockerfile",
+    "context": ".",
+    "published": true,
+    "baseImage": "debian:bookworm-slim (builder rust:1-bookworm)"
+  },
+  {
+    "name": "queue",
+    "dockerfile": "apps/queue-service/Dockerfile",
+    "context": ".",
+    "published": true,
+    "baseImage": "debian:bookworm-slim (builder rust:1-bookworm)"
+  },
+  {
+    "name": "stream",
+    "dockerfile": "apps/stream-service/Dockerfile",
+    "context": ".",
+    "published": true,
+    "baseImage": "debian:bookworm-slim (builder rust:1-bookworm)"
+  },
+  {
+    "name": "warehouse",
+    "dockerfile": "apps/warehouse-service/Dockerfile",
+    "context": ".",
+    "published": true,
+    "baseImage": "debian:bookworm-slim (builder rust:1-bookworm, DuckDB 2.0.0 libduckdb.so)"
+  },
+  {
+    "name": "lakehouse",
+    "dockerfile": "apps/lakehouse-service/Dockerfile",
+    "context": ".",
+    "published": true,
+    "baseImage": "python:3.12-slim"
+  },
+  {
+    "name": "inference",
+    "dockerfile": "apps/inference-service/Dockerfile",
+    "context": ".",
+    "published": true,
+    "baseImage": "python:3.11-slim"
+  },
+  {
+    "name": "ocs",
+    "dockerfile": "apps/ocs-service/Dockerfile",
+    "context": ".",
+    "published": true,
+    "baseImage": "debian:bookworm-slim (builder rust:1-bookworm)"
+  },
+  {
+    "name": "notifications",
+    "dockerfile": "apps/notifications-service/Dockerfile",
+    "context": ".",
+    "published": true,
+    "baseImage": "debian:bookworm-slim (builder rust:1-bookworm)"
+  },
+  {
+    "name": "console",
+    "dockerfile": "apps/console/Dockerfile",
+    "context": ".",
+    "published": true,
+    "baseImage": "nginx:alpine (builder node:20-alpine)"
+  },
+  {
+    "name": "postgres",
+    "dockerfile": "infra/postgres/Dockerfile",
+    "context": ".",
+    "published": true,
+    "baseImage": "pgvector/pgvector:pg16"
+  },
+  {
+    "name": "edge",
+    "dockerfile": "infra/prod/Dockerfile",
+    "context": ".",
+    "published": true,
+    "baseImage": "nginx:alpine"
+  },
+  {
+    "name": "pgbouncer",
+    "dockerfile": "infra/pgbouncer/Dockerfile",
+    "context": ".",
+    "published": false,
+    "baseImage": "alpine:3.20"
+  }
+]

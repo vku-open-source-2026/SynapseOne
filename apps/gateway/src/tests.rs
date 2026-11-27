@@ -3816,6 +3816,50 @@ async fn ready_probes_versions_and_reports_degraded() {
 }
 
 #[tokio::test]
+async fn ready_reports_unreachable_lakehouse_as_optional_degradation() {
+    let (iam, _mock) = MockIam::spawn().await;
+    let mut config = test_config(&iam.base);
+    config.ready_upstreams = vec![
+        crate::config::ReadyUpstream {
+            name: "iam".into(),
+            url: iam.base.clone(),
+            required: true,
+        },
+        crate::config::ReadyUpstream {
+            name: "lakehouse".into(),
+            url: "http://127.0.0.1:1".into(),
+            required: false,
+        },
+    ];
+    let gateway = spawn_gateway(
+        config,
+        vec![route("/v1/auth", &iam.base, AuthMode::None)],
+    )
+    .await;
+    let response = http()
+        .get(format!("{}/ready", gateway.base))
+        .send()
+        .await
+        .unwrap();
+    // A failed optional dependency is visible, but does not take the gateway
+    // out of rotation. Critical readiness semantics are unchanged.
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["criticalOk"], true);
+    assert_eq!(body["optionalDegraded"], true);
+    let lakehouse = body["upstreams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|upstream| upstream["name"] == "lakehouse")
+        .expect("Lakehouse probe must be reported");
+    assert_eq!(lakehouse["ok"], false);
+    assert_eq!(lakehouse["required"], false);
+    assert_eq!(lakehouse["error"], "unreachable");
+}
+
+#[tokio::test]
 async fn ready_rate_limit_is_thirty_per_minute() {
     let mut config = test_config("http://127.0.0.1:1");
     config.ready_upstreams = vec![];

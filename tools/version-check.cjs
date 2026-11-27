@@ -67,8 +67,10 @@ if (fs.existsSync(lakehouseVersion)) {
 const k8s = path.join(root, 'infra', 'k8s', 'base', 'all.yaml');
 if (fs.existsSync(k8s)) {
   for (const line of fs.readFileSync(k8s, 'utf8').split('\n')) {
-    const match = line.match(/image:\s*ghcr\.io\/synapseone\/[a-z-]+:([0-9]+\.[0-9]+\.[0-9]+)/);
-    if (match && match[1] !== version) errors.push(`${path.relative(root, k8s)}: image tag ${match[1]} != ${version}`);
+    const match = line.match(/image:\s*ghcr\.io\/[^/]+\/synapseone-([a-z-]+):([0-9]+\.[0-9]+\.[0-9]+)/);
+    if (match && match[2] !== version) {
+      errors.push(`${path.relative(root, k8s)}: image ${match[1]} tag ${match[2]} != ${version}`);
+    }
   }
 }
 

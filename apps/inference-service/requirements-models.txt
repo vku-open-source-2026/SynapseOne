@@ -1,8 +1,9 @@
 # CPU inference stack for the embedding service (no torch, no CUDA).
 # ONNX Runtime + the tokenizer is all that is needed for the int8 MiniLM path.
 # Verify the exact ONNX graph with EMBEDDING_ONNX_FILE / EMBEDDING_ONNX_PATH.
-onnxruntime>=1.18.0
-transformers>=5.17.0
-huggingface-hub>=0.30.0
-numpy>=1.26.0
-safetensors>=0.4.0
+# Exact pins keep the license/SBOM inventory reproducible.
+onnxruntime==1.32.0
+transformers==5.24.1
+huggingface-hub==2.5.0
+numpy==2.4.6
+safetensors==0.8.0

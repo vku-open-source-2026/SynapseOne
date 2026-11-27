@@ -19,12 +19,17 @@ RUN case "$TARGETARCH" in \
     && tar -xzf /tmp/duckdb.tar.gz -C /opt/duckdb \
     && rm /tmp/duckdb.tar.gz
 WORKDIR /workspace
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+COPY apps/warehouse-service/Cargo.toml apps/warehouse-service/Cargo.lock ./
+COPY apps/warehouse-service/src ./src
 ENV DUCKDB_LIB_DIR=/opt/duckdb
 RUN cargo build --release --locked --no-default-features
 
 FROM debian:bookworm-slim
+ARG SOURCE_COMMIT=unknown
+LABEL org.opencontainers.image.title="SynapseOne Warehouse service" \
+      org.opencontainers.image.source="https://github.com/vku-open-source-2026/SynapseOne" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+      org.opencontainers.image.licenses="Apache-2.0"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libstdc++6 \
     && rm -rf /var/lib/apt/lists/* \
@@ -36,6 +41,20 @@ RUN apt-get update \
 COPY --from=builder /workspace/target/release/synapseone-warehouse /usr/local/bin/synapseone-warehouse
 COPY --from=builder /opt/duckdb/libduckdb.so /usr/local/lib/libduckdb.so
 RUN ldconfig
+COPY LICENSE NOTICE THIRD-PARTY.md /usr/share/licenses/synapseone/
+COPY licenses /usr/share/licenses/synapseone/licenses
+RUN set -eux; \
+    test -s /usr/share/licenses/synapseone/LICENSE; \
+    test -s /usr/share/licenses/synapseone/NOTICE; \
+    test -s /usr/share/licenses/synapseone/THIRD-PARTY.md; \
+    test -s /usr/share/licenses/synapseone/licenses/SOURCE-OFFER.md; \
+    test -s /usr/share/licenses/synapseone/licenses/THIRD-PARTY-NOTICES.txt; \
+    test -s /usr/share/licenses/synapseone/licenses/THIRD-PARTY-NOTICES.generated.txt; \
+    test -s /usr/share/licenses/synapseone/licenses/MPL-2.0.txt; \
+    test -s /usr/share/licenses/synapseone/licenses/MIT-DuckDB.txt; \
+    test -s /usr/share/licenses/synapseone/licenses/sbom/synapseone.cdx.json; \
+    sed -i "s/SOURCE_COMMIT/${SOURCE_COMMIT}/g" /usr/share/licenses/synapseone/licenses/SOURCE-OFFER.md; \
+    cp /usr/share/licenses/synapseone/licenses/SOURCE-OFFER.md /usr/share/licenses/synapseone/SOURCE-OFFER.txt
 
 ENV PORT=4012 \
     WAREHOUSE_DATA_DIR=/data/warehouse

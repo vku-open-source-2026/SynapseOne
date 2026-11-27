@@ -1,11 +1,14 @@
-.PHONY: help bootstrap build test test-rust lint license-check compose-up compose-down compose-logs e2e sdk-check clean
+.PHONY: help bootstrap build test test-rust lint license-check manifest-check compose-up compose-down compose-logs e2e sdk-check clean
+
+PYTHON ?= $(shell if [ -x apps/inference-service/.venv/bin/python ]; then echo apps/inference-service/.venv/bin/python; else echo python3; fi)
 
 help:
 	@echo "synapseone make targets:"
 	@echo "  bootstrap    - copy .env.example to .env + npm install all"
 	@echo "  build        - build all node packages"
 	@echo "  test         - run unit tests"
-	@echo "  license-check - copyleft gate + SBOM (node tools/license-check.cjs)"
+	@echo "  license-check - permissive license gate + SBOM/notices (npm, Cargo, Python, images)"
+	@echo "  manifest-check - static K8s deployability gate (images/env/secrets/probes)"
 	@echo "  compose-up   - docker compose up --build -d"
 	@echo "  compose-down - docker compose down"
 	@echo "  e2e          - run e2e smoke script"
@@ -15,7 +18,7 @@ bootstrap:
 	cp -n .env.example .env || copy .env.example .env
 	npm install --workspaces
 	cd sdks/sdk-python && pip install -e . || true
-	cd apps/inference-service && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt || true
+	cd apps/inference-service && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -r requirements-models.txt -r ../lakehouse-service/requirements.txt || true
 
 build:
 	npm run build --workspaces --if-present
@@ -39,7 +42,10 @@ lint:
 	npm run lint --workspaces --if-present || true
 
 license-check:
-	node tools/license-check.cjs --sbom sbom.json
+	node tools/license-check.cjs --bundle licenses --write-cargo-inventory third-party/cargo-inventory.json --require-python --python $(PYTHON) --python-expect fastapi,pyiceberg,requests
+
+manifest-check:
+	node tools/k8s-manifest-check.cjs
 
 compose-up:
 	docker compose --env-file .env up --build -d

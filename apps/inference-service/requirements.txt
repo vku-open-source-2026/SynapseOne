@@ -1,7 +1,10 @@
-fastapi>=0.110.0
-uvicorn[standard]>=0.29.0
-httpx>=0.27.0
-pydantic>=2.7.0
-python-dotenv>=1.0.1
-pytest>=8.0.0
-pytest-asyncio>=0.23.0
+# CPU inference stack: FastAPI service, tests and the ONNX embedding path.
+# Exact pins keep the license/SBOM inventory reproducible. Bump deliberately
+# (run `make license-check` and commit the regenerated licenses/ bundle).
+fastapi==0.165.0
+uvicorn[standard]==0.54.0
+httpx==0.29.0
+pydantic==2.14.4
+python-dotenv==1.2.4
+pytest==9.2.0
+pytest-asyncio==1.5.0

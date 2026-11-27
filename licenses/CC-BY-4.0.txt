@@ -1,0 +1,12 @@
+Creative Commons Attribution 4.0 International (CC-BY-4.0)
+
+Canonical license: https://creativecommons.org/licenses/by/4.0/
+Canonical legal code: https://creativecommons.org/licenses/by/4.0/legalcode.en
+
+Font Awesome Free icon packages declare (CC-BY-4.0 AND MIT). Both terms apply.
+Attribution: Font Awesome Free by Fonticons, Inc. and contributors — CC-BY-4.0
+and MIT. License information: https://fontawesome.com/license/free
+
+The canonical legal code is incorporated by URI as permitted by CC-BY-4.0
+section 3(a). Component-specific MIT notices are retained in the generated
+third-party inventory.

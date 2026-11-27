@@ -372,6 +372,18 @@ fn today_utc() -> String {
 }
 
 fn ready_upstreams_from_env() -> Vec<ReadyUpstream> {
+    ready_upstreams_from(|name| std::env::var(name).ok())
+}
+
+/// Build the readiness list from an injected environment lookup. Keeping the
+/// lookup injectable lets the tests cover optional service discovery without
+/// mutating process-global environment variables.
+fn ready_upstreams_from<F>(lookup: F) -> Vec<ReadyUpstream>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let read = |name: &str| lookup(name).filter(|value| !value.trim().is_empty());
+    let env_or = |name: &str, fallback: &str| read(name).unwrap_or_else(|| fallback.to_string());
     let mut upstreams = vec![
         ready("iam", env_or("IAM_SERVICE_URL", "http://iam:4001"), true),
         ready(
@@ -389,32 +401,28 @@ fn ready_upstreams_from_env() -> Vec<ReadyUpstream> {
         ),
         ready("queue", env_or("QUEUE_SERVICE_URL", "http://queue:4007"), false),
     ];
+    // Lakehouse is advertised at /v1/lakehouse. It is optional for gateway
+    // liveness (a gateway restart cannot repair it), but it must be reported:
+    // a configured-but-down Lakehouse sets optionalDegraded on /ready, exactly
+    // like Stream/Warehouse/Inference.
     for (name, key) in [
         ("stream", "STREAM_SERVICE_URL"),
         ("warehouse", "WAREHOUSE_SERVICE_URL"),
+        ("lakehouse", "LAKEHOUSE_SERVICE_URL"),
         ("inference", "INFERENCE_SERVICE_URL"),
     ] {
-        if let Some(url) = optional_env(key) {
+        if let Some(url) = read(key) {
             upstreams.push(ready(name, url, false));
         }
     }
-    let ocs = std::env::var("OCS_SERVICE_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| optional_env("STORAGE_SERVICE_URL"));
+    let ocs = read("OCS_SERVICE_URL").or_else(|| read("STORAGE_SERVICE_URL"));
     if let Some(url) = ocs {
         upstreams.push(ready("ocs", url, false));
     }
-    if let Some(url) = optional_env("NOTIFICATIONS_SERVICE_URL") {
+    if let Some(url) = read("NOTIFICATIONS_SERVICE_URL") {
         upstreams.push(ready("notifications", url, false));
     }
     upstreams
-}
-
-fn optional_env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
 }
 
 fn ready(name: &str, url: String, required: bool) -> ReadyUpstream {
@@ -659,11 +667,34 @@ fn prefix_bits_match(base: &[u8], candidate: &[u8], prefix: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::clamped_quota_max;
+    use super::{clamped_quota_max, ready_upstreams_from};
 
     #[test]
     fn workflow_execution_clamp_matches_iam_and_typescript() {
         assert_eq!(clamped_quota_max(Some("5000000"), 1_000, 1_000_000), 1_000_000);
         assert_eq!(clamped_quota_max(Some("500"), 1_000, 1_000_000), 500);
+    }
+
+    #[test]
+    fn lakehouse_is_reported_only_when_configured_and_never_critical() {
+        let without = ready_upstreams_from(|_| None);
+        assert!(!without.iter().any(|upstream| upstream.name == "lakehouse"));
+
+        let with = ready_upstreams_from(|name| match name {
+            "LAKEHOUSE_SERVICE_URL" => Some("http://lakehouse:4013".to_string()),
+            _ => None,
+        });
+        let lakehouse = with
+            .iter()
+            .find(|upstream| upstream.name == "lakehouse")
+            .expect("configured Lakehouse must be probed");
+        assert_eq!(lakehouse.url, "http://lakehouse:4013");
+        assert!(!lakehouse.required, "Lakehouse degradation must not evict the gateway");
+
+        let blank = ready_upstreams_from(|name| match name {
+            "LAKEHOUSE_SERVICE_URL" => Some("   ".to_string()),
+            _ => None,
+        });
+        assert!(!blank.iter().any(|upstream| upstream.name == "lakehouse"));
     }
 }
