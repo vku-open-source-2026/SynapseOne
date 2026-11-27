@@ -25,6 +25,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       RELEASE_TAG: ${{ inputs.tag }}
     steps:
+      - uses: actions/checkout@v4
       - name: Normalize JavaScript/Python checksum paths
         if: startsWith(inputs.tag, 'sdk-v')
         run: |
