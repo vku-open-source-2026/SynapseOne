@@ -35,8 +35,11 @@ jobs:
             --pattern '*.tgz' --pattern '*.whl' --pattern '*.tar.gz'
           (
             cd "${work}"
-            find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' \
-              | sort | xargs sha256sum > SHA256SUMS
+            files=()
+            for file in *; do
+              [ "${file}" = SHA256SUMS ] || files+=("${file}")
+            done
+            sha256sum "${files[@]}" > SHA256SUMS
           )
           gh release upload "${RELEASE_TAG}" "${work}/SHA256SUMS" --clobber
 
