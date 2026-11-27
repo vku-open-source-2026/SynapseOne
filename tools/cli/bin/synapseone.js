@@ -56,32 +56,225 @@ function authHeaders(opts) {
 }
 
 // ---------- http ----------
-async function req(method, p, body, opts) {
-  let r;
-  try {
-    r = await fetch(baseUrl(opts) + p, {
-      method,
-      headers: authHeaders(opts),
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-  } catch (e) {
-    throw new Error(`network ${p}: ${e.message || e}`);
+const DEFAULT_TIMEOUT_MS = 30_000;
+const MAX_JSON_BYTES = envInt('SYNAPSEONE_MAX_JSON_BYTES', 8 * 1024 * 1024);
+const MAX_BINARY_BYTES = envInt('SYNAPSEONE_MAX_BINARY_BYTES', 128 * 1024 * 1024);
+const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
+const CREDENTIAL_HEADERS = new Set([
+  'authorization', 'x-api-key', 'cookie', 'cookie2', 'proxy-authorization',
+  'x-synapseone-tenant', 'x-synapsedx-tenant',
+]);
+
+function envInt(name, fallback) {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+}
+function requestTimeout(o) {
+  const raw = o.timeout !== undefined ? o.timeout : process.env.SYNAPSEONE_TIMEOUT_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_TIMEOUT_MS;
+}
+function maxRedirects(o) {
+  const raw = o.maxRedirects !== undefined ? o.maxRedirects : process.env.SYNAPSEONE_MAX_REDIRECTS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 10;
+}
+function originOf(value) {
+  const url = value instanceof URL ? value : new URL(String(value));
+  const port = url.port || (url.protocol === 'https:' ? '443' : url.protocol === 'http:' ? '80' : '');
+  return `${url.protocol}//${url.hostname.toLowerCase()}${port ? `:${port}` : ''}`;
+}
+function trustedOrigins(o) {
+  const raw = [
+    ...(o.trustedRedirectOrigins || []),
+    ...String(process.env.SYNAPSEONE_TRUSTED_REDIRECT_ORIGINS || '').split(','),
+  ];
+  const out = new Set();
+  for (const value of raw) {
+    const trimmed = String(value || '').trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = new URL(trimmed);
+      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') out.add(originOf(parsed));
+    } catch {
+      /* ignore malformed trusted origins; never trust implicitly */
+    }
   }
-  const text = await r.text();
+  return out;
+}
+function stripCredentialHeaders(headers) {
+  const out = {};
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (!CREDENTIAL_HEADERS.has(key.toLowerCase())) out[key] = value;
+  }
+  return out;
+}
+function responseTooLarge(p, limit) {
+  const err = new Error(`response ${p} exceeds the ${limit}-byte limit`);
+  err.code = 'response_too_large';
+  return err;
+}
+function isAbortError(e) {
+  return e?.name === 'AbortError' || e?.name === 'TimeoutError' || /aborted|abort error/i.test(String(e?.message || ''));
+}
+async function readBody(res, limit, p) {
+  const declared = Number(res.headers.get('content-length') || NaN);
+  if (limit > 0 && Number.isFinite(declared) && declared > limit) {
+    try { await res.body?.cancel?.(); } catch { /* already closed */ }
+    throw responseTooLarge(p, limit);
+  }
+  if (!res.body || typeof res.body.getReader !== 'function') {
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (limit > 0 && buf.length > limit) throw responseTooLarge(p, limit);
+    return buf;
+  }
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      const chunk = Buffer.from(value);
+      total += chunk.length;
+      if (limit > 0 && total > limit) {
+        try { await reader.cancel(); } catch { /* already closed */ }
+        throw responseTooLarge(p, limit);
+      }
+      chunks.push(chunk);
+    }
+  } finally {
+    try { reader.releaseLock(); } catch { /* already released */ }
+  }
+  return Buffer.concat(chunks, total);
+}
+/** One fetch invocation with manual redirects and an armed abort timer. */
+async function fetchWithRedirects(p, init, o) {
+  const ctl = new AbortController();
+  const timer = requestTimeout(o) > 0 ? setTimeout(() => ctl.abort(), requestTimeout(o)) : undefined;
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    if (timer) clearTimeout(timer);
+  };
+  const baseOrigin = originOf(baseUrl(o));
+  const trusted = trustedOrigins(o);
+  let url = new URL(baseUrl(o) + p);
+  let method = String(init.method || 'GET').toUpperCase();
+  let body = init.body;
+  const baseHeaders = { ...(init.headers || {}) };
+
+  try {
+    for (let redirects = 0; ; redirects++) {
+      const headers = originOf(url) === baseOrigin
+        ? baseHeaders
+        : stripCredentialHeaders(baseHeaders);
+      let res;
+      try {
+        res = await fetch(url.toString(), {
+          ...init,
+          method,
+          body: method === 'GET' || method === 'HEAD' ? undefined : body,
+          headers,
+          signal: ctl.signal,
+          redirect: 'manual',
+        });
+      } catch (e) {
+        cleanup();
+        if (isAbortError(e) || ctl.signal.aborted) {
+          throw new Error(`timeout ${p} after ${requestTimeout(o)}ms`);
+        }
+        throw new Error(`network ${p}: ${e.message || e}`);
+      }
+      if (res.type === 'opaqueredirect') {
+        cleanup();
+        throw new Error(`refused an unverifiable redirect from ${p}; use Node.js or the canonical API origin`);
+      }
+      if (!REDIRECT_STATUS.has(res.status)) return { res, cleanup, aborted: () => ctl.signal.aborted };
+      const location = res.headers.get('location');
+      if (!location) return { res, cleanup, aborted: () => ctl.signal.aborted };
+      if (redirects >= maxRedirects(o)) {
+        try { await res.body?.cancel?.(); } catch { /* already closed */ }
+        cleanup();
+        throw new Error(`too many redirects (${maxRedirects(o)}) for ${p}`);
+      }
+      let next;
+      try {
+        next = new URL(location, url);
+      } catch {
+        try { await res.body?.cancel?.(); } catch { /* already closed */ }
+        cleanup();
+        throw new Error(`invalid redirect location '${location}' for ${p}`);
+      }
+      if (next.protocol !== 'http:' && next.protocol !== 'https:') {
+        try { await res.body?.cancel?.(); } catch { /* already closed */ }
+        cleanup();
+        throw new Error(`refused a redirect to non-HTTP origin ${next.origin} for ${p}`);
+      }
+      const nextOrigin = originOf(next);
+      if (nextOrigin !== originOf(url) && !trusted.has(nextOrigin)) {
+        try { await res.body?.cancel?.(); } catch { /* already closed */ }
+        cleanup();
+        throw new Error(
+          `refused a cross-origin redirect from ${originOf(url)} to ${nextOrigin} for ${p}; `
+          + 'add --trusted-redirect-origin or SYNAPSEONE_TRUSTED_REDIRECT_ORIGINS to follow it without credentials',
+        );
+      }
+      if (res.status === 303 || ((res.status === 301 || res.status === 302) && method === 'POST')) {
+        method = 'GET';
+        body = undefined;
+      }
+      try { await res.body?.cancel?.(); } catch { /* already closed */ }
+      url = next;
+    }
+  } catch (e) {
+    cleanup();
+    throw e;
+  }
+}
+
+async function requestBuffer(method, p, body, o, extraHeaders = {}, limit = MAX_JSON_BYTES) {
+  const headers = { ...authHeaders(o), ...extraHeaders };
+  if (body !== undefined && !Object.keys(headers).some((k) => k.toLowerCase() === 'content-type')) {
+    headers['Content-Type'] = 'application/octet-stream';
+  }
+  const session = await fetchWithRedirects(p, { method, headers, body }, o);
+  try {
+    const buffer = await readBody(session.res, limit, p);
+    return { buffer, headers: session.res.headers, status: session.res.status };
+  } catch (e) {
+    if (e?.code === 'response_too_large') throw e;
+    if (session.aborted() || isAbortError(e)) {
+      throw new Error(`timeout ${p} after ${requestTimeout(o)}ms`);
+    }
+    if (e?.message && /network|refused|redirect|too many/i.test(e.message)) throw e;
+    throw new Error(`network ${p}: ${e.message || e}`);
+  } finally {
+    session.cleanup();
+  }
+}
+
+async function req(method, p, body, opts) {
+  const { buffer, headers, status } = await requestBuffer(
+    method, p, body === undefined ? undefined : JSON.stringify(body), opts, {}, MAX_JSON_BYTES,
+  );
+  const text = buffer.toString('utf8');
   let data = null;
   try {
     data = text ? JSON.parse(text) : null;
   } catch {
     data = text;
   }
-  if (!r.ok) throw httpError(r.status, p, data);
+  if (status < 200 || status >= 300) throw httpError(status, p, data);
   // A 200 HTML page means the base URL is the console/marketing host, not the
   // gateway. Surface it instead of printing the SPA as if it were data.
-  const ctype = String(r.headers.get('content-type') || '').toLowerCase();
+  const ctype = String(headers.get('content-type') || '').toLowerCase();
   const looksHtml = ctype.includes('text/html') || /^\s*(<!doctype html|<html)/i.test(String(data || ''));
   if (looksHtml) {
     throw new Error(
-      `non-JSON response from ${baseUrl(opts)}${p}: received HTML (status ${r.status}). ` +
+      `non-JSON response from ${baseUrl(opts)}${p}: received HTML (status ${status}). ` +
       'The base URL looks like the console host; use https://api.synapseone.space or pass --base.',
     );
   }
@@ -127,22 +320,18 @@ const DEL = (p, o) => req('DELETE', p, undefined, o);
  * through req(); OCS bodies are opaque bytes and must never be re-encoded.
  */
 async function reqRaw(method, p, body, opts, extraHeaders = {}) {
-  const headers = { ...authHeaders(opts), ...extraHeaders };
-  if (body !== undefined && !headers['Content-Type']) headers['Content-Type'] = 'application/octet-stream';
-  let r;
-  try {
-    r = await fetch(baseUrl(opts) + p, { method, headers, body });
-  } catch (e) {
-    throw new Error(`network ${p}: ${e.message || e}`);
-  }
-  if (!r.ok) {
-    const text = await r.text();
+  const { buffer, headers, status } = await requestBuffer(
+    method, p, body, opts, extraHeaders, MAX_BINARY_BYTES,
+  );
+  if (status < 200 || status >= 300) {
+    const text = buffer.toString('utf8');
     let data = text;
     try { data = text ? JSON.parse(text) : null; } catch { /* keep text */ }
-    throw httpError(r.status, p, data);
+    throw httpError(status, p, data);
   }
-  return { buffer: Buffer.from(await r.arrayBuffer()), headers: r.headers };
+  return { buffer, headers };
 }
+
 
 // ---------- argument coercion ----------
 /** `--value` accepts JSON when it parses, otherwise the literal string. */
@@ -393,6 +582,16 @@ function parse(argv) {
     else if (a === '--wait') opts.wait = true;
     else if (a === '--timeout') opts.timeout = argv[++i];
     else if (a.startsWith('--timeout=')) opts.timeout = a.slice(10);
+    else if (a === '--trusted-redirect-origin' || a === '--trusted-origin') {
+      const v = argv[++i];
+      if (!v) throw new Error('missing value for --trusted-redirect-origin');
+      (opts.trustedRedirectOrigins ??= []).push(v);
+    } else if (a.startsWith('--trusted-redirect-origin=')) {
+      (opts.trustedRedirectOrigins ??= []).push(a.slice(26));
+    } else if (a.startsWith('--trusted-origin=')) {
+      (opts.trustedRedirectOrigins ??= []).push(a.slice(17));
+    } else if (a === '--max-redirects') opts.maxRedirects = argv[++i];
+    else if (a.startsWith('--max-redirects=')) opts.maxRedirects = a.slice(16);
     else if (a === '--account') opts.account = argv[++i];
     else if (a.startsWith('--account=')) opts.account = a.slice(10);
     else if (a === '--mode') opts.mode = argv[++i];
@@ -555,15 +754,15 @@ async function cmdMe(o) {
 }
 async function cmdHealth(o) {
   const path = o.ready ? '/ready' : '/health';
-  const r = await fetch(baseUrl(o) + path, { headers: authHeaders(o) });
-  const text = await r.text();
+  const { buffer, status } = await requestBuffer('GET', path, undefined, o, {}, MAX_JSON_BYTES);
+  const text = buffer.toString('utf8');
   let data;
   try {
     data = text ? JSON.parse(text) : null;
   } catch {
     throw new Error(`non-JSON response from ${baseUrl(o)}${path}: use https://api.synapseone.space`);
   }
-  if (r.status >= 500 && r.status !== 503) throw httpError(r.status, path, data);
+  if (status >= 500 && status !== 503) throw httpError(status, path, data);
   if (o.json) {
     console.log(JSON.stringify(data, null, 2));
   } else if (o.ready && data && Array.isArray(data.upstreams)) {
@@ -2451,7 +2650,7 @@ const COMMANDS = {
 function help() {
   console.log(`synapseone v${VERSION} — SynapseOne CLI (Apache-2.0)
 
-Usage: synapseone [--base URL] [--token T | --apikey K] [--json] <command> [args]
+Usage: synapseone [--base URL] [--token T | --apikey K] [--json] [--timeout MS] [--trusted-redirect-origin ORIGIN]... <command> [args]
 
 Auth defaults: --base > $SYNAPSEONE_BASE_URL > ~/.synapseone/config.json > https://api.synapseone.space
 `);

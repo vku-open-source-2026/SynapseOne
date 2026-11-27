@@ -46,6 +46,24 @@ Accounts with MFA: `synapseone login --email … --password … --code 123456`.
 Manage it with `synapseone mfa status|setup|enable|recovery-codes|disable`
 (org admins: `mfa reset|unlock <user-id>`).
 
+## Redirects, timeouts and response limits
+
+- Redirects are handled manually. Same-origin redirects keep the
+  `Authorization`/`X-API-Key` headers. Cross-origin redirects are refused
+  unless the target origin is passed with `--trusted-redirect-origin` (or
+  listed in `SYNAPSEONE_TRUSTED_REDIRECT_ORIGINS`); trusted hops are followed
+  **without** credentials. Other cross-origin redirects fail before contacting
+  the target.
+- `--timeout MS` (or `SYNAPSEONE_TIMEOUT_MS`, default 30000) covers
+  connection, headers and body reads, so a stalled body exits non-zero instead
+  of hanging. `--max-redirects N` / `SYNAPSEONE_MAX_REDIRECTS` defaults to 10.
+- JSON responses are capped at 8 MiB and binary downloads at 128 MiB. Override
+  with `SYNAPSEONE_MAX_JSON_BYTES` / `SYNAPSEONE_MAX_BINARY_BYTES`; `0` disables
+  a cap. Overflow is an explicit error, never a silently truncated file.
+- The gateway does not redirect normal API routes; use the canonical HTTPS
+  base URL instead of relying on an HTTP→HTTPS redirect (cross-origin, so it
+  is unauthenticated even when trusted).
+
 ## Full documentation
 
 See **[docs/cli.md](../../docs/cli.md)** for the complete CLI reference —

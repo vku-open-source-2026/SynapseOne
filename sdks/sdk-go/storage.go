@@ -6,10 +6,8 @@
 package synapseone
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -48,36 +46,13 @@ func (c *Client) PutObject(key string, body []byte, contentType, checksumSHA256 
 type httpHeader struct{ key, value string }
 
 func (c *Client) doRawWithHeaders(method, path string, body []byte, contentType string, h httpHeader) ([]byte, map[string][]string, error) {
-	var r io.Reader
-	if body != nil {
-		r = bytes.NewReader(body)
+	extra := http.Header{}
+	if h.key != "" && h.value != "" {
+		extra.Set(h.key, h.value)
 	}
-	req, err := http.NewRequest(method, c.BaseURL+path, r)
+	resp, b, err := c.execute(strings.ToUpper(method), path, body, contentType, extra, 0, c.MaxBinaryBytes, "binary")
 	if err != nil {
 		return nil, nil, err
-	}
-	if h.key != "" && h.value != "" {
-		req.Header.Set(h.key, h.value)
-	}
-	if contentType != "" {
-		req.Header.Set("Content-Type", contentType)
-	}
-	client := c.HTTP
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, nil, fmt.Errorf("synapseone network %s: %w", path, err)
-	}
-	defer resp.Body.Close()
-	b := make([]byte, 0)
-	buf := make([]byte, 32*1024)
-	for {
-		n, rerr := resp.Body.Read(buf)
-		if n > 0 {
-			b = append(b, buf[:n]...)
-		}
-		if rerr != nil {
-			break
-		}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, resp.Header, &APIError{StatusCode: resp.StatusCode, Path: path, Body: string(b)}

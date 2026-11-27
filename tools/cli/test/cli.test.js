@@ -25,6 +25,30 @@ function run(...args) {
   });
 }
 
+function runEnv(env, ...args) {
+  return new Promise((resolve) => {
+    execFile(
+      process.execPath,
+      [BIN, ...args],
+      { timeout: 15000, env: { ...process.env, ...env } },
+      (err, stdout, stderr) => {
+        resolve({ code: err ? err.code || 1 : 0, stdout: String(stdout), stderr: String(stderr) });
+      },
+    );
+  });
+}
+
+function listen(handler) {
+  return new Promise((resolve) => {
+    const srv = http.createServer(handler);
+    srv.listen(0, '127.0.0.1', () => resolve(srv));
+  });
+}
+
+function close(srv) {
+  return new Promise((resolve) => srv.close(() => resolve()));
+}
+
 // Stub "gateway": records the last request, answers canned JSON.
 let last = {};
 let stubBase = '';
@@ -272,6 +296,157 @@ describe('synapseone cli offline', () => {
     const r = await run('--base', 'http://127.0.0.1:1', 'orgs');
     assert.equal(r.code, 1);
     assert.match(r.stderr + r.stdout, /network|HTTP/);
+  });
+
+  it('follows same-origin redirects with credentials intact', async () => {
+    let finalHeaders = {};
+    const srv = await listen((req, res) => {
+      if (req.url === '/v1/orgs') {
+        res.statusCode = 302;
+        res.setHeader('Location', '/v1/final');
+        res.end();
+        return;
+      }
+      finalHeaders = { ...req.headers };
+      res.setHeader('Content-Type', 'application/json');
+      res.end('[]');
+    });
+    const base = `http://127.0.0.1:${srv.address().port}`;
+    try {
+      const r = await run('--base', base, '--token', 'T', '--apikey', 'K', 'orgs');
+      assert.equal(r.code, 0, r.stderr);
+      assert.equal(finalHeaders.authorization, 'Bearer T');
+      assert.equal(finalHeaders['x-api-key'], 'K');
+    } finally {
+      await close(srv);
+    }
+  });
+
+  it('refuses an untrusted cross-origin redirect without contacting the target', async () => {
+    let hits = 0;
+    const other = await listen((req, res) => {
+      hits++;
+      res.setHeader('Content-Type', 'application/json');
+      res.end('[]');
+    });
+    const otherBase = `http://127.0.0.1:${other.address().port}`;
+    const source = await listen((req, res) => {
+      res.statusCode = 302;
+      res.setHeader('Location', `${otherBase}/capture`);
+      res.end();
+    });
+    const base = `http://127.0.0.1:${source.address().port}`;
+    try {
+      const r = await run('--base', base, '--token', 'T', '--apikey', 'K', 'orgs');
+      assert.equal(r.code, 1);
+      assert.match(r.stderr, /cross-origin|refused|redirect/i);
+      assert.equal(hits, 0);
+    } finally {
+      await close(source);
+      await close(other);
+    }
+  });
+
+  it('trusted cross-origin redirects never forward credentials', async () => {
+    let hits = 0;
+    let seen = {};
+    const other = await listen((req, res) => {
+      hits++;
+      seen = { ...req.headers };
+      res.setHeader('Content-Type', 'application/json');
+      res.end('[]');
+    });
+    const otherBase = `http://127.0.0.1:${other.address().port}`;
+    const source = await listen((req, res) => {
+      res.statusCode = 302;
+      res.setHeader('Location', `${otherBase}/capture`);
+      res.end();
+    });
+    const base = `http://127.0.0.1:${source.address().port}`;
+    try {
+      const r = await run(
+        '--base', base, '--token', 'T', '--apikey', 'K',
+        '--trusted-redirect-origin', otherBase, 'orgs',
+      );
+      assert.equal(r.code, 0, r.stderr);
+      assert.equal(hits, 1);
+      assert.equal(seen.authorization, undefined);
+      assert.equal(seen['x-api-key'], undefined);
+      assert.equal(seen.cookie, undefined);
+    } finally {
+      await close(source);
+      await close(other);
+    }
+  });
+
+  it('times out a stalled response body', async () => {
+    const srv = await listen((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.write('{"ok":');
+      // never end the response
+    });
+    const base = `http://127.0.0.1:${srv.address().port}`;
+    try {
+      const started = Date.now();
+      const r = await run('--base', base, '--timeout', '100', 'orgs');
+      assert.equal(r.code, 1);
+      assert.match(r.stderr, /timeout/i);
+      assert.ok(Date.now() - started < 3000);
+    } finally {
+      await close(srv);
+    }
+  });
+
+  it('reports binary responses above the configured limit instead of truncating', async () => {
+    const srv = await listen((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+      res.end(Buffer.alloc(100, 120));
+    });
+    const base = `http://127.0.0.1:${srv.address().port}`;
+    try {
+      const r = await runEnv(
+        { SYNAPSEONE_MAX_BINARY_BYTES: '4' },
+        '--base', base, 'ocs', 'get', 'b', 'k',
+      );
+      assert.equal(r.code, 1);
+      assert.match(r.stderr, /limit|exceeds|response/i);
+    } finally {
+      await close(srv);
+    }
+  });
+
+  it('downloads exact binary bytes without corruption', async () => {
+    const want = Buffer.from([0, 1, 2, 254, 255]);
+    const srv = await listen((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+      res.end(want);
+    });
+    const base = `http://127.0.0.1:${srv.address().port}`;
+    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'cli-bin-')), 'out.bin');
+    try {
+      const r = await run('--base', base, 'ocs', 'get', 'b', 'k', '--output', file);
+      assert.equal(r.code, 0, r.stderr);
+      assert.deepEqual([...fs.readFileSync(file)], [...want]);
+    } finally {
+      await close(srv);
+    }
+  });
+
+  it('does not write a partial file for a truncated body', async () => {
+    const srv = await listen((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': '100' });
+      res.write('short');
+      res.socket?.destroy();
+    });
+    const base = `http://127.0.0.1:${srv.address().port}`;
+    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'cli-bin-')), 'partial.bin');
+    try {
+      const r = await run('--base', base, 'ocs', 'get', 'b', 'k', '--output', file);
+      assert.equal(r.code, 1);
+      assert.ok(!fs.existsSync(file), 'partial download must not be written');
+    } finally {
+      await close(srv);
+    }
   });
 
   it('rejects a 200 HTML SPA response instead of printing it', async () => {

@@ -99,8 +99,14 @@ export class StorageService {
     });
   }
 
-  uploadPart(uploadId: string, key: string, partNumber: number, body: Uint8Array | string) {
-    const bytes = typeof body === 'string' ? new TextEncoder().encode(body) : body;
+  uploadPart(uploadId: string, key: string, partNumber: number, body: Uint8Array | ArrayBuffer | string) {
+    const bytes = typeof body === 'string'
+      ? new TextEncoder().encode(body)
+      : body instanceof Uint8Array
+        ? body
+        : body instanceof ArrayBuffer
+          ? new Uint8Array(body)
+          : new Uint8Array(body);
     return this.http.upload<{ partNumber: number; etag: string; size: number }>(
       `${P}/uploads/${encodeURIComponent(uploadId)}/parts/${partNumber}?key=${encodeURIComponent(key)}`,
       bytes,

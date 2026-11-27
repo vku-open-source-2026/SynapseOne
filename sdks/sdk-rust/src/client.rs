@@ -5,7 +5,7 @@
 use crate::error::{Error, Result};
 use bytes::Bytes;
 use http::header::{
-    HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER,
+    HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, LOCATION, RETRY_AFTER,
     USER_AGENT,
 };
 use http::Method;
@@ -14,7 +14,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
-use url::form_urlencoded;
+use url::{form_urlencoded, Url};
 
 /// Public production gateway.
 pub const DEFAULT_BASE_URL: &str = "https://api.synapseone.space";
@@ -24,6 +24,23 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 /// Base delay for exponential backoff.
 pub const DEFAULT_RETRY_BASE: Duration = Duration::from_millis(200);
+/// Default cap for JSON/text responses (enforced while streaming).
+pub const DEFAULT_MAX_JSON_BYTES: u64 = 8 * 1024 * 1024;
+/// Default cap for binary downloads; matches the production OCS object limit.
+pub const DEFAULT_MAX_BINARY_BYTES: u64 = 128 * 1024 * 1024;
+/// Default redirect-hop budget for one request attempt.
+pub const DEFAULT_MAX_REDIRECTS: usize = 10;
+
+const REDIRECT_STATUS: [u16; 5] = [301, 302, 303, 307, 308];
+const CREDENTIAL_HEADERS: [&str; 7] = [
+    "authorization",
+    "x-api-key",
+    "cookie",
+    "cookie2",
+    "proxy-authorization",
+    "x-synapseone-tenant",
+    "x-synapsedx-tenant",
+];
 
 /// Characters left unescaped in a path segment, matching Python `quote(s, safe='')`.
 const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
@@ -110,6 +127,10 @@ struct Inner {
     retry_base: Duration,
     user_agent: String,
     default_headers: HeaderMap,
+    max_redirects: usize,
+    trusted_redirect_origins: Vec<String>,
+    max_json_bytes: u64,
+    max_binary_bytes: u64,
 }
 
 impl Clone for Inner {
@@ -124,6 +145,10 @@ impl Clone for Inner {
             retry_base: self.retry_base,
             user_agent: self.user_agent.clone(),
             default_headers: self.default_headers.clone(),
+            max_redirects: self.max_redirects,
+            trusted_redirect_origins: self.trusted_redirect_origins.clone(),
+            max_json_bytes: self.max_json_bytes,
+            max_binary_bytes: self.max_binary_bytes,
         }
     }
 }
@@ -247,17 +272,79 @@ impl Client {
                 Method::GET | Method::HEAD | Method::OPTIONS | Method::PUT | Method::DELETE
             ) || request.idempotency_key.is_some()
         });
+        let timeout = request.timeout.unwrap_or(self.inner.timeout);
+        let path = normalize_path(&request.path);
 
         let mut last_error: Option<Error> = None;
 
         for attempt in 1..=attempts {
-            match self.send_once(&request).await {
-                Ok(response) => return Ok(response),
-                Err(error) => {
+            let result = tokio::time::timeout(
+                timeout,
+                self.execute(
+                    &request,
+                    "application/json",
+                    self.inner.max_json_bytes,
+                    "JSON",
+                ),
+            )
+            .await;
+            match result {
+                Ok(Ok((status, headers, retry_after, bytes))) => {
+                    if !status.is_success() {
+                        let error = http_error(
+                            status.as_u16(),
+                            path.clone(),
+                            &bytes,
+                            retry_after,
+                            &self.inner.base_url,
+                        );
+                        if retryable
+                            && attempt < attempts
+                            && matches!(status.as_u16(), 429 | 502 | 503 | 504)
+                        {
+                            let delay = match &error {
+                                Error::Http { retry_after, .. } => request
+                                    .retry_after
+                                    .or(*retry_after)
+                                    .unwrap_or_else(|| self.backoff(attempt)),
+                                _ => self.backoff(attempt),
+                            };
+                            last_error = Some(error);
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                    let text = String::from_utf8_lossy(&bytes);
+                    let trimmed = text.trim_start();
+                    if looks_like_html(trimmed) {
+                        return Err(Error::NonJsonResponse {
+                            status: status.as_u16(),
+                            path,
+                            base_url: self.inner.base_url.clone(),
+                            body: truncate(trimmed, 256),
+                        });
+                    }
+                    let body = if bytes.is_empty() {
+                        Value::Null
+                    } else {
+                        match serde_json::from_slice::<Value>(&bytes) {
+                            Ok(value) => value,
+                            Err(_) => Value::String(text.into_owned()),
+                        }
+                    };
+                    return Ok(Response {
+                        status: status.as_u16(),
+                        headers,
+                        retry_after,
+                        body,
+                    });
+                }
+                Ok(Err(error)) => {
                     let should_retry = retryable
                         && attempt < attempts
                         && match &error {
-                            Error::Network { .. } => true,
+                            Error::Network { .. } | Error::Timeout { .. } => true,
                             Error::Http { status, .. } => {
                                 matches!(status, 429 | 502 | 503 | 504)
                             }
@@ -282,6 +369,18 @@ impl Client {
                     last_error = Some(error);
                     tokio::time::sleep(delay).await;
                 }
+                Err(_) => {
+                    let error = Error::Timeout {
+                        path: path.clone(),
+                        base_url: self.inner.base_url.clone(),
+                        timeout_ms: timeout.as_millis() as u64,
+                    };
+                    if !retryable || attempt >= attempts {
+                        return Err(error);
+                    }
+                    last_error = Some(error);
+                    tokio::time::sleep(self.backoff(attempt)).await;
+                }
             }
         }
 
@@ -301,143 +400,189 @@ impl Client {
         Duration::from_millis(millis as u64)
     }
 
-    async fn send_once(&self, request: &Request) -> Result<Response> {
-        let path = if request.path.starts_with('/') {
-            request.path.clone()
-        } else {
-            format!("/{}", request.path)
-        };
-        let url = format!("{}{}", self.inner.base_url, path);
-
-        let mut builder = self
-            .inner
-            .http
-            .request(request.method.clone(), &url)
-            .timeout(request.timeout.unwrap_or(self.inner.timeout));
-
-        let mut headers = HeaderMap::new();
-        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-        headers.insert(USER_AGENT, HeaderValue::from_str(&self.inner.user_agent)?);
-
-        if let Some(token) = self.inner.credentials.token_value() {
-            headers.insert(
-                AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {token}"))?,
-            );
-        }
-        if let Some(key) = self.inner.credentials.api_key_value() {
-            headers.insert(
-                HeaderName::from_static("x-api-key"),
-                HeaderValue::from_str(key)?,
-            );
-        }
-        if let Some(tenant) = &self.inner.tenant {
-            headers.insert(
-                HeaderName::from_static("x-synapseone-tenant"),
-                HeaderValue::from_str(tenant)?,
-            );
-        }
-        if let Some(idempotency_key) = &request.idempotency_key {
-            headers.insert(
-                HeaderName::from_static("idempotency-key"),
-                HeaderValue::from_str(idempotency_key)?,
-            );
-        }
-
-        for (name, value) in &self.inner.default_headers {
-            headers.insert(name, value.clone());
-        }
-        for (name, value) in &request.headers {
-            headers.insert(name, value.clone());
-        }
-
-        if let Some(content_type) = &request.content_type {
-            headers.insert(CONTENT_TYPE, HeaderValue::from_str(content_type)?);
-        } else if request.json_body.is_some() {
-            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        }
-
-        builder = builder.headers(headers);
-
-        if let Some(bytes) = &request.bytes_body {
-            builder = builder.body(bytes.clone());
-        } else if let Some(json) = &request.json_body {
-            builder = builder.json(json);
-        }
-
-        let response = builder.send().await.map_err(|source| Error::Network {
-            path: path.clone(),
-            base_url: self.inner.base_url.clone(),
-            source,
+    /// One request attempt: manual redirect handling, per-hop credential
+    /// scoping and a bounded body read.
+    async fn execute(
+        &self,
+        request: &Request,
+        accept: &'static str,
+        limit: u64,
+        kind: &'static str,
+    ) -> Result<(reqwest::StatusCode, HeaderMap, Option<Duration>, Bytes)> {
+        let path = normalize_path(&request.path);
+        let base_url = &self.inner.base_url;
+        let base_origin = origin_of(
+            &Url::parse(base_url)
+                .map_err(|error| Error::Config(format!("base_url is not a URL: {error}")))?,
+        );
+        let mut current = Url::parse(&format!("{base_url}{path}")).map_err(|error| {
+            Error::Config(format!("request URL {base_url}{path} is invalid: {error}"))
         })?;
 
-        let status = response.status();
-        let response_headers = response.headers().clone();
-        let retry_after = response
-            .headers()
-            .get(RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(parse_retry_after);
-        let bytes = response.bytes().await.map_err(|source| Error::Network {
-            path: path.clone(),
-            base_url: self.inner.base_url.clone(),
-            source,
-        })?;
+        let mut method = request.method.clone();
+        let mut json_body = request.json_body.clone();
+        let mut bytes_body = request.bytes_body.clone();
+        let mut content_type = request.content_type.clone();
+        let timeout = request.timeout.unwrap_or(self.inner.timeout);
 
-        if !status.is_success() {
-            let body = serde_json::from_slice::<Value>(&bytes).ok();
-            let code = body
-                .as_ref()
-                .and_then(|value| value.get("error"))
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let message = body
-                .as_ref()
-                .and_then(|value| {
-                    value
-                        .get("message")
-                        .or_else(|| value.get("detail"))
-                        .and_then(Value::as_str)
-                })
-                .map(str::to_string)
-                .unwrap_or_else(|| truncate(&String::from_utf8_lossy(&bytes), 500));
-            return Err(Error::Http {
-                status: status.as_u16(),
-                path,
-                message,
-                code,
-                body,
-                base_url: self.inner.base_url.clone(),
-                retry_after,
-            });
-        }
+        for redirects in 0..=self.inner.max_redirects {
+            let credentials_allowed = origin_of(&current) == base_origin;
+            let mut headers = HeaderMap::new();
+            headers.insert(ACCEPT, HeaderValue::from_static(accept));
+            headers.insert(USER_AGENT, HeaderValue::from_str(&self.inner.user_agent)?);
 
-        let text = String::from_utf8_lossy(&bytes);
-        let trimmed = text.trim_start();
-        if looks_like_html(trimmed) {
-            return Err(Error::NonJsonResponse {
-                status: status.as_u16(),
-                path,
-                base_url: self.inner.base_url.clone(),
-                body: truncate(trimmed, 256),
-            });
-        }
-
-        let body = if bytes.is_empty() {
-            Value::Null
-        } else {
-            match serde_json::from_slice::<Value>(&bytes) {
-                Ok(value) => value,
-                Err(_) => Value::String(text.into_owned()),
+            if credentials_allowed {
+                if let Some(token) = self.inner.credentials.token_value() {
+                    headers.insert(
+                        AUTHORIZATION,
+                        HeaderValue::from_str(&format!("Bearer {token}"))?,
+                    );
+                }
+                if let Some(key) = self.inner.credentials.api_key_value() {
+                    headers.insert(
+                        HeaderName::from_static("x-api-key"),
+                        HeaderValue::from_str(key)?,
+                    );
+                }
+                if let Some(tenant) = &self.inner.tenant {
+                    headers.insert(
+                        HeaderName::from_static("x-synapseone-tenant"),
+                        HeaderValue::from_str(tenant)?,
+                    );
+                }
             }
-        };
+            if let Some(idempotency_key) = &request.idempotency_key {
+                headers.insert(
+                    HeaderName::from_static("idempotency-key"),
+                    HeaderValue::from_str(idempotency_key)?,
+                );
+            }
+            for (name, value) in &self.inner.default_headers {
+                headers.insert(name, value.clone());
+            }
+            for (name, value) in &request.headers {
+                headers.insert(name, value.clone());
+            }
+            if !credentials_allowed {
+                strip_credential_headers(&mut headers);
+            }
+            if let Some(value) = &content_type {
+                headers.insert(CONTENT_TYPE, HeaderValue::from_str(value)?);
+            } else if json_body.is_some() {
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            }
 
-        Ok(Response {
-            status: status.as_u16(),
-            headers: response_headers,
-            retry_after,
-            body,
+            let mut builder = self
+                .inner
+                .http
+                .request(method.clone(), current.clone())
+                .timeout(timeout)
+                .headers(headers);
+            if let Some(bytes) = &bytes_body {
+                builder = builder.body(bytes.clone());
+            } else if let Some(json) = &json_body {
+                builder = builder.json(json);
+            }
+
+            let response = builder.send().await.map_err(|source| {
+                if source.is_timeout() {
+                    Error::Timeout {
+                        path: path.clone(),
+                        base_url: base_url.clone(),
+                        timeout_ms: timeout.as_millis() as u64,
+                    }
+                } else {
+                    Error::Network {
+                        path: path.clone(),
+                        base_url: base_url.clone(),
+                        source,
+                    }
+                }
+            })?;
+
+            let status = response.status();
+            let response_headers = response.headers().clone();
+            let retry_after = response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_retry_after);
+
+            if is_redirect_status(status.as_u16()) {
+                if let Some(location) = response_headers
+                    .get(LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                {
+                    if redirects >= self.inner.max_redirects {
+                        return Err(Error::Redirect {
+                            status: status.as_u16(),
+                            path,
+                            base_url: base_url.clone(),
+                            message: format!(
+                                "too many redirects ({} hops)",
+                                self.inner.max_redirects
+                            ),
+                        });
+                    }
+                    let next = current.join(location).map_err(|error| Error::Redirect {
+                        status: status.as_u16(),
+                        path: path.clone(),
+                        base_url: base_url.clone(),
+                        message: format!("invalid Location '{location}': {error}"),
+                    })?;
+                    if !matches!(next.scheme(), "http" | "https") {
+                        return Err(Error::Redirect {
+                            status: status.as_u16(),
+                            path,
+                            base_url: base_url.clone(),
+                            message: format!("refusing non-HTTP redirect to {next}"),
+                        });
+                    }
+                    let next_origin = origin_of(&next);
+                    let current_origin = origin_of(&current);
+                    if next_origin != current_origin && !self.trusted_origin(&next_origin) {
+                        return Err(Error::Redirect {
+                            status: status.as_u16(),
+                            path,
+                            base_url: base_url.clone(),
+                            message: format!(
+                                "refusing cross-origin redirect from {current_origin} to \
+                                 {next_origin}; add the target origin with \
+                                 trusted_redirect_origin() to follow it without credentials"
+                            ),
+                        });
+                    }
+                    if status.as_u16() == 303
+                        || ((status.as_u16() == 301 || status.as_u16() == 302)
+                            && method == Method::POST)
+                    {
+                        method = Method::GET;
+                        json_body = None;
+                        bytes_body = None;
+                        content_type = None;
+                    }
+                    current = next;
+                    continue;
+                }
+            }
+
+            let bytes = read_limited(response, limit, &path, kind, base_url, timeout).await?;
+            return Ok((status, response_headers, retry_after, bytes));
+        }
+
+        Err(Error::Redirect {
+            status: 0,
+            path,
+            base_url: base_url.clone(),
+            message: "redirect loop did not terminate".to_string(),
         })
+    }
+
+    fn trusted_origin(&self, origin: &str) -> bool {
+        self.inner
+            .trusted_redirect_origins
+            .iter()
+            .any(|configured| configured == origin)
     }
 
     /// Convenience wrapper that deserializes into `T`.
@@ -453,87 +598,156 @@ impl Client {
 
     /// Send a request for a binary response (object download, attachment).
     pub async fn send_bytes(&self, request: Request) -> Result<BinaryResponse> {
-        let path = if request.path.starts_with('/') {
-            request.path.clone()
-        } else {
-            format!("/{}", request.path)
-        };
-        let url = format!("{}{}", self.inner.base_url, path);
-        let mut builder = self
-            .inner
-            .http
-            .request(request.method.clone(), &url)
-            .timeout(request.timeout.unwrap_or(self.inner.timeout));
-
-        let mut headers = HeaderMap::new();
-        headers.insert(ACCEPT, HeaderValue::from_static("application/octet-stream"));
-        if let Some(token) = self.inner.credentials.token_value() {
-            headers.insert(
-                AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {token}"))?,
-            );
-        }
-        if let Some(key) = self.inner.credentials.api_key_value() {
-            headers.insert(
-                HeaderName::from_static("x-api-key"),
-                HeaderValue::from_str(key)?,
-            );
-        }
-        if let Some(tenant) = &self.inner.tenant {
-            headers.insert(
-                HeaderName::from_static("x-synapseone-tenant"),
-                HeaderValue::from_str(tenant)?,
-            );
-        }
-        for (name, value) in &self.inner.default_headers {
-            headers.insert(name, value.clone());
-        }
-        for (name, value) in &request.headers {
-            headers.insert(name, value.clone());
-        }
-        if let Some(content_type) = &request.content_type {
-            headers.insert(CONTENT_TYPE, HeaderValue::from_str(content_type)?);
-        }
-        builder = builder.headers(headers);
-        if let Some(bytes) = &request.bytes_body {
-            builder = builder.body(bytes.clone());
-        }
-
-        let response = builder.send().await.map_err(|source| Error::Network {
+        let timeout = request.timeout.unwrap_or(self.inner.timeout);
+        let path = normalize_path(&request.path);
+        let result = tokio::time::timeout(
+            timeout,
+            self.execute(
+                &request,
+                "application/octet-stream",
+                self.inner.max_binary_bytes,
+                "binary",
+            ),
+        )
+        .await
+        .map_err(|_| Error::Timeout {
             path: path.clone(),
             base_url: self.inner.base_url.clone(),
-            source,
+            timeout_ms: timeout.as_millis() as u64,
         })?;
-        let status = response.status();
-        let response_headers = response.headers().clone();
-        let body = response.bytes().await.map_err(|source| Error::Network {
-            path: path.clone(),
-            base_url: self.inner.base_url.clone(),
-            source,
-        })?;
+        let (status, headers, retry_after, body) = result?;
 
         if !status.is_success() {
-            let parsed = serde_json::from_slice::<Value>(&body).ok();
-            return Err(Error::Http {
-                status: status.as_u16(),
+            return Err(http_error(
+                status.as_u16(),
                 path,
-                message: truncate(&String::from_utf8_lossy(&body), 500),
-                code: parsed
-                    .as_ref()
-                    .and_then(|value| value.get("error"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                body: parsed,
-                base_url: self.inner.base_url.clone(),
-                retry_after: None,
-            });
+                &body,
+                retry_after,
+                &self.inner.base_url,
+            ));
         }
 
         Ok(BinaryResponse {
             status: status.as_u16(),
-            headers: response_headers,
+            headers,
             body,
         })
+    }
+}
+
+fn normalize_path(path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
+}
+
+fn http_error(
+    status: u16,
+    path: String,
+    bytes: &Bytes,
+    retry_after: Option<Duration>,
+    base_url: &str,
+) -> Error {
+    let body = serde_json::from_slice::<Value>(bytes).ok();
+    let code = body
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let message = body
+        .as_ref()
+        .and_then(|value| {
+            value
+                .get("message")
+                .or_else(|| value.get("detail"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| truncate(&String::from_utf8_lossy(bytes), 500));
+    Error::Http {
+        status,
+        path,
+        message,
+        code,
+        body,
+        base_url: base_url.to_string(),
+        retry_after,
+    }
+}
+
+async fn read_limited(
+    mut response: reqwest::Response,
+    limit: u64,
+    path: &str,
+    kind: &'static str,
+    base_url: &str,
+    timeout: Duration,
+) -> Result<Bytes> {
+    if limit > 0 {
+        if let Some(declared) = response.content_length() {
+            if declared > limit {
+                return Err(Error::BodyTooLarge {
+                    path: path.to_string(),
+                    base_url: base_url.to_string(),
+                    limit,
+                    kind,
+                });
+            }
+        }
+    }
+
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        let chunk = response.chunk().await.map_err(|source| {
+            if source.is_timeout() {
+                Error::Timeout {
+                    path: path.to_string(),
+                    base_url: base_url.to_string(),
+                    timeout_ms: timeout.as_millis() as u64,
+                }
+            } else {
+                Error::Network {
+                    path: path.to_string(),
+                    base_url: base_url.to_string(),
+                    source,
+                }
+            }
+        })?;
+        let Some(chunk) = chunk else { break };
+        if limit > 0 && out.len() as u64 + chunk.len() as u64 > limit {
+            return Err(Error::BodyTooLarge {
+                path: path.to_string(),
+                base_url: base_url.to_string(),
+                limit,
+                kind,
+            });
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(out))
+}
+
+fn is_redirect_status(status: u16) -> bool {
+    REDIRECT_STATUS.contains(&status)
+}
+
+fn origin_of(url: &Url) -> String {
+    url.origin().ascii_serialization()
+}
+
+fn normalize_origin(raw: &str) -> Option<String> {
+    let parsed = Url::parse(raw.trim()).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    Some(origin_of(&parsed))
+}
+
+fn strip_credential_headers(headers: &mut HeaderMap) {
+    for name in CREDENTIAL_HEADERS {
+        headers.remove(name);
     }
 }
 
@@ -670,6 +884,10 @@ pub struct ClientBuilder {
     user_agent: String,
     headers: HeaderMap,
     connect_timeout: Duration,
+    max_redirects: usize,
+    trusted_redirect_origins: Vec<String>,
+    max_json_bytes: u64,
+    max_binary_bytes: u64,
 }
 
 impl ClientBuilder {
@@ -684,6 +902,10 @@ impl ClientBuilder {
             user_agent: format!("synapseone-rust/{}", env!("CARGO_PKG_VERSION")),
             headers: HeaderMap::new(),
             connect_timeout: Duration::from_secs(10),
+            max_redirects: DEFAULT_MAX_REDIRECTS,
+            trusted_redirect_origins: Vec::new(),
+            max_json_bytes: DEFAULT_MAX_JSON_BYTES,
+            max_binary_bytes: DEFAULT_MAX_BINARY_BYTES,
         }
     }
 
@@ -727,6 +949,31 @@ impl ClientBuilder {
         self
     }
 
+    /// Maximum redirect hops for one request attempt (0 disables redirects).
+    pub fn max_redirects(mut self, redirects: usize) -> Self {
+        self.max_redirects = redirects;
+        self
+    }
+
+    /// Permit following cross-origin redirects to this origin. Such hops are
+    /// always sent without Authorization/X-API-Key/cookies/tenant headers.
+    pub fn trusted_redirect_origin(mut self, origin: impl Into<String>) -> Self {
+        self.trusted_redirect_origins.push(origin.into());
+        self
+    }
+
+    /// Maximum JSON/text response size in bytes (0 disables the limit).
+    pub fn max_json_bytes(mut self, bytes: u64) -> Self {
+        self.max_json_bytes = bytes;
+        self
+    }
+
+    /// Maximum binary response size in bytes (0 disables the limit).
+    pub fn max_binary_bytes(mut self, bytes: u64) -> Self {
+        self.max_binary_bytes = bytes;
+        self
+    }
+
     pub fn user_agent(mut self, user_agent: impl Into<String>) -> Self {
         self.user_agent = user_agent.into();
         self
@@ -754,6 +1001,7 @@ impl ClientBuilder {
         let http = reqwest::Client::builder()
             .connect_timeout(self.connect_timeout)
             .pool_idle_timeout(Duration::from_secs(90))
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent(self.user_agent.clone())
             .build()
             .map_err(|source| Error::Network {
@@ -761,6 +1009,16 @@ impl ClientBuilder {
                 base_url: base_url.clone(),
                 source,
             })?;
+
+        let mut trusted_redirect_origins = Vec::with_capacity(self.trusted_redirect_origins.len());
+        for raw in &self.trusted_redirect_origins {
+            let origin = normalize_origin(raw).ok_or_else(|| {
+                Error::Config(format!(
+                    "trusted redirect origin '{raw}' is not an http(s) origin"
+                ))
+            })?;
+            trusted_redirect_origins.push(origin);
+        }
 
         Ok(Client {
             inner: Arc::new(Inner {
@@ -773,6 +1031,10 @@ impl ClientBuilder {
                 retry_base: self.retry_base,
                 user_agent: self.user_agent,
                 default_headers: self.headers,
+                max_redirects: self.max_redirects,
+                trusted_redirect_origins,
+                max_json_bytes: self.max_json_bytes,
+                max_binary_bytes: self.max_binary_bytes,
             }),
         })
     }

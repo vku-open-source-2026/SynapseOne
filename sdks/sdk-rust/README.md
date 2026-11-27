@@ -110,6 +110,23 @@ match client.base().get_collection("missing").await {
 The SDK detects HTML responses and reports `NonJsonResponse` when the base URL
 points at the console instead of the API gateway.
 
+## Redirects, timeouts and response limits
+
+- Redirects are handled manually with `reqwest::redirect::Policy::none()`.
+  Same-origin redirects keep `Authorization`, `X-API-Key`, cookies and tenant
+  headers. Cross-origin redirects are refused unless the origin is added with
+  `ClientBuilder::trusted_redirect_origin()`, and are then sent **without**
+  credentials. Refusals return `Error::Redirect` without contacting the target.
+- The request timeout covers redirects, headers and body reads.
+  `Error::Timeout` is returned for a stalled body; a slow server cannot hang the
+  caller. `Request::timeout()` overrides the client default per call.
+- `max_json_bytes` (default 8 MiB) and `max_binary_bytes` (default 128 MiB,
+  aligned with OCS) are enforced while streaming. Overflow returns
+  `Error::BodyTooLarge`, never a truncated body. Set a limit to `0` to disable it.
+- `max_redirects` defaults to 10. The gateway does not redirect normal API
+  routes; use the canonical HTTPS base URL instead of relying on an HTTP→HTTPS
+  redirect (cross-origin, therefore unauthenticated).
+
 ## Development
 
 ```bash

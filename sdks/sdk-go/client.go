@@ -7,6 +7,7 @@ package synapseone
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +32,38 @@ const InferenceTimeout = 120 * time.Second
 
 // WebhookTimeout matches the gateway /webhook route budget.
 const WebhookTimeout = 300 * time.Second
+
+// DefaultMaxJSONBytes caps JSON/text responses (enforced while reading).
+const DefaultMaxJSONBytes int64 = 8 << 20
+
+// DefaultMaxBinaryBytes caps object downloads. It matches the production OCS
+// 128 MiB object limit, so a valid maximum-size object still fits.
+const DefaultMaxBinaryBytes int64 = 128 << 20
+
+// DefaultMaxRedirects is the redirect-hop budget for one request attempt.
+const DefaultMaxRedirects = 10
+
+var credentialHeaders = map[string]bool{
+	"Authorization":       true,
+	"X-Api-Key":           true,
+	"Cookie":              true,
+	"Cookie2":             true,
+	"Proxy-Authorization": true,
+	"X-Synapseone-Tenant": true,
+	"X-Synapsedx-Tenant":  true,
+}
+
+// ResponseTooLargeError means a response body exceeded the configured limit.
+// It is returned instead of silently truncating the body.
+type ResponseTooLargeError struct {
+	Path  string
+	Limit int64
+	Kind  string
+}
+
+func (e *ResponseTooLargeError) Error() string {
+	return fmt.Sprintf("synapseone response %s exceeds the %d-byte %s limit", e.Path, e.Limit, e.Kind)
+}
 
 // APIError is returned for non-2xx responses and for a 2xx HTML body (a base
 // URL pointing at the console/marketing host instead of the gateway).
@@ -59,11 +92,24 @@ type Client struct {
 	// Empty keeps the legacy flat API (tenant default database).
 	BaseDatabase string
 	HTTP         *http.Client
+	// Timeout bounds one request attempt, including redirects and body reads.
+	// A per-call timeout override takes precedence. Zero disables the SDK
+	// deadline (the underlying http.Client.Timeout may still apply).
+	Timeout time.Duration
 	// MaxAttempts is the total number of tries for idempotent requests on
 	// 429/502/503/504 (default 3; 1 disables retries).
 	MaxAttempts int
 	// RetryBase is the exponential backoff base (default 200ms).
 	RetryBase time.Duration
+	// MaxJSONBytes caps decoded JSON/text bodies (default 8 MiB; 0 disables).
+	MaxJSONBytes int64
+	// MaxBinaryBytes caps raw binary bodies (default 128 MiB; 0 disables).
+	MaxBinaryBytes int64
+	// MaxRedirects is the redirect-hop budget (default 10; 0 disables).
+	MaxRedirects int
+	// TrustedRedirectOrigins permits following cross-origin redirects to these
+	// origins. They are always followed WITHOUT credentials.
+	TrustedRedirectOrigins []string
 }
 
 // New creates a client with a 15s timeout. If baseURL is empty, it resolves
@@ -91,11 +137,26 @@ func NewWithClient(baseURL string, httpClient *http.Client) *Client {
 			}
 		}
 	}
+	timeout := DefaultTimeout
+	if httpClient.Timeout > 0 {
+		timeout = httpClient.Timeout
+	}
+	trusted := []string{}
+	for _, raw := range strings.Split(os.Getenv("SYNAPSEONE_TRUSTED_REDIRECT_ORIGINS"), ",") {
+		if origin, ok := normalizeOrigin(raw); ok {
+			trusted = append(trusted, origin)
+		}
+	}
 	return &Client{
-		BaseURL:     strings.TrimRight(baseURL, "/"),
-		HTTP:        httpClient,
-		MaxAttempts: 3,
-		RetryBase:   200 * time.Millisecond,
+		BaseURL:                strings.TrimRight(baseURL, "/"),
+		HTTP:                   httpClient,
+		Timeout:                timeout,
+		MaxAttempts:            3,
+		RetryBase:              200 * time.Millisecond,
+		MaxJSONBytes:           DefaultMaxJSONBytes,
+		MaxBinaryBytes:         DefaultMaxBinaryBytes,
+		MaxRedirects:           DefaultMaxRedirects,
+		TrustedRedirectOrigins: trusted,
 	}
 }
 
@@ -147,44 +208,26 @@ func (c *Client) doWithTimeout(method, path string, body any, timeout time.Durat
 	}
 	var last error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		var r io.Reader
-		if payload != nil {
-			r = bytes.NewReader(payload)
-		}
-		req, err := http.NewRequest(method, c.BaseURL+path, r)
-		if err != nil {
-			return nil, fmt.Errorf("synapseone request %s: %w", path, err)
-		}
-		req.Header.Set("Content-Type", "application/json")
-		if c.Token != "" {
-			req.Header.Set("Authorization", "Bearer "+c.Token)
-		}
-		if c.APIKey != "" {
-			req.Header.Set("X-API-Key", c.APIKey)
-		}
-		if c.Tenant != "" {
-			req.Header.Set("x-synapseone-tenant", c.Tenant)
-		}
 		var resp *http.Response
-		if timeout > 0 {
-			// Per-call timeout without mutating the shared client (safe for
-			// concurrent callers): a short-lived client shares the transport.
-			tmp := *c.HTTP
-			tmp.Timeout = timeout
-			resp, err = tmp.Do(req)
-		} else {
-			resp, err = c.HTTP.Do(req)
+		var b []byte
+		var err error
+		contentType := ""
+		if payload != nil {
+			contentType = "application/json"
 		}
+		resp, b, err = c.execute(method, path, payload, contentType, nil, timeout, c.MaxJSONBytes, "JSON")
 		if err != nil {
-			last = fmt.Errorf("synapseone network %s: %w", path, err)
-			if retryable && attempt < attempts {
+			var tooLarge *ResponseTooLargeError
+			if errors.As(err, &tooLarge) {
+				return nil, err
+			}
+			last = err
+			if retryable && attempt < attempts && isRetryableNetworkError(err) {
 				time.Sleep(backoff(base, attempt))
 				continue
 			}
 			return nil, last
 		}
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-		resp.Body.Close()
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			apiErr := &APIError{StatusCode: resp.StatusCode, Path: path, Body: string(b)}
 			var parsed map[string]any
@@ -218,6 +261,15 @@ func (c *Client) doWithTimeout(method, path string, body any, timeout time.Durat
 	return nil, last
 }
 
+func isRetryableNetworkError(err error) bool {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return false
+	}
+	var tooLarge *ResponseTooLargeError
+	return !errors.As(err, &tooLarge)
+}
+
 func isRetryableStatus(status int) bool {
 	return status == 429 || status == 502 || status == 503 || status == 504
 }
@@ -242,48 +294,237 @@ func retryAfter(value string, base time.Duration, attempt int) time.Duration {
 
 // GetBytes fetches a raw binary body (object downloads, attachments).
 func (c *Client) GetBytes(path string) ([]byte, error) {
-	return c.doWithTimeout("GET", path, nil, 0)
+	b, _, err := c.doRaw("GET", path, nil, "", 0)
+	return b, err
 }
 
 // doRaw sends a raw binary body (no JSON encoding) and returns the response
 // bytes plus headers. Used by object storage uploads/downloads.
 func (c *Client) doRaw(method, path string, body []byte, contentType string, timeout time.Duration) ([]byte, http.Header, error) {
-	var r io.Reader
-	if body != nil {
-		r = bytes.NewReader(body)
-	}
-	req, err := http.NewRequest(strings.ToUpper(method), c.BaseURL+path, r)
+	resp, b, err := c.execute(strings.ToUpper(method), path, body, contentType, nil, timeout, c.MaxBinaryBytes, "binary")
 	if err != nil {
-		return nil, nil, fmt.Errorf("synapseone request %s: %w", path, err)
+		var tooLarge *ResponseTooLargeError
+		if errors.As(err, &tooLarge) {
+			return nil, nil, err
+		}
+		return nil, nil, err
 	}
-	if contentType != "" {
-		req.Header.Set("Content-Type", contentType)
-	}
-	if c.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.Token)
-	}
-	if c.APIKey != "" {
-		req.Header.Set("X-API-Key", c.APIKey)
-	}
-	if c.Tenant != "" {
-		req.Header.Set("x-synapseone-tenant", c.Tenant)
-	}
-	client := c.HTTP
-	if timeout > 0 {
-		tmp := *c.HTTP
-		tmp.Timeout = timeout
-		client = &tmp
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, nil, fmt.Errorf("synapseone network %s: %w", path, err)
-	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, resp.Header, &APIError{StatusCode: resp.StatusCode, Path: path, Body: string(b)}
 	}
 	return b, resp.Header, nil
+}
+
+// execute performs one request attempt, including safe redirect handling and
+// bounded body reads. The auth headers are generated per hop: only the base
+// origin receives credentials, and cross-origin requests are refused unless
+// their origin is explicitly trusted.
+func (c *Client) execute(
+	method, path string,
+	body []byte,
+	contentType string,
+	extra http.Header,
+	timeout time.Duration,
+	limit int64,
+	kind string,
+) (*http.Response, []byte, error) {
+	effective := c.effectiveTimeout(timeout)
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if effective > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), effective)
+		defer cancel()
+	} else {
+		ctx = context.Background()
+	}
+
+	method = strings.ToUpper(method)
+	nextURL := c.BaseURL + path
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		nextURL = path
+	}
+	baseOrigin, _ := normalizeOrigin(c.BaseURL)
+
+	for redirects := 0; ; redirects++ {
+		req, err := http.NewRequestWithContext(ctx, method, nextURL, bytes.NewReader(body))
+		if err != nil {
+			return nil, nil, fmt.Errorf("synapseone request %s: %w", path, err)
+		}
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		for key, values := range extra {
+			for _, value := range values {
+				req.Header.Add(key, value)
+			}
+		}
+		origin, _ := normalizeOrigin(nextURL)
+		credentialsAllowed := origin == baseOrigin
+		if credentialsAllowed {
+			if c.Token != "" {
+				req.Header.Set("Authorization", "Bearer "+c.Token)
+			}
+			if c.APIKey != "" {
+				req.Header.Set("X-API-Key", c.APIKey)
+			}
+			if c.Tenant != "" {
+				req.Header.Set("x-synapseone-tenant", c.Tenant)
+			}
+		} else {
+			stripCredentialHeaders(req.Header)
+		}
+
+		// Never let Go's default redirect policy replay credentials or bypass
+		// the origin allowlist; redirects are handled below.
+		tmp := *c.HTTP
+		tmp.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		resp, err := tmp.Do(req)
+		if err != nil {
+			return nil, nil, fmt.Errorf("synapseone network %s: %w", path, err)
+		}
+
+		if !isRedirectStatus(resp.StatusCode) {
+			b, readErr := readLimited(resp.Body, limit, path, kind)
+			resp.Body.Close()
+			if readErr != nil {
+				return resp, nil, readErr
+			}
+			return resp, b, nil
+		}
+
+		location := resp.Header.Get("Location")
+		if location == "" {
+			b, readErr := readLimited(resp.Body, limit, path, kind)
+			resp.Body.Close()
+			if readErr != nil {
+				return resp, nil, readErr
+			}
+			return resp, b, nil
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+
+		if redirects >= c.MaxRedirects {
+			return nil, nil, &APIError{
+				StatusCode: resp.StatusCode,
+				Path:       path,
+				Code:       "too_many_redirects",
+				Body:       fmt.Sprintf("too many redirects (%d)", c.MaxRedirects),
+			}
+		}
+
+		next, err := url.Parse(location)
+		if err != nil {
+			return nil, nil, &APIError{StatusCode: resp.StatusCode, Path: path, Code: "redirect_not_allowed", Body: err.Error()}
+		}
+		current, _ := url.Parse(nextURL)
+		next = current.ResolveReference(next)
+		if next.Scheme != "http" && next.Scheme != "https" {
+			return nil, nil, &APIError{
+				StatusCode: resp.StatusCode,
+				Path:       path,
+				Code:       "redirect_not_allowed",
+				Body:       fmt.Sprintf("refusing non-HTTP redirect to %s", next.String()),
+			}
+		}
+		nextOrigin, ok := normalizeOrigin(next.String())
+		if !ok {
+			return nil, nil, &APIError{StatusCode: resp.StatusCode, Path: path, Code: "redirect_not_allowed", Body: "invalid redirect URL"}
+		}
+		if nextOrigin != origin && !c.trustedOrigin(nextOrigin) {
+			return nil, nil, &APIError{
+				StatusCode: resp.StatusCode,
+				Path:       path,
+				Code:       "redirect_not_allowed",
+				Body: fmt.Sprintf(
+					"refusing cross-origin redirect from %s to %s; add the target origin to TrustedRedirectOrigins to follow it without credentials",
+					origin, nextOrigin,
+				),
+			}
+		}
+		if resp.StatusCode == 303 || ((resp.StatusCode == 301 || resp.StatusCode == 302) && method == "POST") {
+			method = "GET"
+			body = nil
+			contentType = ""
+		}
+		nextURL = next.String()
+	}
+}
+
+func (c *Client) effectiveTimeout(override time.Duration) time.Duration {
+	if override > 0 {
+		return override
+	}
+	var effective time.Duration
+	if c.Timeout > 0 {
+		effective = c.Timeout
+	}
+	if c.HTTP != nil && c.HTTP.Timeout > 0 && (effective == 0 || c.HTTP.Timeout < effective) {
+		effective = c.HTTP.Timeout
+	}
+	return effective
+}
+
+func (c *Client) trustedOrigin(origin string) bool {
+	for _, configured := range c.TrustedRedirectOrigins {
+		if normalized, ok := normalizeOrigin(configured); ok && normalized == origin {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeOrigin(raw string) (string, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Hostname() == "" {
+		return "", false
+	}
+	port := parsed.Port()
+	if port == "" {
+		if parsed.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	return fmt.Sprintf("%s://%s:%s", parsed.Scheme, strings.ToLower(parsed.Hostname()), port), true
+}
+
+func stripCredentialHeaders(headers http.Header) {
+	for key := range headers {
+		if credentialHeaders[http.CanonicalHeaderKey(key)] {
+			headers.Del(key)
+		}
+	}
+}
+
+func isRedirectStatus(status int) bool {
+	switch status {
+	case 301, 302, 303, 307, 308:
+		return true
+	default:
+		return false
+	}
+}
+
+func readLimited(r io.Reader, limit int64, path, kind string) ([]byte, error) {
+	if limit <= 0 {
+		b, err := io.ReadAll(r)
+		if err != nil {
+			return nil, fmt.Errorf("synapseone read %s: %w", path, err)
+		}
+		return b, nil
+	}
+	b, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("synapseone read %s: %w", path, err)
+	}
+	if int64(len(b)) > limit {
+		return nil, &ResponseTooLargeError{Path: path, Limit: limit, Kind: kind}
+	}
+	return b, nil
 }
 
 // Health returns the shallow gateway health payload.

@@ -4,7 +4,7 @@
 
 use serde_json::json;
 use std::time::Duration;
-use synapseone::{BatchOperation, Client, Credentials, OrderBy, Query};
+use synapseone::{BatchOperation, Client, Credentials, Error, OrderBy, Query, Request};
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -244,4 +244,215 @@ async fn warehouse_methods_target_registered_routes() {
     warehouse.base_to_lakehouse(json!({})).await.unwrap();
     warehouse.preview_ocs(json!({})).await.unwrap();
     warehouse.import_ocs(json!({})).await.unwrap();
+}
+
+#[tokio::test]
+async fn same_origin_redirect_keeps_credentials() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/start"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", "/v1/final"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/final"))
+        .and(header("authorization", "Bearer jwt-123"))
+        .and(header("x-api-key", "key-123"))
+        .and(header("x-synapseone-tenant", "acme"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .mount(&server)
+        .await;
+
+    let value = client(&server).get("/v1/start").await.unwrap();
+    assert_eq!(value["ok"], true);
+}
+
+#[tokio::test]
+async fn untrusted_cross_origin_redirect_is_refused() {
+    let other = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"other": true})))
+        .mount(&other)
+        .await;
+    let source = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/start"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/capture", other.uri())),
+        )
+        .mount(&source)
+        .await;
+
+    let error = client(&source).get("/v1/start").await.unwrap_err();
+    assert!(matches!(error, Error::Redirect { .. }), "{error:?}");
+    let requests = other.received_requests().await.unwrap_or_default();
+    assert!(requests.is_empty(), "untrusted target was contacted");
+}
+
+#[tokio::test]
+async fn trusted_cross_origin_redirect_strips_credentials() {
+    let other = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/capture"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"other": true})))
+        .mount(&other)
+        .await;
+    let source = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/start"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/capture", other.uri())),
+        )
+        .mount(&source)
+        .await;
+
+    let client = Client::builder(source.uri())
+        .credentials(Credentials::api_key("key-123").with_token("jwt-123"))
+        .tenant("acme")
+        .trusted_redirect_origin(other.uri())
+        .retry_base(Duration::from_millis(1))
+        .build()
+        .unwrap();
+    let value = client.get("/v1/start").await.unwrap();
+    assert_eq!(value["other"], true);
+
+    let requests = other.received_requests().await.unwrap_or_default();
+    assert_eq!(requests.len(), 1);
+    let headers = &requests[0].headers;
+    assert!(headers.get("authorization").is_none());
+    assert!(headers.get("x-api-key").is_none());
+    assert!(headers.get("x-synapseone-tenant").is_none());
+    assert!(headers.get("cookie").is_none());
+}
+
+#[tokio::test]
+async fn redirect_loops_are_bounded() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/loop"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", "/v1/loop"))
+        .mount(&server)
+        .await;
+
+    let client = Client::builder(server.uri())
+        .max_redirects(2)
+        .retry_base(Duration::from_millis(1))
+        .build()
+        .unwrap();
+    let error = client.get("/v1/loop").await.unwrap_err();
+    assert!(matches!(error, Error::Redirect { .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn binary_responses_preserve_exact_bytes() {
+    let server = MockServer::start().await;
+    let body = vec![0u8, 1, 2, 254, 255];
+    Mock::given(method("GET"))
+        .and(path("/v1/bytes"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .mount(&server)
+        .await;
+
+    let response = client(&server)
+        .send_bytes(Request::get("/v1/bytes"))
+        .await
+        .unwrap();
+    assert_eq!(response.body.as_ref(), body.as_slice());
+}
+
+#[tokio::test]
+async fn binary_limit_overflow_is_explicit() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/bytes"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 100]))
+        .mount(&server)
+        .await;
+
+    let client = Client::builder(server.uri())
+        .max_binary_bytes(4)
+        .retry_base(Duration::from_millis(1))
+        .build()
+        .unwrap();
+    let error = client
+        .send_bytes(Request::get("/v1/bytes"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::BodyTooLarge { .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn json_limit_overflow_is_explicit() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/large"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(100)))
+        .mount(&server)
+        .await;
+
+    let client = Client::builder(server.uri())
+        .max_json_bytes(4)
+        .retry_base(Duration::from_millis(1))
+        .build()
+        .unwrap();
+    let error = client.get("/v1/large").await.unwrap_err();
+    assert!(matches!(error, Error::BodyTooLarge { .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn timeout_covers_slow_response_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/slow"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": true}))
+                .set_delay(Duration::from_millis(300)),
+        )
+        .mount(&server)
+        .await;
+
+    let client = Client::builder(server.uri())
+        .timeout(Duration::from_millis(40))
+        .max_attempts(1)
+        .build()
+        .unwrap();
+    let started = std::time::Instant::now();
+    let error = client.get("/v1/slow").await.unwrap_err();
+    assert!(matches!(error, Error::Timeout { .. }), "{error:?}");
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[tokio::test]
+async fn truncated_body_is_reported() {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort",
+            );
+            let _ = stream.flush();
+        }
+    });
+
+    let client = Client::builder(format!("http://{address}"))
+        .max_attempts(1)
+        .retry_base(Duration::from_millis(1))
+        .build()
+        .unwrap();
+    let error = client
+        .send_bytes(Request::get("/v1/bytes"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::Network { .. } | Error::Timeout { .. }),
+        "{error:?}"
+    );
 }

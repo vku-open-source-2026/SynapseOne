@@ -112,6 +112,25 @@ Enrol with `c.iam.setup_totp()` + `c.iam.enable_totp(code)`; also `mfa_status`,
 `regenerate_recovery_codes`, `disable_mfa`, and for org admins `reset_user_mfa` /
 `unlock_user`.
 
+## Redirects, timeouts and response limits
+
+- Redirects are handled manually. Same-origin redirects keep `Authorization`,
+  `X-API-Key`, cookies and tenant headers. Cross-origin redirects are followed
+  only when the target origin is in `trusted_redirect_origins` (constructor
+  argument or `SYNAPSEONE_TRUSTED_REDIRECT_ORIGINS`, comma separated), and are
+  always sent **without** credentials. Other cross-origin redirects raise
+  `SynapseOneError(code="redirect_not_allowed")` without contacting the target.
+- `timeout` covers connection, headers and body reads. A stalled body raises
+  `SynapseOneError(code="timeout")` instead of hanging.
+- JSON/text responses are capped at `max_json_bytes` (default 8 MiB) and binary
+  downloads at `max_binary_bytes` (default 128 MiB, matching OCS). Limits are
+  enforced while streaming and raise `code="response_too_large"`; bodies are
+  never silently truncated. Set a limit to `0` to disable it.
+- `max_redirects` defaults to 10. The gateway does not redirect normal API
+  routes; use the canonical HTTPS base URL rather than relying on an
+  HTTP→HTTPS cross-origin redirect (which would be unauthenticated even when
+  trusted).
+
 ## Deprecated flat API
 
 The old flat methods (`c.login(...)`, `c.list_templates()`,

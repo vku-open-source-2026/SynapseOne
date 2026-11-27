@@ -115,6 +115,10 @@ class SynapseOneClient:
         timeout: int = 15,
         tenant: str | None = None,
         max_attempts: int = 3,
+        trusted_redirect_origins: list[str] | str | None = None,
+        max_redirects: int = 10,
+        max_json_bytes: int = 8 * 1024 * 1024,
+        max_binary_bytes: int = 128 * 1024 * 1024,
     ) -> None:
         self._http = HttpClient(
             base_url,
@@ -123,6 +127,10 @@ class SynapseOneClient:
             tenant=tenant,
             timeout=timeout,
             max_attempts=max_attempts,
+            trusted_redirect_origins=trusted_redirect_origins,
+            max_redirects=max_redirects,
+            max_json_bytes=max_json_bytes,
+            max_binary_bytes=max_binary_bytes,
         )
         self.iam = IamService(self._http)
         self.workflow = WorkflowService(self._http)

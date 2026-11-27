@@ -28,6 +28,33 @@ Auth: `setToken(jwt)` (Bearer) or `setApiKey(key)` (`X-API-Key`).
 Optional `timeoutMs` (default 15000) and `tenant` (platform callers of
 Faststore/Queue, sent as `x-synapseone-tenant`; change with `setTenant()`).
 
+## Redirects, timeouts and response limits
+
+- Redirects are handled manually. Same-origin redirects (same scheme, host and
+  port) are followed with credentials intact, up to `maxRedirects` (default 10).
+- Cross-origin redirects are refused unless the target origin is listed in
+  `trustedRedirectOrigins` (or `SYNAPSEONE_TRUSTED_REDIRECT_ORIGINS`, comma
+  separated). A trusted cross-origin hop is followed **without**
+  `Authorization`, `X-API-Key`, cookies or platform tenant headers. A redirect
+  to any other origin is reported as `SynapseOneError` with
+  `code: 'redirect_not_allowed'`; no request is sent to that origin.
+- The timeout covers connection, headers **and body consumption**. A server
+  that sends headers and then stalls the body still times out. `timeoutMs: 0`
+  disables the timeout (not recommended).
+- JSON/text bodies are capped at `maxJsonBytes` (default 8 MiB) and binary
+  downloads at `maxBinaryBytes` (default 128 MiB, matching the OCS limit).
+  Limits are enforced while streaming; an oversized body raises
+  `code: 'response_too_large'` and is never silently truncated. Set either
+  limit to `0` to disable it.
+- The gateway itself does not redirect normal API routes. Edge HTTP→HTTPS
+  redirects are cross-origin (scheme change): use the canonical HTTPS base URL,
+  or explicitly trust the HTTPS origin knowing the redirected request is
+  unauthenticated.
+- Browser note: `fetch(..., {redirect: 'manual'})` exposes redirects as opaque
+  responses. The SDK fails closed with `redirect_not_allowed` when it cannot
+  inspect a redirect; use the canonical API origin in browsers. Node.js
+  follows same-origin redirects normally.
+
 ## Services
 
 The SDK is split per service, with matching subpath exports:

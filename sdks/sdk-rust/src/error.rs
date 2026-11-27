@@ -36,6 +36,33 @@ pub enum Error {
         source: reqwest::Error,
     },
 
+    /// One request attempt exceeded its timeout, including body consumption.
+    #[error("synapseone timeout {path} after {timeout_ms}ms (base {base_url})")]
+    Timeout {
+        path: String,
+        base_url: String,
+        timeout_ms: u64,
+    },
+
+    /// A response body exceeded the configured JSON/binary limit. The body is
+    /// rejected while streaming instead of being silently truncated.
+    #[error("synapseone response {path} exceeds the {limit}-byte {kind} limit (base {base_url})")]
+    BodyTooLarge {
+        path: String,
+        base_url: String,
+        limit: u64,
+        kind: &'static str,
+    },
+
+    /// A redirect was refused (untrusted origin, too many hops, bad location).
+    #[error("synapseone refused redirect {status} {path}: {message} (base {base_url})")]
+    Redirect {
+        status: u16,
+        path: String,
+        base_url: String,
+        message: String,
+    },
+
     /// The upstream answered with HTML (usually a console host instead of the API).
     #[error(
         "synapseone expected JSON from {base_url}{path} but received HTML (status {status}); \
@@ -65,7 +92,9 @@ impl Error {
     /// HTTP status code, when the error came from a response.
     pub fn status(&self) -> Option<u16> {
         match self {
-            Error::Http { status, .. } | Error::NonJsonResponse { status, .. } => Some(*status),
+            Error::Http { status, .. }
+            | Error::NonJsonResponse { status, .. }
+            | Error::Redirect { status, .. } => Some(*status),
             _ => None,
         }
     }
@@ -91,6 +120,9 @@ impl Error {
         match self {
             Error::Http { base_url, .. }
             | Error::Network { base_url, .. }
+            | Error::Timeout { base_url, .. }
+            | Error::BodyTooLarge { base_url, .. }
+            | Error::Redirect { base_url, .. }
             | Error::NonJsonResponse { base_url, .. } => Some(base_url),
             _ => None,
         }

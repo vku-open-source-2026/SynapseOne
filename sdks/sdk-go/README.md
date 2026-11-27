@@ -54,6 +54,25 @@ MFA: `SetupTOTP`, `EnableTOTP`, `VerifyMFA` (after a `401 mfa_required` login),
 `MFAStatus`, `RegenerateRecoveryCodes`, `DisableMFA`, and for org admins
 `ResetUserMFA` / `UnlockUser`.
 
+## Redirects, timeouts and response limits
+
+- Redirects are handled manually by the SDK. Same-origin redirects keep
+  `Authorization`, `X-API-Key`, cookies and tenant headers. Cross-origin
+  redirects are refused unless the target origin is listed in
+  `Client.TrustedRedirectOrigins` (or `SYNAPSEONE_TRUSTED_REDIRECT_ORIGINS`),
+  and are then sent **without** credentials. Refusals return `*APIError` with
+  `Code == "redirect_not_allowed"` before contacting the target.
+- `Client.Timeout` (default 15s) covers redirects, headers and body reads; a
+  per-call timeout override wins. The timeout is enforced with a request
+  context, so a server that stalls after sending headers cannot hang a caller.
+- `MaxJSONBytes` (default 8 MiB) and `MaxBinaryBytes` (default 128 MiB, aligned
+  with OCS) are enforced while reading. Overflow returns
+  `*ResponseTooLargeError`; it is never silently truncated. A short body with a
+  larger `Content-Length` returns a read error. Set a limit to `0` to disable it.
+- `MaxRedirects` defaults to 10. The gateway does not redirect normal API
+  routes; prefer the canonical HTTPS base URL over relying on HTTP→HTTPS
+  redirects (cross-origin and therefore unauthenticated).
+
 ## Full documentation
 
 See **[docs/sdk-go.md](../../docs/sdk-go.md)** for the complete API reference —

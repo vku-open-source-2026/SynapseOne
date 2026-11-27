@@ -15,7 +15,12 @@ import { SynapseOneClient, SynapseOneError, DEFAULT_BASE_URL, parseChatDelta } f
 
 const requireCjs = createRequire(__dirname);
 let server: http.Server;
+let other: http.Server;
 let base = '';
+let otherBase = '';
+let otherHits = 0;
+let otherHeaders: Record<string, string | string[] | undefined> = {};
+let finalHeaders: Record<string, string | string[] | undefined> = {};
 let hits = new Map<string, number>();
 let slowMs = 0;
 
@@ -26,6 +31,60 @@ before(
         .createServer((req, res) => {
           const url = req.url || '';
           hits.set(url, (hits.get(url) || 0) + 1);
+          if (url === '/v1/redirect-same') {
+            res.statusCode = 302;
+            res.setHeader('Location', '/v1/final');
+            res.end();
+            return;
+          }
+          if (url === '/v1/final') {
+            finalHeaders = { ...req.headers };
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ ok: true, path: url }));
+            return;
+          }
+          if (url === '/v1/redirect-cross') {
+            res.statusCode = 302;
+            res.setHeader('Location', `${otherBase}/capture`);
+            res.end();
+            return;
+          }
+          if (url === '/v1/redirect-loop') {
+            res.statusCode = 302;
+            res.setHeader('Location', '/v1/redirect-loop');
+            res.end();
+            return;
+          }
+          if (url === '/v1/stall-body') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.write('{"ok":');
+            return; // headers + partial body, never finishes
+          }
+          if (url === '/v1/partial-body') {
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': '100' });
+            res.write('short');
+            res.socket?.destroy();
+            return;
+          }
+          if (url === '/v1/bytes') {
+            res.setHeader('Content-Type', 'application/octet-stream');
+            res.end(Buffer.from([0, 1, 2, 254, 255]));
+            return;
+          }
+          if (url === '/v1/large-json') {
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ data: 'x'.repeat(200) }));
+            return;
+          }
+          if (url === '/v1/echo-len') {
+            const chunks: Buffer[] = [];
+            req.on('data', (chunk) => chunks.push(chunk));
+            req.on('end', () => {
+              res.setHeader('Content-Type', 'application/json');
+              res.end(JSON.stringify({ len: Buffer.concat(chunks).length }));
+            });
+            return;
+          }
           if (url === '/v1/orgs' && req.headers['x-test-html'] === '1') {
             res.setHeader('Content-Type', 'text/html; charset=utf-8');
             res.end('<!doctype html><html><body>console</body></html>');
@@ -100,7 +159,27 @@ before(
     }),
 );
 
+before(
+  () =>
+    new Promise<void>((resolve) => {
+      other = http
+        .createServer((req, res) => {
+          otherHits++;
+          otherHeaders = { ...req.headers };
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ ok: true, other: true }));
+        })
+        .listen(0, '127.0.0.1', () => {
+          const a = other.address();
+          otherBase = `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`;
+          resolve();
+        });
+    }),
+);
+
 after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+after(() => new Promise<void>((resolve) => other.close(() => resolve())));
+
 
 describe('transport', () => {
   it('exposes the API gateway as the default URL constant', () => {
@@ -172,6 +251,91 @@ describe('transport', () => {
       (e: any) => e instanceof SynapseOneError && e.code === 'timeout',
     );
     assert.ok(Date.now() - started < 2000);
+  });
+
+  it('keeps the timeout armed while a stalled response body is read', async () => {
+    const c = new SynapseOneClient({ baseUrl: base, maxAttempts: 1 });
+    const started = Date.now();
+    await assert.rejects(
+      () => c.http.req('/v1/stall-body', undefined, { timeoutMs: 50 }),
+      (e: any) => e instanceof SynapseOneError && e.code === 'timeout',
+    );
+    assert.ok(Date.now() - started < 2000);
+  });
+
+  it('follows same-origin redirects with credentials intact', async () => {
+    const c = new SynapseOneClient({ baseUrl: base, token: 'jwt-1', apiKey: 'key-1', tenant: 'acme', maxAttempts: 1 });
+    const out: any = await c.http.req('/v1/redirect-same');
+    assert.equal(out.path, '/v1/final');
+    assert.equal(finalHeaders['authorization'], 'Bearer jwt-1');
+    assert.equal(finalHeaders['x-api-key'], 'key-1');
+    assert.equal(finalHeaders['x-synapseone-tenant'], 'acme');
+  });
+
+  it('refuses an untrusted cross-origin redirect before sending anything', async () => {
+    otherHits = 0;
+    const c = new SynapseOneClient({ baseUrl: base, token: 'jwt-1', apiKey: 'key-1', maxAttempts: 1 });
+    await assert.rejects(
+      () => c.http.req('/v1/redirect-cross'),
+      (e: any) => e instanceof SynapseOneError && e.code === 'redirect_not_allowed',
+    );
+    assert.equal(otherHits, 0);
+  });
+
+  it('follows a trusted cross-origin redirect without forwarding credentials', async () => {
+    otherHits = 0;
+    otherHeaders = {};
+    const c = new SynapseOneClient({
+      baseUrl: base,
+      token: 'jwt-1',
+      apiKey: 'key-1',
+      tenant: 'acme',
+      trustedRedirectOrigins: [otherBase],
+      maxAttempts: 1,
+    });
+    const out: any = await c.http.req('/v1/redirect-cross');
+    assert.equal(out.other, true);
+    assert.equal(otherHits, 1);
+    assert.equal(otherHeaders['authorization'], undefined);
+    assert.equal(otherHeaders['x-api-key'], undefined);
+    assert.equal(otherHeaders['x-synapseone-tenant'], undefined);
+    assert.equal(otherHeaders['cookie'], undefined);
+  });
+
+  it('caps redirect loops instead of hanging', async () => {
+    const c = new SynapseOneClient({ baseUrl: base, maxRedirects: 2, maxAttempts: 1 });
+    await assert.rejects(
+      () => c.http.req('/v1/redirect-loop'),
+      (e: any) => e instanceof SynapseOneError && e.code === 'too_many_redirects',
+    );
+  });
+
+  it('rejects a truncated body instead of returning partial JSON', async () => {
+    const c = new SynapseOneClient({ baseUrl: base, maxAttempts: 1 });
+    await assert.rejects(
+      () => c.http.req('/v1/partial-body', undefined, { timeoutMs: 1000 }),
+      (e: any) => e instanceof SynapseOneError && e.code === 'network_error',
+    );
+  });
+
+  it('returns exact binary bytes and accepts ArrayBuffer uploads', async () => {
+    const c = new SynapseOneClient({ baseUrl: base, maxAttempts: 1 });
+    const bytes = await c.http.reqBinary('/v1/bytes');
+    assert.deepEqual([...bytes], [0, 1, 2, 254, 255]);
+    const uploaded = await c.http.upload<{ len: number }>(
+      '/v1/echo-len',
+      new Uint8Array([7, 8, 9]).buffer,
+      { method: 'PUT' },
+    );
+    assert.equal(uploaded.len, 3);
+  });
+
+  it('rejects an oversized response instead of silently truncating it', async () => {
+    const c = new SynapseOneClient({ baseUrl: base, maxJsonBytes: 32, maxAttempts: 1 });
+    await assert.rejects(
+      () => c.http.req('/v1/large-json'),
+      (e: any) => e instanceof SynapseOneError && e.code === 'response_too_large',
+    );
   });
 
   it('supports a caller AbortSignal', async () => {
