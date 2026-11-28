@@ -9,7 +9,7 @@ import { Link } from 'react-router-dom';
 import { usePlatformAuth } from '../lib/platform-auth.jsx';
 import { useI18n } from '../lib/i18n-context.js';
 import { EDGE_COPY } from '../lib/edge-i18n.js';
-import { addressRecordConflict, connectorScript, edgePath, normalizeHostname, publicHostname, zoneForHostname } from '../lib/edge.js';
+import { addressRecordConflict, connectorScript, defaultAddressRecord, edgePath, normalizeHostname, zoneForHostname } from '../lib/edge.js';
 import { Badge, Btn, Card, Empty, Err, Field, Input, PageTitle, Skeleton } from '../components/ui.jsx';
 
 const EMPTY_FORM = {
@@ -120,12 +120,12 @@ export default function SynapseTunnelPage() {
     if (wizard.step === 1) {
       try { validateUpstream(form.upstreamUrl); } catch (err) { setFormError(err.message); return; }
       if (!form.name.trim()) { setFormError(t.name + ' is required'); return; }
-      const target = publicHostname(publicOrigin);
+      const suggestion = defaultAddressRecord(publicOrigin);
       setForm((current) => ({
         ...current,
         zone: matchingZone || current.zone,
-        recordType: 'CNAME',
-        recordTarget: current.recordType === 'CNAME' && current.recordTarget ? current.recordTarget : target,
+        recordType: current.recordTarget ? current.recordType : suggestion.type,
+        recordTarget: current.recordTarget || suggestion.target,
       }));
       setWizard({ step: 2 });
       return;
@@ -323,7 +323,7 @@ export default function SynapseTunnelPage() {
                   </select>
                 </Field>
                 <Field label={d.recordType}>
-                  <select value={form.recordType} onChange={(e) => setForm({ ...form, recordType: e.target.value, recordTarget: e.target.value === 'CNAME' ? publicHostname(publicOrigin) : '' })} className="w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm">
+                  <select value={form.recordType} onChange={(e) => setForm({ ...form, recordType: e.target.value, recordTarget: e.target.value === defaultAddressRecord(publicOrigin).type ? defaultAddressRecord(publicOrigin).target : '' })} className="w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm">
                     <option value="CNAME">CNAME</option><option value="A">A</option><option value="AAAA">AAAA</option>
                   </select>
                 </Field>

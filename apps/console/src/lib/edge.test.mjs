@@ -7,7 +7,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  absoluteRecordName, addressRecordConflict, buildRecordInput, connectorScript,
+  absoluteRecordName, addressRecordConflict, buildRecordInput, connectorScript, defaultAddressRecord,
   edgePath, normalizeHostname, publicHostname, recordValue, shellQuote, zoneForHostname,
 } from './edge.js';
 import { EDGE_COPY } from './edge-i18n.js';
@@ -33,6 +33,9 @@ test('hostnames and zones normalize safely and choose the longest matching zone'
   assert.equal(zoneForHostname('other.test', zones), null);
   assert.equal(publicHostname('https://tunnel.example.com:443/'), 'tunnel.example.com');
   assert.equal(publicHostname('not a url'), '');
+  assert.deepEqual(defaultAddressRecord('http://139.162.16.140:18082'), { type: 'A', target: '139.162.16.140' });
+  assert.deepEqual(defaultAddressRecord('https://tunnel.example.com'), { type: 'CNAME', target: 'tunnel.example.com' });
+  assert.deepEqual(defaultAddressRecord('http://[::1]:4016'), { type: 'AAAA', target: '::1' });
 });
 
 test('record names become canonical FQDNs without escaping the selected zone', () => {

@@ -110,6 +110,14 @@ export function publicHostname(origin) {
   }
 }
 
+export function defaultAddressRecord(origin) {
+  const hostname = publicHostname(origin);
+  const bare = hostname.replace(/^\[|\]$/g, '');
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(bare)) return { type: 'A', target: bare };
+  if (bare.includes(':')) return { type: 'AAAA', target: bare };
+  return { type: 'CNAME', target: hostname };
+}
+
 export function shellQuote(value) {
   const text = String(value);
   if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(text)) return text;

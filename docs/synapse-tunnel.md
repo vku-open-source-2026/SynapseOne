@@ -73,8 +73,12 @@ export SYNAPSETUNNEL_ADMIN_TOKEN="$(openssl rand -hex 32)"
 docker compose -f docker-compose.tunnel.yml up -d --build
 ```
 
-The Compose file binds the management API and ingress to loopback. Put a trusted
-TLS reverse proxy in front before exposing the ingress publicly.
+The Compose file binds the management API and ingress to loopback by default. For
+a deliberately public HTTP demo, set `SYNAPSETUNNEL_INGRESS_BIND_IP` to the server
+IP and advertise the same origin with `SYNAPSETUNNEL_PUBLIC_ORIGIN`, for example
+`http://139.162.16.140:18082`. Prefer a trusted TLS reverse proxy and HTTPS/WSS for
+production; plain HTTP exposes application traffic and connector tokens to the
+network.
 
 Create a connector:
 
