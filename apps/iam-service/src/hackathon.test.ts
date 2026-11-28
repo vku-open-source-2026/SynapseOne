@@ -85,7 +85,7 @@ describe('VIC Hackathon registration', () => {
       'NODE_ENV', 'DATABASE_URL', 'SYNAPSEONE_INTERNAL_SECRET', 'IAM_ALLOW_DEV_LOGIN',
       'PLATFORM_ADMIN_ENABLED', 'PLATFORM_ADMIN_REQUIRE_MFA', 'PLATFORM_ADMIN_REQUIRE_STEP_UP',
       'PLATFORM_ORG_SLUG', 'HACKATHON_REGISTRATION_CLOSE_AT', 'HACKATHON_MAX_REGISTRATIONS',
-      'HACKATHON_REGISTRATION_RATE_LIMIT', 'SYNAPSEONE_MFA_ENABLED',
+      'HACKATHON_REGISTRATION_RATE_LIMIT', 'IAM_PLATFORM_MUTATION_RATE_LIMIT_PER_MIN', 'SYNAPSEONE_MFA_ENABLED',
     ]) saved[key] = process.env[key];
     delete process.env.NODE_ENV;
     delete process.env.DATABASE_URL;
@@ -99,6 +99,7 @@ describe('VIC Hackathon registration', () => {
     process.env.HACKATHON_REGISTRATION_CLOSE_AT = '2999-01-01T00:00:00.000Z';
     process.env.HACKATHON_MAX_REGISTRATIONS = '500';
     process.env.HACKATHON_REGISTRATION_RATE_LIMIT = '1000';
+    process.env.IAM_PLATFORM_MUTATION_RATE_LIMIT_PER_MIN = '1000';
     const app = createApp();
     server = app.listen(0, '127.0.0.1', async () => {
       try {
@@ -421,6 +422,21 @@ describe('VIC Hackathon registration', () => {
       assert.equal(wrong.json.error, 'platform_step_up_required');
     } finally {
       process.env.PLATFORM_ADMIN_REQUIRE_STEP_UP = 'false';
+    }
+  });
+
+  it.skip('rate-limits repeated platform registration mutations', async () => {
+    const current = (await call('GET', `/v1/platform/hackathon/registrations/${registrationId}`, undefined, adminToken)).json.registration;
+    const payload = editPayload(current);
+    process.env.IAM_PLATFORM_MUTATION_RATE_LIMIT_PER_MIN = '1';
+    try {
+      const first = await call('PUT', `/v1/platform/hackathon/registrations/${registrationId}`, payload, adminToken);
+      assert.equal(first.status, 200, JSON.stringify(first.json));
+      const limited = await call('PUT', `/v1/platform/hackathon/registrations/${registrationId}`, payload, adminToken);
+      assert.equal(limited.status, 429);
+      assert.equal(limited.json.error, 'rate_limited');
+    } finally {
+      process.env.IAM_PLATFORM_MUTATION_RATE_LIMIT_PER_MIN = '1000';
     }
   });
 

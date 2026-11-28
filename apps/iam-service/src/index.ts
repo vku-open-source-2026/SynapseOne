@@ -1486,6 +1486,16 @@ async function auditMutation(req: express.Request, action: string, resource: str
     Math.max(60_000, Number(process.env.HACKATHON_REGISTRATION_RATE_WINDOW_MS) || 15 * 60_000),
   );
   app.use('/v1/hackathon/registrations', hackathonLimiter as any);
+  // Platform registration mutations are privileged, but still need an abuse
+  // ceiling in case an owner/operator token is stolen or automation loops.
+  const platformMutationLimiter = rateLimit(
+    Math.max(1, Number(process.env.IAM_PLATFORM_MUTATION_RATE_LIMIT_PER_MIN) || 120),
+    60_000,
+  );
+  app.use('/v1/platform/hackathon/registrations', ((req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (req.method === 'GET') return next();
+    return platformMutationLimiter(req, res, next);
+  }) as any);
   // Per-route ceiling for second-factor and account-recovery endpoints
   // (per-user lockout in mfa.ts is the primary brute-force defence).
   const mfaLimiter = expressRateLimit({
