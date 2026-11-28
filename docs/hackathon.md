@@ -101,13 +101,13 @@ only delivery status/timestamps, never plaintext API keys.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `HACKATHON_REGISTRATION_CLOSE_AT` | `2026-11-28T10:00:00.000Z` | Server-side deadline; ISO timestamp. |
+| `HACKATHON_REGISTRATION_CLOSE_AT` | `2026-11-28T17:00:00.000Z` | Server-side deadline; ISO timestamp. |
 | `HACKATHON_MAX_REGISTRATIONS` | `500` | Maximum number of teams. |
 | `HACKATHON_REGISTRATION_RATE_LIMIT` | `5` | Public submissions allowed per IP/window. |
 | `HACKATHON_REGISTRATION_RATE_WINDOW_MS` | `900000` | Rate-limit window (15 minutes). |
 
-The default deadline is 17:00 Vietnam time. Keep the public page schedule and the
-server variable in sync when changing the event date.
+The default deadline is 00:00 Vietnam time on 29 November 2026. Keep the public
+page schedule and the server variable in sync when changing the event date.
 
 ## Privacy and security
 

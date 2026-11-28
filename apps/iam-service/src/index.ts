@@ -466,7 +466,7 @@ const PLATFORM_STEP_UP_ACTIONS = new Set([
   'hackathon:api-key-sent',
 ]);
 
-const HACKATHON_DEFAULT_CLOSE_AT = Date.parse('2026-11-28T10:00:00.000Z'); // 17:00 UTC+7
+const HACKATHON_DEFAULT_CLOSE_AT = Date.parse('2026-11-28T17:00:00.000Z'); // 00:00 UTC+7 on 29/11/2026
 function hackathonCloseAt(): number {
   const raw = String(process.env.HACKATHON_REGISTRATION_CLOSE_AT || '').trim();
   const parsed = raw ? Date.parse(raw) : Number.NaN;
