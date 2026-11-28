@@ -34,8 +34,8 @@ jobs:
       packages: write
       id-token: write # npm Trusted Publishing (OIDC, no token secret)
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with: { node-version: 24, registry-url: https://registry.npmjs.org }
 
       # Moi package lay dev version tu manifest cua chinh no (khong commit tro lai).
@@ -103,7 +103,7 @@ jobs:
           verify_dev cli "${CLI_DEV}"
 
       - name: Login GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
