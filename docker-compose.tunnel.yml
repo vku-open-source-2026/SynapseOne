@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 VKU.VIC
+name: synapsetunnel
+
+services:
+  tunnel:
+    build:
+      context: .
+      dockerfile: apps/tunnel-service/Dockerfile
+    image: ${SYNAPSETUNNEL_IMAGE:-synapse-migration/synapse-tunnel:latest}
+    restart: unless-stopped
+    init: true
+    environment:
+      NODE_ENV: production
+      SYNAPSETUNNEL_HOST: 0.0.0.0
+      SYNAPSETUNNEL_API_PORT: 4015
+      SYNAPSETUNNEL_INGRESS_PORT: 4016
+      SYNAPSETUNNEL_PUBLIC_SCHEME: ${SYNAPSETUNNEL_PUBLIC_SCHEME:-http}
+      SYNAPSETUNNEL_DATA_FILE: /app/data/synapse-tunnel.json
+      SYNAPSETUNNEL_ADMIN_TOKEN: ${SYNAPSETUNNEL_ADMIN_TOKEN:?set SYNAPSETUNNEL_ADMIN_TOKEN}
+    ports:
+      - "127.0.0.1:${SYNAPSETUNNEL_API_PORT:-4015}:4015"
+      - "127.0.0.1:${SYNAPSETUNNEL_INGRESS_PORT:-8082}:4016"
+    volumes:
+      - synapsetunnel-data:/app/data
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4015/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  synapsetunnel-data:

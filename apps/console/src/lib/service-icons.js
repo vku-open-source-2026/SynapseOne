@@ -24,6 +24,8 @@ import {
 /** Icon registry shared by the desktop services sidebar and mobile Topbar menu. */
 export const SERVICE_ICONS = {
   gateway: faServer,
+  dns: faServer,
+  tunnel: faLink,
   iam: faUserShield,
   workflow: faBolt,
   runner: faServer,

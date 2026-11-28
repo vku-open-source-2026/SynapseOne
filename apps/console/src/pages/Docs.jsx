@@ -86,6 +86,56 @@ const REST_CODES = {
   gateway: `curl -s http://localhost:8080/health
 curl -s http://localhost:8080/ready
 curl -s http://localhost:8080/metrics`,
+  dns: `# Direct SynapseDNS management API on 4014; this is not a gateway route.
+export SYNAPSEDNS_ADMIN_TOKEN='<admin-token-at-least-32-characters>'
+curl -sS http://127.0.0.1:4014/ready
+
+curl -sS -XPOST http://127.0.0.1:4014/v1/zones \\
+  -H "Authorization: Bearer $SYNAPSEDNS_ADMIN_TOKEN" \\
+  -H 'Content-Type: application/json' \\
+  -d '{"name":"example.test","nameservers":["ns1.example.test","ns2.example.test"],"ttl":300}'
+
+RECORD=$(curl -sS -XPOST http://127.0.0.1:4014/v1/zones/example.test/records \\
+  -H "Authorization: Bearer $SYNAPSEDNS_ADMIN_TOKEN" \\
+  -H 'Content-Type: application/json' \\
+  -d '{"type":"A","name":"www.example.test","ttl":300,"address":"192.0.2.10"}' | jq -r .id)
+
+curl -sS http://127.0.0.1:4014/v1/zones/example.test/records \\
+  -H "Authorization: Bearer $SYNAPSEDNS_ADMIN_TOKEN"
+curl -sS -XPATCH "http://127.0.0.1:4014/v1/zones/example.test/records/$RECORD" \\
+  -H "Authorization: Bearer $SYNAPSEDNS_ADMIN_TOKEN" \\
+  -H 'Content-Type: application/json' -d '{"ttl":60}'
+
+# Authoritative wire queries on UDP/TCP 53; never send these through HTTP.
+dig @127.0.0.1 -p 53 www.example.test A +norecurse
+dig @127.0.0.1 -p 53 www.example.test A +tcp +norecurse
+dig @127.0.0.1 -p 53 missing.example.test A +norecurse`,
+  tunnel: `# Direct Synapse Tunnel control plane on 4015; this is not a gateway route.
+export SYNAPSETUNNEL_ADMIN_TOKEN='<admin-token-at-least-32-characters>'
+curl -sS http://127.0.0.1:4015/health
+curl -sS http://127.0.0.1:4016/ready
+
+CREATED=$(curl -sS -XPOST http://127.0.0.1:4015/v1/connectors \\
+  -H "Authorization: Bearer $SYNAPSETUNNEL_ADMIN_TOKEN" \\
+  -H 'Content-Type: application/json' \\
+  -d '{"name":"docs-app","upstreamUrl":"http://127.0.0.1:3000"}')
+CONNECTOR_ID=$(printf '%s' "$CREATED" | jq -r .connector.id)
+# Save this connector token once; later reads never return it.
+printf '%s' "$CREATED" | jq -r .token
+
+curl -sS -XPOST http://127.0.0.1:4015/v1/routes \\
+  -H "Authorization: Bearer $SYNAPSETUNNEL_ADMIN_TOKEN" \\
+  -H 'Content-Type: application/json' \\
+  -d "$(jq -nc --arg id "$CONNECTOR_ID" '{name:"docs-app",hostname:"docs.example.com",pathPrefix:"/api",connectorId:$id,timeoutMs:30000}')"
+
+# In another terminal in apps/tunnel-service, start the outbound-only connector:
+# SYNAPSETUNNEL_CONNECTOR_TOKEN='<token-returned-once>' npm run start:connector
+
+# Once the connector is online, call HTTP ingress on 4016 with the route Host.
+# These paths assume the local upstream exposes /items and /events.
+curl -i 'http://127.0.0.1:4016/api/items?limit=10' -H 'Host: docs.example.com'
+curl -N 'http://127.0.0.1:4016/api/events' \\
+  -H 'Host: docs.example.com' -H 'Accept: text/event-stream'`,
   iam: `# Development sign-in; use SSO or API keys in production
 TOKEN=$(curl -s -XPOST http://localhost:8080/v1/auth/login \\
   -H 'Content-Type: application/json' \\
@@ -316,6 +366,23 @@ const SERVICE_DOCS = {
     sections: ['quickstart', 'api', 'semantics'], codes: { quickstart: REST_CODES.gateway },
     endpoints: [['GET', '/health', 'health'], ['GET', '/ready', 'ready'], ['GET', '/metrics', 'metrics'], ['GET', '/', 'index']],
   },
+  dns: {
+    sections: ['quickstart', 'api', 'semantics'], codes: { quickstart: REST_CODES.dns },
+    endpoints: [
+      ['GET', '/health', 'health'], ['GET', '/ready', 'ready'], ['UDP · TCP', ':53', 'dnsWire'],
+      ['GET · POST', '/v1/zones', 'zones'], ['GET · DELETE', '/v1/zones/:zone', 'zone'],
+      ['GET · POST', '/v1/zones/:zone/records', 'records'], ['PATCH · DELETE', '/v1/zones/:zone/records/:recordId', 'record'],
+    ],
+  },
+  tunnel: {
+    sections: ['quickstart', 'api', 'semantics'], codes: { quickstart: REST_CODES.tunnel },
+    endpoints: [
+      ['GET', '/health', 'health'], ['GET', '/ready', 'ready'],
+      ['GET · POST', '/v1/connectors', 'connectors'], ['GET · PATCH · DELETE', '/v1/connectors/:id', 'connector'],
+      ['GET · POST', '/v1/routes', 'routes'], ['GET · PATCH · DELETE', '/v1/routes/:id', 'route'],
+      ['ANY', '/<matched path>/*', 'ingress'], ['WS', '/_synapse/tunnel/connect', 'connectorTransport'],
+    ],
+  },
   iam: {
     sections: ['quickstart', 'policy', 'api', 'semantics'], codes: { quickstart: REST_CODES.iam, policy: REST_CODES.iamPolicy },
     endpoints: [
@@ -429,6 +496,302 @@ let c = SynapseOneClient::new(
 };
 
 const SDK_EXAMPLES = {
+  dns: {
+    setup: {
+      javascript: `// Node 20+ built-in fetch; direct SynapseDNS HTTP API, not the gateway SDK.
+const DNS_API = 'http://127.0.0.1:4014';
+const DNS_HEADERS = {
+  Authorization: 'Bearer ' + process.env.SYNAPSEDNS_ADMIN_TOKEN,
+  'Content-Type': 'application/json',
+};
+
+async function dnsRequest(path, method = 'GET', body) {
+  const response = await fetch(DNS_API + path, {
+    method,
+    headers: DNS_HEADERS,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!response.ok) throw new Error(response.status + ': ' + await response.text());
+  return response.status === 204 ? null : response.json();
+}`,
+      python: `# Direct SynapseDNS HTTP API with the Python standard library.
+import json
+import os
+import urllib.request
+
+DNS_API = "http://127.0.0.1:4014"
+DNS_HEADERS = {
+    "Authorization": f"Bearer {os.environ['SYNAPSEDNS_ADMIN_TOKEN']}",
+    "Content-Type": "application/json",
+}
+
+def dns_request(path, method="GET", body=None):
+    data = None if body is None else json.dumps(body).encode()
+    request = urllib.request.Request(
+        DNS_API + path, data=data, headers=DNS_HEADERS, method=method
+    )
+    with urllib.request.urlopen(request) as response:
+        return None if response.status == 204 else json.load(response)`,
+      go: `package main
+
+import (
+    "bytes"
+    "encoding/json"
+    "fmt"
+    "log"
+    "net/http"
+    "os"
+)
+
+func dnsAPI(method, path string, body []byte) map[string]any {
+    req, err := http.NewRequest(method, "http://127.0.0.1:4014"+path, bytes.NewReader(body))
+    if err != nil { log.Fatal(err) }
+    req.Header.Set("Authorization", "Bearer "+os.Getenv("SYNAPSEDNS_ADMIN_TOKEN"))
+    req.Header.Set("Content-Type", "application/json")
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil { log.Fatal(err) }
+    defer resp.Body.Close()
+    if resp.StatusCode >= 400 { log.Fatal(resp.Status) }
+    var result map[string]any
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil { log.Fatal(err) }
+    return result
+}
+
+// Inside func main(); standard net/http, not the gateway SDK.`,
+      rust: `use reqwest::{Client, Method};
+use serde_json::{json, Value};
+
+// Cargo.toml: reqwest = { version = "0.12", features = ["json"] }, serde_json = "1"
+// Inside async fn main() -> Result<(), Box<dyn std::error::Error>>.
+let dns = Client::new();
+let dns_token = std::env::var("SYNAPSEDNS_ADMIN_TOKEN")?;
+
+async fn dns_request(
+    client: &Client,
+    token: &str,
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Value, reqwest::Error> {
+    let mut request = client
+        .request(method, format!("http://127.0.0.1:4014{path}"))
+        .bearer_auth(token);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    request.send().await?.error_for_status()?.json().await
+}`,
+    },
+    javascript: `await dnsRequest('/v1/zones', 'POST', {
+  name: 'example.test',
+  nameservers: ['ns1.example.test', 'ns2.example.test'],
+  ttl: 300,
+});
+const record = await dnsRequest('/v1/zones/example.test/records', 'POST', {
+  type: 'A', name: 'www.example.test', ttl: 300, address: '192.0.2.10',
+});
+const records = await dnsRequest('/v1/zones/example.test/records');
+console.log(record.id, records.records.length);`,
+    python: `dns_request("/v1/zones", "POST", {
+    "name": "example.test",
+    "nameservers": ["ns1.example.test", "ns2.example.test"],
+    "ttl": 300,
+})
+record = dns_request("/v1/zones/example.test/records", "POST", {
+    "type": "A", "name": "www.example.test", "ttl": 300, "address": "192.0.2.10",
+})
+records = dns_request("/v1/zones/example.test/records")
+print(record["id"], len(records["records"]))`,
+    go: `dnsAPI("POST", "/v1/zones", []byte(\`{"name":"example.test","nameservers":["ns1.example.test","ns2.example.test"],"ttl":300}\`))
+dnsAPI("POST", "/v1/zones/example.test/records", []byte(\`{"type":"A","name":"www.example.test","ttl":300,"address":"192.0.2.10"}\`))
+records := dnsAPI("GET", "/v1/zones/example.test/records", nil)
+fmt.Println(records)`,
+    rust: `dns_request(&dns, &dns_token, Method::POST, "/v1/zones", Some(json!({
+    "name": "example.test",
+    "nameservers": ["ns1.example.test", "ns2.example.test"],
+    "ttl": 300,
+}))).await?;
+let record = dns_request(&dns, &dns_token, Method::POST, "/v1/zones/example.test/records", Some(json!({
+    "type": "A", "name": "www.example.test", "ttl": 300, "address": "192.0.2.10",
+}))).await?;
+let records = dns_request(&dns, &dns_token, Method::GET, "/v1/zones/example.test/records", None).await?;
+println!("{} {}", record["id"], records["records"].as_array().map_or(0, Vec::len));`,
+  },
+  tunnel: {
+    setup: {
+      javascript: `// Node 20+ built-in HTTP clients; direct Synapse Tunnel APIs, not the gateway SDK.
+import { request } from 'node:http';
+
+const TUNNEL_API = 'http://127.0.0.1:4015';
+const TUNNEL_HEADERS = {
+  Authorization: 'Bearer ' + process.env.SYNAPSETUNNEL_ADMIN_TOKEN,
+  'Content-Type': 'application/json',
+};
+
+async function tunnelApi(path, method = 'GET', body) {
+  const response = await fetch(TUNNEL_API + path, {
+    method,
+    headers: TUNNEL_HEADERS,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!response.ok) throw new Error(response.status + ': ' + await response.text());
+  return response.status === 204 ? null : response.json();
+}
+
+function ingressRequest(path) {
+  return new Promise((resolve, reject) => {
+    const req = request('http://127.0.0.1:4016' + path, {
+      headers: { Host: 'docs.example.com' },
+    }, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => resolve({ status: res.statusCode, body }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}`,
+      python: `# Direct Synapse Tunnel HTTP APIs with the Python standard library.
+import json
+import os
+import urllib.request
+
+TUNNEL_API = "http://127.0.0.1:4015"
+TUNNEL_HEADERS = {
+    "Authorization": f"Bearer {os.environ['SYNAPSETUNNEL_ADMIN_TOKEN']}",
+    "Content-Type": "application/json",
+}
+
+def tunnel_api(path, method="GET", body=None):
+    data = None if body is None else json.dumps(body).encode()
+    request = urllib.request.Request(
+        TUNNEL_API + path, data=data, headers=TUNNEL_HEADERS, method=method
+    )
+    with urllib.request.urlopen(request) as response:
+        return None if response.status == 204 else json.load(response)`,
+      go: `package main
+
+import (
+    "bytes"
+    "encoding/json"
+    "fmt"
+    "log"
+    "net/http"
+    "os"
+)
+
+func tunnelAPI(method, path string, body []byte) map[string]any {
+    req, err := http.NewRequest(method, "http://127.0.0.1:4015"+path, bytes.NewReader(body))
+    if err != nil { log.Fatal(err) }
+    req.Header.Set("Authorization", "Bearer "+os.Getenv("SYNAPSETUNNEL_ADMIN_TOKEN"))
+    req.Header.Set("Content-Type", "application/json")
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil { log.Fatal(err) }
+    defer resp.Body.Close()
+    if resp.StatusCode >= 400 { log.Fatal(resp.Status) }
+    var result map[string]any
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil { log.Fatal(err) }
+    return result
+}
+
+// Inside func main(); standard net/http, not the gateway SDK.`,
+      rust: `use reqwest::{Client, Method};
+use serde_json::{json, Value};
+
+// Cargo.toml: reqwest = { version = "0.12", features = ["json"] }, serde_json = "1"
+// Inside async fn main() -> Result<(), Box<dyn std::error::Error>>.
+let tunnel = Client::new();
+let tunnel_token = std::env::var("SYNAPSETUNNEL_ADMIN_TOKEN")?;
+
+async fn tunnel_api(
+    client: &Client,
+    token: &str,
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Value, reqwest::Error> {
+    let mut request = client
+        .request(method, format!("http://127.0.0.1:4015{path}"))
+        .bearer_auth(token);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    request.send().await?.error_for_status()?.json().await
+}`,
+    },
+    javascript: `const created = await tunnelApi('/v1/connectors', 'POST', {
+  name: 'docs-app', upstreamUrl: 'http://127.0.0.1:3000',
+});
+const connectorId = created.connector.id;
+// Save this token once and configure the outbound-only connector with it.
+console.log('Connector token:', created.token);
+await tunnelApi('/v1/routes', 'POST', {
+  name: 'docs-app', hostname: 'docs.example.com', pathPrefix: '/api',
+  connectorId, timeoutMs: 30000,
+});
+
+// After the outbound connector is online, call ingress without the admin token.
+const response = await ingressRequest('/api/items?limit=10');
+if (response.status >= 400) throw new Error(response.status + ': ' + response.body);
+console.log(response.status, response.body);`,
+    python: `created = tunnel_api("/v1/connectors", "POST", {
+    "name": "docs-app", "upstreamUrl": "http://127.0.0.1:3000",
+})
+connector_id = created["connector"]["id"]
+# Save this token once and configure the outbound-only connector with it.
+print("Connector token:", created["token"])
+tunnel_api("/v1/routes", "POST", {
+    "name": "docs-app", "hostname": "docs.example.com", "pathPrefix": "/api",
+    "connectorId": connector_id, "timeoutMs": 30000,
+})
+
+# After the outbound connector is online, call ingress without the admin token.
+request = urllib.request.Request(
+    "http://127.0.0.1:4016/api/items?limit=10",
+    headers={"Host": "docs.example.com"},
+)
+with urllib.request.urlopen(request) as response:
+    print(response.status, response.read().decode())`,
+    go: `created := tunnelAPI("POST", "/v1/connectors", []byte(\`{"name":"docs-app","upstreamUrl":"http://127.0.0.1:3000"}\`))
+connector := created["connector"].(map[string]any)
+connectorID := connector["id"].(string)
+// Save this token once and configure the outbound-only connector with it.
+fmt.Println("Connector token:", created["token"])
+routeBody, err := json.Marshal(map[string]any{
+    "name": "docs-app", "hostname": "docs.example.com", "pathPrefix": "/api",
+    "connectorId": connectorID, "timeoutMs": 30000,
+})
+if err != nil { log.Fatal(err) }
+tunnelAPI("POST", "/v1/routes", routeBody)
+
+// After the outbound connector is online, call ingress without the admin token.
+req, err := http.NewRequest("GET", "http://127.0.0.1:4016/api/items?limit=10", nil)
+if err != nil { log.Fatal(err) }
+req.Host = "docs.example.com"
+resp, err := http.DefaultClient.Do(req)
+if err != nil { log.Fatal(err) }
+defer resp.Body.Close()
+fmt.Println(resp.Status)`,
+    rust: `let created = tunnel_api(&tunnel, &tunnel_token, Method::POST, "/v1/connectors", Some(json!({
+    "name": "docs-app", "upstreamUrl": "http://127.0.0.1:3000",
+}))).await?;
+let connector_id = created["connector"]["id"].as_str().ok_or("missing connector id")?;
+// Save this token once and configure the outbound-only connector with it.
+println!("Connector token: {}", created["token"]);
+tunnel_api(&tunnel, &tunnel_token, Method::POST, "/v1/routes", Some(json!({
+    "name": "docs-app", "hostname": "docs.example.com", "pathPrefix": "/api",
+    "connectorId": connector_id, "timeoutMs": 30000,
+}))).await?;
+
+// After the outbound connector is online, call ingress without the admin token.
+let response = tunnel
+    .get("http://127.0.0.1:4016/api/items?limit=10")
+    .header("Host", "docs.example.com")
+    .send()
+    .await?;
+println!("{}", response.status());`,
+  },
   gateway: {
     javascript: `const health = await c.health.health();
 const ready = await c.health.ready();`,
@@ -829,6 +1192,8 @@ let rows = c.lakehouse()
 
 const SDK_NAMESPACES = [
   ['gateway', 'c.health', 'c.health', 'Client.Health / Ready', 'c.health()'],
+  ['dns', 'fetch', 'urllib.request', 'net/http', 'reqwest'],
+  ['tunnel', 'fetch + node:http', 'urllib.request', 'net/http', 'reqwest'],
   ['iam', 'c.iam', 'c.iam', 'Client.*', 'c.iam()'],
   ['workflow', 'c.workflow', 'c.workflow', 'Client.*Workflow*', 'c.workflow()'],
   ['runner', 'c.workflow', 'c.workflow', 'Client.Call', 'c.workflow()'],
@@ -962,7 +1327,7 @@ synapseone runners list`,
 };
 
 const GUIDE_ICONS = {
-  gateway: Cloud, iam: ShieldCheck, workflow: GitBranch, runner: Boxes, ai: Brain, inference: Brain,
+  gateway: Cloud, dns: Cloud, tunnel: Network, iam: ShieldCheck, workflow: GitBranch, runner: Boxes, ai: Brain, inference: Brain,
   lds: Network, base: Database, search: Zap, faststore: Gauge, queue: Inbox, stream: Radio,
   ocs: Cloud, notifications: Bell, warehouse: Boxes, lakehouse: Boxes,
   javascript: FileCode2, python: FileCode2, go: Boxes, rust: FileCode2, cli: FileCode2,
@@ -1072,7 +1437,7 @@ function SdkExamples({ service }) {
           data-sdk-panel={id}
           hidden={language !== id}
         >
-          <DocCode data={`${SDK_SETUP[id]}\n\n${examples[id]}`} label={d.languages[id]} />
+          <DocCode data={`${examples.setup?.[id] ?? SDK_SETUP[id]}\n\n${examples[id]}`} label={d.languages[id]} />
         </div>
       ))}
     </DocSection>

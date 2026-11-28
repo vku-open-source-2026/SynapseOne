@@ -9,6 +9,11 @@ của từng bản phát hành nằm trong `CHANGELOG.md` tiếng Anh.
 
 ### Thêm
 
+- **SynapseDNS và Synapse Tunnel:** dịch vụ edge Tầng 1 chạy độc lập với DNS
+  authoritative UDP/TCP, API quản lý zone/record, connector tunnel HTTP chỉ kết
+  nối outbound, ingress routing theo host/path, JSON persistence nguyên tử,
+  Docker/Compose, tài liệu vận hành song ngữ và hướng dẫn bốn ngôn ngữ. Tích hợp
+  gateway hiện tại và Tầng 2/3 vẫn để sau.
 - **Quota tổ chức và mặt quản lý API-key.** Quản trị viên nền tảng xem metadata
   API-key tenant, tạo/xoay vòng key với secret chỉ hiện một lần, và quản lý
   override nullable cho `ai`/`inference`/`workflow`. Tenant đọc được tổ chức và

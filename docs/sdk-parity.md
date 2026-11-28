@@ -2,11 +2,13 @@
 <!-- SPDX-FileCopyrightText: 2026 VKU.VIC -->
 # SDK service parity
 
-All four SDKs cover the platform's service groups through the public gateway.
-They do not expose every endpoint through an identical convenience method.
-Use the generic request method for a route that does not have a wrapper yet:
+All four SDKs cover the platform's gateway-routed service groups. They do not
+expose every endpoint through an identical convenience method. Use the generic
+request method for a route that does not have a wrapper yet:
 `client.call` (JavaScript), `client.call` (Python), `Client.Call` (Go), or
-`client.client().request` (Rust).
+`client.client().request` (Rust). Standalone SynapseDNS and Synapse Tunnel APIs
+are currently demonstrated with direct HTTP because gateway integration is
+pending.
 
 | Area | JavaScript / TypeScript | Python | Go | Rust |
 | --- | --- | --- | --- | --- |
@@ -15,6 +17,8 @@ Use the generic request method for a route that does not have a wrapper yet:
 | Base | Typed mapping, graph/GIS, paged reads | Typed mapping, graph/GIS | Typed mapping, documents/vector search; graph/GIS use `Call` | Documents, graph/GIS; raw `data` writes rather than typed model mapping |
 | Search | `client.search` | `client.base.search_*` | `Client.Search*` | `client.base().search_*` |
 | Lakehouse | Namespaces, tables, append/query, snapshots, evolution | Same | Same | Same |
+| SynapseDNS | Direct HTTP zone/record API; no typed wrapper | Direct HTTP; no typed wrapper | Direct HTTP; no typed wrapper | Direct HTTP; no typed wrapper |
+| Synapse Tunnel | Direct HTTP connector/route API; connector CLI | Direct HTTP; no typed wrapper | Direct HTTP; no typed wrapper | Direct HTTP; no typed wrapper |
 | Inference streaming | Incremental SSE iterator | Incremental SSE iterator | No SSE iterator; `Stream: true` is not a supported convenience path | `chat_stream` buffers the complete SSE body |
 | Legacy flat aliases | Supported alias list only; namespaced API is canonical | Deprecated flat aliases forward to namespaces | Flat methods are the primary Go API | Low-level and namespaced handles |
 

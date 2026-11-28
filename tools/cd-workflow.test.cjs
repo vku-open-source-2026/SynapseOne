@@ -10,6 +10,10 @@ const cd = fs.readFileSync(path.join(root, '.github/workflows/cd.yml'), 'utf8');
 
 test('main-channel image publishing keeps the repository root as Docker context', () => {
   assert.ok(
+    cd.includes('for SVC in gateway iam workflow console dns tunnel; do'),
+    'main-channel publish list must include DNS and Tunnel',
+  );
+  assert.ok(
     cd.includes('-f "$CTX/Dockerfile" \\'),
     'publish must select the service Dockerfile explicitly',
   );
@@ -29,6 +33,8 @@ test('published service Dockerfiles require repo-root sources and license files'
     ['iam', 'apps/iam-service'],
     ['workflow', 'apps/workflow-service'],
     ['console', 'apps/console'],
+    ['dns', 'apps/dns-service'],
+    ['tunnel', 'apps/tunnel-service'],
   ]) {
     const dockerfile = fs.readFileSync(path.join(root, directory, 'Dockerfile'), 'utf8');
     assert.ok(dockerfile.includes(`COPY ${directory}/`), `${service} must copy from its repo-root path`);

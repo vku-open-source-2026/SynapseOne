@@ -112,6 +112,10 @@ jobs:
       # Inference/model images are built and published by their own release
       # pipeline; rebuilding the multi-GB model stack on every PR is not a gate.
       - run: docker compose build iam workflow queue base gateway console warehouse lakehouse stream ocs lds notifications
+      - name: Build standalone DNS and Tunnel images
+        run: |
+          docker build -f apps/dns-service/Dockerfile -t synapseone-dns-service:ci .
+          docker build -f apps/tunnel-service/Dockerfile -t synapseone-tunnel-service:ci .
       - name: Build self-hosted workflow runner image (CI fallback model stage)
         run: |
           docker build -f apps/workflow-runner/Dockerfile \

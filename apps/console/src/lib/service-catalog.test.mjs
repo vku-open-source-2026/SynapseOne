@@ -12,7 +12,7 @@ import { vi } from '../locales/vi.js';
 import { SERVICE_ICONS } from './service-icons.js';
 
 const REQUIRED_SERVICES = [
-  'gateway', 'iam', 'workflow', 'runner', 'ai', 'inference', 'lds', 'base', 'search',
+  'gateway', 'dns', 'tunnel', 'iam', 'workflow', 'runner', 'ai', 'inference', 'lds', 'base', 'search',
   'faststore', 'queue', 'stream', 'ocs', 'notifications', 'warehouse', 'lakehouse',
 ];
 

@@ -311,6 +311,41 @@ See `docs/notifications.md`. Key settings: `DATABASE_URL` (required in productio
 `NOTIFICATIONS_MAX_ATTEMPTS` (5), `NOTIFICATIONS_RETRY_BASE_SECONDS` (5),
 `NOTIFICATIONS_RATE_LIMIT_PER_MIN` (120).
 
+## SynapseDNS (`apps/dns-service`, standalone)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `SYNAPSEDNS_DNS_HOST` / `SYNAPSEDNS_DNS_PORT` | `0.0.0.0` / `53` | authoritative UDP/TCP bind |
+| `SYNAPSEDNS_API_HOST` / `SYNAPSEDNS_API_PORT` | `0.0.0.0` / `4014` | management API bind |
+| `SYNAPSEDNS_DATA_FILE` | `./data/synapsedns.json` | persistent JSON store; one writer |
+| `SYNAPSEDNS_ADMIN_TOKEN` | required in production | management bearer token |
+| `SYNAPSEDNS_ALLOW_INSECURE` | `false` | local-only explicit auth bypass; forbidden in production |
+| `SYNAPSEDNS_LOG_LEVEL` | `info` | structured log level |
+| `SYNAPSEDNS_SHUTDOWN_TIMEOUT_MS` | `15000` | graceful shutdown budget |
+
+Standalone Compose: `docker-compose.dns.yml`. Keep the API private and do not
+delegate production NS until all records are migrated and verified.
+
+## Synapse Tunnel (`apps/tunnel-service`, standalone)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `SYNAPSETUNNEL_HOST` | `0.0.0.0` | API/ingress bind |
+| `SYNAPSETUNNEL_API_PORT` | `4015` | management API |
+| `SYNAPSETUNNEL_INGRESS_PORT` | `4016` | public HTTP/WebSocket ingress |
+| `SYNAPSETUNNEL_DATA_FILE` | `./data/synapse-tunnel.json` | persistent JSON store; one writer |
+| `SYNAPSETUNNEL_ADMIN_TOKEN` | required in production | management bearer token |
+| `SYNAPSETUNNEL_PUBLIC_SCHEME` | `http` | forwarded scheme; set `https` behind TLS |
+| `SYNAPSETUNNEL_WS_PATH` | `/_synapse/tunnel/connect` | connector WebSocket path |
+| `SYNAPSETUNNEL_MAX_REQUEST_BYTES` | `10485760` | buffered request limit |
+| `SYNAPSETUNNEL_MAX_RESPONSE_BYTES` | `16777216` | cumulative response limit |
+| `SYNAPSETUNNEL_REQUEST_TIMEOUT_MS` | `30000` | upstream response-header timeout |
+| `SYNAPSETUNNEL_CONNECTOR_TOKEN` | required for connector | one-time connector credential |
+| `SYNAPSETUNNEL_SERVER_URL` | `http://127.0.0.1:4016` | outbound connector target |
+
+Standalone Compose: `docker-compose.tunnel.yml`. TLS termination, existing API
+Gateway routing and Tier-2/3 integration are intentionally pending.
+
 ## Console (`apps/console`, runtime via `config.js`)
 
 | Key | Default | Meaning |

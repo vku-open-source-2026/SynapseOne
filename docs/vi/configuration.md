@@ -301,6 +301,41 @@ Xem `../notifications.md`. Biến chính: `DATABASE_URL`,
 `NOTIFICATIONS_MAX_ATTEMPTS` (5), `NOTIFICATIONS_RETRY_BASE_SECONDS` (5),
 `NOTIFICATIONS_RATE_LIMIT_PER_MIN` (120).
 
+## SynapseDNS (`apps/dns-service`, chạy độc lập)
+
+| Biến | Mặc định | Ý nghĩa |
+|---|---|---|
+| `SYNAPSEDNS_DNS_HOST` / `SYNAPSEDNS_DNS_PORT` | `0.0.0.0` / `53` | bind DNS authoritative UDP/TCP |
+| `SYNAPSEDNS_API_HOST` / `SYNAPSEDNS_API_PORT` | `0.0.0.0` / `4014` | bind API quản trị |
+| `SYNAPSEDNS_DATA_FILE` | `./data/synapsedns.json` | JSON store bền vững; một writer |
+| `SYNAPSEDNS_ADMIN_TOKEN` | bắt buộc production | bearer token quản trị |
+| `SYNAPSEDNS_ALLOW_INSECURE` | `false` | bỏ auth chỉ cho test local; cấm production |
+| `SYNAPSEDNS_LOG_LEVEL` | `info` | mức log structured |
+| `SYNAPSEDNS_SHUTDOWN_TIMEOUT_MS` | `15000` | thời gian shutdown graceful |
+
+Compose độc lập: `docker-compose.dns.yml`. Giữ API private và chưa delegate NS
+production cho tới khi migrate/verify toàn bộ record.
+
+## Synapse Tunnel (`apps/tunnel-service`, chạy độc lập)
+
+| Biến | Mặc định | Ý nghĩa |
+|---|---|---|
+| `SYNAPSETUNNEL_HOST` | `0.0.0.0` | bind API/ingress |
+| `SYNAPSETUNNEL_API_PORT` | `4015` | API quản trị |
+| `SYNAPSETUNNEL_INGRESS_PORT` | `4016` | ingress HTTP/WebSocket public |
+| `SYNAPSETUNNEL_DATA_FILE` | `./data/synapse-tunnel.json` | JSON store bền vững; một writer |
+| `SYNAPSETUNNEL_ADMIN_TOKEN` | bắt buộc production | bearer token quản trị |
+| `SYNAPSETUNNEL_PUBLIC_SCHEME` | `http` | scheme forwarded; đặt `https` sau TLS |
+| `SYNAPSETUNNEL_WS_PATH` | `/_synapse/tunnel/connect` | đường dẫn WebSocket connector |
+| `SYNAPSETUNNEL_MAX_REQUEST_BYTES` | `10485760` | giới hạn request body buffer |
+| `SYNAPSETUNNEL_MAX_RESPONSE_BYTES` | `16777216` | giới hạn response tích lũy |
+| `SYNAPSETUNNEL_REQUEST_TIMEOUT_MS` | `30000` | timeout tới response header upstream |
+| `SYNAPSETUNNEL_CONNECTOR_TOKEN` | bắt buộc cho connector | credential connector dùng một lần |
+| `SYNAPSETUNNEL_SERVER_URL` | `http://127.0.0.1:4016` | đích connector kết nối outbound |
+
+Compose độc lập: `docker-compose.tunnel.yml`. TLS termination, routing qua API
+Gateway hiện tại và tích hợp Tầng 2/3 vẫn để sau.
+
 ## Console (`apps/console`, runtime qua `config.js`)
 
 | Biến | Mặc định | Ý nghĩa |

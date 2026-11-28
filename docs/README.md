@@ -6,6 +6,8 @@
 |---|---|---|
 | [quickstart.md](quickstart.md) | 3 commands to run, first flow, Authentik/S3/workflow setup | — |
 | [architecture.md](architecture.md) | Tier-1 PaaS architecture + technical decisions | — |
+| [synapsedns.md](synapsedns.md) | SynapseDNS authoritative server, zone/record API, standalone deployment | — |
+| [synapse-tunnel.md](synapse-tunnel.md) | Synapse Tunnel control plane, outbound connector, HTTP ingress and limits | — |
 | [business-flows.md](business-flows.md) | Canonical actors, lifecycle, BF-01..BF-22 business rules and traceability | — |
 | [iam-model.md](iam-model.md) | Organization/Account/Role/Policy model + tokens + OIDC | — |
 | [api.md](api.md) | Full API reference via the gateway | [vi/api.md](vi/api.md) |

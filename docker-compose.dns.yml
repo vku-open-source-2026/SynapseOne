@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 VKU.VIC
+name: synapsedns
+
+services:
+  dns:
+    build:
+      context: .
+      dockerfile: apps/dns-service/Dockerfile
+    image: ${SYNAPSEDNS_IMAGE:-synapse-migration/synapsedns:latest}
+    restart: unless-stopped
+    init: true
+    environment:
+      NODE_ENV: production
+      SYNAPSEDNS_DNS_HOST: 0.0.0.0
+      SYNAPSEDNS_DNS_PORT: 53
+      SYNAPSEDNS_API_HOST: 0.0.0.0
+      SYNAPSEDNS_API_PORT: 4014
+      SYNAPSEDNS_DATA_FILE: /app/data/synapsedns.json
+      SYNAPSEDNS_ADMIN_TOKEN: ${SYNAPSEDNS_ADMIN_TOKEN:?set SYNAPSEDNS_ADMIN_TOKEN}
+    ports:
+      - "${SYNAPSEDNS_BIND_IP:-0.0.0.0}:${SYNAPSEDNS_HOST_PORT:-53}:53/udp"
+      - "${SYNAPSEDNS_BIND_IP:-0.0.0.0}:${SYNAPSEDNS_HOST_PORT:-53}:53/tcp"
+      - "127.0.0.1:${SYNAPSEDNS_API_PORT:-4014}:4014"
+    volumes:
+      - synapsedns-data:/app/data
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4014/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  synapsedns-data:

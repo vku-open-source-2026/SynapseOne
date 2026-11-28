@@ -98,15 +98,17 @@ jobs:
           set -euo pipefail
           OWNER="${{ github.repository_owner }}"
           SHA="${{ steps.ver.outputs.sha }}"
-          # Dev channel publishes the control-plane services. The heavy
+          # Dev channel publishes the control-plane and edge services. The heavy
           # warehouse/inference/runner artifacts are published by the tagged
           # release pipeline, which has the model/toolchain build budget.
-          for SVC in gateway iam workflow console; do
+          for SVC in gateway iam workflow console dns tunnel; do
             case "$SVC" in
               gateway) CTX=apps/gateway ;;
               iam) CTX=apps/iam-service ;;
               workflow) CTX=apps/workflow-service ;;
               console) CTX=apps/console ;;
+              dns) CTX=apps/dns-service ;;
+              tunnel) CTX=apps/tunnel-service ;;
             esac
             echo "::group::build $SVC"
             df -h /
@@ -133,6 +135,6 @@ jobs:
           {
             echo "## CD (dev channel) — ${{ github.sha }}";
             echo "- npm: \`@synapseone/sdk@${{ steps.ver.outputs.sdk_version }}\`, \`@synapseone/cli@${{ steps.ver.outputs.cli_version }}\` (tag \`dev\`)";
-            echo "- GHCR: \`ghcr.io/${{ github.repository_owner }}/synapseone-{gateway,iam,workflow,console}:main(-${{ steps.ver.outputs.sha }})\`";
+            echo "- GHCR: \`ghcr.io/${{ github.repository_owner }}/synapseone-{gateway,iam,workflow,console,dns,tunnel}:main(-${{ steps.ver.outputs.sha }})\`";
             echo "- warehouse/workflow-runner: published by the tagged release pipeline.";
           } >> "$GITHUB_STEP_SUMMARY"

@@ -8,10 +8,10 @@ Ports assume Compose defaults. Apart from explicit public gateway routes
 production and require `x-synapseone-internal` when the shared secret is set.
 
 Implementation: gateway, base, faststore, queue, stream, lds, ocs,
-notifications, warehouse and ai are Rust/Axum services. IAM and Workflow are
-Node/TypeScript; inference and Lakehouse are Python/FastAPI (Lakehouse uses
-PyIceberg). This document describes the HTTP contract, which is shared with the
-reference sources where they still exist.
+notifications, warehouse and ai are Rust/Axum services. IAM, Workflow, SynapseDNS
+and Synapse Tunnel are Node/TypeScript; inference and Lakehouse are
+Python/FastAPI (Lakehouse uses PyIceberg). This document describes the HTTP
+contract, which is shared with the reference sources where they still exist.
 
 ---
 
@@ -71,6 +71,62 @@ their `*_REQUESTS_PER_5H` (minute × 300) and `*_REQUESTS_PER_DAY` (minute × 14
 defaults, `AI_QUOTA_TOKENS_PER_DAY`, `INFERENCE_QUOTA_TOKENS_PER_DAY` (1M),
 `WORKFLOW_QUOTA_EXECUTIONS_PER_HOUR` (1000), `WORKFLOW_QUOTA_CONCURRENT` (10),
 `QUOTA_CACHE_TTL_MS` (30 s). Legacy `INFERENCE_RATE_LIMIT_PER_MIN` is a fallback.
+
+---
+
+## SynapseDNS — `apps/dns-service` (:53 UDP/TCP, API :4014)
+
+**Purpose:** standalone Tier-1 authoritative DNS and zone/record management.
+It never recurses or forwards queries. Existing gateway integration is pending.
+
+**Files:** `src/dns-server.ts` (UDP/TCP authority), `src/api.ts` (zone/record
+CRUD), `src/store.ts` (atomic JSON persistence), `src/validation.ts`.
+
+**Endpoints:** public DNS protocol; `GET /health`, `/ready`;
+`GET/POST /v1/zones`; `GET/DELETE /v1/zones/:zone`;
+`GET/POST /v1/zones/:zone/records`;
+`PATCH/DELETE /v1/zones/:zone/records/:recordId`.
+
+**Rules:**
+- Supports A, AAAA, CNAME, MX, TXT, NS, SOA, SRV, CAA and PTR.
+- Unknown zones return REFUSED; NXDOMAIN/NODATA include SOA; UDP may truncate.
+- One JSON writer/instance. No DNSSEC, AXFR, recursion, rate limiting or HA.
+- Management bearer token is mandatory in production; keep API private.
+- Do not delegate production NS until every record is migrated and verified.
+
+**Env:** `SYNAPSEDNS_DNS_HOST/PORT`, `SYNAPSEDNS_API_HOST/PORT`,
+`SYNAPSEDNS_DATA_FILE`, `SYNAPSEDNS_ADMIN_TOKEN`, `SYNAPSEDNS_ALLOW_INSECURE`,
+`SYNAPSEDNS_LOG_LEVEL`, `SYNAPSEDNS_SHUTDOWN_TIMEOUT_MS`.
+
+---
+
+## Synapse Tunnel — `apps/tunnel-service` (API :4015, ingress :4016)
+
+**Purpose:** standalone Tier-1 HTTP reverse tunnel for applications behind NAT
+or private networks. Existing gateway and Tier-2/3 integration is pending.
+
+**Files:** `src/index.ts` (combined server), `src/control-plane.ts`,
+`src/ingress.ts`, `src/connector.ts`, `src/registry.ts` (WebSocket multiplex),
+`src/store.ts` (atomic JSON persistence).
+
+**Endpoints:** `GET /health`, `/ready`; connector CRUD under `/v1/connectors`;
+route CRUD under `/v1/routes`; connector WebSocket `/_synapse/tunnel/connect`.
+
+**Rules:**
+- Connector is outbound-only and opens no inbound listener.
+- HTTP/SSE streaming is supported; raw WebSocket, TCP and UDP are not.
+- Unknown host 404, offline connector 502, response-header timeout 504.
+- Admin token protects management; connector token is returned once and stored
+  only as SHA-256. Public apps still enforce end-user authorization.
+- One JSON writer/instance. TLS termination and API Gateway wiring are external.
+- Request bodies are buffered; responses stream with a cumulative size cap.
+
+**Env:** `SYNAPSETUNNEL_HOST`, `SYNAPSETUNNEL_API_PORT`,
+`SYNAPSETUNNEL_INGRESS_PORT`, `SYNAPSETUNNEL_DATA_FILE`,
+`SYNAPSETUNNEL_ADMIN_TOKEN`, `SYNAPSETUNNEL_PUBLIC_SCHEME`,
+`SYNAPSETUNNEL_WS_PATH`, `SYNAPSETUNNEL_MAX_REQUEST_BYTES`,
+`SYNAPSETUNNEL_MAX_RESPONSE_BYTES`, `SYNAPSETUNNEL_REQUEST_TIMEOUT_MS`;
+connector uses `SYNAPSETUNNEL_CONNECTOR_TOKEN` and `SYNAPSETUNNEL_SERVER_URL`.
 
 ---
 

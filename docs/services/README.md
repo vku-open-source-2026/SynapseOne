@@ -13,6 +13,8 @@ wrapper coverage and escape-hatch rules.
 | Area | Guide | Primary responsibility |
 | --- | --- | --- |
 | Gateway | [Gateway](gateway.md) | Public routing, authentication, principal propagation, readiness |
+| Edge | [SynapseDNS](dns.md) | Authoritative UDP/TCP DNS and zone/record management |
+| Edge | [Synapse Tunnel](tunnel.md) | Outbound-only HTTP application exposure and host/path routing |
 | Identity | [IAM](iam.md) | Users, orgs/accounts, roles/policies, keys, service accounts, MFA |
 | Automation | [Workflow](workflow.md) | Definitions, triggers, executions, human tasks, credentials, secrets |
 | Compute | [Workflow runners](workflow-runners.md) | Runner registration, connector health, workflow/inference job protocol |
@@ -28,6 +30,11 @@ wrapper coverage and escape-hatch rules.
 | Delivery | [Notifications](notifications.md) | Outbox, templates, preferences, retries, delivery status |
 | Analytics | [Warehouse](warehouse.md) | DuckDB datasets, read-only SQL, batch/stream ETL |
 | Analytics | [Lakehouse](lakehouse.md) | Iceberg namespaces/tables, snapshots, time travel, schema evolution |
+
+## Edge services
+
+- [SynapseDNS](../synapsedns.md) — authoritative DNS and zone/record management.
+- [Synapse Tunnel](../synapse-tunnel.md) — outbound-only HTTP application exposure.
 
 ## Four-language convention
 

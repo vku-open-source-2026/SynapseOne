@@ -15,6 +15,20 @@ export const SERVICE_CATALOG = [
     iconColor: 'from-slate-400 to-slate-600', bgGradient: 'linear-gradient(135deg, #94a3b8 0%, #475569 100%)', shadowColor: 'rgba(100, 116, 139, 0.28)',
   },
   {
+    id: 'dns', docsTab: 'dns', group: 'platform', label: 'SynapseDNS',
+    consoleRoute: '/api-docs', activePaths: ['/api-docs'], port: '53 / 4014', prefix: '/v1/zones',
+    category: 'Networking & Edge', desc: 'Standalone authoritative UDP/TCP DNS with zone and record management',
+    keywords: ['synapsedns', 'dns', 'authoritative', 'udp', 'tcp', 'zone', 'record', 'nameserver', 'soa', 'ns', 'mx', 'txt', 'edge', 'standalone'],
+    iconColor: 'from-cyan-400 to-sky-600', bgGradient: 'linear-gradient(135deg, #22d3ee 0%, #0284c7 100%)', shadowColor: 'rgba(6, 182, 212, 0.28)',
+  },
+  {
+    id: 'tunnel', docsTab: 'tunnel', group: 'platform', label: 'Synapse Tunnel',
+    consoleRoute: '/api-docs', activePaths: ['/api-docs'], port: '4015 / 4016', prefix: '/v1/connectors, /v1/routes',
+    category: 'Networking & Edge', desc: 'Standalone HTTP/SSE reverse tunnels through an outbound-only connector',
+    keywords: ['synapse tunnel', 'tunnel', 'reverse tunnel', 'http', 'sse', 'ingress', 'connector', 'control plane', 'edge', 'standalone'],
+    iconColor: 'from-violet-400 to-indigo-600', bgGradient: 'linear-gradient(135deg, #a78bfa 0%, #4f46e5 100%)', shadowColor: 'rgba(139, 92, 246, 0.28)',
+  },
+  {
     id: 'iam', docsTab: 'iam', group: 'platform', label: 'IAM & Auth',
     consoleRoute: '/orgs', activePaths: ['/orgs', '/accounts', '/users', '/roles', '/policies', '/keys', '/service-accounts', '/authorize', '/audit', '/security'], port: '4001', prefix: '/v1/auth, /v1/orgs, /v1/accounts, …',
     category: 'Identity & Access', desc: 'Organizations, accounts, users, roles, policies, keys, OIDC, MFA, audit and usage',

@@ -6,6 +6,8 @@
 |---|---|---|
 | quickstart.md | Ba lệnh chạy, luồng đầu tiên, cài đặt Authentik/S3/workflow | — |
 | architecture.md | Kiến trúc PaaS Tầng 1 và các quyết định kỹ thuật | — |
+| synapsedns.md | SynapseDNS authoritative, API zone/record và triển khai độc lập | — |
+| synapse-tunnel.md | Synapse Tunnel control plane, connector outbound, ingress HTTP và giới hạn | — |
 | business-flows.md | Tác nhân, vòng đời, quy tắc nghiệp vụ BF-01..BF-22 và truy vết | — |
 | iam-model.md | Mô hình Organization/Account/Role/Policy, token và OIDC | — |
 | [api.md](api.md) | Tài liệu API đầy đủ qua gateway | [../api.md](../api.md) |

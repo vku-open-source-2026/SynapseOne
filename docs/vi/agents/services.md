@@ -7,8 +7,9 @@ Bản đồ endpoint, file, dữ liệu, quy tắc và biến môi trường the
 `x-synapseone-internal` khi đặt shared secret.
 
 Implementation: gateway, base, faststore, queue, stream, lds, ocs, notifications,
-warehouse và ai chạy Rust/Axum. IAM/Workflow chạy Node/TypeScript; inference và
-Lakehouse chạy Python/FastAPI. TypeScript còn lại là behavioral reference.
+warehouse và ai chạy Rust/Axum. IAM, Workflow, SynapseDNS và Synapse Tunnel chạy
+Node/TypeScript; inference và Lakehouse chạy Python/FastAPI. TypeScript còn lại là
+behavioral reference.
 
 ## Gateway — `apps/gateway` (:8080)
 
@@ -56,6 +57,62 @@ các `*_QUOTA_REQUESTS_PER_5H` (minute × 300), `*_QUOTA_REQUESTS_PER_DAY`
 (minute × 1440), `AI_QUOTA_TOKENS_PER_DAY`, `INFERENCE_QUOTA_TOKENS_PER_DAY` (1M),
 `WORKFLOW_QUOTA_EXECUTIONS_PER_HOUR` (1000), `WORKFLOW_QUOTA_CONCURRENT` (10),
 `QUOTA_CACHE_TTL_MS` (30s). `INFERENCE_RATE_LIMIT_PER_MIN` là fallback cũ.
+
+## SynapseDNS — `apps/dns-service` (:53 UDP/TCP, API :4014)
+
+**Mục đích:** dịch vụ Tier-1 độc lập cho DNS authoritative và quản lý zone/record.
+Không recurse hoặc forward. Chưa tích hợp gateway hiện tại.
+
+**File:** `src/dns-server.ts` (UDP/TCP authority), `src/api.ts` (CRUD zone/record),
+`src/store.ts` (JSON persistence nguyên tử), `src/validation.ts`.
+
+**Endpoint:** DNS protocol công khai; `GET /health`, `/ready`;
+`GET/POST /v1/zones`; `GET/DELETE /v1/zones/:zone`;
+`GET/POST /v1/zones/:zone/records`;
+`PATCH/DELETE /v1/zones/:zone/records/:recordId`.
+
+**Quy tắc:**
+- Hỗ trợ A, AAAA, CNAME, MX, TXT, NS, SOA, SRV, CAA và PTR.
+- Zone lạ trả REFUSED; NXDOMAIN/NODATA kèm SOA; UDP có thể truncate.
+- Một JSON writer/instance. Không có DNSSEC, AXFR, recursion, rate limit hoặc HA.
+- Management bearer token bắt buộc trong production; giữ API ở private network.
+- Chưa delegate NS production cho tới khi migrate và verify toàn bộ record.
+
+**Env:** `SYNAPSEDNS_DNS_HOST/PORT`, `SYNAPSEDNS_API_HOST/PORT`,
+`SYNAPSEDNS_DATA_FILE`, `SYNAPSEDNS_ADMIN_TOKEN`, `SYNAPSEDNS_ALLOW_INSECURE`,
+`SYNAPSEDNS_LOG_LEVEL`, `SYNAPSEDNS_SHUTDOWN_TIMEOUT_MS`.
+
+---
+
+## Synapse Tunnel — `apps/tunnel-service` (API :4015, ingress :4016)
+
+**Mục đích:** dịch vụ Tier-1 độc lập để expose ứng dụng HTTP sau NAT/private
+network. Chưa tích hợp gateway và Tầng 2/3.
+
+**File:** `src/index.ts` (combined server), `src/control-plane.ts`,
+`src/ingress.ts`, `src/connector.ts`, `src/registry.ts` (WebSocket multiplex),
+`src/store.ts` (JSON persistence nguyên tử).
+
+**Endpoint:** `GET /health`, `/ready`; CRUD connector tại `/v1/connectors`;
+CRUD route tại `/v1/routes`; connector WebSocket `/_synapse/tunnel/connect`.
+
+**Quy tắc:**
+- Connector chỉ kết nối outbound, không mở inbound listener.
+- Hỗ trợ HTTP/SSE streaming; chưa hỗ trợ raw WebSocket, TCP hoặc UDP.
+- Unknown host 404, connector offline 502, timeout response header 504.
+- Admin token bảo vệ management; connector token trả một lần và chỉ lưu SHA-256.
+  Ứng dụng public vẫn phải tự kiểm tra authorization người dùng cuối.
+- Một JSON writer/instance. TLS termination và API Gateway là phần tích hợp ngoài.
+- Request body được buffer; response stream với giới hạn kích thước tích lũy.
+
+**Env:** `SYNAPSETUNNEL_HOST`, `SYNAPSETUNNEL_API_PORT`,
+`SYNAPSETUNNEL_INGRESS_PORT`, `SYNAPSETUNNEL_DATA_FILE`,
+`SYNAPSETUNNEL_ADMIN_TOKEN`, `SYNAPSETUNNEL_PUBLIC_SCHEME`,
+`SYNAPSETUNNEL_WS_PATH`, `SYNAPSETUNNEL_MAX_REQUEST_BYTES`,
+`SYNAPSETUNNEL_MAX_RESPONSE_BYTES`, `SYNAPSETUNNEL_REQUEST_TIMEOUT_MS`;
+connector dùng `SYNAPSETUNNEL_CONNECTOR_TOKEN` và `SYNAPSETUNNEL_SERVER_URL`.
+
+---
 
 ## IAM — `apps/iam-service` (:4001)
 

@@ -153,7 +153,7 @@ client.faststore.set("status:node-1", {"healthy": True}, ttl_seconds=120)
 ## Repository Layout
 
 ```text
-apps/        gateway, console, iam, workflow, lds, base, faststore, queue, stream, warehouse, ocs, notifications, inference
+apps/        gateway, console, iam, workflow, lds, base, faststore, queue, stream, warehouse, ocs, notifications, inference, dns-service, tunnel-service
 sdks/        sdk-js (@synapseone/sdk), sdk-python (synapseone-sdk), sdk-go, sdk-rust
 tools/       cli (@synapseone/cli) and Postgres/S3 backup scripts
 infra/       production nginx + Certbot overlay, Prometheus rules, Kustomize k8s manifests
@@ -166,6 +166,8 @@ tests/e2e/   API smoke tests and live multi-SDK verification suites
 - [Quickstart Guide](docs/quickstart.md) — first end-to-end flow in 3 commands
 - [API Reference](docs/api.md) — complete gateway route & payload contract
 - [IAM & Policy Model](docs/iam-model.md) — organizations, roles, policies, OIDC
+- [SynapseDNS](docs/synapsedns.md) — authoritative DNS and zone/record API
+- [Synapse Tunnel](docs/synapse-tunnel.md) — outbound-only HTTP application exposure
 - [Production Checklist](docs/production.md) — TLS, secrets, backups, monitoring (`docker-compose.prod.yml`)
 - [Troubleshooting](docs/troubleshooting.md) — common operational issues and fixes
 
