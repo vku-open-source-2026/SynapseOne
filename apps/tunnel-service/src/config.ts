@@ -30,6 +30,8 @@ export interface ServerConfig {
   maxBufferedAmount: number;
   trustProxy: boolean;
   publicScheme: 'http' | 'https';
+  /** Origin advertised to Console/CLI for the public ingress (no path/query). */
+  publicOrigin?: string;
   logLevel: LogLevel;
 }
 
@@ -93,6 +95,17 @@ export function loadServerConfig(mode: ServerMode = 'combined', env: Env = proce
 
   const publicScheme = (env.SYNAPSETUNNEL_PUBLIC_SCHEME ?? 'http').trim().toLowerCase();
   if (publicScheme !== 'http' && publicScheme !== 'https') throw new Error('SYNAPSETUNNEL_PUBLIC_SCHEME must be http or https');
+  const rawPublicOrigin = env.SYNAPSETUNNEL_PUBLIC_ORIGIN?.trim();
+  let publicOrigin: string | undefined;
+  if (rawPublicOrigin) {
+    let parsed: URL;
+    try { parsed = new URL(rawPublicOrigin); } catch { throw new Error('SYNAPSETUNNEL_PUBLIC_ORIGIN must be an absolute HTTP(S) origin'); }
+    if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname || parsed.username || parsed.password
+        || parsed.pathname !== '/' || parsed.search || parsed.hash) {
+      throw new Error('SYNAPSETUNNEL_PUBLIC_ORIGIN must be an HTTP(S) origin without credentials, path, query, or fragment');
+    }
+    publicOrigin = parsed.origin;
+  }
 
   return {
     mode,
@@ -114,6 +127,7 @@ export function loadServerConfig(mode: ServerMode = 'combined', env: Env = proce
     maxBufferedAmount: readInteger(env, 'SYNAPSETUNNEL_MAX_BUFFERED_BYTES', 4194304, 1048576, 67108864),
     trustProxy: readBoolean(env, 'SYNAPSETUNNEL_TRUST_PROXY'),
     publicScheme,
+    publicOrigin,
     logLevel: readLogLevel(env),
   };
 }

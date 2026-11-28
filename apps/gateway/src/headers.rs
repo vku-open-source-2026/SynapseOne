@@ -119,7 +119,16 @@ pub fn propagate_principal(
     // Mirror canonical headers onto the legacy prefix for rolling deploys.
     // Values were stripped above, so this cannot amplify client identity.
     for name in [
-        "user", "org", "account", "scopes", "kind", "runner", "key-id", "internal", "anon", "quota-org",
+        "user",
+        "org",
+        "account",
+        "scopes",
+        "kind",
+        "runner",
+        "key-id",
+        "internal",
+        "anon",
+        "quota-org",
     ] {
         if let Some(value) = headers.get(format!("x-synapseone-{name}")).cloned() {
             headers.insert(HeaderName::from_static(legacy_static(name)), value);

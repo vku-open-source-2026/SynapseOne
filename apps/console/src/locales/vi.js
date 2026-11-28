@@ -122,7 +122,7 @@ export const vi = {
       },
       {
         title: 'Trợ lý AI và SDK',
-        text: 'Chatbot trên trang Tài liệu API điền sẵn form thử nghiệm. JS/TS, Python, Go, CLI không phụ thuộc và Console quản trị dùng chung một API.',
+        text: 'Chatbot trên trang Tài liệu API điền sẵn form thử nghiệm. JS/TS, Python, Go, CLI cài một lần và Console quản trị dùng chung một API.',
       },
     ],
   },
@@ -298,7 +298,7 @@ export const vi = {
     overviewKicker: 'Nền tảng SynapseOne',
     overviewTitle: 'Dịch vụ nền tảng và API edge độc lập',
     overviewLead:
-      'Cổng API SynapseOne đứng trước IAM, Workflow, AI, Inference, LDS, Base, Faststore, Queue, Stream, OCS, Notifications, Warehouse và Lakehouse; Tìm kiếm và Runner Engine xây trên các dịch vụ này. SynapseDNS và Synapse Tunnel là dịch vụ edge Tầng 1 hoạt động độc lập với API DNS và HTTP trực tiếp. Chúng không nằm sau cổng API hiện tại: tích hợp gateway/IAM và Tầng 2/Tầng 3 vẫn đang chờ.',
+      'Cổng API SynapseOne đứng trước IAM, Workflow, AI, Inference, LDS, Base, Faststore, Queue, Stream, OCS, Notifications, Warehouse và Lakehouse; Tìm kiếm và Runner Engine xây trên các dịch vụ này. SynapseDNS và Synapse Tunnel là dịch vụ edge Tầng 1 hoạt động độc lập. Management API giờ đi qua route gateway chỉ dành cho Platform Admin và MFA, còn DNS wire traffic và Tunnel ingress vẫn tách riêng. Tích hợp Tầng 2/Tầng 3 vẫn đang chờ.',
     startHere: 'Bắt đầu từ đây',
     guides: {
       gateway: 'Hướng dẫn Cổng API & vận hành',
@@ -341,7 +341,7 @@ export const vi = {
         'Cổng API xóa các header x-synapseone-* do client gửi và thay bằng principal đã xác minh. Không gửi internal secret từ trình duyệt.',
         'Phạm vi tenant ưu tiên tổ chức, rồi tài khoản, rồi người dùng. Platform caller không có principal phải chọn tenant bằng x-synapseone-tenant hoặc ?tenant=.',
         'API key và token được ủy quyền được kiểm tra scope theo dịch vụ tại cổng API. Việc tạo credential không bao giờ mở rộng scope của caller.',
-        'SynapseDNS và Synapse Tunnel xác thực management API riêng bằng admin bearer token; chưa dịch vụ nào nhận lời gọi SDK qua cổng hoặc header tenant đã xác minh.',
+        'SynapseDNS và Synapse Tunnel vẫn dùng admin bearer token riêng. Console chỉ truy cập chúng qua /v1/platform/edge/* bằng phiên Platform Administrator; gateway tự gắn credential phía server và từ chối credential tenant.',
       ],
       namespaceTitle: 'Không gian tên SDK',
       namespaceKicker: 'Client',
@@ -393,24 +393,24 @@ export const vi = {
     serviceDocs: {
       gateway: {
         title: 'Cổng API & vận hành', kicker: 'Điểm vào · cổng 8080 · API công khai',
-        lead: 'Với các dịch vụ tích hợp qua cổng, đây là điểm vào công khai duy nhất trong production. Cổng xác minh credential, kiểm tra scope, gắn định danh tenant, proxy nguyên body request và cung cấp health vận hành. SynapseDNS và Synapse Tunnel vẫn là các API độc lập riêng.',
+        lead: 'Với các dịch vụ tích hợp qua cổng, đây là điểm vào công khai duy nhất trong production. Cổng xác minh credential, kiểm tra scope, gắn định danh tenant, proxy nguyên body request và cung cấp health vận hành. Quản lý DNS/Tunnel dùng namespace platform-admin hẹp được bảo vệ MFA; data plane public vẫn tách riêng.',
         highlights: ['Route được đối chiếu từ apps/gateway/routes.yaml; tiền tố chưa có sẽ trả 404 trước khi service nhận request.', 'Header x-synapseone-* do client gửi bị xóa và thay bằng dữ liệu principal đã xác minh.', 'Readiness tổng hợp trả HTTP 503 khi dependency bị suy giảm.'],
         semantics: ['Không buffer body tại gateway để upload và stream đi qua nguyên vẹn.', 'Timeout theo route phù hợp với LLM, webhook và workflow chạy lâu.', 'Dùng /metrics cho Prometheus và /ready cho kiểm tra triển khai.'],
         purposes: { health: 'Liveness của cổng API và service index', ready: 'Readiness tổng hợp; 503 khi suy giảm', metrics: 'Metric Prometheus', index: 'Service index và bảng route trực tiếp' },
       },
       dns: {
         title: 'SynapseDNS', kicker: 'Edge độc lập · DNS UDP/TCP 53 · API 4014 · /v1/zones',
-        lead: 'Dịch vụ DNS chỉ authoritative chạy độc lập trên Node 20. Truy vấn DNS qua UDP/TCP ở cổng 53 và quản lý zone/record bằng HTTP API trực tiếp được bảo vệ bearer token ở cổng 4014. Dịch vụ không nằm sau cổng API hiện tại; tích hợp gateway/IAM và Tầng 2/Tầng 3 vẫn đang chờ.',
+        lead: 'Dịch vụ DNS chỉ authoritative chạy độc lập trên Node 20. Truy vấn DNS qua UDP/TCP ở cổng 53. Platform Administrator quản lý zone/record tại /admin/dns qua namespace gateway được bảo vệ MFA; API trực tiếp ở 4014 vẫn dùng bearer token cho người vận hành.',
         highlights: ['Zone cấu hình khớp dài nhất trả lời authoritative; zone không biết trả REFUSED và recursion luôn tắt.', 'Tạo zone sẽ cài SOA/NS; API record hỗ trợ A, AAAA, CNAME, MX, TXT, NS, SOA, SRV, CAA và PTR.', 'Một snapshot JSON được thay thế nguyên tử lưu zone; mọi thay đổi không phải SOA đều tăng SOA serial.'],
-        semantics: ['Management API trực tiếp dùng Authorization: Bearer $SYNAPSEDNS_ADMIN_TOKEN. Production yêu cầu token ít nhất 32 ký tự và lưu trữ bền vững.', 'Không có DNSSEC signing, recursion/forwarding, zone transfer, secondary/notify hay high availability. Chỉ chạy một instance cho mỗi tệp JSON.', 'TLS termination cũng vẫn đang chờ. Giữ cổng 4014 riêng sau ranh giới TLS đáng tin cậy; không gửi admin token qua cổng API hiện tại.'],
+        semantics: ['Management API trực tiếp dùng Authorization: Bearer $SYNAPSEDNS_ADMIN_TOKEN. Console không nhận token này; gateway chỉ gắn token sau khi xác thực platform-admin.', 'Không có DNSSEC signing, recursion/forwarding, zone transfer, secondary/notify hay high availability. Chỉ chạy một instance cho mỗi tệp JSON.', 'Tạo zone không delegate tên miền. Phải chuyển và kiểm chứng mọi bản ghi trước khi đổi NS/glue tại registrar; NS production vẫn giữ nguyên cho tới lúc đó.'],
         purposes: { health: 'Liveness và phiên bản dịch vụ', ready: 'Readiness của DNS listener và JSON store; 503 khi suy giảm', dnsWire: 'Truy vấn authoritative UDP/TCP, không phải HTTP', zones: 'Liệt kê hoặc tạo zone với record SOA/NS', zone: 'Đọc hoặc xóa zone cùng toàn bộ record', records: 'Liệt kê hoặc tạo record trong zone', record: 'Sửa hoặc xóa một record; type không đổi được' },
       },
       tunnel: {
         title: 'Synapse Tunnel', kicker: 'Edge độc lập · control plane 4015 · ingress 4016 · /v1/connectors, /v1/routes',
-        lead: 'Reverse tunnel HTTP chạy độc lập trên Node 20. Control API trực tiếp ở 4015 quản lý connector và route theo host/path; ingress công khai ở 4016 chuyển tiếp HTTP và phát trực tiếp phản hồi HTTP/SSE qua connector chỉ kết nối ra ngoài. Dịch vụ không nằm sau cổng API hiện tại; tích hợp gateway/IAM và Tầng 2/Tầng 3 vẫn đang chờ.',
+        lead: 'Reverse tunnel HTTP chạy độc lập trên Node 20. Platform Administrator tạo connector, route hostname và bản ghi DNS tại /admin/tunnel; ingress public chuyển tiếp HTTP/SSE qua connector outbound chạy cục bộ bằng synapseone tunnel run.',
         highlights: ['Tạo connector trả bearer token đúng một lần; các lần đọc sau chỉ expose trạng thái kết nối, không trả token hay hash.', 'Route khớp Host đã chuẩn hóa và path prefix enabled dài nhất, rồi bỏ prefix trước khi chuyển tiếp tới upstream HTTP(S) đã kiểm tra.', 'Connector không mở listener inbound. Nó tạo một kết nối WebSocket outbound đã xác thực tới /_synapse/tunnel/connect và multiplex request HTTP.'],
-        semantics: ['Client chỉ dùng HTTP và SSE. Không hỗ trợ raw WebSocket, TCP hoặc UDP passthrough; HTTP CONNECT và protocol upgrade bị từ chối.', 'Một writer JSON và một instance lưu hash token cùng route theo nguyên tử. Không có database hay high availability; request đang chạy không được retry.', 'TLS termination cũng vẫn đang chờ. Giữ 4015 riêng và đặt HTTPS/WSS phía trước 4016; không gửi traffic tunnel qua cổng API hiện tại.'],
-        purposes: { health: 'Liveness của control plane hoặc ingress', ready: 'Readiness của JSON store trên cả hai HTTP listener', connectors: 'Liệt kê connector hoặc tạo connector và trả token một lần', connector: 'Đọc, sửa hoặc xóa connector', routes: 'Liệt kê hoặc tạo route theo host/path', route: 'Đọc, sửa hoặc xóa route', ingress: 'Chuyển tiếp HTTP khớp route và stream phản hồi HTTP/SSE', connectorTransport: 'Transport outbound đã xác thực của connector; không phải raw WebSocket passthrough' },
+        semantics: ['Client chỉ dùng HTTP và SSE. Không hỗ trợ raw WebSocket, TCP hoặc UDP passthrough; HTTP CONNECT và protocol upgrade bị từ chối.', 'Một writer JSON và một instance lưu hash token cùng route theo nguyên tử. Không có database hay high availability; request đang chạy không được retry.', 'Management dùng route gateway platform-admin được bảo vệ MFA. Traffic ứng dụng public và WSS của connector phải qua reverse proxy HTTPS/WSS riêng; Synapse Tunnel không cấp chứng chỉ TLS.'],
+        purposes: { health: 'Liveness của control plane hoặc ingress', ready: 'Readiness của JSON store trên cả hai HTTP listener', config: 'Public ingress origin và cấu hình protocol connector', connectors: 'Liệt kê connector hoặc tạo connector và trả token một lần', connector: 'Đọc, sửa hoặc xóa connector', routes: 'Liệt kê hoặc tạo route theo host/path', route: 'Đọc, sửa hoặc xóa route', ingress: 'Chuyển tiếp HTTP khớp route và stream phản hồi HTTP/SSE', connectorTransport: 'Transport outbound đã xác thực của connector; không phải raw WebSocket passthrough' },
       },
       iam: {
         title: 'IAM & xác thực', kicker: 'Định danh · cổng 4001 · /v1/auth, /v1/orgs, …',

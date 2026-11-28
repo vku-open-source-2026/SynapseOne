@@ -269,11 +269,16 @@ async function firstWebSocketMessage(socket: WebSocket): Promise<Record<string, 
 test('management API enforces auth, validates CRUD, and persists only token hashes', async (t) => {
   const directory = await tempDirectory(t);
   const dataFile = join(directory, 'nested', 'tunnel.json');
-  let service = await startService(t, { mode: 'api', dataFile });
+  let service = await startService(t, { mode: 'api', dataFile, publicOrigin: 'https://tunnel.example.com' });
 
   assert.equal((await fetch(`${service.apiUrl}/health`)).status, 200);
   assert.equal((await fetch(`${service.apiUrl}/ready`)).status, 200);
   assert.equal((await admin(service, '/v1/connectors', {}, null)).status, 401);
+  assert.equal((await admin(service, '/v1/config', {}, null)).status, 401);
+  const advertised = await (await admin(service, '/v1/config')).json() as Record<string, unknown>;
+  assert.equal(advertised.publicOrigin, 'https://tunnel.example.com');
+  assert.equal(advertised.connectorPath, '/_synapse/tunnel/connect');
+  assert.equal(advertised.protocolVersion, 1);
   assert.equal((await admin(service, '/v1/connectors', {}, 'wrong-token')).status, 401);
   assert.equal((await admin(service, '/v1/connectors', { method: 'POST', body: '{}' })).status, 400);
 

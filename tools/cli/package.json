@@ -1,8 +1,8 @@
 {
   "name": "@synapseone/cli",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "license": "Apache-2.0",
-  "description": "synapseone CLI - zero-dependency command line for Tier-1 PaaS (Node 18+)",
+  "description": "synapseone CLI for Tier-1 PaaS with a built-in outbound tunnel connector (Node 18+)",
   "homepage": "https://synapseone.space",
   "repository": {
     "type": "git",
@@ -31,10 +31,14 @@
   },
   "files": [
     "bin",
+    "lib",
     "README.md",
     "LICENSE",
     "NOTICE"
   ],
+  "dependencies": {
+    "ws": "8.23.1"
+  },
   "scripts": {
     "test": "node --test test/*.test.js"
   },

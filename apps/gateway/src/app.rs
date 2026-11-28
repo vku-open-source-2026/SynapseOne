@@ -23,7 +23,9 @@ use crate::config::{validate_security_config, Config};
 use crate::headers::{propagate_principal, request_id, HSTS_HEADER, SECURITY_HEADERS};
 use crate::metrics::{Metrics, CONTENT_TYPE};
 use crate::proxy::{proxy_error_response, proxy_request, ProxyError};
-use crate::quotas::{consumes_workflow_execution, quota_service_for_route, QuotaClient, QuotaService};
+use crate::quotas::{
+    consumes_workflow_execution, quota_service_for_route, QuotaClient, QuotaService,
+};
 use crate::rate_limit::{LimitResult, RateLimiter};
 use crate::routes::{find_route, validate_routes, AuthMode, RouteRule};
 use crate::scopes::scope_allows;
@@ -86,10 +88,7 @@ pub(crate) fn canonical_policy_path(path: &str) -> Option<String> {
     if decoded.contains('%') || decoded.contains('\\') {
         return None;
     }
-    if decoded
-        .chars()
-        .any(|ch| ch == '\0' || ch.is_control())
-    {
+    if decoded.chars().any(|ch| ch == '\0' || ch.is_control()) {
         return None;
     }
     let mut segments: Vec<&str> = Vec::new();
@@ -177,10 +176,7 @@ pub(crate) fn exec_delegated_scopes_allowed(scopes: &[String]) -> bool {
 /// encoding differences without breaking encoded object keys under `/v1/ocs`.
 /// Queue access is limited to message operations in the execution's tenant.
 pub(crate) fn exec_delegated_request_allowed(method: &str, raw: &str, canonical: &str) -> bool {
-    if !matches!(
-        method,
-        "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE"
-    ) {
+    if !matches!(method, "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE") {
         return false;
     }
     if let (Some(raw_service), Some(canonical_service)) =
@@ -209,7 +205,10 @@ pub(crate) fn exec_delegated_request_allowed(method: &str, raw: &str, canonical:
     if queue.is_empty() || queue.contains('/') {
         return false;
     }
-    matches!(action, "messages" | "consume" | "ack" | "nack" | "heartbeat")
+    matches!(
+        action,
+        "messages" | "consume" | "ack" | "nack" | "heartbeat"
+    )
 }
 
 #[derive(Clone)]
@@ -586,7 +585,12 @@ async fn usage_middleware(
                 status: status.as_u16(),
                 duration_ms,
                 auth_kind,
-                org_id: principal.and_then(|principal| principal.attribution_org.clone().or_else(|| principal.org.clone())),
+                org_id: principal.and_then(|principal| {
+                    principal
+                        .attribution_org
+                        .clone()
+                        .or_else(|| principal.org.clone())
+                }),
                 account_id: principal.and_then(|principal| principal.account.clone()),
                 user_id: if is_user {
                     principal.and_then(|principal| principal.sub.clone())
@@ -718,7 +722,11 @@ async fn probe_upstream(
     // Node services expose a dependency-aware /ready; Rust services expose
     // /health. Probing the stronger endpoint avoids green readiness on a
     // service whose database is down.
-    let path = if matches!(name, "iam" | "workflow") { "/ready" } else { "/health" };
+    let path = if matches!(name, "iam" | "workflow") {
+        "/ready"
+    } else {
+        "/health"
+    };
     let mut request = client
         .get(format!("{}{path}", base_url.trim_end_matches('/')))
         .timeout(Duration::from_secs(4))
@@ -828,7 +836,10 @@ async fn dispatch(State(state): State<AppState>, mut request: Request) -> Respon
     update_meta(&meta, |meta| meta.principal = principal.clone());
 
     let is_platform_path = path == "/v1/platform" || path.starts_with("/v1/platform/");
-    let is_platform_session = path == "/v1/platform/session";
+    // The session exchange is the sole user-JWT entry point. Any route carrying
+    // a server-side admin credential (including a future /session alias) remains
+    // platform-admin-only.
+    let is_platform_session = path == "/v1/platform/session" && route.admin_token_env.is_none();
     let principal_kind = principal
         .as_ref()
         .and_then(|principal| principal.kind.as_deref());
@@ -941,7 +952,11 @@ async fn dispatch(State(state): State<AppState>, mut request: Request) -> Respon
             .unwrap_or("");
         if let Err(failure) = state.auth.verify_execution_grant(token).await {
             update_meta(&meta, |meta| meta.error = Some(failure.error.clone()));
-            return error_response(failure.status, &failure.error, Some(failure.message.as_str()));
+            return error_response(
+                failure.status,
+                &failure.error,
+                Some(failure.message.as_str()),
+            );
         }
         // Fall through: the normal scope check and central authorization still
         // apply, so the grant needs the concrete data-plane scope/action.
@@ -1065,7 +1080,9 @@ async fn dispatch(State(state): State<AppState>, mut request: Request) -> Respon
         &path,
         &ip,
         &meta,
-    ).await {
+    )
+    .await
+    {
         Ok(guard) => guard,
         Err(response) => return response,
     };
@@ -1086,9 +1103,17 @@ async fn admit_service_quota(
     ip: &str,
     meta: &Option<MetaHandle>,
 ) -> Result<Option<ExecutionGuard>, Response> {
-    let Some(service) = quota_service_for_route(&route.path) else { return Ok(None) };
-    let org_id = principal.and_then(|principal| principal.attribution_org.clone().or_else(|| principal.org.clone()));
-    let bucket = org_id.clone()
+    let Some(service) = quota_service_for_route(&route.path) else {
+        return Ok(None);
+    };
+    let org_id = principal.and_then(|principal| {
+        principal
+            .attribution_org
+            .clone()
+            .or_else(|| principal.org.clone())
+    });
+    let bucket = org_id
+        .clone()
         .or_else(|| principal.and_then(|principal| principal.account.clone()))
         .unwrap_or_else(|| ip.to_string());
     let lookup = match org_id.as_deref() {
@@ -1123,11 +1148,15 @@ async fn admit_service_quota(
                 Some("workflow execution quota configuration unavailable"),
             ));
         }
-        let admitted = match state.quotas.admit_execution(
-            &format!("org:{org}"),
-            quota.executions_per_hour.unwrap_or(1_000_000),
-            quota.concurrent_executions.unwrap_or(1_000),
-        ).await {
+        let admitted = match state
+            .quotas
+            .admit_execution(
+                &format!("org:{org}"),
+                quota.executions_per_hour.unwrap_or(1_000_000),
+                quota.concurrent_executions.unwrap_or(1_000),
+            )
+            .await
+        {
             Ok(result) => result,
             Err(()) => {
                 update_meta(meta, |meta| meta.error = Some("quota_unavailable".into()));
@@ -1145,7 +1174,11 @@ async fn admit_service_quota(
                 &admitted.window,
                 admitted.limit,
                 admitted.retry_after_seconds,
-                if admitted.window == "hour" { "flow executions/hour" } else { "concurrent flow executions" },
+                if admitted.window == "hour" {
+                    "flow executions/hour"
+                } else {
+                    "concurrent flow executions"
+                },
                 admitted.reset_at.as_deref(),
             ));
         }
@@ -1154,7 +1187,9 @@ async fn admit_service_quota(
             format!("org:{org}"),
             admitted.token.unwrap_or_default(),
         ))
-    } else { None };
+    } else {
+        None
+    };
 
     if service != QuotaService::Workflow {
         if let (Some(org), Some(limit)) = (org_id.as_deref(), quota.tokens_per_day) {
@@ -1166,7 +1201,14 @@ async fn admit_service_quota(
             };
             if used >= limit {
                 update_meta(meta, |meta| meta.error = Some("quota_exceeded".into()));
-                return Err(quota_exceeded_response(service, "day", limit, 3_600, "tokens/day", None));
+                return Err(quota_exceeded_response(
+                    service,
+                    "day",
+                    limit,
+                    3_600,
+                    "tokens/day",
+                    None,
+                ));
             }
         }
     }
@@ -1198,7 +1240,14 @@ async fn admit_service_quota(
             quota.requests_per_min,
         ) {
             update_meta(meta, |meta| meta.error = Some("quota_exceeded".into()));
-            return Err(quota_exceeded_response(service, "minute", quota.requests_per_min, retry_after, "requests/minute", None));
+            return Err(quota_exceeded_response(
+                service,
+                "minute",
+                quota.requests_per_min,
+                retry_after,
+                "requests/minute",
+                None,
+            ));
         }
     }
     Ok(execution_guard)
@@ -1213,24 +1262,39 @@ struct ExecutionGuard {
 
 impl ExecutionGuard {
     fn new(quotas: Arc<QuotaClient>, subject: String, token: String) -> Self {
-        Self { quotas, lease: Some((subject, token)) }
+        Self {
+            quotas,
+            lease: Some((subject, token)),
+        }
     }
 
     async fn release(mut self) {
-        let Some((subject, token)) = self.lease.take() else { return };
+        let Some((subject, token)) = self.lease.take() else {
+            return;
+        };
         if let Err(()) = self.quotas.release_execution(&subject, &token).await {
-            tracing::warn!(event = "gateway_execution_quota_release_failed", subject, "execution lease release failed");
+            tracing::warn!(
+                event = "gateway_execution_quota_release_failed",
+                subject,
+                "execution lease release failed"
+            );
         }
     }
 }
 
 impl Drop for ExecutionGuard {
     fn drop(&mut self) {
-        let Some((subject, token)) = self.lease.take() else { return };
+        let Some((subject, token)) = self.lease.take() else {
+            return;
+        };
         let quotas = self.quotas.clone();
         tokio::spawn(async move {
             if let Err(()) = quotas.release_execution(&subject, &token).await {
-                tracing::warn!(event = "gateway_execution_quota_release_failed", subject, "execution lease release failed");
+                tracing::warn!(
+                    event = "gateway_execution_quota_release_failed",
+                    subject,
+                    "execution lease release failed"
+                );
             }
         });
     }
@@ -1271,14 +1335,26 @@ async fn forward(
     audit_header: Option<String>,
 ) -> Response {
     let timeout = Duration::from_millis(route.timeout_ms(state.config.proxy_timeout_ms));
-    let result = proxy_request(&state.client, &route.target, request, timeout).await;
+    let result = proxy_request(
+        &state.client,
+        &route.target,
+        request,
+        timeout,
+        route.strip_prefix.as_deref(),
+        route.admin_token_env.as_deref(),
+    )
+    .await;
     let mut response = match result {
         Ok(response) => response,
         Err(error) => {
-            if matches!(error, ProxyError::Upstream(_)) {
-                update_meta(meta, |meta| {
+            match &error {
+                ProxyError::Upstream(_) => update_meta(meta, |meta| {
                     meta.error = Some("upstream_unavailable".into())
-                });
+                }),
+                ProxyError::EdgeNotConfigured => {
+                    update_meta(meta, |meta| meta.error = Some("edge_not_configured".into()))
+                }
+                ProxyError::Timeout => {}
             }
             proxy_error_response(&error)
         }

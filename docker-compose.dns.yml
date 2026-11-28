@@ -24,6 +24,9 @@ services:
       - "127.0.0.1:${SYNAPSEDNS_API_PORT:-4014}:4014"
     volumes:
       - synapsedns-data:/app/data
+    networks:
+      synapseone-edge-net:
+        aliases: [synapsedns]
     cap_drop: [ALL]
     cap_add: [NET_BIND_SERVICE]
     security_opt: [no-new-privileges:true]
@@ -33,6 +36,11 @@ services:
       timeout: 5s
       retries: 5
       start_period: 15s
+
+networks:
+  synapseone-edge-net:
+    name: ${SYNAPSEONE_EDGE_NETWORK:-synapseone-edge-net}
+    driver: bridge
 
 volumes:
   synapsedns-data:

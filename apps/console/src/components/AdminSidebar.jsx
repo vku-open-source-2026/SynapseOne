@@ -6,7 +6,7 @@ import { useAuth } from '../lib/auth.jsx';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import {
   faHouse, faBuilding, faUsers, faServer, faChartSimple, faBoxes,
-  faListCheck, faUserShield, faArrowLeft, faPlug, faGauge, faFlagCheckered,
+  faListCheck, faUserShield, faArrowLeft, faPlug, faGauge, faFlagCheckered, faGlobe, faRoute,
 } from '@fortawesome/free-solid-svg-icons';
 
 const ITEMS = [
@@ -17,6 +17,8 @@ const ITEMS = [
   { to: '/admin/quotas', label: 'Rate Limits', icon: faGauge },
   { to: '/admin/runners', label: 'Platform Runners', icon: faPlug, owner: true },
   { to: '/admin/health', label: 'Service Health', icon: faServer },
+  { to: '/admin/dns', label: 'SynapseDNS', icon: faGlobe },
+  { to: '/admin/tunnel', label: 'Synapse Tunnel', icon: faRoute },
   { to: '/admin/usage', label: 'Usage', icon: faChartSimple },
   { to: '/admin/audit', label: 'Audit & Security', icon: faListCheck },
   { to: '/admin/hackathon', label: 'VIC Hackathon', icon: faFlagCheckered },

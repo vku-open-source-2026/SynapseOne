@@ -93,12 +93,16 @@ export interface RouteRule {
   service?: string;
   /** Per-path action overrides for RPC-style endpoints (POST query → Read). */
   actions?: ActionOverride[];
+  /** Literal pathname prefix removed before forwarding; query is kept. */
+  stripPrefix?: string;
+  /** Server-side edge credential variable. Only JWT platform-admin routes may set it. */
+  adminTokenEnv?: string;
   /** Compiled matcher cache (set by loadRoutes / createApp validation). */
   compiled?: { match: (pathname: string) => boolean; specificity: number };
 }
 
 export function expandEnv(s: string): string {
-  return s.replace(/\$\{([^:}]+)(?::([^}]*))?\}/g, (_, k, d) => process.env[k] ?? d ?? '');
+  return s.replace(/\$\{([^:}]+)(?::-?([^}]*))?\}/g, (_, k, d) => process.env[k] ?? d ?? '');
 }
 
 /**
@@ -141,6 +145,19 @@ export function compileRoutePath(path: string): { match: (pathname: string) => b
   return { match: (p) => re.test(p), specificity: literal };
 }
 
+/** Strip a literal pathname prefix at a segment boundary without touching the
+ *  query substring (including repeated keys and percent-encoding). */
+export function rewriteProxyPath(pathAndQuery: string, prefix: string): string {
+  const queryIndex = pathAndQuery.indexOf('?');
+  const pathname = queryIndex >= 0 ? pathAndQuery.slice(0, queryIndex) : pathAndQuery;
+  const query = queryIndex >= 0 ? pathAndQuery.slice(queryIndex) : '';
+  let rewritten: string;
+  if (pathname === prefix) rewritten = '/';
+  else if (pathname.startsWith(prefix + '/')) rewritten = pathname.slice(prefix.length);
+  else throw new Error('[gateway] stripPrefix does not match a path-segment boundary');
+  return rewritten + query;
+}
+
 export function findRoute(routes: RouteRule[], pathname: string): RouteRule | undefined {
   let best: RouteRule | undefined;
   let bestScore = -1;
@@ -153,6 +170,54 @@ export function findRoute(routes: RouteRule[], pathname: string): RouteRule | un
     }
   }
   return best;
+}
+
+/** Fail fast on route typos and keep server-side credential routing confined to
+ *  the platform-admin JWT control plane. Exported for parity tests. */
+export function validateRouteRule(r: RouteRule): void {
+  if (!['none', 'jwt', 'apikey', 'either'].includes(r.auth)) {
+    throw new Error(`[gateway] invalid auth mode '${r.auth}' for path '${r.path}' (want none|jwt|apikey|either)`);
+  }
+  if (typeof r.path !== 'string' || !r.path.startsWith('/')) {
+    throw new Error(`[gateway] invalid route path '${r.path}' (must start with /)`);
+  }
+  try {
+    r.compiled = compileRoutePath(r.path);
+  } catch (e: any) {
+    throw new Error(`[gateway] ${e?.message || 'invalid route path'}`);
+  }
+  if (r.timeoutMs !== undefined && (!Number.isInteger(r.timeoutMs) || r.timeoutMs < 1000 || r.timeoutMs > 300000)) {
+    throw new Error(`[gateway] invalid timeoutMs '${r.timeoutMs}' for path '${r.path}' (want 1000..300000)`);
+  }
+  if (r.service !== undefined && !/^[a-z][a-z0-9-]{0,31}$/.test(String(r.service))) {
+    throw new Error(`[gateway] invalid service '${r.service}' for path '${r.path}'`);
+  }
+  if (r.stripPrefix !== undefined) {
+    const prefix = r.stripPrefix;
+    if (typeof prefix !== 'string' || !prefix || !prefix.startsWith('/') || prefix.includes('*')
+        || prefix.endsWith('/') || prefix.includes('//') || prefix.includes('?') || prefix.includes('#')
+        || /[\u0000-\u001f\u007f]/.test(prefix)) {
+      throw new Error(`[gateway] invalid stripPrefix '${prefix}' for path '${r.path}' (want an absolute literal path without wildcards, query, fragment, empty or trailing segments)`);
+    }
+    if (prefix !== r.path && !r.path.startsWith(prefix + '/')) {
+      throw new Error(`[gateway] invalid stripPrefix '${prefix}' for path '${r.path}' (must equal the route path or be its path-segment ancestor)`);
+    }
+  }
+  if (r.adminTokenEnv !== undefined) {
+    const envName = r.adminTokenEnv;
+    if (typeof envName !== 'string' || !/^[A-Z_][A-Z0-9_]*$/.test(envName)) {
+      throw new Error(`[gateway] invalid adminTokenEnv '${envName}' for path '${r.path}' (want an environment variable name)`);
+    }
+    const isPlatformPath = r.path === '/v1/platform' || r.path.startsWith('/v1/platform/');
+    if (r.auth !== 'jwt' || r.service !== 'platform' || !isPlatformPath) {
+      throw new Error(`[gateway] adminTokenEnv is only allowed on JWT /v1/platform routes with service platform (path '${r.path}')`);
+    }
+  }
+  for (const o of r.actions || []) {
+    if (!o || typeof o.path !== 'string' || !o.path.startsWith('/') || typeof o.action !== 'string' || !/^[a-z][a-z0-9-]*:[A-Za-z]+$/.test(o.action)) {
+      throw new Error(`[gateway] invalid action override on '${r.path}': ${JSON.stringify(o)}`);
+    }
+  }
 }
 
 function loadRoutes(): RouteRule[] {
@@ -930,30 +995,7 @@ export function createApp(): express.Express {
   const routes = loadRoutes();
   // Precompile matchers + fail fast on operator typos: unknown auth mode would
   // 401 everything silently; malformed wildcard paths would throw mid-request.
-  for (const r of routes) {
-    if (!['none', 'jwt', 'apikey', 'either'].includes(r.auth)) {
-      throw new Error(`[gateway] invalid auth mode '${r.auth}' for path '${r.path}' (want none|jwt|apikey|either)`);
-    }
-    if (typeof r.path !== 'string' || !r.path.startsWith('/')) {
-      throw new Error(`[gateway] invalid route path '${r.path}' (must start with /)`);
-    }
-    try {
-      r.compiled = compileRoutePath(r.path);
-    } catch (e: any) {
-      throw new Error(`[gateway] ${e?.message || 'invalid route path'}`);
-    }
-    if (r.timeoutMs !== undefined && (!Number.isInteger(r.timeoutMs) || r.timeoutMs < 1000 || r.timeoutMs > 300000)) {
-      throw new Error(`[gateway] invalid timeoutMs '${r.timeoutMs}' for path '${r.path}' (want 1000..300000)`);
-    }
-    if (r.service !== undefined && !/^[a-z][a-z0-9-]{0,31}$/.test(String(r.service))) {
-      throw new Error(`[gateway] invalid service '${r.service}' for path '${r.path}'`);
-    }
-    for (const o of r.actions || []) {
-      if (!o || typeof o.path !== 'string' || !o.path.startsWith('/') || typeof o.action !== 'string' || !/^[a-z][a-z0-9-]*:[A-Za-z]+$/.test(o.action)) {
-        throw new Error(`[gateway] invalid action override on '${r.path}': ${JSON.stringify(o)}`);
-      }
-    }
-  }
+  for (const r of routes) validateRouteRule(r);
   const authz = authzMiddleware({ iamBase: IAM_SERVICE_URL, internalSecret: INTERNAL_SECRET });
   console.log(`[gateway] central authorization mode: ${authzMode()}`);
   console.log(`[gateway] loaded ${routes.length} routes: ${routes.map((r) => `${r.path}->${expandEnv(r.target)}[${r.auth}]`).join(', ')}`);
@@ -1004,7 +1046,9 @@ export function createApp(): express.Express {
       // with action overrides, is enforced consistently.
       const principal = (req as any).principal;
       const isPlatformPath = req.path === '/v1/platform' || req.path.startsWith('/v1/platform/');
-      const isPlatformSession = req.path === '/v1/platform/session';
+      // Only the ordinary session exchange accepts a non-admin user JWT. A
+      // server-side admin credential always keeps the route platform-admin-only.
+      const isPlatformSession = req.path === '/v1/platform/session' && !route.adminTokenEnv;
       if (isPlatformPath && !isPlatformSession && principal?.kind !== 'platform-admin') {
         (req as any).synapseoneError = 'platform_admin_required';
         return res.status(403).json({ error: 'platform_admin_required', message: 'a platform administrator token is required' });
@@ -1211,6 +1255,24 @@ export function createApp(): express.Express {
     // (exclusive match) — wildcard routes phải chiếm đúng shape của chúng mà
     // không bị proxy prefix tổng ('/v1/lds') nhốt hết.
     const routeMatcher = (pathname: string) => findRoute(routes, pathname) === r;
+    if (r.adminTokenEnv) {
+      const envName = r.adminTokenEnv;
+      // Authenticate/authorize first (the common middleware above), then fail
+      // closed before opening an upstream socket when the optional edge is not
+      // configured. Read per request so blanking the env disables the route.
+      app.use(((req: express.Request, res: express.Response, next: express.NextFunction) => {
+        if (!routeMatcher(req.path)) return next();
+        const token = String(process.env[envName] ?? '').trim();
+        if (!token) {
+          (req as any).synapseoneError = 'edge_not_configured';
+          return res.status(503).json({ error: 'edge_not_configured', message: 'edge management is not configured' });
+        }
+        // Kept only for this request's proxyReq hook; never logged or forwarded
+        // as a separate header.
+        (req as any).synapseoneEdgeAdminToken = token;
+        return next();
+      }) as any);
+    }
     const proxy = createProxyMiddleware({
       pathFilter: routeMatcher as any,
       target,
@@ -1219,13 +1281,27 @@ export function createApp(): express.Express {
       // Upstream treo thì 504 sau 30s thay vì treo gateway theo.
       proxyTimeout: proxyTimeoutMs,
       timeout: proxyTimeoutMs,
+      ...(r.stripPrefix ? {
+        pathRewrite: (path: string, req: any) => rewriteProxyPath(req.originalUrl || path, r.stripPrefix!),
+      } : {}),
       // HPM v3: error handling qua `on.error` (KHÔNG phải `onError` v2).
       // Upstream chết giữa chừng (ECONNREFUSED/socket hangup): trả 502 JSON ngay
       // thay vì trang 504 mặc định của proxy.
       on: {
+        ...(r.adminTokenEnv ? {
+          proxyReq: (proxyReq: any, req: any) => {
+            const token = req.synapseoneEdgeAdminToken as string;
+            proxyReq.removeHeader('authorization');
+            proxyReq.removeHeader('x-api-key');
+            proxyReq.setHeader('authorization', `Bearer ${token}`);
+          },
+        } : {}),
         error: (err: any, _req: any, res: any) => {
           (_req as any).synapseoneError = 'upstream_unavailable';
-          console.error(`[gateway] proxy ${r.path}->${target} failed:`, err?.message || err);
+          // Lower-level errors can contain request metadata. Edge routes log a
+          // fixed message so the server-side admin credential can never leak.
+          const detail = r.adminTokenEnv ? 'edge upstream unavailable' : (err?.message || err);
+          console.error(`[gateway] proxy ${r.path}->${target} failed:`, detail);
           try {
             if (!res.headersSent && !res.writableEnded) {
               res.writeHead(502, { 'Content-Type': 'application/json' });

@@ -81,6 +81,14 @@ export function createControlApp(options: ControlAppOptions): express.Express {
 
   app.use(express.json({ limit: '64kb', strict: true }));
 
+  app.get('/v1/config', (_req, res) => {
+    res.json({
+      publicOrigin: config.publicOrigin || null,
+      connectorPath: config.wsPath,
+      protocolVersion: 1,
+    });
+  });
+
   app.get('/v1/connectors', asyncRoute(async (_req, res) => {
     const connectors = await store.listConnectors();
     res.json({ connectors: connectors.map((connector) => withStatus(connector, registry)) });

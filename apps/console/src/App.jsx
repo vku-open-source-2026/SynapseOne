@@ -69,6 +69,8 @@ const AdminAudit = React.lazy(() => import('./pages/admin/Audit.jsx'));
 const AdminPlatformAdmins = React.lazy(() => import('./pages/admin/PlatformAdmins.jsx'));
 const AdminRunners = React.lazy(() => import('./pages/admin/Runners.jsx'));
 const AdminHackathon = React.lazy(() => import('./pages/admin/AdminHackathon.jsx'));
+const SynapseDNS = React.lazy(() => import('./pages/SynapseDNS.jsx'));
+const SynapseTunnel = React.lazy(() => import('./pages/SynapseTunnel.jsx'));
 
 import { appLoginUrl, isCanonicalAppHost } from './lib/site.js';
 import { LanguageProvider } from './lib/i18n.jsx';
@@ -220,6 +222,8 @@ function AppRoutes() {
           <Route path="/admin/users" element={<PlatformGuard><AdminLayout><AdminUsers /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/users/:userId" element={<PlatformGuard><AdminLayout><AdminUserDetail /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/health" element={<PlatformGuard><AdminLayout><AdminServiceHealth /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/dns" element={<PlatformGuard><AdminLayout><SynapseDNS /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/tunnel" element={<PlatformGuard><AdminLayout><SynapseTunnel /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/usage" element={<PlatformGuard><AdminLayout><AdminUsage /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/quotas" element={<PlatformGuard><AdminLayout><AdminQuotas /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/audit" element={<PlatformGuard><AdminLayout><AdminAudit /></AdminLayout></PlatformGuard>} />

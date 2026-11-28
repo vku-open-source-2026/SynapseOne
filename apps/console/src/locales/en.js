@@ -122,7 +122,7 @@ export const en = {
       },
       {
         title: 'AI assistant + SDKs',
-        text: 'Chatbot on the API Docs pre-fills try-it forms. JS/TS, Python, Go, a zero-dependency CLI and an admin Console share one API.',
+        text: 'Chatbot on the API Docs pre-fills try-it forms. JS/TS, Python, Go, a single-install CLI and an admin Console share one API.',
       },
     ],
   },
@@ -298,7 +298,7 @@ export const en = {
     overviewKicker: 'SynapseOne platform',
     overviewTitle: 'Platform services and standalone edge APIs',
     overviewLead:
-      'The SynapseOne gateway fronts IAM, Workflow, AI, Inference, LDS, Base, Faststore, Queue, Stream, OCS, Notifications, Warehouse and Lakehouse; Search and Runner Engine build on those services. SynapseDNS and Synapse Tunnel are standalone Tier-1 edge services with direct DNS and HTTP APIs. They are not behind the existing gateway: gateway/IAM and Tier-2/Tier-3 integration is pending.',
+      'The SynapseOne gateway fronts IAM, Workflow, AI, Inference, LDS, Base, Faststore, Queue, Stream, OCS, Notifications, Warehouse and Lakehouse; Search and Runner Engine build on those services. SynapseDNS and Synapse Tunnel are standalone Tier-1 edge services. Their management APIs now sit behind MFA-protected platform-admin gateway routes, while DNS wire traffic and Tunnel ingress remain separate. Tier-2/Tier-3 integration is still pending.',
     startHere: 'Start here',
     guides: {
       gateway: 'Gateway & Ops guide',
@@ -341,7 +341,7 @@ export const en = {
         'The gateway strips client-sent x-synapseone-* headers and re-stamps the verified principal. Never send the internal service secret from a browser.',
         'Tenant scope is org-first, then account, then user. Platform callers without a principal select a tenant with x-synapseone-tenant or ?tenant=.',
         'API keys and delegated tokens are checked against service scopes at the gateway. Minting a credential never widens the caller’s scopes.',
-        'SynapseDNS and Synapse Tunnel authenticate their own management APIs with service admin bearer tokens; neither accepts gateway SDK calls or verified tenant headers yet.',
+        'SynapseDNS and Synapse Tunnel keep their service admin bearer tokens. Console reaches them only through /v1/platform/edge/* with a Platform Administrator session; the gateway injects the server-side credential and tenant credentials are rejected.',
       ],
       namespaceTitle: 'SDK namespaces at a glance',
       namespaceKicker: 'Clients',
@@ -393,24 +393,24 @@ export const en = {
     serviceDocs: {
       gateway: {
         title: 'Gateway & Ops', kicker: 'Entry point · port 8080 · public API',
-        lead: 'For gateway-integrated services, this is the only public API in production. It verifies credentials, enforces scopes, stamps tenant identity, proxies raw request bodies and exposes operational health. SynapseDNS and Synapse Tunnel remain separate standalone APIs.',
+        lead: 'For gateway-integrated services, this is the only public API in production. It verifies credentials, enforces scopes, stamps tenant identity, proxies raw request bodies and exposes operational health. DNS/Tunnel management uses a narrow MFA-protected platform-admin namespace; their public data planes remain separate.',
         highlights: ['Routes are matched from apps/gateway/routes.yaml; a missing gateway prefix returns 404 before the service sees the request.', 'Client x-synapseone-* headers are stripped and replaced with verified principal data.', 'Readiness is aggregate; a degraded dependency returns HTTP 503.'],
         semantics: ['Keep the gateway body unbuffered so uploads and streams pass through unchanged.', 'Per-route timeouts accommodate long LLM, webhook and workflow executions.', 'Use /metrics for Prometheus scraping and /ready for deployment health checks.'],
         purposes: { health: 'Liveness for the gateway and service index', ready: 'Aggregate dependency readiness; 503 when degraded', metrics: 'Prometheus metrics', index: 'Service index and live route table' },
       },
       dns: {
         title: 'SynapseDNS', kicker: 'Standalone edge · DNS UDP/TCP 53 · API 4014 · /v1/zones',
-        lead: 'A standalone Node 20 authoritative-only DNS service. Query DNS over UDP/TCP on port 53 and manage zones and records through its direct bearer-protected HTTP API on port 4014. It is not behind the existing gateway; gateway/IAM and Tier-2/Tier-3 integration is pending.',
+        lead: 'A standalone Node 20 authoritative-only DNS service. Query DNS over UDP/TCP on port 53. Platform Administrators manage zones and records at /admin/dns through an MFA-protected gateway namespace; the direct API on 4014 remains bearer-protected for operators.',
         highlights: ['The longest matching configured zone answers authoritatively; unknown zones return REFUSED and recursion always stays off.', 'Zone creation installs SOA/NS records; the record API supports A, AAAA, CNAME, MX, TXT, NS, SOA, SRV, CAA and PTR.', 'One atomically replaced JSON snapshot stores zones, and non-SOA mutations advance the SOA serial.'],
-        semantics: ['The direct management API uses Authorization: Bearer $SYNAPSEDNS_ADMIN_TOKEN. Production requires a token of at least 32 characters and persistent storage.', 'There is no DNSSEC signing, recursion/forwarding, zone transfer, secondary/notify or high availability. Run one instance per JSON file.', 'TLS termination is also pending. Keep port 4014 private behind a trusted TLS boundary; never send the admin token through the existing gateway.'],
+        semantics: ['The direct management API uses Authorization: Bearer $SYNAPSEDNS_ADMIN_TOKEN. Console never receives it; the gateway injects it only after platform-admin authentication.', 'There is no DNSSEC signing, recursion/forwarding, zone transfer, secondary/notify or high availability. Run one instance per JSON file.', 'Creating a zone does not delegate the domain. Migrate and verify every record before changing registrar NS/glue; production NS remains unchanged until then.'],
         purposes: { health: 'Liveness and service version', ready: 'DNS listener and JSON store readiness; 503 when degraded', dnsWire: 'Authoritative UDP/TCP queries, not HTTP', zones: 'List or create zones with SOA/NS records', zone: 'Read or delete a zone and all its records', records: 'List or create records in a zone', record: 'Patch or delete one record; its type is immutable' },
       },
       tunnel: {
         title: 'Synapse Tunnel', kicker: 'Standalone edge · control 4015 · ingress 4016 · /v1/connectors, /v1/routes',
-        lead: 'A standalone Node 20 HTTP reverse tunnel. The direct control API on 4015 manages connectors and host/path routes; public ingress on 4016 forwards HTTP requests and streams HTTP/SSE responses through an outbound-only connector. It is not behind the existing gateway; gateway/IAM and Tier-2/Tier-3 integration is pending.',
+        lead: 'A standalone Node 20 HTTP reverse tunnel. Platform Administrators create connectors, hostname routes and DNS records at /admin/tunnel; public ingress forwards HTTP/SSE through an outbound-only connector run locally with synapseone tunnel run.',
         highlights: ['Connector creation returns its bearer token once; subsequent reads expose connection state but never the token or its hash.', 'Routes match a normalized Host and the longest enabled path prefix, then strip that prefix before forwarding to the validated HTTP(S) upstream.', 'The connector opens no inbound listener. It makes one authenticated outbound WebSocket connection to /_synapse/tunnel/connect and multiplexes HTTP requests.'],
-        semantics: ['HTTP and SSE are the only client-facing data plane. Raw WebSocket, TCP and UDP passthrough are not supported; HTTP CONNECT and protocol upgrades are rejected.', 'One JSON writer and one instance store token hashes and routes atomically. There is no database or high availability, and in-flight requests are not retried.', 'TLS termination is also pending. Keep 4015 private and place HTTPS/WSS controls in front of 4016; do not send tunnel traffic through the existing gateway.'],
-        purposes: { health: 'Control-plane or ingress liveness', ready: 'JSON store readiness on either HTTP listener', connectors: 'List connectors or create one and return its token once', connector: 'Read, update or delete a connector', routes: 'List or create host/path routes', route: 'Read, update or delete a route', ingress: 'Forward matching HTTP requests and stream HTTP/SSE responses', connectorTransport: 'Authenticated outbound connector transport; not raw WebSocket passthrough' },
+        semantics: ['HTTP and SSE are the only client-facing data plane. Raw WebSocket, TCP and UDP passthrough are not supported; HTTP CONNECT and protocol upgrades are rejected.', 'One JSON writer and one instance store token hashes and routes atomically. There is no database or high availability, and in-flight requests are not retried.', 'Management uses an MFA-protected platform-admin gateway route. Public application traffic and connector WSS must use a separate HTTPS/WSS reverse proxy; Synapse Tunnel does not issue TLS certificates.'],
+        purposes: { health: 'Control-plane or ingress liveness', ready: 'JSON store readiness on either HTTP listener', config: 'Advertised public ingress origin and connector protocol settings', connectors: 'List connectors or create one and return its token once', connector: 'Read, update or delete a connector', routes: 'List or create host/path routes', route: 'Read, update or delete a route', ingress: 'Forward matching HTTP requests and stream HTTP/SSE responses', connectorTransport: 'Authenticated outbound connector transport; not raw WebSocket passthrough' },
       },
       iam: {
         title: 'IAM & Auth', kicker: 'Identity · port 4001 · /v1/auth, /v1/orgs, …',

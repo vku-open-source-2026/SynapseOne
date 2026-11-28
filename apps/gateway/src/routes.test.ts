@@ -201,6 +201,7 @@ describe('expandEnv', () => {
     assert.equal(expandEnv('${SYNAPSEONE_TEST_VAR:http://default}'), 'from-env');
     delete process.env.SYNAPSEONE_TEST_VAR;
     assert.equal(expandEnv('${SYNAPSEONE_TEST_VAR:http://default}'), 'http://default');
+    assert.equal(expandEnv('${SYNAPSEONE_TEST_VAR:-http://shell-default}'), 'http://shell-default');
   });
 });
 

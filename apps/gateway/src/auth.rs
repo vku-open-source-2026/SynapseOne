@@ -186,7 +186,9 @@ impl AuthService {
                         // then be re-used as an API key.
                         let validation = self.validate_jwt_session_detailed(bearer, &claims).await;
                         return if validation.rejection.is_none() {
-                            Ok(Some(self.verified_principal(&claims, validation.attribution_org)))
+                            Ok(Some(
+                                self.verified_principal(&claims, validation.attribution_org),
+                            ))
                         } else {
                             Ok(None)
                         };
@@ -220,7 +222,8 @@ impl AuthService {
                                     "step-up token is not an access token",
                                 ));
                             }
-                            let validation = self.validate_jwt_session_detailed(bearer, &claims).await;
+                            let validation =
+                                self.validate_jwt_session_detailed(bearer, &claims).await;
                             if let Some(rejected) = validation.rejection {
                                 let message = match rejected.error.as_str() {
                                     "iam_unavailable" => "IAM session check unavailable",
@@ -237,7 +240,9 @@ impl AuthService {
                                     message,
                                 ));
                             }
-                            return Ok(Some(self.verified_principal(&claims, validation.attribution_org)));
+                            return Ok(Some(
+                                self.verified_principal(&claims, validation.attribution_org),
+                            ));
                         }
                         Err(_) => {
                             if route.auth == AuthMode::Jwt {
@@ -351,7 +356,9 @@ impl AuthService {
         token: &str,
         decoded: &Value,
     ) -> Option<SessionRejection> {
-        self.validate_jwt_session_detailed(token, decoded).await.rejection
+        self.validate_jwt_session_detailed(token, decoded)
+            .await
+            .rejection
     }
 
     /// Validate the session and return attribution metadata for this exact
@@ -365,12 +372,21 @@ impl AuthService {
         let claimed_org = claim_text(decoded, "org");
         let kind = decoded.get("kind").and_then(Value::as_str).unwrap_or("");
         if kind == "platform-step-up" || kind == "exec-delegated" {
-            return SessionValidation { attribution_org: claimed_org, rejection: None };
+            return SessionValidation {
+                attribution_org: claimed_org,
+                rejection: None,
+            };
         }
-        if claim_text(decoded, "sub").filter(|value| !value.is_empty()).is_none() {
+        if claim_text(decoded, "sub")
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
             return SessionValidation {
                 attribution_org: None,
-                rejection: Some(SessionRejection { status: 401, error: "invalid_token".into() }),
+                rejection: Some(SessionRejection {
+                    status: 401,
+                    error: "invalid_token".into(),
+                }),
             };
         }
         let ttl = self.session_cache_ttl;
@@ -381,11 +397,18 @@ impl AuthService {
             if let Some(hit) = cache.get(&key) {
                 if hit.expires > now {
                     return SessionValidation {
-                        attribution_org: if hit.status == 200 { hit.attribution_org.clone() } else { None },
+                        attribution_org: if hit.status == 200 {
+                            hit.attribution_org.clone()
+                        } else {
+                            None
+                        },
                         rejection: if hit.status == 200 {
                             None
                         } else {
-                            Some(SessionRejection { status: hit.status, error: hit.error.clone() })
+                            Some(SessionRejection {
+                                status: hit.status,
+                                error: hit.error.clone(),
+                            })
                         },
                     };
                 }
@@ -396,27 +419,52 @@ impl AuthService {
             }
         }
         let url = format!("{}/v1/auth/verify", self.iam_base);
-        let response = self.client.get(url).bearer_auth(token)
-            .timeout(Duration::from_millis(2_500)).send().await;
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(token)
+            .timeout(Duration::from_millis(2_500))
+            .send()
+            .await;
         match response {
             Ok(response) if response.status().is_success() => {
-                let org_id = response.json::<Value>().await.ok().and_then(|body| {
-                    body.get("org_id").and_then(Value::as_str).map(str::to_string)
-                }).or(claimed_org);
+                let org_id = response
+                    .json::<Value>()
+                    .await
+                    .ok()
+                    .and_then(|body| {
+                        body.get("org_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .or(claimed_org);
                 self.put_session(&key, ttl, 200, "", org_id.clone());
-                SessionValidation { attribution_org: org_id, rejection: None }
+                SessionValidation {
+                    attribution_org: org_id,
+                    rejection: None,
+                }
             }
             Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
                 self.put_session(&key, ttl, 401, "token_revoked", None);
                 SessionValidation {
                     attribution_org: None,
-                    rejection: Some(SessionRejection { status: 401, error: "token_revoked".into() }),
+                    rejection: Some(SessionRejection {
+                        status: 401,
+                        error: "token_revoked".into(),
+                    }),
                 }
             }
             Ok(response) if response.status() == StatusCode::FORBIDDEN => {
-                let error = response.json::<Value>().await.ok().and_then(|body| {
-                    body.get("error").and_then(Value::as_str).map(str::to_string)
-                }).unwrap_or_else(|| "org_suspended".into());
+                let error = response
+                    .json::<Value>()
+                    .await
+                    .ok()
+                    .and_then(|body| {
+                        body.get("error")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| "org_suspended".into());
                 self.put_session(&key, ttl, 403, &error, None);
                 SessionValidation {
                     attribution_org: None,
@@ -424,26 +472,45 @@ impl AuthService {
                 }
             }
             _ => {
-                self.put_session(&key, Duration::from_millis(500), 503, "iam_unavailable", None);
+                self.put_session(
+                    &key,
+                    Duration::from_millis(500),
+                    503,
+                    "iam_unavailable",
+                    None,
+                );
                 SessionValidation {
                     attribution_org: None,
-                    rejection: Some(SessionRejection { status: 503, error: "iam_unavailable".into() }),
+                    rejection: Some(SessionRejection {
+                        status: 503,
+                        error: "iam_unavailable".into(),
+                    }),
                 }
             }
         }
     }
 
-    fn put_session(&self, key: &str, ttl: Duration, status: u16, error: &str, attribution_org: Option<String>) {
+    fn put_session(
+        &self,
+        key: &str,
+        ttl: Duration,
+        status: u16,
+        error: &str,
+        attribution_org: Option<String>,
+    ) {
         if ttl.is_zero() {
             return;
         }
         let mut cache = self.session_cache.lock().expect("session cache");
-        cache.insert(key.to_string(), SessionCacheEntry {
-            expires: Instant::now() + ttl,
-            status,
-            error: error.to_string(),
-            attribution_org,
-        });
+        cache.insert(
+            key.to_string(),
+            SessionCacheEntry {
+                expires: Instant::now() + ttl,
+                status,
+                error: error.to_string(),
+                attribution_org,
+            },
+        );
     }
 
     /// Verify a per-execution delegated grant against IAM on **every** request.
@@ -487,19 +554,21 @@ impl AuthService {
                     )),
                 }
             }
-            Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-                Err(AuthFailure::new(
-                    StatusCode::UNAUTHORIZED,
-                    "execution_grant_inactive",
-                    "execution grant is inactive or revoked",
-                ))
-            }
+            Ok(response) if response.status() == StatusCode::UNAUTHORIZED => Err(AuthFailure::new(
+                StatusCode::UNAUTHORIZED,
+                "execution_grant_inactive",
+                "execution grant is inactive or revoked",
+            )),
             Ok(response) if response.status() == StatusCode::FORBIDDEN => {
                 let error = response
                     .json::<Value>()
                     .await
                     .ok()
-                    .and_then(|body| body.get("error").and_then(Value::as_str).map(str::to_string))
+                    .and_then(|body| {
+                        body.get("error")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
                     .unwrap_or_else(|| "execution_grant_forbidden".into());
                 Err(AuthFailure::new(
                     StatusCode::FORBIDDEN,

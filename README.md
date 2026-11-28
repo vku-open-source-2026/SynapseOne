@@ -25,7 +25,7 @@
 
 ---
 
-**SynapseOne** is a self-hostable Tier-1 Platform-as-a-Service (`Apache-2.0`) bundling an API gateway, AWS-style IAM, managed data primitives, linked-data publishing, AI inference, and a DAG workflow engine behind one unified contract. Operate it from the web Console, a zero-dependency CLI, or typed SDKs in TypeScript, Python, Go, and Rust.
+**SynapseOne** is a self-hostable Tier-1 Platform-as-a-Service (`Apache-2.0`) bundling an API gateway, AWS-style IAM, managed data primitives, linked-data publishing, AI inference, and a DAG workflow engine behind one unified contract. Operate it from the web Console, a single-install CLI, or typed SDKs in TypeScript, Python, Go, and Rust.
 
 ## Preview
 

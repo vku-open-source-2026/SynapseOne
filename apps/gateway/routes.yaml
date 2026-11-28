@@ -99,6 +99,37 @@ routes:
       - { method: DELETE, path: /v1/platform/runners/*, action: platform:Admin }
       - { method: DELETE, path: /v1/platform/runners/*/*/*, action: platform:Admin }
 
+  # Edge management is platform-admin-only. The caller JWT is verified by the
+  # gateway, then replaced with the edge service's server-side admin credential.
+  # Blank admin tokens disable these optional routes with 503 edge_not_configured.
+  - path: /v1/platform/edge/dns
+    target: ${SYNAPSEDNS_SERVICE_URL:-http://synapsedns:4014}
+    auth: jwt
+    service: platform
+    stripPrefix: /v1/platform/edge/dns
+    adminTokenEnv: SYNAPSEDNS_ADMIN_TOKEN
+    actions:
+      - { method: GET, path: /v1/platform/edge/dns/*, action: platform:Read }
+      - { method: HEAD, path: /v1/platform/edge/dns/*, action: platform:Read }
+      - { method: POST, path: /v1/platform/edge/dns/*, action: platform:Write }
+      - { method: PATCH, path: /v1/platform/edge/dns/*, action: platform:Write }
+      - { method: PUT, path: /v1/platform/edge/dns/*, action: platform:Write }
+      - { method: DELETE, path: /v1/platform/edge/dns/*, action: platform:Write }
+
+  - path: /v1/platform/edge/tunnel
+    target: ${SYNAPSETUNNEL_SERVICE_URL:-http://synapsetunnel:4015}
+    auth: jwt
+    service: platform
+    stripPrefix: /v1/platform/edge/tunnel
+    adminTokenEnv: SYNAPSETUNNEL_ADMIN_TOKEN
+    actions:
+      - { method: GET, path: /v1/platform/edge/tunnel/*, action: platform:Read }
+      - { method: HEAD, path: /v1/platform/edge/tunnel/*, action: platform:Read }
+      - { method: POST, path: /v1/platform/edge/tunnel/*, action: platform:Write }
+      - { method: PATCH, path: /v1/platform/edge/tunnel/*, action: platform:Write }
+      - { method: PUT, path: /v1/platform/edge/tunnel/*, action: platform:Write }
+      - { method: DELETE, path: /v1/platform/edge/tunnel/*, action: platform:Write }
+
   # Platform Super Admin control plane. Only JWT credentials are accepted
   # (API keys/service accounts are rejected at the gateway); normal user JWTs
   # are allowed only on /session to exchange for a short-lived platform token.

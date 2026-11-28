@@ -7,6 +7,41 @@ Synapse Tunnel is a standalone Tier-1 edge capability for publishing HTTP
 applications that run behind NAT, firewalls, or private networks. It is not wired
 to Tier-2/3 applications yet.
 
+## Cloudflare-style connection flow
+
+1. Open **Platform Admin → Synapse Tunnel** at `/admin/tunnel` and choose
+   **Create tunnel**.
+2. Enter the local application URL, for example `http://localhost:3000`.
+3. Add the public hostname. Choose SynapseDNS to create an A/AAAA/CNAME record in
+   an existing zone, or External DNS to create the record at your provider.
+4. Save the one-time connector token and run the displayed `synapseone` command
+   on the machine that runs the application.
+5. Watch the connector change from **Disconnected** to **Connected** in Console.
+   Live status refreshes every five seconds.
+
+```bash
+npm install -g @synapseone/cli@latest
+read -rsp "Connector token: " SYNAPSETUNNEL_CONNECTOR_TOKEN; echo
+export SYNAPSETUNNEL_CONNECTOR_TOKEN
+synapseone tunnel run <connector-id> --server-url https://tunnel.example.com
+```
+
+The CLI opens only an outbound WebSocket. No inbound listener is required on the
+application machine. `--token-file` is also available for a root-only token file.
+The connector ID is a label; the secret token authenticates the connection.
+
+Console calls `/v1/platform/edge/tunnel/*` through the gateway. This namespace is
+restricted to Platform Administrator sessions with MFA, rewrites to the Tunnel
+control API and injects the server-side admin credential. Admin/connector tokens
+are never stored in browser storage. DNS management uses the equivalent
+`/v1/platform/edge/dns/*` namespace.
+
+Set `SYNAPSETUNNEL_PUBLIC_ORIGIN=https://tunnel.example.com` on the server so
+Console can render the correct CLI command. This must be an HTTP(S) origin without
+a path, query, credentials or fragment. Public HTTPS/WSS termination and per-host
+TLS certificates are still operator responsibilities; the service does not issue
+certificates.
+
 ## Components
 
 | Component | Default port | Responsibility |
@@ -80,8 +115,9 @@ curl -fsS -H 'Host: city.example.com' http://127.0.0.1:18082/
 ## Security and limits
 
 - HTTP/SSE streaming is supported; raw WebSocket, TCP, and UDP passthrough are not.
-- TLS termination, WAF policy, and integration with the existing SynapseOne API
-  Gateway are external/future work.
+- Management is integrated with the existing gateway under the platform-admin
+  namespace; public application traffic and connector WebSockets must bypass the
+  management gateway and use a dedicated HTTPS/WSS reverse proxy.
 - The MVP supports one JSON writer and one service instance; it is not HA.
 - Request bodies are buffered up to the configured limit. Responses stream with a
   cumulative size cap.

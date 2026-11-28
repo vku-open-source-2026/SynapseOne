@@ -32,6 +32,16 @@ test('server configuration fails closed and applies documented defaults', () => 
   assert.equal(defaults.requestTimeoutMs, 30000);
   assert.equal(defaults.maxRequestBytes, 10485760);
   assert.equal(defaults.maxResponseBytes, 16777216);
+  assert.equal(defaults.publicOrigin, undefined);
+
+  const advertised = loadServerConfig('combined', {
+    SYNAPSETUNNEL_ADMIN_TOKEN: 'test-token',
+    SYNAPSETUNNEL_PUBLIC_ORIGIN: 'https://tunnel.example.com/',
+  });
+  assert.equal(advertised.publicOrigin, 'https://tunnel.example.com');
+  assert.throws(() => loadServerConfig('combined', {
+    SYNAPSETUNNEL_ADMIN_TOKEN: 'test-token', SYNAPSETUNNEL_PUBLIC_ORIGIN: 'https://tunnel.example.com/base',
+  }), /PUBLIC_ORIGIN/);
 });
 
 test('hostname, route, and upstream validation reject unsafe input', () => {

@@ -22,6 +22,19 @@ recursive resolution or forwards queries.
 - Atomic mode-0600 JSON persistence; one writer/instance per data file.
 - No DNSSEC, AXFR, recursive forwarding, rate limiting, or HA in this MVP.
 
+## Console management
+
+Open **Platform Admin → SynapseDNS** at `/admin/dns`. The page uses the existing
+Platform Administrator session and MFA; it lists zones, creates SOA/NS records,
+manages application records and shows the current SOA serial. The browser never
+receives `SYNAPSEDNS_ADMIN_TOKEN`.
+
+The gateway exposes this narrow management surface at
+`/v1/platform/edge/dns/*`. It accepts platform-admin JWTs only, rewrites the
+prefix to the service's `/v1/*` API and injects the server-side admin credential.
+Tenant JWTs, API keys and anonymous callers are rejected. Direct loopback API
+access remains available for operators.
+
 ## Standalone deployment
 
 ```bash

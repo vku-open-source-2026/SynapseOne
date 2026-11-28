@@ -189,8 +189,8 @@ pub fn scope_allows(
     // Generic read/write actions still accept legacy verb-style scopes
     // (`faststore:get`). Custom actions such as `platform:Admin` must not be
     // satisfiable by the bare HTTP method (`platform:post`).
-    let exact_override = action_override.is_some()
-        && !matches!(requirement.action.as_str(), "read" | "write");
+    let exact_override =
+        action_override.is_some() && !matches!(requirement.action.as_str(), "read" | "write");
     let mut alternatives = HashSet::new();
     alternatives.insert(format!("{}:{}", requirement.service, requirement.action));
     if !exact_override {

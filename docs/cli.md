@@ -1,6 +1,8 @@
-# `synapseone` CLI — zero-dependency command line (Node 18+)
+# `synapseone` CLI — one install for platform and Tunnel commands (Node 18+)
 
-Apache-2.0. Part of [SynapseOne](../README.md) Tier-1 PaaS. No `npm install` needed — single file, only Node's built-in `fetch`.
+Apache-2.0. Part of [SynapseOne](../README.md) Tier-1 PaaS. Platform commands use
+Node's built-in `fetch`; the outbound Tunnel connector bundles the pinned `ws`
+runtime dependency. Install once and use the same `synapseone` binary.
 
 ## Install
 
@@ -1132,6 +1134,50 @@ curl -X POST http://localhost:4002/webhook/transform \
   -H 'Content-Type: application/json' \
   -d '{"value":21}'
 ```
+
+### Synapse Tunnel connector
+
+Run the same outbound-only connector used by `synapse-tunnel-connector`, without
+installing a second binary:
+
+```bash
+npm install -g @synapseone/cli@latest
+read -rsp "Connector token: " SYNAPSETUNNEL_CONNECTOR_TOKEN; echo
+export SYNAPSETUNNEL_CONNECTOR_TOKEN
+synapseone tunnel run <connector-id> --server-url https://tunnel.example.com
+```
+
+Or read the token from an owner-only file:
+
+```bash
+umask 077
+printf '%s\n' "$SYNAPSETUNNEL_CONNECTOR_TOKEN" > ./connector.token
+synapseone tunnel run --token-file ./connector.token \
+  --server-url https://tunnel.example.com --reconnect-delay-ms 1000
+```
+
+`<connector-id>` is optional and display-only; the `st_...` token authenticates
+and selects the server-side connector. The process opens no inbound listener. It
+forwards HTTP/HTTPS to the upstream configured in Console, streams response bodies
+and SSE, applies the limits from the protocol welcome message, and reconnects with
+exponential backoff and jitter. Stop it with `Ctrl-C` or `SIGTERM`.
+
+| Flag | Environment | Default |
+|---|---|---|
+| `--token-file F` (preferred), `--token T` | `SYNAPSETUNNEL_CONNECTOR_TOKEN`, then `SYNAPSETUNNEL_TOKEN` | required |
+| `--server-url URL` | `SYNAPSETUNNEL_SERVER_URL` | `http://127.0.0.1:4016` |
+| `--reconnect-delay-ms MS` | `SYNAPSETUNNEL_RECONNECT_DELAY_MS` | `1000` |
+| — | `SYNAPSETUNNEL_WS_PATH` | `/_synapse/tunnel/connect` |
+| — | `SYNAPSETUNNEL_LOG_LEVEL` | `info` |
+
+Prefer a `0600` token file or environment variable over `--token`, which can be
+visible in process listings and shell history. Tokens are sent only in the
+WebSocket handshake and are never logged. Public HTTPS/WSS termination and TLS
+certificates are configured on the server, not by the CLI.
+
+Stable CLI packages use `cli-v<version>` tags (for example `cli-v0.11.0`). The tag
+must match `tools/cli/package.json`; the release workflow runs the CLI test suite,
+publishes the npm package and verifies the registry version.
 
 ## Output format
 

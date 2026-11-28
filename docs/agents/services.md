@@ -679,7 +679,7 @@ the platform token is sessionStorage-only and only used on `/v1/platform/*`.
   namespaces.
 - `sdks/sdk-go` — `synapseone-sdk-go`, Go 1.22+, stdlib only; typed
   `BaseCollection`; install via `replace` (monorepo path has uppercase letters).
-- `tools/cli` — `@synapseone/cli`, zero deps, Node 18+, `synapseone` binary.
+- `tools/cli` — `@synapseone/cli`, Node 18+, `synapseone` binary with bundled outbound Tunnel connector.
   Commands cover auth, orgs/accounts/users/roles/policies/keys/service accounts,
   workflows/executions/templates/webhooks, LDS, and a generic `call` escape
   hatch; there are no first-class Base/Faststore/Queue/Inference commands yet.

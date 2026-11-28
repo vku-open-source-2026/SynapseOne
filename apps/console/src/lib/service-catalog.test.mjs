@@ -42,6 +42,11 @@ test('every service has a valid Console route, Docs target and active route matc
   }
 });
 
+test('DNS and Tunnel sidebar links open management pages, not API Docs', () => {
+  assert.equal(SERVICE_CATALOG.find((service) => service.id === 'dns').consoleRoute, '/admin/dns');
+  assert.equal(SERVICE_CATALOG.find((service) => service.id === 'tunnel').consoleRoute, '/admin/tunnel');
+});
+
 test('English and Vietnamese Docs/service locale shapes stay in parity', () => {
   assert.deepEqual(shape(en.docsPage), shape(vi.docsPage));
   assert.deepEqual(shape(en.services), shape(vi.services));

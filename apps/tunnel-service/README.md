@@ -9,8 +9,10 @@ applications. It has three roles in one Node 20 + TypeScript package:
 - **Outbound-only connector CLI**, which makes one outbound WebSocket connection
   and forwards requests to a local HTTP upstream.
 
-The default server command runs the API and ingress in one process. This service
-is intentionally **not integrated with the existing SynapseOne gateway yet**.
+The default server command runs the API and ingress in one process. Management is
+available through the SynapseOne gateway only under the MFA-protected
+`/v1/platform/edge/tunnel/*` namespace; public ingress and connector WebSockets
+remain separate from the management gateway.
 
 ## Architecture
 
@@ -127,6 +129,7 @@ limited to 64 KiB. Errors use
 | --- | --- | --- |
 | `GET` | `/health` | Liveness; no authentication |
 | `GET` | `/ready` | Readiness and storage mode; no authentication |
+| `GET` | `/v1/config` | Advertised public ingress origin, connector path and protocol version; admin authentication required |
 | `GET` | `/v1/connectors` | List connectors and live connection status |
 | `POST` | `/v1/connectors` | Create `{name, upstreamUrl}`; returns token once |
 | `GET` | `/v1/connectors/:id` | Read one connector |
@@ -198,6 +201,7 @@ avoids filesystem coordination entirely.
 | `SYNAPSETUNNEL_MAX_BUFFERED_BYTES` | `4194304` | Server WebSocket send high-water mark |
 | `SYNAPSETUNNEL_TRUST_PROXY` | `false` | Trust proxy-derived client IP for rate limits/forwarding; enable only behind a sanitizing trusted proxy |
 | `SYNAPSETUNNEL_PUBLIC_SCHEME` | `http` | Scheme stamped into `X-Forwarded-Proto` (`http` or `https`) |
+| `SYNAPSETUNNEL_PUBLIC_ORIGIN` | unset | Public HTTP(S) origin advertised by `/v1/config` to Console/CLI; no path, query, credentials, or fragment |
 | `SYNAPSETUNNEL_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, or `error` |
 | `SYNAPSETUNNEL_CONNECTOR_TOKEN` | required for connector | Connector bearer token (`SYNAPSETUNNEL_TOKEN` alias) |
 | `SYNAPSETUNNEL_SERVER_URL` | `http://127.0.0.1:4016` | Connector's outbound server base URL |

@@ -145,20 +145,41 @@ impl Config {
         };
 
         let mut ai = service_quota_defaults("AI", DEFAULT_AI_LIMIT, Some("AI_RATE_LIMIT"));
-        ai.tpd = Some(clamped_quota(std::env::var("AI_QUOTA_TOKENS_PER_DAY").ok().as_deref(), 1_000_000));
-        let mut inference = service_quota_defaults("INFERENCE", DEFAULT_INFERENCE_LIMIT, Some("INFERENCE_RATE_LIMIT_PER_MIN"));
-        inference.tpd = Some(clamped_quota(std::env::var("INFERENCE_QUOTA_TOKENS_PER_DAY").ok().as_deref(), 1_000_000));
+        ai.tpd = Some(clamped_quota(
+            std::env::var("AI_QUOTA_TOKENS_PER_DAY").ok().as_deref(),
+            1_000_000,
+        ));
+        let mut inference = service_quota_defaults(
+            "INFERENCE",
+            DEFAULT_INFERENCE_LIMIT,
+            Some("INFERENCE_RATE_LIMIT_PER_MIN"),
+        );
+        inference.tpd = Some(clamped_quota(
+            std::env::var("INFERENCE_QUOTA_TOKENS_PER_DAY")
+                .ok()
+                .as_deref(),
+            1_000_000,
+        ));
         let mut workflow = service_quota_defaults("WORKFLOW", DEFAULT_WORKFLOW_LIMIT, None);
         workflow.eph = Some(clamped_quota_max(
-            std::env::var("WORKFLOW_QUOTA_EXECUTIONS_PER_HOUR").ok().as_deref(),
+            std::env::var("WORKFLOW_QUOTA_EXECUTIONS_PER_HOUR")
+                .ok()
+                .as_deref(),
             1_000,
             1_000_000,
         ));
-        workflow.concurrent = Some(clamped_quota(
-            std::env::var("WORKFLOW_QUOTA_CONCURRENT").ok().as_deref(),
-            10,
-        ).min(1_000));
-        let quota_defaults = crate::quotas::QuotaDefaults { ai, inference, workflow };
+        workflow.concurrent = Some(
+            clamped_quota(
+                std::env::var("WORKFLOW_QUOTA_CONCURRENT").ok().as_deref(),
+                10,
+            )
+            .min(1_000),
+        );
+        let quota_defaults = crate::quotas::QuotaDefaults {
+            ai,
+            inference,
+            workflow,
+        };
         let quota_cache_ttl = Duration::from_millis(clamped_ms(
             std::env::var("QUOTA_CACHE_TTL_MS").ok().as_deref(),
             DEFAULT_QUOTA_CACHE_MS,
@@ -216,15 +237,29 @@ fn env_or(name: &str, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
-fn service_quota_defaults(prefix: &str, fallback_rpm: u32, legacy_rpm: Option<&str>) -> crate::quotas::ServiceDefaults {
+fn service_quota_defaults(
+    prefix: &str,
+    fallback_rpm: u32,
+    legacy_rpm: Option<&str>,
+) -> crate::quotas::ServiceDefaults {
     let preferred = std::env::var(format!("{prefix}_QUOTA_REQUESTS_PER_MIN")).ok();
     let legacy = legacy_rpm.and_then(|name| std::env::var(name).ok());
     let fallback = clamped_rate_limit(legacy.as_deref(), fallback_rpm);
     let rpm = u64::from(clamped_rate_limit(preferred.as_deref(), fallback));
     crate::quotas::ServiceDefaults {
         rpm,
-        rp5h: clamped_quota(std::env::var(format!("{prefix}_QUOTA_REQUESTS_PER_5H")).ok().as_deref(), rpm * 300),
-        rpd: clamped_quota(std::env::var(format!("{prefix}_QUOTA_REQUESTS_PER_DAY")).ok().as_deref(), rpm * 1_440),
+        rp5h: clamped_quota(
+            std::env::var(format!("{prefix}_QUOTA_REQUESTS_PER_5H"))
+                .ok()
+                .as_deref(),
+            rpm * 300,
+        ),
+        rpd: clamped_quota(
+            std::env::var(format!("{prefix}_QUOTA_REQUESTS_PER_DAY"))
+                .ok()
+                .as_deref(),
+            rpm * 1_440,
+        ),
         tpd: None,
         eph: None,
         concurrent: None,
@@ -246,9 +281,7 @@ fn clamped_quota(raw: Option<&str>, fallback: u64) -> u64 {
 
 fn clamped_quota_max(raw: Option<&str>, fallback: u64, max: u64) -> u64 {
     match raw.and_then(|value| value.trim().parse::<f64>().ok()) {
-        Some(value) if value.is_finite() => {
-            (value.floor() as i64).clamp(1, max as i64) as u64
-        }
+        Some(value) if value.is_finite() => (value.floor() as i64).clamp(1, max as i64) as u64,
         _ => fallback,
     }
 }
@@ -339,7 +372,9 @@ pub fn validate_security_config(
         let ack = audit_ack.trim();
         let owner = ack.split(';').find_map(|part| {
             let (key, value) = part.split_once('=')?;
-            (key.trim() == "owner").then(|| value.trim()).filter(|v| !v.is_empty())
+            (key.trim() == "owner")
+                .then(|| value.trim())
+                .filter(|v| !v.is_empty())
         });
         let expires = ack.split(';').find_map(|part| {
             let (key, value) = part.split_once('=')?;
@@ -399,7 +434,11 @@ where
             env_or("FASTSTORE_SERVICE_URL", "http://faststore:4006"),
             false,
         ),
-        ready("queue", env_or("QUEUE_SERVICE_URL", "http://queue:4007"), false),
+        ready(
+            "queue",
+            env_or("QUEUE_SERVICE_URL", "http://queue:4007"),
+            false,
+        ),
     ];
     // Lakehouse is advertised at /v1/lakehouse. It is optional for gateway
     // liveness (a gateway restart cannot repair it), but it must be reported:
@@ -671,7 +710,10 @@ mod tests {
 
     #[test]
     fn workflow_execution_clamp_matches_iam_and_typescript() {
-        assert_eq!(clamped_quota_max(Some("5000000"), 1_000, 1_000_000), 1_000_000);
+        assert_eq!(
+            clamped_quota_max(Some("5000000"), 1_000, 1_000_000),
+            1_000_000
+        );
         assert_eq!(clamped_quota_max(Some("500"), 1_000, 1_000_000), 500);
     }
 
@@ -689,7 +731,10 @@ mod tests {
             .find(|upstream| upstream.name == "lakehouse")
             .expect("configured Lakehouse must be probed");
         assert_eq!(lakehouse.url, "http://lakehouse:4013");
-        assert!(!lakehouse.required, "Lakehouse degradation must not evict the gateway");
+        assert!(
+            !lakehouse.required,
+            "Lakehouse degradation must not evict the gateway"
+        );
 
         let blank = ready_upstreams_from(|name| match name {
             "LAKEHOUSE_SERVICE_URL" => Some("   ".to_string()),

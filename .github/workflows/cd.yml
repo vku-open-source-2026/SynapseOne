@@ -86,6 +86,8 @@ jobs:
           }
           publish_dev sdk sdks/sdk-js "${SDK_DEV}"
           publish_dev cli tools/cli "${CLI_DEV}"
+          test "$(npm view "@synapseone/sdk@${SDK_DEV}" version)" = "${SDK_DEV}"
+          test "$(npm view "@synapseone/cli@${CLI_DEV}" version)" = "${CLI_DEV}"
 
       - name: Login GHCR
         uses: docker/login-action@v3
@@ -115,11 +117,14 @@ jobs:
             # Every service Dockerfile copies from repo-root paths (apps/*,
             # LICENSE, licenses), so the build context must remain the root.
             docker build --progress=plain \
+              --build-arg SOURCE_COMMIT="$SHA" \
               -f "$CTX/Dockerfile" \
               -t "ghcr.io/$OWNER/synapseone-$SVC:main" \
               -t "ghcr.io/$OWNER/synapseone-$SVC:main-$SHA" .
+            test "$(docker image inspect "ghcr.io/$OWNER/synapseone-$SVC:main" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SHA"
             docker push "ghcr.io/$OWNER/synapseone-$SVC:main"
             docker push "ghcr.io/$OWNER/synapseone-$SVC:main-$SHA"
+            docker manifest inspect "ghcr.io/$OWNER/synapseone-$SVC:main-$SHA" >/dev/null
             docker builder prune -f >/dev/null || true
             docker image prune -f >/dev/null || true
             echo "::endgroup::"

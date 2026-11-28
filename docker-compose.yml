@@ -873,6 +873,12 @@ services:
       STORAGE_SERVICE_URL: ${STORAGE_SERVICE_URL:-http://ocs:4010}
       OCS_SERVICE_URL: ${OCS_SERVICE_URL:-http://ocs:4010}
       NOTIFICATIONS_SERVICE_URL: ${NOTIFICATIONS_SERVICE_URL:-http://notifications:4011}
+      # Optional edge management upstreams. Admin tokens deliberately default to
+      # blank: the gateway returns 503 edge_not_configured until each is set.
+      SYNAPSEDNS_SERVICE_URL: ${SYNAPSEDNS_SERVICE_URL:-http://synapsedns:4014}
+      SYNAPSEDNS_ADMIN_TOKEN: ${SYNAPSEDNS_ADMIN_TOKEN:-}
+      SYNAPSETUNNEL_SERVICE_URL: ${SYNAPSETUNNEL_SERVICE_URL:-http://synapsetunnel:4015}
+      SYNAPSETUNNEL_ADMIN_TOKEN: ${SYNAPSETUNNEL_ADMIN_TOKEN:-}
       TRUST_PROXY: ${TRUST_PROXY:-}
       IAM_JWT_SECRET: ${IAM_JWT_SECRET:-change_me_super_secret_32chars_min}
       SYNAPSEONE_INTERNAL_SECRET: ${SYNAPSEONE_INTERNAL_SECRET:-${SYNAPSEDX_INTERNAL_SECRET:-}}
@@ -932,6 +938,8 @@ services:
     networks:
       synapseone-net:
         aliases: [synapseone-gateway]
+      synapseone-edge-net:
+        aliases: [synapseone-gateway-edge]
 
   console:
     build:
@@ -1008,4 +1016,7 @@ volumes:
 
 networks:
   synapseone-net:
+    driver: bridge
+  synapseone-edge-net:
+    name: ${SYNAPSEONE_EDGE_NETWORK:-synapseone-edge-net}
     driver: bridge

@@ -9,7 +9,7 @@ SynapseOne v0.9.0 — Apache-2.0 "Tier-1 PaaS": one API gateway, AWS-style IAM,
 Postgres/Valkey data plane + tenant-scoped object storage (S3-compatible), built-in
 workflow engine, NGSI-LD linked data (SynapseLDS), document DB (SynapseBase),
 Valkey cache (Synapse Faststore), and at-least-once queue (SynapseQueue).
-Clients: React Console, TypeScript/Python/Go SDKs, zero-dependency CLI.
+Clients: React Console, TypeScript/Python/Go SDKs, single-install CLI.
 Authentik/Keycloak are optional external OIDC IdPs.
 
 ## Reading map (do not read the whole repo/docs)
@@ -69,7 +69,7 @@ and `.notes/` (local credentials — never print, copy, or commit).
 | `pg-backup` (compose) | daily pg_dump of platform + Authentik DBs (`tools/backup/pg-backup.sh`) | — | volume `pgbackups` |
 | `s3-backup` (compose) | daily incremental object snapshots (`tools/backup/s3-backup.mjs`, OCS image) | — | volume `s3backups` |
 | `sdks/sdk-js`, `sdks/sdk-python`, `sdks/sdk-go`, `sdks/sdk-rust` | Client SDKs | — | — |
-| `tools/cli` | `synapseone` CLI (zero deps, Node 18+) | — | — |
+| `tools/cli` | `synapseone` CLI (Node 18+, bundled Tunnel connector) | — | — |
 
 Infra: Postgres 5432, Valkey 6379, S3 9090 (SeaweedFS), Prometheus 9091. In
 production only the gateway (and TLS edge) is public; service ports stay

@@ -198,6 +198,7 @@ services:
       - console
     networks:
       synapseone-net:
+      synapseone-edge-net:
       synapsedx-public-stack:
         aliases: [synapseone-edge]
       synapsecity-public-stack:

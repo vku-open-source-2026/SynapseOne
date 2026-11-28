@@ -16,6 +16,9 @@ import { MemoryRouter } from 'react-router-dom';
 import { AuthProvider } from './lib/auth.jsx';
 import App from './App.jsx';
 import Docs from './pages/Docs.jsx';
+import SynapseDNS from './pages/SynapseDNS.jsx';
+import SynapseTunnel from './pages/SynapseTunnel.jsx';
+import { PlatformAuthProvider } from './lib/platform-auth.jsx';
 import { LanguageProvider } from './lib/i18n.jsx';
 import WorkflowEditor from './components/WorkflowEditor.jsx';
 import { OrganizationTable } from './pages/Orgs.jsx';
@@ -67,6 +70,8 @@ const ROUTES = [
   '/admin/orgs',
   '/admin/users',
   '/admin/health',
+  '/admin/dns',
+  '/admin/tunnel',
   '/admin/usage',
   '/admin/quotas',
   '/admin/audit',
@@ -111,6 +116,8 @@ const GUARDED = new Set([
   '/admin/orgs',
   '/admin/users',
   '/admin/health',
+  '/admin/dns',
+  '/admin/tunnel',
   '/admin/usage',
   '/admin/quotas',
   '/admin/audit',
@@ -146,6 +153,25 @@ for (const [label, session] of Object.entries(SESSIONS)) {
       failures++;
       console.error(`FAIL [${label}] ${path}: ${e?.message || e}`);
     }
+  }
+}
+
+for (const [name, Page] of [['SynapseDNS', SynapseDNS], ['Synapse Tunnel', SynapseTunnel]] as const) {
+  try {
+    const html = renderToString(
+      <MemoryRouter initialEntries={['/admin/edge']}>
+        <AuthProvider>
+          <PlatformAuthProvider>
+            <LanguageProvider><Page /></LanguageProvider>
+          </PlatformAuthProvider>
+        </AuthProvider>
+      </MemoryRouter>,
+    );
+    if (!html.includes(name)) throw new Error('missing page heading');
+    console.log(`ok [edge-page] ${name} (${html.length} chars)`);
+  } catch (e: any) {
+    failures++;
+    console.error(`FAIL [edge-page] ${name}: ${e?.message || e}`);
   }
 }
 

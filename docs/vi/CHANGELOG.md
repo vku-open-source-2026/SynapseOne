@@ -9,11 +9,19 @@ của từng bản phát hành nằm trong `CHANGELOG.md` tiếng Anh.
 
 ### Thêm
 
+- **Kênh phát hành CLI 0.11.0:** tag `cli-v<version>` kiểm thử và publish CLI cài
+  một lần độc lập với bản phát hành toàn bộ image nền tảng.
 - **SynapseDNS và Synapse Tunnel:** dịch vụ edge Tầng 1 chạy độc lập với DNS
   authoritative UDP/TCP, API quản lý zone/record, connector tunnel HTTP chỉ kết
   nối outbound, ingress routing theo host/path, JSON persistence nguyên tử,
-  Docker/Compose, tài liệu vận hành song ngữ và hướng dẫn bốn ngôn ngữ. Tích hợp
-  gateway hiện tại và Tầng 2/3 vẫn để sau.
+  Docker/Compose, tài liệu vận hành song ngữ và hướng dẫn bốn ngôn ngữ. Quản lý
+  giờ có qua trang Platform Admin được bảo vệ MFA và route gateway hẹp; tích hợp
+  Tầng 2/3 vẫn để sau.
+- **Quy trình Tunnel kiểu Cloudflare:** Console tạo connector, route hostname và
+  bản ghi SynapseDNS tùy chọn trong một luồng hướng dẫn, hiển thị token connector
+  một lần và tạo lệnh `synapseone tunnel run` an toàn. CLI chạy connector
+  HTTP/SSE chỉ outbound trên máy cục bộ với reconnect và streaming; Console làm
+  mới trạng thái kết nối trực tiếp.
 - **Quota tổ chức và mặt quản lý API-key.** Quản trị viên nền tảng xem metadata
   API-key tenant, tạo/xoay vòng key với secret chỉ hiện một lần, và quản lý
   override nullable cho `ai`/`inference`/`workflow`. Tenant đọc được tổ chức và

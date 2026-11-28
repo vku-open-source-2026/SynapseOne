@@ -19,7 +19,7 @@ Current platform release: `0.9.0` (release candidate in this worktree).
   catalog, tenant namespaces, snapshots/time travel, additive schema evolution,
   idempotent appends and quotas.
 - Console tenant pages, Search/Warehouse/Lakehouse, platform Super Admin.
-- JS/Python/Go/Rust SDKs, zero-dependency CLI, API catalogue and docs.
+- JS/Python/Go/Rust SDKs, single-install CLI, API catalogue and docs.
 - Backups for Postgres and object storage with restore drills.
 
 ## Current release targets

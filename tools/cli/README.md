@@ -1,7 +1,9 @@
-# `synapseone` CLI — zero-dependency command line (Node 18+)
+# `synapseone` CLI — Node 18+
 
-Apache-2.0. Part of [SynapseOne](../../README.md) Tier-1 PaaS. No `npm install` needed —
-single file, only Node's built-in `fetch`.
+Apache-2.0. Part of [SynapseOne](../../README.md) Tier-1 PaaS. API commands use
+Node's built-in `fetch`. The tunnel connector uses the small, pinned `ws` runtime
+dependency, installed automatically with the CLI; no separate connector binary
+is needed.
 
 ## Install
 
@@ -63,6 +65,63 @@ Manage it with `synapseone mfa status|setup|enable|recovery-codes|disable`
 - The gateway does not redirect normal API routes; use the canonical HTTPS
   base URL instead of relying on an HTTP→HTTPS redirect (cross-origin, so it
   is unauthenticated even when trusted).
+
+## Synapse Tunnel connector
+
+Run an outbound-only tunnel from a machine that can reach both the local upstream
+and the tunnel ingress. The connector opens one authenticated WebSocket to the
+ingress and forwards HTTP/HTTPS requests to the upstream configured on the
+server. It does **not** open an inbound listening port. Response bodies, including
+SSE, stream back without waiting for the upstream response to finish.
+
+```bash
+# Store the connector's st_... bearer token with owner-only permissions.
+umask 077
+printf '%s\n' "$SYNAPSETUNNEL_CONNECTOR_TOKEN" > ./connector.token
+
+# The same installed synapseone command is the connector process.
+synapseone tunnel run \
+  --token-file ./connector.token \
+  --server-url https://tunnel.example.com \
+  --reconnect-delay-ms 1000
+```
+
+`[connector-id]` is an optional display-only UUID; it never selects or authenticates
+a connector. The bearer token selects the server-side connector. Prefer a
+`0600` token file or `SYNAPSETUNNEL_CONNECTOR_TOKEN`; `--token` is supported but
+discouraged because argv is visible in process listings and shell history.
+Tokens are sent only in the WebSocket `Authorization: Bearer ...` handshake and
+are never logged.
+
+| Setting | Flag | Environment | Default |
+|---|---|---|---|
+| Connector token | `--token-file F` (preferred), `--token T` | `SYNAPSETUNNEL_CONNECTOR_TOKEN`, then `SYNAPSETUNNEL_TOKEN` | required |
+| Ingress URL | `--server-url URL` | `SYNAPSETUNNEL_SERVER_URL` | `http://127.0.0.1:4016` |
+| WebSocket path | — | `SYNAPSETUNNEL_WS_PATH` | `/_synapse/tunnel/connect` |
+| Initial reconnect delay | `--reconnect-delay-ms MS` | `SYNAPSETUNNEL_RECONNECT_DELAY_MS` | `1000` ms |
+| Log level | — | `SYNAPSETUNNEL_LOG_LEVEL` | `info` |
+
+Explicit flags override environment settings, and `--token-file` takes precedence
+over `--token`. Server URLs must be HTTP(S) without embedded credentials, query
+strings, or fragments. Reconnects use exponential backoff with jitter. Request
+body/response limits, timeouts, and maximum concurrency come from the v1
+`welcome` message; oversized bodies, aborted requests, and busy connectors are
+reported using the tunnel protocol. Hop-by-hop headers are stripped and redirects
+are not followed.
+
+Logs are JSON lines on stderr. Stop with Ctrl-C (`SIGINT`) or `SIGTERM`; the
+connector aborts active upstream work and closes the WebSocket cleanly.
+
+```bash
+synapseone tunnel run --help
+```
+
+## Stable releases
+
+Stable CLI packages are published from `cli-v<version>` tags (for example
+`cli-v0.11.0`). The tag must match this package's version. The release workflow
+runs the CLI tests, publishes `@synapseone/cli` to npm and verifies the registry
+version before the release is considered complete.
 
 ## Full documentation
 

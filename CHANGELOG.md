@@ -8,11 +8,20 @@ Format based on Keep a Changelog; versioning follows SemVer.
 ## [Unreleased]
 
 ### Added
+- **CLI 0.11.0 release channel:** `cli-v<version>` tags test and publish the
+  single-install CLI independently of the full platform image release.
 - **SynapseDNS and Synapse Tunnel:** standalone Tier-1 edge services with
   authoritative UDP/TCP DNS, zone/record management, an outbound-only HTTP
   tunnel connector, host/path ingress routing, atomic JSON persistence,
   Docker/Compose deployment, bilingual operations docs and four-language service
-  guides. Existing gateway and Tier-2/3 integration remain intentionally pending.
+  guides. Management is now available through MFA-protected Platform Admin
+  Console pages and narrow gateway proxy routes; Tier-2/3 integration remains
+  intentionally pending.
+- **Cloudflare-style Tunnel workflow:** Console creates a connector, hostname
+  route and optional SynapseDNS record in one guided flow, shows the connector
+  token once and renders a secure `synapseone tunnel run` command. The CLI runs
+  the outbound-only HTTP/SSE connector locally with reconnect and streaming
+  support; live connector status refreshes in Console.
 - **VIC Hackathon #1:** public Vietnamese `/hackathon` page with animation,
   countdown, timeline, rules, prizes, jury and anonymous team/individual
   registration with per-member year and advanced skills; superadmin review

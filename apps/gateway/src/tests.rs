@@ -35,8 +35,8 @@ use crate::config::{
 };
 use crate::headers::{propagate_principal, request_id, sanitize_request_id};
 use crate::metrics::Metrics;
-use crate::quotas::{QuotaDefaults, ServiceDefaults};
 use crate::quotas::{consumes_workflow_execution, quota_service_for_route, QuotaService};
+use crate::quotas::{QuotaDefaults, ServiceDefaults};
 use crate::rate_limit::{LimitResult, RateLimiter};
 use crate::routes::{
     compile_route_path, expand_env, find_route, load_routes, parse_routes_yaml, AuthMode, RouteRule,
@@ -94,13 +94,10 @@ async fn raw_get_status(base: &str, path: &str, token: &str) -> u16 {
     );
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut response = Vec::new();
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        stream.read_to_end(&mut response),
-    )
-    .await
-    .expect("raw request timed out")
-    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+        .await
+        .expect("raw request timed out")
+        .unwrap();
     let text = String::from_utf8_lossy(&response);
     text.lines()
         .next()
@@ -285,8 +282,14 @@ impl MockIam {
             .route("/v1/usage/ingest", post(mock_usage))
             .route("/internal/quotas", get(mock_quotas))
             .route("/internal/quota/check", post(mock_quota_check))
-            .route("/internal/workflow/execution/check", post(mock_execution_check))
-            .route("/internal/workflow/execution/release", post(mock_execution_release))
+            .route(
+                "/internal/workflow/execution/check",
+                post(mock_execution_check),
+            )
+            .route(
+                "/internal/workflow/execution/release",
+                post(mock_execution_release),
+            )
             .route("/internal/usage/meter", get(mock_meter))
             .route("/v1/platform/session", post(mock_platform_session))
             .route(
@@ -361,13 +364,21 @@ impl MockIam {
     }
 
     fn set_quota_override(&self, org: &str, service: &str, body: Value) {
-        self.state.quota_overrides.lock().unwrap().insert(format!("{service}:{org}"), body);
+        self.state
+            .quota_overrides
+            .lock()
+            .unwrap()
+            .insert(format!("{service}:{org}"), body);
     }
     fn set_quota_unavailable(&self, unavailable: bool) {
-        self.state.quota_unavailable.store(unavailable, Ordering::SeqCst);
+        self.state
+            .quota_unavailable
+            .store(unavailable, Ordering::SeqCst);
     }
     fn set_check_unavailable(&self, unavailable: bool) {
-        self.state.check_unavailable.store(unavailable, Ordering::SeqCst);
+        self.state
+            .check_unavailable
+            .store(unavailable, Ordering::SeqCst);
     }
     fn set_check_result(&self, body: Option<Value>) {
         *self.state.check_result.lock().unwrap() = body;
@@ -408,7 +419,9 @@ async fn mock_verify(State(state): State<Arc<MockIamState>>) -> Response {
         VerifyMode::Ok => {
             let org = state.verify_org.lock().unwrap().clone();
             let mut body = json!({ "valid": true });
-            if let Some(org_id) = org { body["org_id"] = json!(org_id); }
+            if let Some(org_id) = org {
+                body["org_id"] = json!(org_id);
+            }
             Json(body).into_response()
         }
         VerifyMode::Revoked => (
@@ -510,14 +523,25 @@ async fn mock_quotas(
     }
     let org = params.get("orgId").cloned().unwrap_or_default();
     let service = params.get("service").cloned().unwrap_or_default();
-    if let Some(body) = state.quota_overrides.lock().unwrap().get(&format!("{service}:{org}")) {
+    if let Some(body) = state
+        .quota_overrides
+        .lock()
+        .unwrap()
+        .get(&format!("{service}:{org}"))
+    {
         return Json(body.clone()).into_response();
     }
     let (rpm, tpd, eph, concurrent) = match service.as_str() {
         "ai" => (30, Some(1_000_000), None, None),
         "inference" => (60, Some(1_000_000), None, None),
         "workflow" => (120, None, Some(1_000), Some(10)),
-        _ => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid_service" }))).into_response(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid_service" })),
+            )
+                .into_response()
+        }
     };
     Json(json!({
         "service": service,
@@ -529,7 +553,8 @@ async fn mock_quotas(
         "executionsPerHour": eph,
         "concurrentExecutions": concurrent,
         "overridden": false,
-    })).into_response()
+    }))
+    .into_response()
 }
 
 async fn mock_quota_check(
@@ -547,9 +572,18 @@ async fn mock_quota_check(
     if let Some(result) = state.check_result.lock().unwrap().clone() {
         return Json(result).into_response();
     }
-    let Some(parsed) = parsed else { return StatusCode::BAD_REQUEST.into_response() };
-    let subject = parsed.get("subject").and_then(Value::as_str).unwrap_or("").to_string();
-    let limit = parsed.pointer("/limits/minute").and_then(Value::as_u64).unwrap_or(100_000);
+    let Some(parsed) = parsed else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let subject = parsed
+        .get("subject")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let limit = parsed
+        .pointer("/limits/minute")
+        .and_then(Value::as_u64)
+        .unwrap_or(100_000);
     let mut counts = state.check_counts.lock().unwrap();
     let count = counts.entry(subject).or_insert(0);
     *count += 1;
@@ -561,31 +595,54 @@ async fn mock_quota_check(
         "limit": limit,
         "retryAfterSeconds": if allowed { 0 } else { 60 },
         "resetAt": "2026-11-26T12:35:00.000Z",
-    })).into_response()
+    }))
+    .into_response()
 }
 
-async fn mock_execution_check(
-    State(state): State<Arc<MockIamState>>,
-    body: Bytes,
-) -> Response {
+async fn mock_execution_check(State(state): State<Arc<MockIamState>>, body: Bytes) -> Response {
     state.execution_hits.fetch_add(1, Ordering::SeqCst);
     let parsed = serde_json::from_slice::<Value>(&body).ok();
     *state.execution_body.lock().unwrap() = parsed.clone();
     if state.execution_unavailable.load(Ordering::SeqCst) {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    let Some(parsed) = parsed else { return StatusCode::BAD_REQUEST.into_response() };
-    let subject = parsed.get("subject").and_then(Value::as_str).unwrap_or("").to_string();
-    let hour_limit = parsed.pointer("/limits/hour").and_then(Value::as_u64).unwrap_or(1_000);
-    let concurrent_limit = parsed.pointer("/limits/concurrent").and_then(Value::as_u64).unwrap_or(10);
-    let hour_count = state.execution_hour_counts.lock().unwrap().get(&subject).copied().unwrap_or(0);
+    let Some(parsed) = parsed else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let subject = parsed
+        .get("subject")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let hour_limit = parsed
+        .pointer("/limits/hour")
+        .and_then(Value::as_u64)
+        .unwrap_or(1_000);
+    let concurrent_limit = parsed
+        .pointer("/limits/concurrent")
+        .and_then(Value::as_u64)
+        .unwrap_or(10);
+    let hour_count = state
+        .execution_hour_counts
+        .lock()
+        .unwrap()
+        .get(&subject)
+        .copied()
+        .unwrap_or(0);
     if hour_count >= hour_limit {
         return Json(json!({
             "allowed": false, "window": "hour", "count": hour_count, "limit": hour_limit,
             "retryAfterSeconds": 60, "resetAt": "2026-11-27T13:00:00.000Z", "token": null,
-        })).into_response();
+        }))
+        .into_response();
     }
-    let concurrent_count = state.execution_leases.lock().unwrap().get(&subject).map(Vec::len).unwrap_or(0) as u64;
+    let concurrent_count = state
+        .execution_leases
+        .lock()
+        .unwrap()
+        .get(&subject)
+        .map(Vec::len)
+        .unwrap_or(0) as u64;
     if concurrent_count >= concurrent_limit {
         return Json(json!({
             "allowed": false, "window": "concurrent", "count": concurrent_count, "limit": concurrent_limit,
@@ -593,29 +650,44 @@ async fn mock_execution_check(
         })).into_response();
     }
     let token = format!("lease-{}", state.execution_hits.load(Ordering::SeqCst));
-    *state.execution_hour_counts.lock().unwrap().entry(subject.clone()).or_insert(0) += 1;
-    state.execution_leases.lock().unwrap().entry(subject.clone()).or_default().push(token.clone());
+    *state
+        .execution_hour_counts
+        .lock()
+        .unwrap()
+        .entry(subject.clone())
+        .or_insert(0) += 1;
+    state
+        .execution_leases
+        .lock()
+        .unwrap()
+        .entry(subject.clone())
+        .or_default()
+        .push(token.clone());
     Json(json!({
         "allowed": true, "window": "hour", "count": hour_count + 1, "limit": hour_limit,
         "retryAfterSeconds": 0, "resetAt": "2026-11-27T13:00:00.000Z", "token": token,
-    })).into_response()
+    }))
+    .into_response()
 }
 
-async fn mock_execution_release(
-    State(state): State<Arc<MockIamState>>,
-    body: Bytes,
-) -> Response {
+async fn mock_execution_release(State(state): State<Arc<MockIamState>>, body: Bytes) -> Response {
     state.execution_release_hits.fetch_add(1, Ordering::SeqCst);
     let parsed = serde_json::from_slice::<Value>(&body).ok();
-    let Some(parsed) = parsed else { return StatusCode::BAD_REQUEST.into_response() };
+    let Some(parsed) = parsed else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
     let subject = parsed.get("subject").and_then(Value::as_str).unwrap_or("");
     let token = parsed.get("token").and_then(Value::as_str).unwrap_or("");
     let released = if let Some(leases) = state.execution_leases.lock().unwrap().get_mut(subject) {
         if let Some(index) = leases.iter().position(|value| value == token) {
             leases.remove(index);
             true
-        } else { false }
-    } else { false };
+        } else {
+            false
+        }
+    } else {
+        false
+    };
     Json(json!({ "released": released })).into_response()
 }
 
@@ -814,6 +886,12 @@ fn with_timeout(mut route: RouteRule, timeout_ms: u64) -> RouteRule {
     route
 }
 
+fn with_edge(mut route: RouteRule, prefix: &str, admin_token_env: &str) -> RouteRule {
+    route.strip_prefix = Some(prefix.into());
+    route.admin_token_env = Some(admin_token_env.into());
+    route
+}
+
 async fn spawn_gateway(config: Config, routes: Vec<RouteRule>) -> TestServer {
     spawn(create_app(config, routes).unwrap()).await
 }
@@ -913,13 +991,65 @@ fn routes_yaml_loads_and_validates() {
         find_route(&routes, "/v1/platform/me").unwrap().auth,
         AuthMode::Jwt
     );
+    for (path, url_env, default_target, token_env) in [
+        (
+            "/v1/platform/edge/dns",
+            "SYNAPSEDNS_SERVICE_URL",
+            "http://synapsedns:4014",
+            "SYNAPSEDNS_ADMIN_TOKEN",
+        ),
+        (
+            "/v1/platform/edge/tunnel",
+            "SYNAPSETUNNEL_SERVICE_URL",
+            "http://synapsetunnel:4015",
+            "SYNAPSETUNNEL_ADMIN_TOKEN",
+        ),
+    ] {
+        let edge = find_route(&routes, path).unwrap();
+        assert_eq!(edge.auth, AuthMode::Jwt);
+        assert_eq!(edge.service.as_deref(), Some("platform"));
+        assert_eq!(edge.strip_prefix.as_deref(), Some(path));
+        assert_eq!(edge.admin_token_env.as_deref(), Some(token_env));
+        assert_eq!(
+            edge.target,
+            std::env::var(url_env).unwrap_or_else(|_| default_target.to_string())
+        );
+        let child = format!("{path}/v1/zones");
+        let read_action = action_for(edge, "GET", &child).unwrap();
+        let delete_action = action_for(edge, "DELETE", &child).unwrap();
+        assert_eq!(read_action, "platform:Read");
+        assert_eq!(delete_action, "platform:Write");
+        assert!(scope_allows(
+            &["platform:read".into()],
+            &child,
+            "GET",
+            Some("platform"),
+            Some(&read_action),
+        ));
+        assert!(scope_allows(
+            &["platform:write".into()],
+            &child,
+            "DELETE",
+            Some("platform"),
+            Some(&delete_action),
+        ));
+        assert!(!scope_allows(
+            &["platform:read".into()],
+            &child,
+            "DELETE",
+            Some("platform"),
+            Some(&delete_action),
+        ));
+    }
     assert_eq!(
         find_route(&routes, "/webhook").unwrap().timeout_ms,
         Some(300_000)
     );
     // `?wait=1` workflow calls may run for the full 300 s budget.
     assert_eq!(
-        find_route(&routes, "/v1/workflows/x/execute").unwrap().timeout_ms,
+        find_route(&routes, "/v1/workflows/x/execute")
+            .unwrap()
+            .timeout_ms,
         Some(300_000)
     );
     // Runner job protocols accept machine credentials only, never user JWTs.
@@ -928,10 +1058,7 @@ fn routes_yaml_loads_and_validates() {
         AuthMode::ApiKey
     );
     // Anonymous MCP is disabled at the edge; the gateway requires a credential.
-    assert_eq!(
-        find_route(&routes, "/mcp").unwrap().auth,
-        AuthMode::Either
-    );
+    assert_eq!(find_route(&routes, "/mcp").unwrap().auth, AuthMode::Either);
     for route in &routes {
         if route.auth != AuthMode::None {
             assert!(
@@ -974,6 +1101,87 @@ fn routes_yaml_rejects_operator_typos() {
 }
 
 #[test]
+fn edge_route_validation_is_narrow() {
+    let valid = parse_routes_yaml(
+        "routes:\n  - path: /v1/platform/edge/dns\n    target: http://dns:4014\n    auth: jwt\n    service: platform\n    stripPrefix: /v1/platform/edge/dns\n    adminTokenEnv: SYNAPSEDNS_ADMIN_TOKEN\n",
+    )
+    .unwrap();
+    assert_eq!(
+        valid[0].strip_prefix.as_deref(),
+        Some("/v1/platform/edge/dns")
+    );
+    assert_eq!(
+        valid[0].admin_token_env.as_deref(),
+        Some("SYNAPSEDNS_ADMIN_TOKEN")
+    );
+
+    let document = |path: &str, auth: &str, service: &str, extra: &str| {
+        format!(
+            "routes:\n  - path: {path}\n    target: http://edge:1\n    auth: {auth}\n    service: {service}\n{extra}"
+        )
+    };
+    for (yaml, expected) in [
+        (
+            document(
+                "/v1/platform/edge/dns",
+                "jwt",
+                "platform",
+                "    stripPrefix: /v1/platform/edge/*\n    adminTokenEnv: SYNAPSEDNS_ADMIN_TOKEN\n",
+            ),
+            "invalid stripPrefix",
+        ),
+        (
+            document(
+                "/v1/platform/edge/dns",
+                "jwt",
+                "platform",
+                "    stripPrefix: /v1/platform/edge/dns/zones\n    adminTokenEnv: SYNAPSEDNS_ADMIN_TOKEN\n",
+            ),
+            "must equal the route path or be its path-segment ancestor",
+        ),
+        (
+            document(
+                "/v1/platform/edge/dns",
+                "either",
+                "platform",
+                "    adminTokenEnv: SYNAPSEDNS_ADMIN_TOKEN\n",
+            ),
+            "adminTokenEnv is only allowed",
+        ),
+        (
+            document(
+                "/v1/platform/edge/dns",
+                "jwt",
+                "iam",
+                "    adminTokenEnv: SYNAPSEDNS_ADMIN_TOKEN\n",
+            ),
+            "adminTokenEnv is only allowed",
+        ),
+        (
+            document(
+                "/v1/platform-other/edge/dns",
+                "jwt",
+                "platform",
+                "    adminTokenEnv: SYNAPSEDNS_ADMIN_TOKEN\n",
+            ),
+            "adminTokenEnv is only allowed",
+        ),
+        (
+            document(
+                "/v1/platform/edge/dns",
+                "jwt",
+                "platform",
+                "    adminTokenEnv: ''\n",
+            ),
+            "invalid adminTokenEnv",
+        ),
+    ] {
+        let error = parse_routes_yaml(&yaml).unwrap_err();
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[test]
 fn expand_env_uses_env_then_default() {
     std::env::set_var("SYNAPSEONE_GATEWAY_TEST_EXPAND", "from-env");
     assert_eq!(
@@ -984,6 +1192,10 @@ fn expand_env_uses_env_then_default() {
     assert_eq!(
         expand_env("${SYNAPSEONE_GATEWAY_TEST_EXPAND:http://default}"),
         "http://default"
+    );
+    assert_eq!(
+        expand_env("${SYNAPSEONE_GATEWAY_TEST_EXPAND:-http://shell-default}"),
+        "http://shell-default"
     );
 }
 
@@ -1097,8 +1309,14 @@ fn platform_runner_kind_and_binding_are_stamped() {
 
 #[test]
 fn canonical_policy_path_normalizes_encoded_traversal() {
-    assert_eq!(canonical_policy_path("/v1/base/x").as_deref(), Some("/v1/base/x"));
-    assert_eq!(canonical_policy_path("/v1//base/./x").as_deref(), Some("/v1/base/x"));
+    assert_eq!(
+        canonical_policy_path("/v1/base/x").as_deref(),
+        Some("/v1/base/x")
+    );
+    assert_eq!(
+        canonical_policy_path("/v1//base/./x").as_deref(),
+        Some("/v1/base/x")
+    );
     assert_eq!(
         canonical_policy_path("/v1/base/../iam/orgs").as_deref(),
         Some("/v1/iam/orgs")
@@ -1137,7 +1355,10 @@ fn exec_delegated_policy_is_data_plane_only() {
         "/v1/inference-jobs/x",
     ] {
         let canonical = canonical_policy_path(path).unwrap();
-        assert!(exec_delegated_request_allowed("GET", path, &canonical), "{path}");
+        assert!(
+            exec_delegated_request_allowed("GET", path, &canonical),
+            "{path}"
+        );
     }
     for path in [
         "/v1/orgs",
@@ -1165,7 +1386,10 @@ fn exec_delegated_policy_is_data_plane_only() {
         "/v1/queue/queues/q/stats",
     ] {
         let canonical = canonical_policy_path(path).unwrap();
-        assert!(!exec_delegated_request_allowed("GET", path, &canonical), "{path}");
+        assert!(
+            !exec_delegated_request_allowed("GET", path, &canonical),
+            "{path}"
+        );
     }
     let queue_publish = "/v1/queue/queues/q/messages";
     assert!(exec_delegated_request_allowed(
@@ -1754,14 +1978,46 @@ fn trust_proxy_and_config_guards() {
     assert!(validate_security_config(true, false, AuthzMode::Off, false, "").is_err());
     assert!(validate_security_config(true, true, AuthzMode::Off, true, "").is_err());
     assert!(validate_security_config(true, true, AuthzMode::Audit, true, "").is_err());
-    assert!(validate_security_config(true, true, AuthzMode::Audit, true, "owner=security;expires=2030-12-01").is_ok());
-    assert!(validate_security_config(true, true, AuthzMode::Audit, true, "owner=security;expires=2030-12-01;reason=migration").is_ok());
+    assert!(validate_security_config(
+        true,
+        true,
+        AuthzMode::Audit,
+        true,
+        "owner=security;expires=2030-12-01"
+    )
+    .is_ok());
+    assert!(validate_security_config(
+        true,
+        true,
+        AuthzMode::Audit,
+        true,
+        "owner=security;expires=2030-12-01;reason=migration"
+    )
+    .is_ok());
     // An audit override without an owner or with a missing/malformed/past
     // expiry must fail closed: otherwise audit mode is an indefinite hole.
-    assert!(validate_security_config(true, true, AuthzMode::Audit, true, "expires=2030-12-01").is_err());
-    assert!(validate_security_config(true, true, AuthzMode::Audit, true, "owner=security").is_err());
-    assert!(validate_security_config(true, true, AuthzMode::Audit, true, "owner=security;expires=soon").is_err());
-    assert!(validate_security_config(true, true, AuthzMode::Audit, true, "owner=security;expires=2000-01-01").is_err());
+    assert!(
+        validate_security_config(true, true, AuthzMode::Audit, true, "expires=2030-12-01").is_err()
+    );
+    assert!(
+        validate_security_config(true, true, AuthzMode::Audit, true, "owner=security").is_err()
+    );
+    assert!(validate_security_config(
+        true,
+        true,
+        AuthzMode::Audit,
+        true,
+        "owner=security;expires=soon"
+    )
+    .is_err());
+    assert!(validate_security_config(
+        true,
+        true,
+        AuthzMode::Audit,
+        true,
+        "owner=security;expires=2000-01-01"
+    )
+    .is_err());
     assert!(validate_security_config(true, true, AuthzMode::Enforce, true, "").is_ok());
     assert!(validate_security_config(false, false, AuthzMode::Off, true, "").is_ok());
     let mut prod = test_config("http://127.0.0.1:1");
@@ -2314,7 +2570,10 @@ async fn api_key_verification_and_fail_closed() {
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
-    assert_eq!(upstream.header("x-synapseone-key-id").as_deref(), Some("key-1"));
+    assert_eq!(
+        upstream.header("x-synapseone-key-id").as_deref(),
+        Some("key-1")
+    );
 
     // A user-bound key (verified IAM `user_id`) must reach the upstream as the
     // real user with `kind=apikey` preserved, on both header spellings, and any
@@ -2580,7 +2839,7 @@ async fn session_revocation_cache_and_fail_closed() {
     let rejected = service
         .validate_jwt_session(
             "tok-sa-suspended",
-            &json!({ "kind": "service-account", "sub": "sa1" })
+            &json!({ "kind": "service-account", "sub": "sa1" }),
         )
         .await
         .unwrap();
@@ -2590,7 +2849,7 @@ async fn session_revocation_cache_and_fail_closed() {
     let rejected = service
         .validate_jwt_session(
             "tok-sa-suspended",
-            &json!({ "kind": "service-account", "sub": "sa1" })
+            &json!({ "kind": "service-account", "sub": "sa1" }),
         )
         .await
         .unwrap();
@@ -2654,10 +2913,18 @@ async fn inference_quota_per_tenant() {
         scopes: vec!["*"],
         owner: None,
     });
-    mock.set_quota_override("o1", "inference", quota_override("o1", "inference", json!({
-        "requestsPerMin": 2, "requestsPer5h": 600, "requestsPerDay": 2880,
-        "tokensPerDay": null, "executionsPerHour": null, "concurrentExecutions": null,
-    })));
+    mock.set_quota_override(
+        "o1",
+        "inference",
+        quota_override(
+            "o1",
+            "inference",
+            json!({
+                "requestsPerMin": 2, "requestsPer5h": 600, "requestsPerDay": 2880,
+                "tokensPerDay": null, "executionsPerHour": null, "concurrentExecutions": null,
+            }),
+        ),
+    );
     let mut config = test_config(&iam.base);
     config.quota_defaults.inference.rpm = 2;
     let routes = vec![with_actions(
@@ -2698,18 +2965,45 @@ async fn inference_quota_per_tenant() {
 
 #[test]
 fn quota_service_routing_matches_typescript_reference() {
-    assert_eq!(quota_service_for_route("/v1/ai/agent"), Some(QuotaService::Ai));
-    assert_eq!(quota_service_for_route("/v1/inference/chat/completions"), Some(QuotaService::Inference));
-    assert_eq!(quota_service_for_route("/v1/workflows/w1/test-run"), Some(QuotaService::Workflow));
-    assert_eq!(quota_service_for_route("/mcp"), Some(QuotaService::Workflow));
+    assert_eq!(
+        quota_service_for_route("/v1/ai/agent"),
+        Some(QuotaService::Ai)
+    );
+    assert_eq!(
+        quota_service_for_route("/v1/inference/chat/completions"),
+        Some(QuotaService::Inference)
+    );
+    assert_eq!(
+        quota_service_for_route("/v1/workflows/w1/test-run"),
+        Some(QuotaService::Workflow)
+    );
+    assert_eq!(
+        quota_service_for_route("/mcp"),
+        Some(QuotaService::Workflow)
+    );
     assert!(!consumes_workflow_execution("POST", "/mcp"));
     assert_eq!(quota_service_for_route("/v1/base/collections"), None);
-    assert!(consumes_workflow_execution("POST", "/v1/workflows/w1/execute"));
-    assert!(consumes_workflow_execution("POST", "/v1/workflows/w1/test-run"));
-    assert!(consumes_workflow_execution("POST", "/v1/workflows/test-run"));
+    assert!(consumes_workflow_execution(
+        "POST",
+        "/v1/workflows/w1/execute"
+    ));
+    assert!(consumes_workflow_execution(
+        "POST",
+        "/v1/workflows/w1/test-run"
+    ));
+    assert!(consumes_workflow_execution(
+        "POST",
+        "/v1/workflows/test-run"
+    ));
     assert!(consumes_workflow_execution("POST", "/v1/inference-jobs"));
-    assert!(!consumes_workflow_execution("POST", "/v1/inference-jobs/j1/complete"));
-    assert!(!consumes_workflow_execution("GET", "/v1/workflows/w1/execute"));
+    assert!(!consumes_workflow_execution(
+        "POST",
+        "/v1/inference-jobs/j1/complete"
+    ));
+    assert!(!consumes_workflow_execution(
+        "GET",
+        "/v1/workflows/w1/execute"
+    ));
 }
 
 // ---------- shared IAM/Valkey quota admission ----------
@@ -2726,19 +3020,43 @@ fn quota_override(org: &str, service: &str, body: Value) -> Value {
 async fn ai_quota_override_uses_shared_minute_admission() {
     let (iam, mock) = MockIam::spawn().await;
     let upstream = Upstream::spawn().await;
-    mock.set_key(KeyMode::Valid { account: "a1", org: "o1", scopes: vec!["*"], owner: None });
-    mock.set_quota_override("o1", "ai", quota_override("o1", "ai", json!({
-        "requestsPerMin": 2,
-        "requestsPer5h": 600,
-        "requestsPerDay": 2880,
-        "tokensPerDay": null,
-        "executionsPerHour": null,
-        "concurrentExecutions": null,
-    })));
-    let gateway = spawn_gateway(test_config(&iam.base), vec![with_service(
-        route("/v1/ai", upstream.base(), AuthMode::Either), "ai",
-    )]).await;
-    let hit = || http().post(format!("{}/v1/ai/agent", gateway.base)).header("x-api-key", "k").json(&json!({})).send();
+    mock.set_key(KeyMode::Valid {
+        account: "a1",
+        org: "o1",
+        scopes: vec!["*"],
+        owner: None,
+    });
+    mock.set_quota_override(
+        "o1",
+        "ai",
+        quota_override(
+            "o1",
+            "ai",
+            json!({
+                "requestsPerMin": 2,
+                "requestsPer5h": 600,
+                "requestsPerDay": 2880,
+                "tokensPerDay": null,
+                "executionsPerHour": null,
+                "concurrentExecutions": null,
+            }),
+        ),
+    );
+    let gateway = spawn_gateway(
+        test_config(&iam.base),
+        vec![with_service(
+            route("/v1/ai", upstream.base(), AuthMode::Either),
+            "ai",
+        )],
+    )
+    .await;
+    let hit = || {
+        http()
+            .post(format!("{}/v1/ai/agent", gateway.base))
+            .header("x-api-key", "k")
+            .json(&json!({}))
+            .send()
+    };
     assert_eq!(hit().await.unwrap().status(), 200);
     assert_eq!(hit().await.unwrap().status(), 200);
     let limited = hit().await.unwrap();
@@ -2759,19 +3077,42 @@ async fn ai_quota_override_uses_shared_minute_admission() {
 async fn five_hour_and_day_denials_return_binding_window_and_retry_after() {
     let (iam, mock) = MockIam::spawn().await;
     let upstream = Upstream::spawn().await;
-    mock.set_key(KeyMode::Valid { account: "a1", org: "o5", scopes: vec!["*"], owner: None });
-    let gateway = spawn_gateway(test_config(&iam.base), vec![with_service(
-        route("/v1/inference", upstream.base(), AuthMode::Either), "inference",
-    )]).await;
+    mock.set_key(KeyMode::Valid {
+        account: "a1",
+        org: "o5",
+        scopes: vec!["*"],
+        owner: None,
+    });
+    let gateway = spawn_gateway(
+        test_config(&iam.base),
+        vec![with_service(
+            route("/v1/inference", upstream.base(), AuthMode::Either),
+            "inference",
+        )],
+    )
+    .await;
     for (window, retry) in [("fiveHour", 1234), ("day", 4321)] {
         mock.set_check_result(Some(json!({
             "allowed": false, "window": window, "count": 100, "limit": 100,
             "retryAfterSeconds": retry, "resetAt": "2026-11-27T00:00:00.000Z",
         })));
-        let response = http().post(format!("{}/v1/inference/chat/completions", gateway.base))
-            .header("x-api-key", "k").json(&json!({})).send().await.unwrap();
+        let response = http()
+            .post(format!("{}/v1/inference/chat/completions", gateway.base))
+            .header("x-api-key", "k")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(response.status(), 429);
-        assert_eq!(response.headers().get("retry-after").unwrap().to_str().unwrap(), retry.to_string());
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            retry.to_string()
+        );
         let body: Value = response.json().await.unwrap();
         assert_eq!(body["window"], window);
         assert_eq!(body["retryAfterSeconds"], retry);
@@ -2785,7 +3126,12 @@ async fn iam_and_valkey_outages_fall_back_to_local_minute_limiter() {
     for valkey_outage in [false, true] {
         let (iam, mock) = MockIam::spawn().await;
         let upstream = Upstream::spawn().await;
-        mock.set_key(KeyMode::Valid { account: "a1", org: "o6", scopes: vec!["*"], owner: None });
+        mock.set_key(KeyMode::Valid {
+            account: "a1",
+            org: "o6",
+            scopes: vec!["*"],
+            owner: None,
+        });
         if valkey_outage {
             mock.set_quota_override("o6", "ai", quota_override("o6", "ai", json!({
                 "requestsPerMin": 2, "requestsPer5h": 600, "requestsPerDay": 2880,
@@ -2797,10 +3143,21 @@ async fn iam_and_valkey_outages_fall_back_to_local_minute_limiter() {
         }
         let mut config = test_config(&iam.base);
         config.quota_defaults.ai.rpm = 2;
-        let gateway = spawn_gateway(config, vec![with_service(
-            route("/v1/ai", upstream.base(), AuthMode::Either), "ai",
-        )]).await;
-        let hit = || http().post(format!("{}/v1/ai/agent", gateway.base)).header("x-api-key", "k").json(&json!({})).send();
+        let gateway = spawn_gateway(
+            config,
+            vec![with_service(
+                route("/v1/ai", upstream.base(), AuthMode::Either),
+                "ai",
+            )],
+        )
+        .await;
+        let hit = || {
+            http()
+                .post(format!("{}/v1/ai/agent", gateway.base))
+                .header("x-api-key", "k")
+                .json(&json!({}))
+                .send()
+        };
         assert_eq!(hit().await.unwrap().status(), 200);
         assert_eq!(hit().await.unwrap().status(), 200);
         let limited = hit().await.unwrap();
@@ -2817,18 +3174,52 @@ async fn policy_denied_and_authz_unavailable_requests_do_not_consume_quota() {
     for unavailable in [false, true] {
         let (iam, mock) = MockIam::spawn().await;
         let upstream = Upstream::spawn().await;
-        mock.set_key(KeyMode::Valid { account: "a1", org: "o-authz", scopes: vec!["*"], owner: None });
-        mock.set_authz(if unavailable { AuthzMock::Error } else { AuthzMock::Deny("policy-deny") });
+        mock.set_key(KeyMode::Valid {
+            account: "a1",
+            org: "o-authz",
+            scopes: vec!["*"],
+            owner: None,
+        });
+        mock.set_authz(if unavailable {
+            AuthzMock::Error
+        } else {
+            AuthzMock::Deny("policy-deny")
+        });
         let mut config = test_config(&iam.base);
         config.authz_mode = AuthzMode::Enforce;
-        let gateway = spawn_gateway(config, vec![with_service(
-            route("/v1/ai", upstream.base(), AuthMode::Either), "ai",
-        )]).await;
-        let response = http().post(format!("{}/v1/ai/agent", gateway.base))
-            .header("x-api-key", "k").json(&json!({})).send().await.unwrap();
-        assert_eq!(response.status(), if unavailable { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::FORBIDDEN });
-        assert_eq!(mock.quota_hits(), 0, "effective lookup must wait for authorization");
-        assert_eq!(mock.check_hits(), 0, "denied request must not increment shared counters");
+        let gateway = spawn_gateway(
+            config,
+            vec![with_service(
+                route("/v1/ai", upstream.base(), AuthMode::Either),
+                "ai",
+            )],
+        )
+        .await;
+        let response = http()
+            .post(format!("{}/v1/ai/agent", gateway.base))
+            .header("x-api-key", "k")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if unavailable {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::FORBIDDEN
+            }
+        );
+        assert_eq!(
+            mock.quota_hits(),
+            0,
+            "effective lookup must wait for authorization"
+        );
+        assert_eq!(
+            mock.check_hits(),
+            0,
+            "denied request must not increment shared counters"
+        );
         assert_eq!(upstream.hits(), 0);
     }
 }
@@ -2838,25 +3229,54 @@ async fn service_account_jwt_resolves_owning_org_for_quota_attribution() {
     let (iam, mock) = MockIam::spawn().await;
     mock.set_verify_org("o-sa");
     let upstream = Upstream::spawn().await;
-    mock.set_quota_override("o-sa", "ai", quota_override("o-sa", "ai", json!({
-        "requestsPerMin": 1, "requestsPer5h": 300, "requestsPerDay": 1440,
-        "tokensPerDay": null, "executionsPerHour": null, "concurrentExecutions": null,
-    })));
-    let gateway = spawn_gateway(test_config(&iam.base), vec![with_service(
-        route("/v1/ai", upstream.base(), AuthMode::Either), "ai",
-    )]).await;
+    mock.set_quota_override(
+        "o-sa",
+        "ai",
+        quota_override(
+            "o-sa",
+            "ai",
+            json!({
+                "requestsPerMin": 1, "requestsPer5h": 300, "requestsPerDay": 1440,
+                "tokensPerDay": null, "executionsPerHour": null, "concurrentExecutions": null,
+            }),
+        ),
+    );
+    let gateway = spawn_gateway(
+        test_config(&iam.base),
+        vec![with_service(
+            route("/v1/ai", upstream.base(), AuthMode::Either),
+            "ai",
+        )],
+    )
+    .await;
     let token = sign(json!({
         "sub": "sa1", "kind": "service-account", "account": "a1", "scopes": ["*"],
         "iss": TEST_ISSUER, "exp": now_ts() + 300,
     }));
-    let hit = || http().post(format!("{}/v1/ai/agent", gateway.base)).bearer_auth(&token).json(&json!({})).send();
+    let hit = || {
+        http()
+            .post(format!("{}/v1/ai/agent", gateway.base))
+            .bearer_auth(&token)
+            .json(&json!({}))
+            .send()
+    };
     assert_eq!(hit().await.unwrap().status(), 200);
     assert_eq!(hit().await.unwrap().status(), 429);
     assert!(mock.quota_hits() >= 1);
     assert_eq!(mock.check_body().unwrap()["subject"], "org:o-sa");
-    assert_eq!(upstream.header("x-synapseone-account").as_deref(), Some("a1"));
-    assert_eq!(upstream.header("x-synapseone-org"), None, "attribution must not widen service-account authorization");
-    assert_eq!(upstream.header("x-synapseone-quota-org").as_deref(), Some("o-sa"));
+    assert_eq!(
+        upstream.header("x-synapseone-account").as_deref(),
+        Some("a1")
+    );
+    assert_eq!(
+        upstream.header("x-synapseone-org"),
+        None,
+        "attribution must not widen service-account authorization"
+    );
+    assert_eq!(
+        upstream.header("x-synapseone-quota-org").as_deref(),
+        Some("o-sa")
+    );
 }
 
 #[tokio::test]
@@ -2864,46 +3284,96 @@ async fn service_account_quota_attribution_works_with_zero_session_cache_ttl() {
     let (iam, mock) = MockIam::spawn().await;
     mock.set_verify_org("o-sa");
     let upstream = Upstream::spawn().await;
-    mock.set_quota_override("o-sa", "ai", quota_override("o-sa", "ai", json!({
-        "requestsPerMin": 1, "requestsPer5h": 300, "requestsPerDay": 1440,
-        "tokensPerDay": null, "executionsPerHour": null, "concurrentExecutions": null,
-    })));
+    mock.set_quota_override(
+        "o-sa",
+        "ai",
+        quota_override(
+            "o-sa",
+            "ai",
+            json!({
+                "requestsPerMin": 1, "requestsPer5h": 300, "requestsPerDay": 1440,
+                "tokensPerDay": null, "executionsPerHour": null, "concurrentExecutions": null,
+            }),
+        ),
+    );
     let mut config = test_config(&iam.base);
     config.session_cache_ttl = Duration::ZERO;
-    let gateway = spawn_gateway(config, vec![with_service(
-        route("/v1/ai", upstream.base(), AuthMode::Either), "ai",
-    )]).await;
+    let gateway = spawn_gateway(
+        config,
+        vec![with_service(
+            route("/v1/ai", upstream.base(), AuthMode::Either),
+            "ai",
+        )],
+    )
+    .await;
     let token = sign(json!({
         "sub": "sa1", "kind": "service-account", "account": "a1", "scopes": ["*"],
         "iss": TEST_ISSUER, "exp": now_ts() + 300,
     }));
-    let hit = || http().post(format!("{}/v1/ai/agent", gateway.base)).bearer_auth(&token).json(&json!({})).send();
+    let hit = || {
+        http()
+            .post(format!("{}/v1/ai/agent", gateway.base))
+            .bearer_auth(&token)
+            .json(&json!({}))
+            .send()
+    };
     assert_eq!(hit().await.unwrap().status(), 200);
     assert_eq!(hit().await.unwrap().status(), 429);
     assert_eq!(mock.check_body().unwrap()["subject"], "org:o-sa");
     assert_eq!(upstream.header("x-synapseone-org"), None);
-    assert_eq!(upstream.header("x-synapseone-quota-org").as_deref(), Some("o-sa"));
+    assert_eq!(
+        upstream.header("x-synapseone-quota-org").as_deref(),
+        Some("o-sa")
+    );
 }
 
 #[tokio::test]
 async fn mcp_batch_is_request_metered_without_buffering() {
     let (iam, mock) = MockIam::spawn().await;
     let upstream = Upstream::spawn().await;
-    mock.set_key(KeyMode::Valid { account: "a1", org: "o-mcp", scopes: vec!["*"], owner: None });
-    mock.set_quota_override("o-mcp", "workflow", quota_override("o-mcp", "workflow", json!({
-        "requestsPerMin": 1, "requestsPer5h": 300, "requestsPerDay": 1440,
-        "tokensPerDay": null, "executionsPerHour": null, "concurrentExecutions": null,
-    })));
-    let gateway = spawn_gateway(test_config(&iam.base), vec![with_service(
-        route("/mcp", upstream.base(), AuthMode::Either), "workflow",
-    )]).await;
+    mock.set_key(KeyMode::Valid {
+        account: "a1",
+        org: "o-mcp",
+        scopes: vec!["*"],
+        owner: None,
+    });
+    mock.set_quota_override(
+        "o-mcp",
+        "workflow",
+        quota_override(
+            "o-mcp",
+            "workflow",
+            json!({
+                "requestsPerMin": 1, "requestsPer5h": 300, "requestsPerDay": 1440,
+                "tokensPerDay": null, "executionsPerHour": null, "concurrentExecutions": null,
+            }),
+        ),
+    );
+    let gateway = spawn_gateway(
+        test_config(&iam.base),
+        vec![with_service(
+            route("/mcp", upstream.base(), AuthMode::Either),
+            "workflow",
+        )],
+    )
+    .await;
     let batch = json!([
         { "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "one" } },
         { "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "two" } },
     ]);
-    let send = || http().post(format!("{}/mcp", gateway.base)).header("x-api-key", "k").json(&batch).send();
+    let send = || {
+        http()
+            .post(format!("{}/mcp", gateway.base))
+            .header("x-api-key", "k")
+            .json(&batch)
+            .send()
+    };
     assert_eq!(send().await.unwrap().status(), 200);
-    assert_eq!(upstream.body(), serde_json::to_vec(&batch).unwrap(), "gateway must forward the batch body unchanged");
+    assert_eq!(
+        upstream.body(),
+        serde_json::to_vec(&batch).unwrap(),
+        "gateway must forward the batch body unchanged"
+    );
     let limited = send().await.unwrap();
     assert_eq!(limited.status(), 429);
     let body: Value = limited.json().await.unwrap();
@@ -2912,15 +3382,27 @@ async fn mcp_batch_is_request_metered_without_buffering() {
 }
 
 async fn admit_mcp_execution(iam: &TestServer, subject: &str, hour: u64, concurrent: u64) -> Value {
-    http().post(format!("{}/internal/workflow/execution/check", iam.base))
+    http()
+        .post(format!("{}/internal/workflow/execution/check", iam.base))
         .json(&json!({ "subject": subject, "limits": { "hour": hour, "concurrent": concurrent } }))
-        .send().await.unwrap().json().await.unwrap()
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
 }
 
 async fn release_mcp_execution(iam: &TestServer, subject: &str, token: &str) -> Value {
-    http().post(format!("{}/internal/workflow/execution/release", iam.base))
+    http()
+        .post(format!("{}/internal/workflow/execution/release", iam.base))
         .json(&json!({ "subject": subject, "token": token }))
-        .send().await.unwrap().json().await.unwrap()
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -2928,21 +3410,48 @@ async fn workflow_execution_lease_releases_after_proxy_response() {
     let (iam, mock) = MockIam::spawn().await;
     let upstream = Upstream::spawn().await;
     upstream.set_delay(400);
-    mock.set_key(KeyMode::Valid { account: "a1", org: "o7", scopes: vec!["*"], owner: None });
-    mock.set_quota_override("o7", "workflow", quota_override("o7", "workflow", json!({
-        "requestsPerMin": 100, "requestsPer5h": 30000, "requestsPerDay": 144000,
-        "tokensPerDay": null, "executionsPerHour": null, "concurrentExecutions": 1,
-    })));
-    let gateway = spawn_gateway(test_config(&iam.base), vec![with_service(
-        route("/v1/workflows", upstream.base(), AuthMode::Either), "workflow",
-    )]).await;
-    let execute = || http().post(format!("{}/v1/workflows/w1/execute", gateway.base))
-        .header("x-api-key", "k").json(&json!({})).send();
+    mock.set_key(KeyMode::Valid {
+        account: "a1",
+        org: "o7",
+        scopes: vec!["*"],
+        owner: None,
+    });
+    mock.set_quota_override(
+        "o7",
+        "workflow",
+        quota_override(
+            "o7",
+            "workflow",
+            json!({
+                "requestsPerMin": 100, "requestsPer5h": 30000, "requestsPerDay": 144000,
+                "tokensPerDay": null, "executionsPerHour": null, "concurrentExecutions": 1,
+            }),
+        ),
+    );
+    let gateway = spawn_gateway(
+        test_config(&iam.base),
+        vec![with_service(
+            route("/v1/workflows", upstream.base(), AuthMode::Either),
+            "workflow",
+        )],
+    )
+    .await;
+    let execute = || {
+        http()
+            .post(format!("{}/v1/workflows/w1/execute", gateway.base))
+            .header("x-api-key", "k")
+            .json(&json!({}))
+            .send()
+    };
     let (first, second) = tokio::join!(execute(), execute());
     let mut statuses = [first.unwrap().status(), second.unwrap().status()];
     statuses.sort();
     assert_eq!(statuses, [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS]);
-    assert_eq!(mock.check_hits(), 1, "concurrency denial must not consume request quota");
+    assert_eq!(
+        mock.check_hits(),
+        1,
+        "concurrency denial must not consume request quota"
+    );
     assert_eq!(mock.execution_body().unwrap()["subject"], "org:o7");
     assert_eq!(mock.execution_body().unwrap()["limits"]["concurrent"], 1);
     assert_eq!(execute().await.unwrap().status(), 200);
@@ -2954,29 +3463,60 @@ async fn workflow_execution_lease_releases_after_proxy_response() {
 async fn mcp_and_normal_executions_share_the_hour_budget() {
     let (iam, mock) = MockIam::spawn().await;
     let upstream = Upstream::spawn().await;
-    mock.set_key(KeyMode::Valid { account: "a1", org: "o-mixed", scopes: vec!["*"], owner: None });
-    mock.set_quota_override("o-mixed", "workflow", quota_override("o-mixed", "workflow", json!({
-        "requestsPerMin": 100, "requestsPer5h": 30000, "requestsPerDay": 144000,
-        "tokensPerDay": null, "executionsPerHour": 2, "concurrentExecutions": 10,
-    })));
-    let gateway = spawn_gateway(test_config(&iam.base), vec![with_service(
-        route("/v1/workflows", upstream.base(), AuthMode::Either), "workflow",
-    )]).await;
+    mock.set_key(KeyMode::Valid {
+        account: "a1",
+        org: "o-mixed",
+        scopes: vec!["*"],
+        owner: None,
+    });
+    mock.set_quota_override(
+        "o-mixed",
+        "workflow",
+        quota_override(
+            "o-mixed",
+            "workflow",
+            json!({
+                "requestsPerMin": 100, "requestsPer5h": 30000, "requestsPerDay": 144000,
+                "tokensPerDay": null, "executionsPerHour": 2, "concurrentExecutions": 10,
+            }),
+        ),
+    );
+    let gateway = spawn_gateway(
+        test_config(&iam.base),
+        vec![with_service(
+            route("/v1/workflows", upstream.base(), AuthMode::Either),
+            "workflow",
+        )],
+    )
+    .await;
 
     // This is the same IAM admission workflow-service makes for an MCP tools/call.
     let mcp = admit_mcp_execution(&iam, "org:o-mixed", 2, 10).await;
     assert_eq!(mcp["allowed"], true);
     assert_eq!(mcp["count"], 1);
-    let execute = || http().post(format!("{}/v1/workflows/w1/execute", gateway.base))
-        .header("x-api-key", "k").json(&json!({})).send();
-    assert_eq!(execute().await.unwrap().status(), 200, "one MCP plus one normal execution reaches the shared cap");
+    let execute = || {
+        http()
+            .post(format!("{}/v1/workflows/w1/execute", gateway.base))
+            .header("x-api-key", "k")
+            .json(&json!({}))
+            .send()
+    };
+    assert_eq!(
+        execute().await.unwrap().status(),
+        200,
+        "one MCP plus one normal execution reaches the shared cap"
+    );
     let denied = execute().await.unwrap();
     assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
     let body: Value = denied.json().await.unwrap();
     assert_eq!(body["window"], "hour");
     assert_eq!(body["limit"], 2);
     assert_eq!(upstream.hits(), 1);
-    assert_eq!(mock.check_hits(), 1, "the denied third execution must not consume request quota");
+    assert_eq!(
+        mock.check_hits(),
+        1,
+        "the denied third execution must not consume request quota"
+    );
     assert_eq!(mock.execution_hits(), 3);
 }
 
@@ -2984,25 +3524,52 @@ async fn mcp_and_normal_executions_share_the_hour_budget() {
 async fn mcp_and_normal_executions_share_the_concurrency_budget() {
     let (iam, mock) = MockIam::spawn().await;
     let upstream = Upstream::spawn().await;
-    mock.set_key(KeyMode::Valid { account: "a1", org: "o-mixed", scopes: vec!["*"], owner: None });
-    mock.set_quota_override("o-mixed", "workflow", quota_override("o-mixed", "workflow", json!({
-        "requestsPerMin": 100, "requestsPer5h": 30000, "requestsPerDay": 144000,
-        "tokensPerDay": null, "executionsPerHour": 100, "concurrentExecutions": 1,
-    })));
-    let gateway = spawn_gateway(test_config(&iam.base), vec![with_service(
-        route("/v1/workflows", upstream.base(), AuthMode::Either), "workflow",
-    )]).await;
+    mock.set_key(KeyMode::Valid {
+        account: "a1",
+        org: "o-mixed",
+        scopes: vec!["*"],
+        owner: None,
+    });
+    mock.set_quota_override(
+        "o-mixed",
+        "workflow",
+        quota_override(
+            "o-mixed",
+            "workflow",
+            json!({
+                "requestsPerMin": 100, "requestsPer5h": 30000, "requestsPerDay": 144000,
+                "tokensPerDay": null, "executionsPerHour": 100, "concurrentExecutions": 1,
+            }),
+        ),
+    );
+    let gateway = spawn_gateway(
+        test_config(&iam.base),
+        vec![with_service(
+            route("/v1/workflows", upstream.base(), AuthMode::Either),
+            "workflow",
+        )],
+    )
+    .await;
 
     let mcp = admit_mcp_execution(&iam, "org:o-mixed", 100, 1).await;
     assert_eq!(mcp["allowed"], true);
-    let execute = || http().post(format!("{}/v1/workflows/w1/execute", gateway.base))
-        .header("x-api-key", "k").json(&json!({})).send();
+    let execute = || {
+        http()
+            .post(format!("{}/v1/workflows/w1/execute", gateway.base))
+            .header("x-api-key", "k")
+            .json(&json!({}))
+            .send()
+    };
     let denied = execute().await.unwrap();
     assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
     let body: Value = denied.json().await.unwrap();
     assert_eq!(body["window"], "concurrent");
     assert_eq!(upstream.hits(), 0);
-    assert_eq!(mock.check_hits(), 0, "mixed-path concurrency denial must not consume request quota");
+    assert_eq!(
+        mock.check_hits(),
+        0,
+        "mixed-path concurrency denial must not consume request quota"
+    );
 
     let released = release_mcp_execution(&iam, "org:o-mixed", mcp["token"].as_str().unwrap()).await;
     assert_eq!(released["released"], true);
@@ -3015,13 +3582,30 @@ async fn mcp_and_normal_executions_share_the_concurrency_budget() {
 async fn normal_execution_fails_closed_when_shared_execution_quota_is_unavailable() {
     let (iam, mock) = MockIam::spawn().await;
     let upstream = Upstream::spawn().await;
-    mock.set_key(KeyMode::Valid { account: "a1", org: "o7", scopes: vec!["*"], owner: None });
-    mock.state.execution_unavailable.store(true, Ordering::SeqCst);
-    let gateway = spawn_gateway(test_config(&iam.base), vec![with_service(
-        route("/v1/workflows", upstream.base(), AuthMode::Either), "workflow",
-    )]).await;
-    let response = http().post(format!("{}/v1/workflows/w1/execute", gateway.base))
-        .header("x-api-key", "k").json(&json!({})).send().await.unwrap();
+    mock.set_key(KeyMode::Valid {
+        account: "a1",
+        org: "o7",
+        scopes: vec!["*"],
+        owner: None,
+    });
+    mock.state
+        .execution_unavailable
+        .store(true, Ordering::SeqCst);
+    let gateway = spawn_gateway(
+        test_config(&iam.base),
+        vec![with_service(
+            route("/v1/workflows", upstream.base(), AuthMode::Either),
+            "workflow",
+        )],
+    )
+    .await;
+    let response = http()
+        .post(format!("{}/v1/workflows/w1/execute", gateway.base))
+        .header("x-api-key", "k")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(upstream.hits(), 0);
     assert_eq!(mock.check_hits(), 0);
@@ -3031,16 +3615,35 @@ async fn normal_execution_fails_closed_when_shared_execution_quota_is_unavailabl
 async fn normal_execution_fails_closed_when_effective_execution_quota_is_unavailable() {
     let (iam, mock) = MockIam::spawn().await;
     let upstream = Upstream::spawn().await;
-    mock.set_key(KeyMode::Valid { account: "a1", org: "o7", scopes: vec!["*"], owner: None });
+    mock.set_key(KeyMode::Valid {
+        account: "a1",
+        org: "o7",
+        scopes: vec!["*"],
+        owner: None,
+    });
     mock.set_quota_unavailable(true);
-    let gateway = spawn_gateway(test_config(&iam.base), vec![with_service(
-        route("/v1/workflows", upstream.base(), AuthMode::Either), "workflow",
-    )]).await;
-    let response = http().post(format!("{}/v1/workflows/w1/execute", gateway.base))
-        .header("x-api-key", "k").json(&json!({})).send().await.unwrap();
+    let gateway = spawn_gateway(
+        test_config(&iam.base),
+        vec![with_service(
+            route("/v1/workflows", upstream.base(), AuthMode::Either),
+            "workflow",
+        )],
+    )
+    .await;
+    let response = http()
+        .post(format!("{}/v1/workflows/w1/execute", gateway.base))
+        .header("x-api-key", "k")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(upstream.hits(), 0);
-    assert_eq!(mock.execution_hits(), 0, "defaults must not bypass an unavailable org override lookup");
+    assert_eq!(
+        mock.execution_hits(),
+        0,
+        "defaults must not bypass an unavailable org override lookup"
+    );
     assert_eq!(mock.check_hits(), 0);
 }
 
@@ -3129,6 +3732,141 @@ async fn proxy_streams_body_paths_queries_and_strips_hop_headers() {
         .unwrap();
     assert_eq!(response.status(), 200);
     assert_eq!(upstream.body(), raw);
+}
+
+#[tokio::test]
+async fn edge_proxy_rewrites_query_replaces_credentials_and_requires_platform_admin() {
+    let (iam, _mock) = MockIam::spawn().await;
+    let upstream = Upstream::spawn().await;
+    let env_name = "SYNAPSEONE_GATEWAY_TEST_DNS_ADMIN_TOKEN";
+    let previous = std::env::var_os(env_name);
+    std::env::set_var(env_name, "dns-server-admin-token");
+    let edge = with_edge(
+        with_service(
+            route("/v1/platform/edge/dns", upstream.base(), AuthMode::Jwt),
+            "platform",
+        ),
+        "/v1/platform/edge/dns",
+        env_name,
+    );
+    let gateway = spawn_gateway(test_config(&iam.base), vec![edge]).await;
+    let client = http();
+
+    let tenant = user_token("tenant-edge-user", "org-1");
+    let response = client
+        .get(format!("{}/v1/platform/edge/dns/zones", gateway.base))
+        .header("authorization", format!("Bearer {tenant}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"],
+        "platform_admin_required"
+    );
+    assert_eq!(
+        upstream.hits(),
+        0,
+        "tenant JWTs must never reach an edge service"
+    );
+
+    let response = client
+        .get(format!("{}/v1/platform/edge/dns/zones", gateway.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        upstream.hits(),
+        0,
+        "anonymous callers must never reach an edge service"
+    );
+
+    let admin = sign(platform_admin_claims("admin-edge-user"));
+    let response = client
+        .get(format!(
+            "{}/v1/platform/edge/dns/zones/example.com?type=TXT&value=a%2Fb&type=MX",
+            gateway.base
+        ))
+        .header("authorization", format!("Bearer {admin}"))
+        .header("x-api-key", "caller-api-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(upstream.hits(), 1);
+    assert_eq!(
+        upstream.path(),
+        "/zones/example.com?type=TXT&value=a%2Fb&type=MX"
+    );
+    assert_eq!(
+        upstream.header("authorization").as_deref(),
+        Some("Bearer dns-server-admin-token")
+    );
+    assert!(upstream.header("x-api-key").is_none());
+    assert_eq!(
+        upstream.header("x-synapseone-kind").as_deref(),
+        Some("platform-admin")
+    );
+
+    let response = client
+        .get(format!("{}/v1/platform/edge/dns?dryRun=1", gateway.base))
+        .header("authorization", format!("Bearer {admin}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(upstream.path(), "/?dryRun=1");
+
+    match previous {
+        Some(value) => std::env::set_var(env_name, value),
+        None => std::env::remove_var(env_name),
+    }
+}
+
+#[tokio::test]
+async fn edge_proxy_fails_closed_when_admin_token_is_missing_or_blank() {
+    let (iam, _mock) = MockIam::spawn().await;
+    let upstream = Upstream::spawn().await;
+    let env_name = "SYNAPSEONE_GATEWAY_TEST_MISSING_EDGE_ADMIN_TOKEN";
+    let previous = std::env::var_os(env_name);
+    std::env::remove_var(env_name);
+    let edge = with_edge(
+        with_service(
+            route("/v1/platform/edge/tunnel", upstream.base(), AuthMode::Jwt),
+            "platform",
+        ),
+        "/v1/platform/edge/tunnel",
+        env_name,
+    );
+    let gateway = spawn_gateway(test_config(&iam.base), vec![edge]).await;
+    let client = http();
+    let admin = sign(platform_admin_claims("admin-edge-user"));
+
+    for value in [None, Some("   ")] {
+        if let Some(value) = value {
+            std::env::set_var(env_name, value);
+        }
+        let response = client
+            .get(format!("{}/v1/platform/edge/tunnel/status", gateway.base))
+            .header("authorization", format!("Bearer {admin}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"], "edge_not_configured");
+        assert_eq!(
+            upstream.hits(),
+            0,
+            "unconfigured edge routes must fail closed"
+        );
+    }
+
+    match previous {
+        Some(value) => std::env::set_var(env_name, value),
+        None => std::env::remove_var(env_name),
+    }
 }
 
 #[tokio::test]
@@ -3831,11 +4569,7 @@ async fn ready_reports_unreachable_lakehouse_as_optional_degradation() {
             required: false,
         },
     ];
-    let gateway = spawn_gateway(
-        config,
-        vec![route("/v1/auth", &iam.base, AuthMode::None)],
-    )
-    .await;
+    let gateway = spawn_gateway(config, vec![route("/v1/auth", &iam.base, AuthMode::None)]).await;
     let response = http()
         .get(format!("{}/ready", gateway.base))
         .send()
@@ -3967,14 +4701,35 @@ async fn exec_delegated_grants_are_data_plane_only_and_checked_every_request() {
     let upstream = Upstream::spawn().await;
     let routes = vec![
         with_service(route("/v1/base", upstream.base(), AuthMode::Either), "base"),
-        with_service(route("/v1/ocs", upstream.base(), AuthMode::Either), "storage"),
-        with_service(route("/v1/queue", upstream.base(), AuthMode::Either), "queue"),
+        with_service(
+            route("/v1/ocs", upstream.base(), AuthMode::Either),
+            "storage",
+        ),
+        with_service(
+            route("/v1/queue", upstream.base(), AuthMode::Either),
+            "queue",
+        ),
         with_service(route("/v1/keys", upstream.base(), AuthMode::Either), "iam"),
-        with_service(route("/v1/accounts", upstream.base(), AuthMode::Either), "iam"),
-        with_service(route("/v1/platform", upstream.base(), AuthMode::Jwt), "platform"),
-        with_service(route("/v1/runner", upstream.base(), AuthMode::Either), "workflow"),
-        with_service(route("/v1/credentials", upstream.base(), AuthMode::Either), "workflow"),
-        with_service(route("/v1/workflows", upstream.base(), AuthMode::Either), "workflow"),
+        with_service(
+            route("/v1/accounts", upstream.base(), AuthMode::Either),
+            "iam",
+        ),
+        with_service(
+            route("/v1/platform", upstream.base(), AuthMode::Jwt),
+            "platform",
+        ),
+        with_service(
+            route("/v1/runner", upstream.base(), AuthMode::Either),
+            "workflow",
+        ),
+        with_service(
+            route("/v1/credentials", upstream.base(), AuthMode::Either),
+            "workflow",
+        ),
+        with_service(
+            route("/v1/workflows", upstream.base(), AuthMode::Either),
+            "workflow",
+        ),
     ];
     let gateway = spawn_gateway(test_config(&iam.base), routes).await;
     let client = http();
@@ -4011,7 +4766,11 @@ async fn exec_delegated_grants_are_data_plane_only_and_checked_every_request() {
         .unwrap();
     assert_eq!(second.status(), StatusCode::OK);
     assert_eq!(upstream.hits(), 2);
-    assert_eq!(mock.verify_hits(), 2, "grant must be verified on every request");
+    assert_eq!(
+        mock.verify_hits(),
+        2,
+        "grant must be verified on every request"
+    );
 
     // Completion/release/runner revocation flips IAM to 401; the next request
     // must not reach the upstream.
@@ -4077,7 +4836,11 @@ async fn exec_delegated_grants_are_data_plane_only_and_checked_every_request() {
         .unwrap();
     assert_eq!(platform.status(), StatusCode::FORBIDDEN);
     assert_eq!(upstream.hits(), hits_before);
-    assert_eq!(mock.verify_hits(), verify_before, "denied paths need no grant check");
+    assert_eq!(
+        mock.verify_hits(),
+        verify_before,
+        "denied paths need no grant check"
+    );
 
     // Encoded/traversal spellings that route to a data-plane prefix are denied.
     for path in [
@@ -4098,10 +4861,7 @@ async fn exec_delegated_grants_are_data_plane_only_and_checked_every_request() {
     // unknown path (/v1/v1/...) is a 404 before auth and is not asserted as a
     // policy 403.
     let hits_before_raw = upstream.hits();
-    for path in [
-        "/v1/base/%2e%2e/v1/workflows",
-        "/v1/base/%2e%2e/iam/orgs",
-    ] {
+    for path in ["/v1/base/%2e%2e/v1/workflows", "/v1/base/%2e%2e/iam/orgs"] {
         let status = raw_get_status(&gateway.base, path, &token).await;
         assert_eq!(status, 403, "{path}");
         assert_eq!(upstream.hits(), hits_before_raw, "{path}");

@@ -72,6 +72,12 @@ pub struct RouteRule {
     pub timeout_ms: Option<u64>,
     pub service: Option<String>,
     pub actions: Vec<ActionOverride>,
+    /// Literal pathname prefix to remove before forwarding. Query strings are
+    /// preserved. The prefix must align with the route at a path boundary.
+    pub strip_prefix: Option<String>,
+    /// Environment variable holding a server-side edge admin credential. The
+    /// caller's Authorization/X-API-Key headers are replaced, never forwarded.
+    pub admin_token_env: Option<String>,
     pub compiled: CompiledPath,
 }
 
@@ -90,6 +96,8 @@ impl RouteRule {
             timeout_ms: None,
             service: None,
             actions: Vec::new(),
+            strip_prefix: None,
+            admin_token_env: None,
             compiled,
         })
     }
@@ -109,6 +117,10 @@ struct RawRoute {
     service: Option<String>,
     #[serde(default)]
     actions: Vec<ActionOverride>,
+    #[serde(rename = "stripPrefix")]
+    strip_prefix: Option<String>,
+    #[serde(rename = "adminTokenEnv")]
+    admin_token_env: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -187,10 +199,11 @@ pub fn find_route<'a>(routes: &'a [RouteRule], pathname: &str) -> Option<&'a Rou
 
 fn expand_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\$\{([^:}]+)(?::([^}]*))?\}").expect("env regex"))
+    RE.get_or_init(|| Regex::new(r"\$\{([^:}]+)(?::-?([^}]*))?\}").expect("env regex"))
 }
 
-/// `${NAME:default}` expansion; a set env var (even empty) wins over default.
+/// `${NAME:-default}` (and legacy `${NAME:default}`) expansion; a set env var
+/// (even empty) wins over default.
 pub fn expand_env(input: &str) -> String {
     expand_regex()
         .replace_all(input, |captures: &regex::Captures<'_>| {
@@ -246,6 +259,8 @@ pub fn load_routes() -> Result<Vec<RouteRule>, String> {
                 timeout_ms: raw_route.timeout_ms,
                 service: raw_route.service,
                 actions: raw_route.actions,
+                strip_prefix: raw_route.strip_prefix,
+                admin_token_env: raw_route.admin_token_env,
                 compiled,
             });
         }
@@ -279,6 +294,54 @@ fn action_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^[a-z][a-z0-9-]*:[A-Za-z]+$").expect("action regex"))
 }
 
+fn admin_token_env_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[A-Z_][A-Z0-9_]*$").expect("admin token env regex"))
+}
+
+fn validate_strip_prefix(route: &RouteRule, prefix: &str) -> Result<(), String> {
+    let invalid_shape = prefix.is_empty()
+        || !prefix.starts_with('/')
+        || prefix.contains('*')
+        || prefix.ends_with('/')
+        || prefix.contains("//")
+        || prefix.contains(['?', '#'])
+        || prefix.chars().any(char::is_control);
+    if invalid_shape {
+        return Err(format!(
+            "[gateway] invalid stripPrefix '{prefix}' for path '{}' (want an absolute literal path without wildcards, query, fragment, empty or trailing segments)",
+            route.path
+        ));
+    }
+    if prefix != route.path && !route.path.starts_with(&format!("{prefix}/")) {
+        return Err(format!(
+            "[gateway] invalid stripPrefix '{prefix}' for path '{}' (must equal the route path or be its path-segment ancestor)",
+            route.path
+        ));
+    }
+    Ok(())
+}
+
+fn validate_admin_token_env(route: &RouteRule, env_name: &str) -> Result<(), String> {
+    if !admin_token_env_regex().is_match(env_name) {
+        return Err(format!(
+            "[gateway] invalid adminTokenEnv '{env_name}' for path '{}' (want an environment variable name)",
+            route.path
+        ));
+    }
+    let is_platform_path = route.path == "/v1/platform" || route.path.starts_with("/v1/platform/");
+    if route.auth != AuthMode::Jwt
+        || route.service.as_deref() != Some("platform")
+        || !is_platform_path
+    {
+        return Err(format!(
+            "[gateway] adminTokenEnv is only allowed on JWT /v1/platform routes with service platform (path '{}')",
+            route.path
+        ));
+    }
+    Ok(())
+}
+
 /// Precompile matchers and fail fast on operator typos: an unknown auth mode
 /// would 401 everything silently and a malformed wildcard would throw later.
 pub fn validate_routes(routes: &[RouteRule]) -> Result<(), String> {
@@ -305,6 +368,12 @@ pub fn validate_routes(routes: &[RouteRule]) -> Result<(), String> {
                     route.path
                 ));
             }
+        }
+        if let Some(prefix) = &route.strip_prefix {
+            validate_strip_prefix(route, prefix)?;
+        }
+        if let Some(env_name) = &route.admin_token_env {
+            validate_admin_token_env(route, env_name)?;
         }
         for action in &route.actions {
             if !action.path.starts_with('/') || !action_regex().is_match(&action.action) {
@@ -340,6 +409,8 @@ pub fn parse_routes_yaml(raw: &str) -> Result<Vec<RouteRule>, String> {
             timeout_ms: raw_route.timeout_ms,
             service: raw_route.service,
             actions: raw_route.actions,
+            strip_prefix: raw_route.strip_prefix,
+            admin_token_env: raw_route.admin_token_env,
             compiled,
         });
     }

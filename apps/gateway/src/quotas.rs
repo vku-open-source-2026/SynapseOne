@@ -72,8 +72,12 @@ pub fn consumes_workflow_execution(method: &str, path: &str) -> bool {
         return false;
     };
     let mut segments = rest.split('/');
-    let Some(workflow) = segments.next() else { return false };
-    let Some(action) = segments.next() else { return false };
+    let Some(workflow) = segments.next() else {
+        return false;
+    };
+    let Some(action) = segments.next() else {
+        return false;
+    };
     if workflow.is_empty() || segments.next().is_some() {
         return false;
     }
@@ -169,7 +173,9 @@ pub struct UsageMeter {
 }
 
 fn clamp_u64(value: &Value, max: u64) -> Option<u64> {
-    value.as_u64().filter(|number| *number >= 1 && *number <= max)
+    value
+        .as_u64()
+        .filter(|number| *number >= 1 && *number <= max)
 }
 
 fn optional_clamp_u64(value: Option<&Value>, max: u64) -> Option<Option<u64>> {
@@ -189,16 +195,25 @@ fn parse_quota(service: QuotaService, org_id: &str, body: &Value) -> Option<Effe
         tokens_per_day: optional_clamp_u64(body.get("tokensPerDay"), 1_000_000_000)?,
         executions_per_hour: optional_clamp_u64(body.get("executionsPerHour"), 1_000_000)?,
         concurrent_executions: optional_clamp_u64(body.get("concurrentExecutions"), 1_000)?,
-        overridden: body.get("overridden").and_then(Value::as_bool).unwrap_or(false),
+        overridden: body
+            .get("overridden")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
 fn parse_meter(body: &Value) -> UsageMeter {
     UsageMeter {
-        tokens_today_ai: body.get("tokensToday").and_then(|value| value.get("ai"))
-            .and_then(Value::as_u64).unwrap_or(0),
-        tokens_today_inference: body.get("tokensToday").and_then(|value| value.get("inference"))
-            .and_then(Value::as_u64).unwrap_or(0),
+        tokens_today_ai: body
+            .get("tokensToday")
+            .and_then(|value| value.get("ai"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        tokens_today_inference: body
+            .get("tokensToday")
+            .and_then(|value| value.get("inference"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
     }
 }
 
@@ -208,8 +223,15 @@ fn parse_execution_admission(body: &Value) -> Option<ExecutionAdmissionResult> {
     if !matches!(window, "hour" | "concurrent") {
         return None;
     }
-    let token = body.get("token").and_then(Value::as_str).map(str::to_string);
-    if allowed && token.as_deref().is_none_or(|value| value.is_empty() || value.len() > 64) {
+    let token = body
+        .get("token")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if allowed
+        && token
+            .as_deref()
+            .is_none_or(|value| value.is_empty() || value.len() > 64)
+    {
         return None;
     }
     Some(ExecutionAdmissionResult {
@@ -218,7 +240,10 @@ fn parse_execution_admission(body: &Value) -> Option<ExecutionAdmissionResult> {
         count: body.get("count")?.as_u64()?,
         limit: body.get("limit")?.as_u64()?,
         retry_after_seconds: body.get("retryAfterSeconds")?.as_u64()?,
-        reset_at: body.get("resetAt").and_then(Value::as_str).map(str::to_string),
+        reset_at: body
+            .get("resetAt")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         token,
     })
 }
@@ -235,7 +260,10 @@ fn parse_check(body: &Value) -> Option<QuotaCheckResult> {
         count: body.get("count")?.as_u64()?,
         limit: body.get("limit")?.as_u64()?,
         retry_after_seconds: body.get("retryAfterSeconds")?.as_u64()?,
-        reset_at: body.get("resetAt").and_then(Value::as_str).map(str::to_string),
+        reset_at: body
+            .get("resetAt")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -277,13 +305,19 @@ impl QuotaClient {
         if let Ok(cache) = self.quotas.lock() {
             if let Some((quota, at)) = cache.get(&key) {
                 if at.elapsed() < self.ttl {
-                    return QuotaLookup { quota: quota.clone(), authoritative: true };
+                    return QuotaLookup {
+                        quota: quota.clone(),
+                        authoritative: true,
+                    };
                 }
             }
         }
         let fetched = self.fetch_quota(org_id, service).await;
         let Some(mut quota) = fetched else {
-            return QuotaLookup { quota: self.defaults.for_service(service), authoritative: false };
+            return QuotaLookup {
+                quota: self.defaults.for_service(service),
+                authoritative: false,
+            };
         };
         quota.org_id = org_id.to_string();
         if let Ok(mut cache) = self.quotas.lock() {
@@ -292,13 +326,22 @@ impl QuotaClient {
             }
             cache.insert(key, (quota.clone(), Instant::now()));
         }
-        QuotaLookup { quota, authoritative: true }
+        QuotaLookup {
+            quota,
+            authoritative: true,
+        }
     }
 
     /// Atomically admit a tenant request across all fixed request windows.
     /// Any IAM/Valkey failure is explicit so the caller can use its local fallback.
-    pub async fn check(&self, subject: &str, quota: &EffectiveQuota) -> Result<QuotaCheckResult, ()> {
-        let mut request = self.client.post(format!("{}/internal/quota/check", self.iam_base))
+    pub async fn check(
+        &self,
+        subject: &str,
+        quota: &EffectiveQuota,
+    ) -> Result<QuotaCheckResult, ()> {
+        let mut request = self
+            .client
+            .post(format!("{}/internal/quota/check", self.iam_base))
             .timeout(Duration::from_secs(3))
             .json(&serde_json::json!({
                 "subject": subject,
@@ -328,7 +371,12 @@ impl QuotaClient {
         hour: u64,
         concurrent: u64,
     ) -> Result<ExecutionAdmissionResult, ()> {
-        let mut request = self.client.post(format!("{}/internal/workflow/execution/check", self.iam_base))
+        let mut request = self
+            .client
+            .post(format!(
+                "{}/internal/workflow/execution/check",
+                self.iam_base
+            ))
             .timeout(Duration::from_secs(3))
             .json(&serde_json::json!({
                 "subject": subject,
@@ -346,7 +394,12 @@ impl QuotaClient {
     }
 
     pub async fn release_execution(&self, subject: &str, token: &str) -> Result<bool, ()> {
-        let mut request = self.client.post(format!("{}/internal/workflow/execution/release", self.iam_base))
+        let mut request = self
+            .client
+            .post(format!(
+                "{}/internal/workflow/execution/release",
+                self.iam_base
+            ))
             .timeout(Duration::from_secs(3))
             .json(&serde_json::json!({ "subject": subject, "token": token }));
         if !self.internal_secret.is_empty() {
@@ -379,25 +432,49 @@ impl QuotaClient {
     }
 
     async fn fetch_quota(&self, org_id: &str, service: QuotaService) -> Option<EffectiveQuota> {
-        let mut request = self.client.get(format!(
-            "{}/internal/quotas?orgId={org_id}&service={}",
-            self.iam_base,
-            service.as_str(),
-        )).timeout(Duration::from_secs(3));
-        if !self.internal_secret.is_empty() {
-            request = request.header("x-synapseone-internal", &self.internal_secret);
-        }
-        let body: Value = request.send().await.ok()?.error_for_status().ok()?.json().await.ok()?;
-        parse_quota(service, org_id, &body)
-    }
-
-    async fn fetch_meter(&self, org_id: &str) -> Option<UsageMeter> {
-        let mut request = self.client.get(format!("{}/internal/usage/meter?orgId={org_id}", self.iam_base))
+        let mut request = self
+            .client
+            .get(format!(
+                "{}/internal/quotas?orgId={org_id}&service={}",
+                self.iam_base,
+                service.as_str(),
+            ))
             .timeout(Duration::from_secs(3));
         if !self.internal_secret.is_empty() {
             request = request.header("x-synapseone-internal", &self.internal_secret);
         }
-        let body: Value = request.send().await.ok()?.error_for_status().ok()?.json().await.ok()?;
+        let body: Value = request
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        parse_quota(service, org_id, &body)
+    }
+
+    async fn fetch_meter(&self, org_id: &str) -> Option<UsageMeter> {
+        let mut request = self
+            .client
+            .get(format!(
+                "{}/internal/usage/meter?orgId={org_id}",
+                self.iam_base
+            ))
+            .timeout(Duration::from_secs(3));
+        if !self.internal_secret.is_empty() {
+            request = request.header("x-synapseone-internal", &self.internal_secret);
+        }
+        let body: Value = request
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
         Some(parse_meter(&body))
     }
 }

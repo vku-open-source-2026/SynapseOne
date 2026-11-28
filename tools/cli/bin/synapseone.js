@@ -4,7 +4,7 @@
 /*
  * Copyright 2026 SynapseOne Contributors
  * Licensed under the Apache License, Version 2.0 (the "License");
- * synapseone CLI — zero dependencies, Node 18+ (global fetch).
+ * synapseone CLI — Node 18+, built-in fetch, and an optional ws-backed tunnel runtime.
  */
 'use strict';
 
@@ -537,8 +537,16 @@ function parse(argv) {
     if (a === '--json') opts.json = true;
     else if (a === '--ready') opts.ready = true;
     else if (a === '--base' || a === '--token' || a === '--apikey') opts[a.slice(2)] = argv[++i];
+    else if (a === '--token-file' || a === '--server-url' || a === '--reconnect-delay-ms') {
+      const value = argv[++i];
+      if (!value || value.startsWith('--')) throw new Error(`missing value for ${a}`);
+      opts[a.slice(2).replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase())] = value;
+    }
     else if (a.startsWith('--base=')) opts.base = a.slice(7);
     else if (a.startsWith('--token=')) opts.token = a.slice(8);
+    else if (a.startsWith('--token-file=')) opts.tokenFile = a.slice(12);
+    else if (a.startsWith('--server-url=')) opts.serverUrl = a.slice(13);
+    else if (a.startsWith('--reconnect-delay-ms=')) opts.reconnectDelayMs = a.slice(21);
     else if (a.startsWith('--apikey=')) opts.apikey = a.slice(9);
     else if (a.startsWith('--context=')) contextOpt(opts, a.slice(10));
     else if (a === '--context') {
@@ -1291,6 +1299,18 @@ async function cmdCredentials(o) {
     return out(await POST(`/v1/credentials/${encodeURIComponent(rest[0])}/rotate`, { secret: credentialSecret(o) }, o), o);
   }
   throw new Error(`unknown credentials subcommand '${sub}' (want create|list|get|delete|rotate)`);
+}
+async function cmdTunnel(o) {
+  // Lazy-load ws and the connector runtime so ordinary CLI commands do not pay
+  // startup cost for the tunnel transport. This is the same installed binary.
+  const { runTunnelCommand } = require('../lib/tunnel');
+  return runTunnelCommand({
+    args: o._,
+    token: o.token,
+    tokenFile: o.tokenFile,
+    serverUrl: o.serverUrl,
+    reconnectDelayMs: o.reconnectDelayMs,
+  });
 }
 async function cmdCall(o) {
   // Generic escape hatch: call any gateway endpoint directly.
@@ -2644,6 +2664,7 @@ const COMMANDS = {
   'human-tasks': { fn: cmdHumanTasks, use: 'human-tasks [list|get|create|claim|approve|reject|expire] ...', doc: 'Workflow human approval tasks' },
   usage: { fn: cmdUsage, use: 'usage summary|events [--from ISO] [--to ISO] [--feature F] [--limit N]', doc: 'Org usage analytics (summary and request events)' },
   scim: { fn: cmdScim, use: 'scim tokens | scim token create|revoke ...', doc: 'SCIM provisioning token lifecycle' },
+  tunnel: { fn: cmdTunnel, use: 'tunnel run [connector-id] [--token-file F | --token T] [--server-url URL] [--reconnect-delay-ms MS]', doc: 'Run the outbound-only Synapse Tunnel connector (no separate binary)' },
   call: { fn: cmdCall, use: 'call <METHOD> <path> [--data \'{...}\'|body.json] [--file body.json]', doc: 'Generic gateway call (escape hatch for new endpoints)' },
 };
 
@@ -2657,7 +2678,7 @@ Auth defaults: --base > $SYNAPSEONE_BASE_URL > ~/.synapseone/config.json > https
   const names = Object.keys(COMMANDS);
   const w = Math.max(...names.map((n) => n.length));
   for (const n of names) console.log(`  ${n.padEnd(w)}  ${COMMANDS[n].doc}\n    usage: synapseone ${COMMANDS[n].use}`);
-  console.log('\nExamples:\n  synapseone login --email demo@acme.local\n  synapseone orgs create acme2 "ACME 2"\n  synapseone authz <uid> workflow:Execute "*" --context team=etl\n  synapseone --json workflows list\n  synapseone workflows create --template code-transform --name demo-transform\n  synapseone workflows test-run --file def.json --input input.json\n  synapseone workflows exec wf_abc123 --data \'{"value":21}\'\n  synapseone executions list --workflow-id wf_abc123 --status success --limit 20\n  synapseone webhook synapseone-event --data \'{"value":21}\' --base http://localhost:4002\n  synapseone base collections create kb --mapping \'{"fields":{"vec":{"path":"embedding","type":"vector","dimension":384}}}\'\n  synapseone base vector-search kb --query "authentication guide" --limit 5\n  synapseone faststore set cache:demo --value \'{"ok":true}\' --ttl 300\n  synapseone queue create emails --max-attempts 5\n  synapseone queue send emails --payload \'{"to":"a@b.c"}\'\n  synapseone stream create telemetry --max-len 100000\n  synapseone stream publish telemetry --payload \'{"value":25.4}\'\n  synapseone ocs bucket create city-assets\n  synapseone ocs put city-assets map.png --file ./map.png\n  synapseone notifications send a@b.c --channel email --subject Hi --body Hello\n  synapseone inference chat "summarize the incident" --model gpt-4o-mini\n  synapseone lds licenses\n  synapseone lds datasources create --name buildings --entity-type Building --license CC-BY-4.0\n  synapseone lds entities ds_123 --limit 20 --visibility public');
+  console.log('\nExamples:\n  synapseone login --email demo@acme.local\n  synapseone orgs create acme2 "ACME 2"\n  synapseone authz <uid> workflow:Execute "*" --context team=etl\n  synapseone --json workflows list\n  synapseone workflows create --template code-transform --name demo-transform\n  synapseone workflows test-run --file def.json --input input.json\n  synapseone workflows exec wf_abc123 --data \'{"value":21}\'\n  synapseone executions list --workflow-id wf_abc123 --status success --limit 20\n  synapseone webhook synapseone-event --data \'{"value":21}\' --base http://localhost:4002\n  synapseone base collections create kb --mapping \'{"fields":{"vec":{"path":"embedding","type":"vector","dimension":384}}}\'\n  synapseone base vector-search kb --query "authentication guide" --limit 5\n  synapseone faststore set cache:demo --value \'{"ok":true}\' --ttl 300\n  synapseone queue create emails --max-attempts 5\n  synapseone queue send emails --payload \'{"to":"a@b.c"}\'\n  synapseone stream create telemetry --max-len 100000\n  synapseone stream publish telemetry --payload \'{"value":25.4}\'\n  synapseone ocs bucket create city-assets\n  synapseone ocs put city-assets map.png --file ./map.png\n  synapseone notifications send a@b.c --channel email --subject Hi --body Hello\n  synapseone inference chat "summarize the incident" --model gpt-4o-mini\n  synapseone lds licenses\n  synapseone lds datasources create --name buildings --entity-type Building --license CC-BY-4.0\n  synapseone lds entities ds_123 --limit 20 --visibility public\n  synapseone tunnel run --token-file ./connector.token --server-url http://127.0.0.1:4016');
 }
 
 async function main() {
