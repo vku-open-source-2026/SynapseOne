@@ -10,12 +10,30 @@ import { useAuth } from '../lib/auth.jsx';
 import { api } from '../lib/api.js';
 import { useI18n } from '../lib/i18n-context.js';
 import { EDGE_COPY } from '../lib/edge-i18n.js';
-import { addressRecordConflict, connectorScript, defaultAddressRecord, edgePath, normalizeHostname, zoneForHostname } from '../lib/edge.js';
+import {
+  addressRecordConflict,
+  connectorScript,
+  daemonConnectorScript,
+  defaultAddressRecord,
+  edgePath,
+  normalizeHostname,
+  normalizeSubdomain,
+  quickTunnelScript,
+  suggestSubdomain,
+  zoneForHostname,
+} from '../lib/edge.js';
 import { Badge, Btn, Card, Empty, Err, Field, Input, PageTitle, Skeleton } from '../components/ui.jsx';
 
 const EMPTY_FORM = {
-  name: '', upstreamUrl: 'http://localhost:3000', hostname: '', pathPrefix: '',
-  dnsMode: 'external', zone: '', recordType: 'CNAME', recordTarget: '',
+  name: '',
+  upstreamUrl: 'http://localhost:3000',
+  subdomain: '',
+  hostname: '',
+  pathPrefix: '',
+  dnsMode: 'subdomain',
+  zone: '',
+  recordType: 'CNAME',
+  recordTarget: '',
 };
 
 function errorText(error) {
@@ -33,6 +51,10 @@ function validateUpstream(value) {
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function randomSuffix() {
+  return Math.random().toString(16).slice(2, 8).padEnd(6, '0');
 }
 
 function Step({ number, active, complete, children }) {
@@ -57,6 +79,7 @@ export default function SynapseTunnelPage() {
   const [routes, setRoutes] = useState([]);
   const [zones, setZones] = useState([]);
   const [config, setConfig] = useState(null);
+  const [quota, setQuota] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [notice, setNotice] = useState('');
@@ -65,14 +88,16 @@ export default function SynapseTunnelPage() {
   const [form, setForm] = useState(EMPTY_FORM);
   const [formError, setFormError] = useState('');
   const [issued, setIssued] = useState(null);
+  const [commandMode, setCommandMode] = useState('daemon');
   const [connectionTest, setConnectionTest] = useState({ status: 'idle', attempts: 0, error: '' });
   const inFlight = useRef(false);
   const connectionGeneration = useRef(0);
 
+  const baseDomain = config?.baseDomain || 'synapsetunnel.site';
   const publicOrigin = config?.publicOrigin
     || (typeof window !== 'undefined' && window.SYNAPSEONE_CONFIG?.TUNNEL_PUBLIC_ORIGIN)
     || import.meta.env?.VITE_SYNAPSETUNNEL_PUBLIC_ORIGIN
-    || '';
+    || `https://${baseDomain}`;
 
   const loadStatus = useCallback(async (initial = false) => {
     if (inFlight.current) return;
@@ -80,12 +105,14 @@ export default function SynapseTunnelPage() {
     if (initial) setLoading(true);
     setError(null);
     try {
-      const [connectorData, routeData] = await Promise.all([
+      const [connectorData, routeData, quotaData] = await Promise.all([
         request(edgePath('tunnel', '/v1/connectors')),
         request(edgePath('tunnel', '/v1/routes')),
+        request(edgePath('tunnel', '/v1/quota')).catch(() => null),
       ]);
       setConnectors(connectorData?.connectors || []);
       setRoutes(routeData?.routes || []);
+      if (quotaData) setQuota(quotaData);
     } catch (err) {
       setError(err);
     } finally {
@@ -97,7 +124,10 @@ export default function SynapseTunnelPage() {
   const loadInitial = useCallback(async () => {
     await Promise.allSettled([
       loadStatus(true),
-      request(edgePath('tunnel', '/v1/config')).then((value) => setConfig(value)).catch((err) => setError(err)),
+      request(edgePath('tunnel', '/v1/config')).then((value) => {
+        setConfig(value);
+        if (value?.quota) setQuota(value.quota);
+      }).catch((err) => setError(err)),
       request(edgePath('dns', '/v1/zones')).then((value) => setZones(value?.zones || [])).catch(() => undefined),
     ]);
   }, [loadStatus, request]);
@@ -119,6 +149,7 @@ export default function SynapseTunnelPage() {
     connectionGeneration.current += 1;
     setForm({ ...EMPTY_FORM, zone: matchingZone || '' });
     setIssued(null);
+    setCommandMode('daemon');
     setConnectionTest({ status: 'idle', attempts: 0, error: '' });
     setFormError('');
     setWizard({ step: 1 });
@@ -133,14 +164,20 @@ export default function SynapseTunnelPage() {
     setFormError('');
   };
 
+  const randomizeSubdomain = () => {
+    const base = suggestSubdomain(form.name || 'app');
+    setForm((current) => ({ ...current, subdomain: `${base}-${randomSuffix()}` }));
+  };
+
   const nextStep = () => {
     setFormError('');
     if (wizard.step === 1) {
       try { validateUpstream(form.upstreamUrl); } catch (err) { setFormError(err.message); return; }
-      if (!form.name.trim()) { setFormError(t.name + ' is required'); return; }
+      if (!form.name.trim()) { setFormError(`${t.name} is required`); return; }
       const suggestion = defaultAddressRecord(publicOrigin);
       setForm((current) => ({
         ...current,
+        subdomain: current.subdomain || `${suggestSubdomain(current.name)}-${randomSuffix()}`,
         zone: matchingZone || current.zone,
         recordType: current.recordTarget ? current.recordType : suggestion.type,
         recordTarget: current.recordTarget || suggestion.target,
@@ -148,10 +185,24 @@ export default function SynapseTunnelPage() {
       setWizard({ step: 2 });
       return;
     }
+
+    if (form.dnsMode === 'subdomain') {
+      if (form.subdomain.trim()) {
+        try {
+          normalizeSubdomain(form.subdomain, baseDomain);
+        } catch (err) {
+          setFormError(err.message);
+          return;
+        }
+      }
+      setWizard({ step: 3 });
+      return;
+    }
+
     try { normalizeHostname(form.hostname); } catch (err) { setFormError(err.message); return; }
     if (form.dnsMode === 'managed') {
       if (!form.zone) { setFormError(d.noZone); return; }
-      if (!form.recordTarget.trim()) { setFormError(d.recordTarget + ' is required'); return; }
+      if (!form.recordTarget.trim()) { setFormError(`${d.recordTarget} is required`); return; }
     }
     setWizard({ step: 3 });
   };
@@ -165,6 +216,39 @@ export default function SynapseTunnelPage() {
     let dnsRecordAttempted = false;
     const cleanupErrors = [];
     try {
+      const upstreamUrl = validateUpstream(form.upstreamUrl);
+      if (form.dnsMode === 'subdomain') {
+        const sub = form.subdomain.trim() ? normalizeSubdomain(form.subdomain, baseDomain) : undefined;
+        const provisioned = await request(edgePath('tunnel', '/v1/quick'), {
+          method: 'POST',
+          body: {
+            name: form.name.trim(),
+            upstreamUrl,
+            ...(sub ? { subdomain: sub } : {}),
+            ...(form.pathPrefix.trim() ? { pathPrefix: form.pathPrefix.trim() } : {}),
+            reuseExisting: false,
+          },
+        });
+        setIssued({
+          token: provisioned.token,
+          connectorId: provisioned.connector.id,
+          routeId: provisioned.route.id,
+          hostname: provisioned.route.hostname,
+          publicUrl: provisioned.publicUrl,
+          upstreamUrl: provisioned.connector.upstreamUrl,
+          name: provisioned.connector.name,
+          publicOrigin: provisioned.serverUrl || publicOrigin,
+          rotated: false,
+        });
+        if (provisioned.quota) setQuota(provisioned.quota);
+        setCommandMode('daemon');
+        setConnectionTest({ status: 'idle', attempts: 0, error: '' });
+        setWizard({ step: 3, done: false });
+        setNotice(d.created);
+        await loadStatus();
+        return;
+      }
+
       const hostname = normalizeHostname(form.hostname);
       if (form.dnsMode === 'managed') {
         const selectedZone = matchingZone || form.zone;
@@ -177,7 +261,8 @@ export default function SynapseTunnelPage() {
       }
 
       const created = await request(edgePath('tunnel', '/v1/connectors'), {
-        method: 'POST', body: { name: form.name.trim(), upstreamUrl: validateUpstream(form.upstreamUrl) },
+        method: 'POST',
+        body: { name: form.name.trim(), upstreamUrl },
       });
       connectorId = created.connector.id;
       const token = created.token;
@@ -200,7 +285,18 @@ export default function SynapseTunnelPage() {
         }
       }
 
-      setIssued({ token, connectorId, routeId, hostname, publicOrigin });
+      setIssued({
+        token,
+        connectorId,
+        routeId,
+        hostname,
+        publicUrl: `https://${hostname}${form.pathPrefix.trim() || ''}`,
+        upstreamUrl,
+        name: form.name.trim(),
+        publicOrigin,
+        rotated: false,
+      });
+      setCommandMode('daemon');
       setConnectionTest({ status: 'idle', attempts: 0, error: '' });
       setWizard({ step: 3, done: false });
       setNotice(d.created);
@@ -212,9 +308,6 @@ export default function SynapseTunnelPage() {
       if (connectorId) {
         try { await request(edgePath('tunnel', `/v1/connectors/${encodeURIComponent(connectorId)}`), { method: 'DELETE' }); } catch { cleanupErrors.push('connector'); }
       }
-      // The DNS POST may have reached the server even if its response was lost.
-      // Remove only the exact record this wizard tried to create; pre-existing
-      // records were detected before connector creation and are never deleted.
       if (dnsRecordAttempted && zoneDetail) {
         try {
           const current = await request(edgePath('dns', `/v1/zones/${encodeURIComponent(zoneDetail.name)}`));
@@ -228,6 +321,36 @@ export default function SynapseTunnelPage() {
       }
       setFormError(errorText(err) + (cleanupErrors.length ? ` (cleanup failed: ${cleanupErrors.join(', ')})` : ''));
       await loadStatus();
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const rotateConnectorToken = async (connector) => {
+    if (!window.confirm(d.rotateTokenConfirm)) return;
+    setBusy(`connector-${connector.id}`);
+    setError(null);
+    try {
+      const res = await request(edgePath('tunnel', `/v1/connectors/${encodeURIComponent(connector.id)}/rotate-token`), { method: 'POST' });
+      const firstRoute = routes.find((route) => route.connectorId === connector.id);
+      const hostname = firstRoute?.hostname || '';
+      setIssued({
+        token: res.token,
+        connectorId: connector.id,
+        routeId: firstRoute?.id || '',
+        hostname,
+        publicUrl: hostname ? `https://${hostname}${firstRoute?.pathPrefix || ''}` : '',
+        upstreamUrl: connector.upstreamUrl,
+        name: connector.name,
+        publicOrigin,
+        rotated: true,
+      });
+      setCommandMode('daemon');
+      setConnectionTest({ status: 'idle', attempts: 0, error: '' });
+      setWizard({ step: 3, done: false });
+      await loadStatus();
+    } catch (err) {
+      setError(err);
     } finally {
       setBusy('');
     }
@@ -261,7 +384,7 @@ export default function SynapseTunnelPage() {
     setBusy(`connector-${connector.id}`);
     setError(null);
     try {
-      await request(edgePath('tunnel', `/v1/connectors/${encodeURIComponent(connector.id)}`), { method: 'DELETE' });
+      await request(edgePath('tunnel', `/v1/connectors/${encodeURIComponent(connector.id)}?force=true`), { method: 'DELETE' });
       setNotice(d.connectorDeleted);
       await loadStatus();
     } catch (err) { setError(err); } finally { setBusy(''); }
@@ -278,9 +401,9 @@ export default function SynapseTunnelPage() {
   };
 
   const copyCommand = async () => {
-    if (!script) return;
+    if (!activeScript) return;
     try {
-      await navigator.clipboard.writeText(script);
+      await navigator.clipboard.writeText(activeScript);
       setNotice(t.copied);
     } catch {
       setFormError(d.clipboardUnavailable);
@@ -332,10 +455,33 @@ export default function SynapseTunnelPage() {
     setConnectionTest((current) => ({ ...current, status: 'idle' }));
   };
 
-  let script = '';
+  let activeScript = '';
   if (issued) {
-    try { script = connectorScript(issued.connectorId, issued.publicOrigin || publicOrigin); } catch { script = ''; }
+    try {
+      const origin = issued.publicOrigin || publicOrigin;
+      if (commandMode === 'foreground') {
+        activeScript = connectorScript(issued.connectorId, origin);
+      } else if (commandMode === 'quick') {
+        activeScript = quickTunnelScript(issued.upstreamUrl || form.upstreamUrl, issued.hostname, baseDomain);
+      } else {
+        activeScript = daemonConnectorScript(issued.connectorId, origin, issued.name || form.name || 'my-tunnel');
+      }
+    } catch {
+      activeScript = '';
+    }
   }
+
+  const previewHostname = useMemo(() => {
+    if (form.dnsMode !== 'subdomain') return form.hostname;
+    try {
+      const label = form.subdomain.trim() ? normalizeSubdomain(form.subdomain, baseDomain) : `${suggestSubdomain(form.name || 'app')}-xxxxxx`;
+      return `${label}.${baseDomain}`;
+    } catch {
+      return `${form.subdomain.trim() || 'app'}.${baseDomain}`;
+    }
+  }, [baseDomain, form.dnsMode, form.hostname, form.name, form.subdomain]);
+
+  const usedDomains = quota?.usedDomains ?? new Set(routes.map((route) => route.hostname)).size;
 
   return (
     <div className="space-y-6">
@@ -353,9 +499,18 @@ export default function SynapseTunnelPage() {
       {notice && <div className="rounded-2xl bg-emerald-500/10 px-4 py-3 text-sm text-emerald-700">{notice}</div>}
       <Err e={error} />
 
-      <div className="grid gap-4 sm:grid-cols-3">
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <Card><div className="text-xs text-normal-text">{d.connectors}</div><div className="mt-2 text-2xl font-semibold text-main-text">{connectors.length}</div><div className="mt-1 text-xs text-emerald-600">{connectors.filter((item) => item.connected).length} {t.connected.toLowerCase()}</div></Card>
-        <Card><div className="text-xs text-normal-text">{d.routes}</div><div className="mt-2 text-2xl font-semibold text-main-text">{routes.length}</div><div className="mt-1 text-xs text-normal-text">HTTP / SSE</div></Card>
+        <Card><div className="text-xs text-normal-text">{d.routes}</div><div className="mt-2 text-2xl font-semibold text-main-text">{routes.length}</div><div className="mt-1 text-xs text-normal-text">HTTP / SSE / WS</div></Card>
+        <Card>
+          <div className="text-xs text-normal-text">{d.quotaTitle}</div>
+          <div className="mt-2 text-2xl font-semibold text-main-text">
+            {quota?.unlimited ? `${usedDomains} / ∞` : `${usedDomains} / ${quota?.maxDomains ?? 5}`}
+          </div>
+          <div className="mt-1 text-xs text-normal-text">
+            {quota?.unlimited ? d.quotaUnlimited : d.quotaLimited}
+          </div>
+        </Card>
         <Card><div className="text-xs text-normal-text">{d.endpoint}</div><div className="mt-2 break-all font-mono text-sm text-main-text">{publicOrigin || '—'}</div><div className="mt-1 text-xs text-normal-text">{d.autoRefresh}</div></Card>
       </div>
 
@@ -363,7 +518,7 @@ export default function SynapseTunnelPage() {
         <Card className="border border-main-blue/20">
           <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
             <div>
-              <h2 className="text-lg font-semibold text-main-text">{issued ? d.tokenTitle : d.createTitle}</h2>
+              <h2 className="text-lg font-semibold text-main-text">{issued ? (issued.rotated ? d.rotatedTokenTitle : d.tokenTitle) : d.createTitle}</h2>
               <p className="mt-1 text-sm text-normal-text">{wizard.step === 1 ? d.stepApplication : wizard.step === 2 ? d.stepAddress : d.stepRun}</p>
             </div>
             <Btn kind="secondary" onClick={closeWizard}>{t.close}</Btn>
@@ -382,14 +537,44 @@ export default function SynapseTunnelPage() {
 
           {wizard.step === 2 && (
             <div className="mt-6 grid gap-4 md:grid-cols-2">
-              <Field label={d.hostname}><Input autoFocus required value={form.hostname} onChange={(e) => setForm({ ...form, hostname: e.target.value })} placeholder="app.example.com" /></Field>
               <Field label={d.dnsMode}>
                 <select value={form.dnsMode} onChange={(e) => setForm({ ...form, dnsMode: e.target.value })} className="w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm">
+                  <option value="subdomain">{d.subdomainMode} (*.{baseDomain})</option>
                   <option value="external">{d.externalDns}</option>
                   <option value="managed" disabled={!zones.length}>{d.managedDns}</option>
                 </select>
               </Field>
-              {form.dnsMode === 'managed' ? <>
+              {form.dnsMode === 'subdomain' ? (
+                <Field label={d.subdomainLabel} desc={d.subdomainHint}>
+                  <div className="flex gap-2">
+                    <div className="flex flex-1 items-center rounded-2xl border border-slate-200 bg-white pr-3">
+                      <Input
+                        autoFocus
+                        value={form.subdomain}
+                        onChange={(e) => setForm({ ...form, subdomain: e.target.value })}
+                        placeholder="my-app"
+                        className="border-0 focus:ring-0"
+                      />
+                      <span className="shrink-0 font-mono text-xs text-normal-text">.{baseDomain}</span>
+                    </div>
+                    <Btn kind="secondary" onClick={randomizeSubdomain}>{d.randomSubdomain}</Btn>
+                  </div>
+                </Field>
+              ) : (
+                <Field label={d.hostname}><Input autoFocus required value={form.hostname} onChange={(e) => setForm({ ...form, hostname: e.target.value })} placeholder="app.example.com" /></Field>
+              )}
+
+              {form.dnsMode === 'subdomain' && (
+                <div className="md:col-span-2 space-y-3">
+                  <div className="rounded-2xl bg-slate-50 p-4 text-sm">
+                    <div className="text-xs text-normal-text">{d.subdomainPreview}</div>
+                    <div className="mt-1 font-mono text-main-text">https://{previewHostname}{form.pathPrefix.trim() || ''} → {form.upstreamUrl}</div>
+                  </div>
+                  <div className="rounded-2xl border border-emerald-300/60 bg-emerald-50 p-4 text-xs leading-5 text-emerald-900">{d.autoHttpsNotice}</div>
+                </div>
+              )}
+
+              {form.dnsMode === 'managed' && <>
                 <Field label={d.zone} desc={matchingZone ? null : d.noZone}>
                   <select required value={form.zone} onChange={(e) => setForm({ ...form, zone: e.target.value })} className="w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm">
                     <option value="">{d.selectZone}</option>
@@ -402,16 +587,24 @@ export default function SynapseTunnelPage() {
                   </select>
                 </Field>
                 <div className="md:col-span-2"><Field label={d.recordTarget} desc={d.recordTargetHint}><Input required value={form.recordTarget} onChange={(e) => setForm({ ...form, recordTarget: e.target.value })} placeholder={form.recordType === 'A' ? '192.0.2.10' : form.recordType === 'AAAA' ? '2001:db8::10' : 'edge.example.net'} /></Field></div>
-              </> : <div className="md:col-span-2 rounded-2xl bg-slate-50 p-4 text-sm text-normal-text">{d.externalHint}</div>}
-              <div className="md:col-span-2 rounded-2xl border border-amber-300/60 bg-amber-50 p-4 text-xs leading-5 text-amber-900">{d.tlsWarning}</div>
+              </>}
+
+              {form.dnsMode === 'external' && <div className="md:col-span-2 rounded-2xl bg-slate-50 p-4 text-sm text-normal-text">{d.externalHint}</div>}
+              {form.dnsMode !== 'subdomain' && <div className="md:col-span-2 rounded-2xl border border-amber-300/60 bg-amber-50 p-4 text-xs leading-5 text-amber-900">{d.tlsWarning}</div>}
             </div>
           )}
 
           {wizard.step === 3 && !issued && (
             <div className="mt-6 rounded-2xl bg-slate-50 p-5">
               <h3 className="font-medium text-main-text">{form.name}</h3>
-              <p className="mt-1 font-mono text-sm text-normal-text">{form.hostname} → {form.upstreamUrl}</p>
-              <p className="mt-3 text-xs text-normal-text">{form.dnsMode === 'managed' ? `${form.zone} · ${form.recordType} ${form.recordTarget}` : d.externalHint}</p>
+              <p className="mt-1 font-mono text-sm text-normal-text">{previewHostname}{form.pathPrefix.trim() || ''} → {form.upstreamUrl}</p>
+              <p className="mt-3 text-xs text-normal-text">
+                {form.dnsMode === 'subdomain'
+                  ? d.autoHttpsNotice
+                  : form.dnsMode === 'managed'
+                    ? `${form.zone} · ${form.recordType} ${form.recordTarget}`
+                    : d.externalHint}
+              </p>
             </div>
           )}
 
@@ -420,7 +613,11 @@ export default function SynapseTunnelPage() {
               <div>
                 <div className="rounded-2xl border border-amber-300/70 bg-amber-50 p-4 text-sm text-amber-900">
                   <p className="font-medium">{d.tokenWarning}</p>
-                  <p className="mt-1 text-xs">{issued.hostname}</p>
+                  {issued.publicUrl ? (
+                    <a href={issued.publicUrl} target="_blank" rel="noreferrer" className="mt-1 inline-block font-mono text-xs underline">{issued.publicUrl}</a>
+                  ) : (
+                    <p className="mt-1 text-xs">{issued.hostname}</p>
+                  )}
                 </div>
                 <Field label={d.connectorToken}>
                   <div className="flex gap-2">
@@ -431,12 +628,28 @@ export default function SynapseTunnelPage() {
                 <Btn kind="success" onClick={closeWizard}>{connectionTest.status === 'success' ? d.finish : d.savedToken}</Btn>
               </div>
               <div>
-                <div className="flex items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <h3 className="font-medium text-main-text">{d.runTitle}</h3>
-                  {script && <Btn kind="secondary" onClick={copyCommand}>{d.copyCommand}</Btn>}
+                  {activeScript && <Btn kind="secondary" onClick={copyCommand}>{d.copyCommand}</Btn>}
                 </div>
                 <p className="mt-1 text-xs text-normal-text">{d.runHint}</p>
-                {script ? <pre className="mt-3 overflow-x-auto rounded-2xl bg-slate-900 p-4 text-xs leading-5 text-slate-100"><code>{script}</code></pre> : <div className="mt-3 rounded-2xl bg-red-50 p-4 text-sm text-red-700">{d.publicOriginMissing}</div>}
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {[
+                    ['daemon', d.commandTabDaemon],
+                    ['foreground', d.commandTabForeground],
+                    ['quick', d.commandTabQuick],
+                  ].map(([mode, label]) => (
+                    <button
+                      key={mode}
+                      type="button"
+                      onClick={() => setCommandMode(mode)}
+                      className={`rounded-xl px-3 py-1.5 text-xs font-medium transition ${commandMode === mode ? 'bg-main-blue text-white' : 'bg-slate-100 text-normal-text hover:bg-slate-200'}`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                {activeScript ? <pre className="mt-3 overflow-x-auto rounded-2xl bg-slate-900 p-4 text-xs leading-5 text-slate-100"><code>{activeScript}</code></pre> : <div className="mt-3 rounded-2xl bg-red-50 p-4 text-sm text-red-700">{d.publicOriginMissing}</div>}
 
                 <div className={`mt-4 rounded-2xl border p-4 ${
                   connectionTest.status === 'success' ? 'border-emerald-300 bg-emerald-50' :
@@ -501,6 +714,7 @@ export default function SynapseTunnelPage() {
                         <p className="mt-2 text-xs text-normal-text">{count} {d.routeCount.toLowerCase()} · <code>{connector.id}</code></p>
                       </div>
                       <div className="flex flex-wrap gap-2">
+                        <Btn kind="secondary" loading={busy === `connector-${connector.id}`} onClick={() => rotateConnectorToken(connector)}>{d.rotateToken}</Btn>
                         <Btn kind="secondary" loading={busy === `connector-${connector.id}`} onClick={() => toggleConnector(connector)}>{connector.enabled ? d.disable : d.enable}</Btn>
                         <Btn kind="danger" loading={busy === `connector-${connector.id}`} onClick={() => deleteConnector(connector)}>{t.delete}</Btn>
                       </div>
@@ -521,12 +735,13 @@ export default function SynapseTunnelPage() {
             <div className="space-y-3">
               {routes.map((route) => {
                 const connector = connectors.find((item) => item.id === route.connectorId);
+                const routeUrl = `https://${route.hostname}${route.pathPrefix || ''}`;
                 return (
                   <div key={route.id} className="rounded-2xl border border-slate-200 p-4">
                     <div className="flex flex-wrap items-start justify-between gap-3">
                       <div className="min-w-0">
                         <div className="flex flex-wrap items-center gap-2">
-                          <h3 className="font-medium text-main-text break-all">{route.hostname}{route.pathPrefix || ''}</h3>
+                          <a href={routeUrl} target="_blank" rel="noreferrer" className="font-medium text-main-blue hover:underline break-all">{route.hostname}{route.pathPrefix || ''}</a>
                           <Badge tone={route.enabled ? (connector?.connected ? 'green' : 'amber') : 'gray'}>{route.enabled ? (connector?.connected ? t.connected : t.disconnected) : t.disabled}</Badge>
                         </div>
                         <p className="mt-1 text-xs text-normal-text">{connector?.name || route.connectorId} · {route.timeoutMs || 30000} ms</p>

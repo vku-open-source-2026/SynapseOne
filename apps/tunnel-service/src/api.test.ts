@@ -162,6 +162,16 @@ test('management auth fails closed and supports the verified owner-org fallback'
     publicOrigin: 'https://tunnel.example.com',
     connectorPath: '/_synapse/tunnel/connect',
     protocolVersion: 1,
+    baseDomain: 'synapsetunnel.site',
+    quota: {
+      orgId: ORG_A,
+      baseDomain: 'synapsetunnel.site',
+      usedDomains: 0,
+      maxDomains: 5,
+      remainingDomains: 5,
+      unlimited: false,
+      domains: [],
+    },
   });
 
   const ownerFallback = await manage(service, tenantCaller(undefined, ORG_A), '/v1/config');
@@ -282,4 +292,150 @@ test('connector and route ownership is isolated while platform access remains un
   assert.equal((await manage(service, admin, `/v1/routes/${platformCreatedRoute}`, { method: 'DELETE' })).status, 204);
   assert.equal((await manage(service, tenantA, `/v1/connectors/${connectorA2.id}`, { method: 'DELETE' })).status, 204);
   assert.equal((await manage(service, tenantB, `/v1/connectors/${connectorB.id}`)).status, 404);
+});
+
+test('enforces 5-domain per-org limit while allowing unlimited domains for Tier 2/3 orgs', async (t) => {
+  const tier2Org = '5e8cbd7b-b659-4944-ab9b-c06b8f56c17c';
+  const service = await startService(t, {
+    baseDomain: 'synapsetunnel.site',
+    maxDomainsPerOrg: 5,
+    unlimitedOrgIds: [tier2Org],
+  });
+  const tenantA = tenantCaller(ORG_A);
+  const tenantB = tenantCaller(ORG_B);
+  const tier2 = tenantCaller(tier2Org);
+
+  const connectorA = await createConnector(service, tenantA, 'quota-a');
+  const connectorB = await createConnector(service, tenantB, 'quota-b');
+  const connectorTier2 = await createConnector(service, tier2, 'quota-tier2');
+
+  for (let i = 1; i <= 5; i += 1) {
+    const res = await manage(service, tenantA, '/v1/routes', {
+      method: 'POST',
+      body: JSON.stringify({ subdomain: `app-${i}`, connectorId: connectorA.id }),
+    });
+    assert.equal(res.status, 201);
+    const body = await res.json() as { route: { hostname: string } };
+    assert.equal(body.route.hostname, `app-${i}.synapsetunnel.site`);
+  }
+
+  // Same domain with a different pathPrefix must still succeed within the 5-domain limit.
+  const extraPathRes = await manage(service, tenantA, '/v1/routes', {
+    method: 'POST',
+    body: JSON.stringify({ hostname: 'app-1.synapsetunnel.site', pathPrefix: '/v2', connectorId: connectorA.id }),
+  });
+  assert.equal(extraPathRes.status, 201);
+
+  // 6th distinct domain for standard org must fail with 409 domain_limit_exceeded.
+  const sixthRes = await manage(service, tenantA, '/v1/routes', {
+    method: 'POST',
+    body: JSON.stringify({ subdomain: 'app-6', connectorId: connectorA.id }),
+  });
+  assert.equal(sixthRes.status, 409);
+  assert.equal((await sixthRes.json() as { error: string }).error, 'domain_limit_exceeded');
+
+  // Reserved, apex, and multi-level subdomains must be rejected.
+  for (const invalidBody of [
+    { subdomain: 'api', connectorId: connectorA.id },
+    { subdomain: 'a.b', connectorId: connectorA.id },
+    { hostname: 'synapsetunnel.site', connectorId: connectorA.id },
+    { hostname: 'a.b.synapsetunnel.site', connectorId: connectorA.id },
+  ]) {
+    const bad = await manage(service, tenantA, '/v1/routes', {
+      method: 'POST',
+      body: JSON.stringify(invalidBody),
+    });
+    assert.equal(bad.status, 400);
+  }
+
+  // Another org cannot claim an already-taken hostname.
+  const stolen = await manage(service, tenantB, '/v1/routes', {
+    method: 'POST',
+    body: JSON.stringify({ subdomain: 'app-1', connectorId: connectorB.id }),
+  });
+  assert.equal(stolen.status, 409);
+  assert.equal((await stolen.json() as { error: string }).error, 'hostname_taken');
+
+  // Tier 2/3 org is unlimited and can create >5 distinct domains.
+  for (let i = 1; i <= 7; i += 1) {
+    const res = await manage(service, tier2, '/v1/routes', {
+      method: 'POST',
+      body: JSON.stringify({ subdomain: `tier2-app-${i}`, connectorId: connectorTier2.id }),
+    });
+    assert.equal(res.status, 201);
+  }
+  const quotaRes = await manage(service, tier2, '/v1/quota');
+  assert.equal(quotaRes.status, 200);
+  const quota = await quotaRes.json() as { unlimited: boolean; maxDomains: number | null; usedDomains: number };
+  assert.equal(quota.unlimited, true);
+  assert.equal(quota.maxDomains, null);
+  assert.equal(quota.usedDomains, 7);
+});
+
+test('quick provision, token rotation, and force delete work end-to-end', async (t) => {
+  const service = await startService(t, {
+    publicScheme: 'https',
+    publicOrigin: 'https://synapsetunnel.site',
+    baseDomain: 'synapsetunnel.site',
+  });
+  const tenantA = tenantCaller(ORG_A);
+
+  // Quick provision with auto-generated subdomain
+  const autoRes = await manage(service, tenantA, '/v1/quick', {
+    method: 'POST',
+    body: JSON.stringify({ name: 'My Web', upstreamUrl: 'http://127.0.0.1:3000' }),
+  });
+  assert.equal(autoRes.status, 201);
+  const autoBody = await autoRes.json() as {
+    connector: { id: string };
+    route: { hostname: string };
+    token: string;
+    publicUrl: string;
+    serverUrl: string;
+    reused: boolean;
+  };
+  assert.match(autoBody.route.hostname, /^my-web-[a-f0-9]{6}\.synapsetunnel\.site$/);
+  assert.equal(autoBody.publicUrl, `https://${autoBody.route.hostname}`);
+  assert.equal(autoBody.serverUrl, 'https://synapsetunnel.site');
+  assert.equal(autoBody.reused, false);
+  assert.match(autoBody.token, /^st_[A-Za-z0-9_-]{43}$/);
+
+  // Quick provision with explicit subdomain + reuse
+  const namedRes = await manage(service, tenantA, '/v1/quick', {
+    method: 'POST',
+    body: JSON.stringify({ subdomain: 'demo-api', upstreamUrl: 'http://127.0.0.1:4000' }),
+  });
+  assert.equal(namedRes.status, 201);
+  const namedBody = await namedRes.json() as { connector: { id: string }; token: string; publicUrl: string };
+  assert.equal(namedBody.publicUrl, 'https://demo-api.synapsetunnel.site');
+
+  const reusedRes = await manage(service, tenantA, '/v1/quick', {
+    method: 'POST',
+    body: JSON.stringify({ subdomain: 'demo-api', upstreamUrl: 'http://127.0.0.1:4001' }),
+  });
+  assert.equal(reusedRes.status, 200);
+  const reusedBody = await reusedRes.json() as {
+    connector: { id: string; upstreamUrl: string };
+    token: string;
+    reused: boolean;
+  };
+  assert.equal(reusedBody.connector.id, namedBody.connector.id);
+  assert.equal(reusedBody.connector.upstreamUrl, 'http://127.0.0.1:4001/');
+  assert.equal(reusedBody.reused, true);
+  assert.notEqual(reusedBody.token, namedBody.token);
+
+  // Rotate token endpoint
+  const rotateRes = await manage(service, tenantA, `/v1/connectors/${namedBody.connector.id}/rotate-token`, {
+    method: 'POST',
+  });
+  assert.equal(rotateRes.status, 200);
+  const rotateBody = await rotateRes.json() as { token: string };
+  assert.notEqual(rotateBody.token, reusedBody.token);
+
+  // Force delete removes connector and its routes
+  const delRes = await manage(service, tenantA, `/v1/connectors/${namedBody.connector.id}?force=true`, {
+    method: 'DELETE',
+  });
+  assert.equal(delRes.status, 204);
+  assert.equal((await manage(service, tenantA, `/v1/connectors/${namedBody.connector.id}`)).status, 404);
 });

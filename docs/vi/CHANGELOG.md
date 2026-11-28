@@ -9,8 +9,14 @@ của từng bản phát hành nằm trong `CHANGELOG.md` tiếng Anh.
 
 ### Thêm
 
-- **Kênh phát hành CLI 0.11.1:** tag `cli-v<version>` kiểm thử và publish CLI cài
-  một lần độc lập với bản phát hành toàn bộ image nền tảng.
+- **Kênh phát hành CLI 0.12.0:** tag `cli-v<version>` kiểm thử và publish CLI cài
+  một lần độc lập với bản phát hành toàn bộ image nền tảng. Bổ sung luồng
+  ngrok (`synapseone tunnel http <port|url> [--subdomain S] [-d]`), chạy ngầm
+  daemon (`start`, `stop`, `restart`, `status`, `logs`), `quota`, `list`,
+  `create`, `delete` và `rotate-token`.
+- **Subdomain `synapsetunnel.site` & quota org cho Synapse Tunnel:** bổ sung
+  `POST /v1/quick`, `GET /v1/quota`, `POST /v1/connectors/:id/rotate-token`,
+  giới hạn 5 tên miền mỗi org chuẩn và không giới hạn cho org Tầng 2/3.
 - **SynapseDNS và Synapse Tunnel:** dịch vụ edge Tầng 1 chạy độc lập với DNS
   authoritative UDP/TCP, API quản lý zone/record, connector tunnel HTTP chỉ kết
   nối outbound, ingress routing theo host/path, JSON persistence nguyên tử,

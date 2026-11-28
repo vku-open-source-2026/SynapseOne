@@ -115,13 +115,17 @@ Logs are JSON lines on stderr. Stop with Ctrl-C (`SIGINT`) or `SIGTERM`; the
 connector aborts active upstream work and closes the WebSocket cleanly.
 
 ```bash
+synapseone tunnel http 3000 --subdomain myapp -d
+synapseone tunnel status
+synapseone tunnel logs myapp -f
+synapseone tunnel stop myapp
 synapseone tunnel run --help
 ```
 
 ## Stable releases
 
 Stable CLI packages are published from `cli-v<version>` tags (for example
-`cli-v0.11.1`). The tag must match this package's version. The release workflow
+`cli-v0.12.0`). The tag must match this package's version. The release workflow
 runs the CLI tests, publishes `@synapseone/cli` to npm and verifies the registry
 version before the release is considered complete.
 

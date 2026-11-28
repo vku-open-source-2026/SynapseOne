@@ -7,8 +7,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  absoluteRecordName, addressRecordConflict, buildRecordInput, connectorScript, defaultAddressRecord,
-  edgePath, normalizeHostname, publicHostname, recordValue, shellQuote, zoneForHostname,
+  absoluteRecordName, addressRecordConflict, buildRecordInput, connectorScript, daemonConnectorScript,
+  defaultAddressRecord, edgePath, normalizeHostname, normalizeSubdomain, publicHostname,
+  quickTunnelScript, recordValue, shellQuote, suggestSubdomain, zoneForHostname,
 } from './edge.js';
 import { EDGE_COPY } from './edge-i18n.js';
 
@@ -84,6 +85,18 @@ test('record rendering and shell quoting do not expose malformed control data', 
   assert.doesNotMatch(script, /st_[A-Za-z0-9_-]/);
   assert.throws(() => connectorScript('bad', 'https://tunnel.example.com'), /Invalid connector/);
   assert.throws(() => connectorScript('123e4567-e89b-12d3-a456-426614174000', 'https://user:pass@example.com'), /public ingress/);
+
+  const daemon = daemonConnectorScript('123e4567-e89b-12d3-a456-426614174000', 'https://synapsetunnel.site/', 'My App');
+  assert.match(daemon, /synapseone tunnel start my-app --server-url https:\/\/synapsetunnel\.site/);
+  assert.match(daemon, /synapseone tunnel status my-app/);
+  assert.match(daemon, /synapseone tunnel stop my-app/);
+
+  const quick = quickTunnelScript('http://localhost:3000', 'demo.synapsetunnel.site', 'synapsetunnel.site');
+  assert.match(quick, /synapseone tunnel http http:\/\/localhost:3000 --subdomain demo --daemon/);
+
+  assert.equal(normalizeSubdomain('My-App.synapsetunnel.site.', 'synapsetunnel.site'), 'my-app');
+  assert.throws(() => normalizeSubdomain('api', 'synapsetunnel.site'), /reserved/);
+  assert.equal(suggestSubdomain('My Cool App!'), 'my-cool-app');
 });
 
 test('edge UI copy keeps English and Vietnamese key parity', () => {

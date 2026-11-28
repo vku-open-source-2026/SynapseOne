@@ -60,3 +60,13 @@ export interface ConnectorStatus {
   connected: boolean;
   connectedAt?: string;
 }
+
+export interface DomainQuota {
+  orgId: string | null;
+  baseDomain: string;
+  usedDomains: number;
+  maxDomains: number | null;
+  remainingDomains: number | null;
+  unlimited: boolean;
+  domains: string[];
+}

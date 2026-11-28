@@ -8,8 +8,16 @@ Format based on Keep a Changelog; versioning follows SemVer.
 ## [Unreleased]
 
 ### Added
-- **CLI 0.11.1 release channel:** `cli-v<version>` tags test and publish the
-  single-install CLI independently of the full platform image release.
+- **CLI 0.12.0 release channel:** `cli-v<version>` tags test and publish the
+  single-install CLI independently of the full platform image release. Added
+  ngrok-style `synapseone tunnel http <port|url> [--subdomain S] [-d]`,
+  background daemon management (`start`, `stop`, `restart`, `status`, `logs`),
+  `quota`, `list`, `create`, `delete`, and `rotate-token`.
+- **Synapse Tunnel managed subdomains & org quotas:** `POST /v1/quick`,
+  `GET /v1/quota`, and `POST /v1/connectors/:id/rotate-token` support
+  `*.synapsetunnel.site` subdomain provisioning with Cloudflare HTTPS/WSS
+  termination, a 5-domain limit per standard organization, and unlimited domains
+  for Tier 2/3 and platform organizations.
 - **SynapseDNS and Synapse Tunnel:** standalone Tier-1 edge services with
   authoritative UDP/TCP DNS, zone/record management, an outbound-only HTTP
   tunnel connector, host/path ingress routing, atomic JSON persistence,

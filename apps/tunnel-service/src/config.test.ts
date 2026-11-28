@@ -34,6 +34,23 @@ test('server configuration fails closed and applies documented defaults', () => 
   assert.equal(defaults.maxResponseBytes, 16777216);
   assert.equal(defaults.publicOrigin, undefined);
   assert.equal(defaults.internalSecret, undefined);
+  assert.equal(defaults.baseDomain, 'synapsetunnel.site');
+  assert.equal(defaults.maxDomainsPerOrg, 5);
+  assert.ok(defaults.unlimitedOrgIds?.includes('5e8cbd7b-b659-4944-ab9b-c06b8f56c17c'));
+
+  const customQuota = loadServerConfig('combined', {
+    SYNAPSETUNNEL_ADMIN_TOKEN: 'test-token',
+    SYNAPSETUNNEL_BASE_DOMAIN: 'Tunnel.Example.NET.',
+    SYNAPSETUNNEL_MAX_DOMAINS_PER_ORG: '10',
+    SYNAPSETUNNEL_UNLIMITED_ORG_IDS: 'org-tier2, org-tier3',
+  });
+  assert.equal(customQuota.baseDomain, 'tunnel.example.net');
+  assert.equal(customQuota.maxDomainsPerOrg, 10);
+  assert.deepEqual(customQuota.unlimitedOrgIds, ['org-tier2', 'org-tier3']);
+  assert.throws(() => loadServerConfig('combined', {
+    SYNAPSETUNNEL_ADMIN_TOKEN: 'test-token',
+    SYNAPSETUNNEL_BASE_DOMAIN: 'localhost',
+  }), /BASE_DOMAIN/);
 
   const gateway = loadServerConfig('combined', {
     SYNAPSETUNNEL_ADMIN_TOKEN: 'test-token',

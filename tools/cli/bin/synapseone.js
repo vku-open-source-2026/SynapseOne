@@ -520,6 +520,8 @@ const FLAG_TARGETS = {
   choice: 'choices', questions: 'questions', state: 'state', history: 'history',
   'job-type': 'jobType', 'timeout-ms': 'timeoutMs', question: 'question', dataset: 'dataset',
   key: 'key', error: 'error', headers: 'headers',
+  subdomain: 'subdomain', hostname: 'hostname', domain: 'hostname',
+  upstream: 'upstream', port: 'port', 'path-prefix': 'pathPrefix', lines: 'lines',
 };
 const LIST_FLAGS = new Set(['collections', 'filters', 'columns', 'roles', 'candidateRoles', 'messages', 'choices', 'headers', 'members', 'values', 'receipts', 'ids']);
 const BOOL_FLAGS = {
@@ -527,6 +529,7 @@ const BOOL_FLAGS = {
   'no-requeue': 'noRequeue', requeue: 'requeue', 'if-not-exists': 'ifNotExists', 'if-exists': 'ifExists',
   'reset-attempts': 'resetAttempts', 'with-stats': 'withStats', 'auto-ack': 'autoAck',
   'include-data': 'includeData', unsubscribed: 'unsubscribed',
+  daemon: 'daemon', background: 'daemon', all: 'all', follow: 'follow',
 };
 
 function parse(argv) {
@@ -1310,6 +1313,18 @@ async function cmdTunnel(o) {
     tokenFile: o.tokenFile,
     serverUrl: o.serverUrl,
     reconnectDelayMs: o.reconnectDelayMs,
+    subdomain: o.subdomain,
+    hostname: o.hostname,
+    upstream: o.upstream,
+    port: o.port,
+    pathPrefix: o.pathPrefix,
+    name: o.name,
+    lines: o.lines,
+    daemon: o.daemon,
+    all: o.all,
+    follow: o.follow,
+    json: o.json,
+    apiCall: (method, p, body) => req(method, p, body, o),
   });
 }
 async function cmdCall(o) {
@@ -2664,7 +2679,7 @@ const COMMANDS = {
   'human-tasks': { fn: cmdHumanTasks, use: 'human-tasks [list|get|create|claim|approve|reject|expire] ...', doc: 'Workflow human approval tasks' },
   usage: { fn: cmdUsage, use: 'usage summary|events [--from ISO] [--to ISO] [--feature F] [--limit N]', doc: 'Org usage analytics (summary and request events)' },
   scim: { fn: cmdScim, use: 'scim tokens | scim token create|revoke ...', doc: 'SCIM provisioning token lifecycle' },
-  tunnel: { fn: cmdTunnel, use: 'tunnel run [connector-id] [--token-file F | --token T] [--server-url URL] [--reconnect-delay-ms MS]', doc: 'Run the outbound-only Synapse Tunnel connector (no separate binary)' },
+  tunnel: { fn: cmdTunnel, use: 'tunnel http <port|url> [--subdomain S] [-d] | tunnel start|stop|status|logs|list|quota | tunnel run [connector-id] [--token-file F | --token T] [--server-url URL]', doc: 'Expose local services via Synapse Tunnel (foreground or background daemon)' },
   call: { fn: cmdCall, use: 'call <METHOD> <path> [--data \'{...}\'|body.json] [--file body.json]', doc: 'Generic gateway call (escape hatch for new endpoints)' },
 };
 

@@ -1180,9 +1180,20 @@ visible in process listings and shell history. Tokens are sent only in the
 WebSocket handshake and are never logged. Public HTTPS/WSS termination and TLS
 certificates are configured on the server, not by the CLI.
 
-Stable CLI packages use `cli-v<version>` tags (for example `cli-v0.11.1`). The tag
+Stable CLI packages use `cli-v<version>` tags (for example `cli-v0.12.0`). The tag
 must match `tools/cli/package.json`; the release workflow runs the CLI test suite,
 publishes the npm package and verifies the registry version.
+
+Quick ngrok-style and background daemon commands (v0.12.0+):
+
+```bash
+synapseone tunnel http 3000 --subdomain myapp -d
+synapseone tunnel start 3000 --subdomain myapp
+synapseone tunnel status
+synapseone tunnel logs myapp -f
+synapseone tunnel stop myapp
+synapseone tunnel quota
+```
 
 ## Output format
 

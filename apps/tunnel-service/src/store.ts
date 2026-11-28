@@ -220,6 +220,16 @@ export class JsonStore {
     });
   }
 
+  async rotateConnectorToken(id: string, token: string): Promise<ConnectorRecord | null> {
+    return this.mutate((draft) => {
+      const connector = draft.connectors.find((item) => item.id === id);
+      if (!connector) return null;
+      connector.tokenHash = hashConnectorToken(token);
+      connector.updatedAt = new Date().toISOString();
+      return clone(connector);
+    });
+  }
+
   async deleteConnector(id: string): Promise<boolean> {
     return this.mutate((draft) => {
       const index = draft.connectors.findIndex((item) => item.id === id);

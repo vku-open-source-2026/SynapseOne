@@ -25,6 +25,43 @@ export const HOP_BY_HOP_HEADERS = new Set([
 const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9a-z-]+$/;
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 
+export const RESERVED_SUBDOMAINS = new Set([
+  'www', 'api', 'cloud', 'auth', 'admin', 'edge', 'tunnel', 'connect',
+  'ns1', 'ns2', 'mail', 'smtp', 'imap', 'pop', 'ftp', 'localhost', '_synapse',
+]);
+
+export function normalizeSubdomainLabel(value: string, baseDomain?: string): string {
+  let label = value.trim().toLowerCase();
+  if (label.endsWith('.')) label = label.slice(0, -1);
+  if (baseDomain) {
+    const base = baseDomain.trim().toLowerCase().replace(/\.$/, '');
+    if (label.endsWith(`.${base}`)) label = label.slice(0, -(base.length + 1));
+  }
+  if (!label || label.length > 63 || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)) {
+    throw new Error('Invalid subdomain');
+  }
+  if (RESERVED_SUBDOMAINS.has(label)) {
+    throw new Error(`Subdomain '${label}' is reserved`);
+  }
+  return label;
+}
+
+export function validateManagedDomainHostname(hostname: string, baseDomain: string): void {
+  const base = baseDomain.trim().toLowerCase().replace(/\.$/, '');
+  if (hostname === base) {
+    throw new Error(`Cannot bind route directly to apex domain ${base}; specify a subdomain`);
+  }
+  if (hostname.endsWith(`.${base}`)) {
+    const prefix = hostname.slice(0, -(base.length + 1));
+    if (!prefix || prefix.includes('.')) {
+      throw new Error(`Subdomain under ${base} must be a single label`);
+    }
+    if (RESERVED_SUBDOMAINS.has(prefix)) {
+      throw new Error(`Subdomain '${prefix}' is reserved`);
+    }
+  }
+}
+
 export function normalizeHostname(value: string): string {
   let hostname = value.trim().toLowerCase();
   if (hostname.startsWith('[') && hostname.endsWith(']')) hostname = hostname.slice(1, -1);
@@ -170,7 +207,8 @@ export const routeCreateSchema = z.object({
   name: z.string().trim().min(1).max(80).refine((value) => !CONTROL_CHARS.test(value), 'Invalid name').optional(),
   hostname: z.string().transform((value, ctx) => {
     try { return normalizeHostname(value); } catch { ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Invalid hostname' }); return z.NEVER; }
-  }),
+  }).optional(),
+  subdomain: z.string().trim().min(1).max(253).optional(),
   pathPrefix: z.string().optional().transform((value, ctx) => {
     try { return normalizePathPrefix(value); } catch { ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Invalid path prefix' }); return z.NEVER; }
   }),
@@ -179,13 +217,14 @@ export const routeCreateSchema = z.object({
   timeoutMs: z.number().int().min(100).max(300000).optional(),
   maxResponseBytes: z.number().int().min(1024).max(104857600).optional(),
   rateLimitPerMinute: z.number().int().min(0).max(1000000).optional(),
-}).strict();
+}).strict().refine((value) => Boolean(value.hostname || value.subdomain), 'Either hostname or subdomain is required');
 
 export const routeUpdateSchema = z.object({
   name: z.string().trim().min(1).max(80).refine((value) => !CONTROL_CHARS.test(value), 'Invalid name').optional(),
   hostname: z.string().transform((value, ctx) => {
     try { return normalizeHostname(value); } catch { ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Invalid hostname' }); return z.NEVER; }
   }).optional(),
+  subdomain: z.string().trim().min(1).max(253).optional(),
   pathPrefix: z.string().transform((value, ctx) => {
     try { return normalizePathPrefix(value); } catch { ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Invalid path prefix' }); return z.NEVER; }
   }).optional(),
@@ -195,3 +234,18 @@ export const routeUpdateSchema = z.object({
   maxResponseBytes: z.number().int().min(1024).max(104857600).optional(),
   rateLimitPerMinute: z.number().int().min(0).max(1000000).optional(),
 }).strict().refine((value) => Object.keys(value).length > 0, 'No fields to update');
+
+export const quickTunnelSchema = z.object({
+  name: z.string().trim().min(1).max(80).refine((value) => !CONTROL_CHARS.test(value), 'Invalid name').optional(),
+  upstreamUrl: z.string().transform((value, ctx) => {
+    try { return normalizeUpstreamUrl(value); } catch { ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Invalid upstream URL' }); return z.NEVER; }
+  }),
+  subdomain: z.string().trim().min(1).max(253).optional(),
+  hostname: z.string().transform((value, ctx) => {
+    try { return normalizeHostname(value); } catch { ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Invalid hostname' }); return z.NEVER; }
+  }).optional(),
+  pathPrefix: z.string().optional().transform((value, ctx) => {
+    try { return normalizePathPrefix(value); } catch { ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Invalid path prefix' }); return z.NEVER; }
+  }),
+  reuseExisting: z.boolean().optional(),
+}).strict();

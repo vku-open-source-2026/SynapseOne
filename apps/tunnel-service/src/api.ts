@@ -7,14 +7,27 @@
 
 import { randomBytes, timingSafeEqual } from 'crypto';
 import express, { type NextFunction, type Request, type Response } from 'express';
-import { z, type ZodType } from 'zod';
-import type { ServerConfig } from './config';
+import { type ZodType } from 'zod';
+import {
+  DEFAULT_BASE_DOMAIN,
+  DEFAULT_MAX_DOMAINS_PER_ORG,
+  DEFAULT_UNLIMITED_ORG_IDS,
+  type ServerConfig,
+} from './config';
 import { TunnelError, sendError } from './errors';
 import type { Logger } from './logger';
 import type { TunnelRegistry } from './registry';
 import { JsonStore } from './store';
-import type { ConnectorRecord, ManagementPrincipal, PublicConnector, RouteRecord } from './types';
-import { connectorCreateSchema, connectorUpdateSchema, routeCreateSchema, routeUpdateSchema } from './validation';
+import type { ConnectorRecord, DomainQuota, ManagementPrincipal, PublicConnector, RouteRecord } from './types';
+import {
+  connectorCreateSchema,
+  connectorUpdateSchema,
+  normalizeSubdomainLabel,
+  quickTunnelSchema,
+  routeCreateSchema,
+  routeUpdateSchema,
+  validateManagedDomainHostname,
+} from './validation';
 
 export interface ControlAppOptions {
   store: JsonStore;
@@ -131,6 +144,134 @@ function asyncRoute(handler: (req: Request, res: Response) => Promise<void>): (r
   return (req, res, next) => { void handler(req, res).catch(next); };
 }
 
+function resolveBaseDomain(config: ServerConfig): string {
+  return config.baseDomain ?? DEFAULT_BASE_DOMAIN;
+}
+
+function resolveMaxDomainsPerOrg(config: ServerConfig): number {
+  return config.maxDomainsPerOrg ?? DEFAULT_MAX_DOMAINS_PER_ORG;
+}
+
+function resolveUnlimitedOrgIds(config: ServerConfig): string[] {
+  return config.unlimitedOrgIds ?? DEFAULT_UNLIMITED_ORG_IDS;
+}
+
+function isUnlimitedOrg(caller: ManagementPrincipal, config: ServerConfig): boolean {
+  return caller.orgId === null || resolveUnlimitedOrgIds(config).includes(caller.orgId);
+}
+
+async function computeDomainQuota(store: JsonStore, caller: ManagementPrincipal, config: ServerConfig): Promise<DomainQuota> {
+  const [connectors, routes] = await Promise.all([store.listConnectors(), store.listRoutes()]);
+  const ownedIds = new Set(
+    connectors
+      .filter((connector) => canAccess(caller, connector))
+      .map((connector) => connector.id),
+  );
+  const domainSet = new Set<string>();
+  for (const route of routes) {
+    if (ownedIds.has(route.connectorId)) domainSet.add(route.hostname);
+  }
+  const domains = Array.from(domainSet).sort();
+  const unlimited = isUnlimitedOrg(caller, config);
+  const maxDomains = unlimited ? null : resolveMaxDomainsPerOrg(config);
+  const remainingDomains = unlimited || maxDomains === null ? null : Math.max(0, maxDomains - domains.length);
+  return {
+    orgId: caller.orgId,
+    baseDomain: resolveBaseDomain(config),
+    usedDomains: domains.length,
+    maxDomains,
+    remainingDomains,
+    unlimited,
+    domains,
+  };
+}
+
+function resolveRouteHostname(hostnameInput: string | undefined, subdomainInput: string | undefined, config: ServerConfig): string {
+  const baseDomain = resolveBaseDomain(config);
+  let resolved = hostnameInput;
+  if (subdomainInput !== undefined) {
+    let label: string;
+    try {
+      label = normalizeSubdomainLabel(subdomainInput, baseDomain);
+    } catch (error) {
+      throw new TunnelError(400, 'invalid_subdomain', error instanceof Error ? error.message : 'Invalid subdomain');
+    }
+    const candidate = `${label}.${baseDomain}`;
+    if (resolved && resolved !== candidate) {
+      throw new TunnelError(400, 'validation_error', 'Conflicting hostname and subdomain values');
+    }
+    resolved = candidate;
+  }
+  if (!resolved) {
+    throw new TunnelError(400, 'validation_error', 'Either hostname or subdomain is required');
+  }
+  try {
+    validateManagedDomainHostname(resolved, baseDomain);
+  } catch (error) {
+    throw new TunnelError(400, 'invalid_subdomain', error instanceof Error ? error.message : 'Invalid subdomain');
+  }
+  return resolved;
+}
+
+async function assertDomainAllowed(
+  store: JsonStore,
+  caller: ManagementPrincipal,
+  config: ServerConfig,
+  hostname: string,
+  ignoreRouteId?: string,
+): Promise<void> {
+  const [connectors, routes] = await Promise.all([store.listConnectors(), store.listRoutes()]);
+  const connectorOrgById = new Map<string, string | null>(connectors.map((connector) => [connector.id, connector.orgId]));
+  const ownedDomains = new Set<string>();
+  for (const route of routes) {
+    if (route.id === ignoreRouteId) continue;
+    const ownerOrgId = connectorOrgById.get(route.connectorId) ?? null;
+    if (route.hostname === hostname && caller.orgId !== null && ownerOrgId !== caller.orgId) {
+      throw new TunnelError(409, 'hostname_taken', 'This domain or subdomain is already claimed by another organization');
+    }
+    if (caller.orgId !== null && ownerOrgId === caller.orgId) {
+      ownedDomains.add(route.hostname);
+    }
+  }
+  if (caller.orgId !== null && !isUnlimitedOrg(caller, config)) {
+    const maxDomains = resolveMaxDomainsPerOrg(config);
+    if (!ownedDomains.has(hostname) && ownedDomains.size >= maxDomains) {
+      throw new TunnelError(
+        409,
+        'domain_limit_exceeded',
+        `Organization domain limit reached (maximum ${maxDomains} domains per organization)`,
+      );
+    }
+  }
+}
+
+function slugifyPrefix(value: string | undefined): string {
+  const cleaned = (value ?? 'app')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 24)
+    .replace(/-+$/, '');
+  return cleaned || 'app';
+}
+
+function buildPublicUrls(config: ServerConfig, hostname: string, pathPrefix: string): { publicUrl: string; serverUrl: string } {
+  const baseDomain = resolveBaseDomain(config);
+  const serverUrl = config.publicOrigin || `${config.publicScheme}://${baseDomain}`;
+  let scheme = config.publicScheme;
+  let port = '';
+  if (config.publicOrigin) {
+    const parsed = new URL(config.publicOrigin);
+    scheme = parsed.protocol === 'https:' ? 'https' : 'http';
+    port = parsed.port ? `:${parsed.port}` : '';
+  }
+  return {
+    publicUrl: `${scheme}://${hostname}${port}${pathPrefix}`,
+    serverUrl,
+  };
+}
+
 export function createControlApp(options: ControlAppOptions): express.Express {
   const { store, registry, config, logger } = options;
   const app = express();
@@ -153,13 +294,22 @@ export function createControlApp(options: ControlAppOptions): express.Express {
 
   app.use(express.json({ limit: '64kb', strict: true }));
 
-  app.get('/v1/config', (_req, res) => {
+  app.get('/v1/config', asyncRoute(async (_req, res) => {
+    const caller = principal(res);
+    const quota = await computeDomainQuota(store, caller, config);
     res.json({
       publicOrigin: config.publicOrigin || null,
       connectorPath: config.wsPath,
       protocolVersion: 1,
+      baseDomain: resolveBaseDomain(config),
+      quota,
     });
-  });
+  }));
+
+  app.get('/v1/quota', asyncRoute(async (_req, res) => {
+    const quota = await computeDomainQuota(store, principal(res), config);
+    res.json(quota);
+  }));
 
   app.get('/v1/connectors', asyncRoute(async (_req, res) => {
     const caller = principal(res);
@@ -193,15 +343,34 @@ export function createControlApp(options: ControlAppOptions): express.Express {
     res.json({ connector: withStatus(safe, registry) });
   }));
 
+  app.post('/v1/connectors/:id/rotate-token', asyncRoute(async (req, res) => {
+    const caller = principal(res);
+    await ownedConnector(store, req.params.id, caller);
+    const token = `st_${randomBytes(32).toString('base64url')}`;
+    const connector = await store.rotateConnectorToken(req.params.id, token);
+    if (!connector) throw new TunnelError(404, 'connector_not_found', 'Connector not found');
+    registry.disconnect(connector.id);
+    const { tokenHash: _tokenHash, ...safe } = connector;
+    logger.info('connector_token_rotated', { connectorId: connector.id });
+    res.json({ connector: withStatus(safe, registry), token });
+  }));
+
   app.delete('/v1/connectors/:id', asyncRoute(async (req, res) => {
     const caller = principal(res);
     await ownedConnector(store, req.params.id, caller);
-    if ((await store.routesForConnector(req.params.id)).length > 0) {
+    const routes = await store.routesForConnector(req.params.id);
+    const force = req.query.force === 'true' || req.query.force === '1';
+    if (routes.length > 0 && !force) {
       throw new TunnelError(409, 'connector_in_use', 'Delete the connector routes before deleting the connector');
+    }
+    if (force) {
+      for (const route of routes) {
+        await store.deleteRoute(route.id);
+      }
     }
     await store.deleteConnector(req.params.id);
     registry.disconnect(req.params.id);
-    logger.info('connector_deleted', { connectorId: req.params.id });
+    logger.info('connector_deleted', { connectorId: req.params.id, forced: force });
     res.status(204).end();
   }));
 
@@ -212,15 +381,18 @@ export function createControlApp(options: ControlAppOptions): express.Express {
   app.post('/v1/routes', asyncRoute(async (req, res) => {
     const caller = principal(res);
     const input = parseBody(routeCreateSchema, req.body);
+    const hostname = resolveRouteHostname(input.hostname, input.subdomain, config);
+    const pathPrefix = input.pathPrefix ?? '';
     const connector = await ownedConnector(store, input.connectorId, caller);
     if (!connector.enabled) throw new TunnelError(409, 'connector_disabled', 'Connector is disabled');
-    if ((await store.listRoutes()).some((route) => route.hostname === input.hostname && route.pathPrefix === (input.pathPrefix ?? ''))) {
+    await assertDomainAllowed(store, caller, config, hostname);
+    if ((await store.listRoutes()).some((route) => route.hostname === hostname && route.pathPrefix === pathPrefix)) {
       throw new TunnelError(409, 'route_exists', 'A route already exists for this hostname and path prefix');
     }
     const route = await store.createRoute({
-      name: input.name ?? `${input.hostname}${input.pathPrefix ?? ''}`,
-      hostname: input.hostname,
-      pathPrefix: input.pathPrefix ?? '',
+      name: input.name ?? `${hostname}${pathPrefix}`,
+      hostname,
+      pathPrefix,
       connectorId: input.connectorId,
       enabled: input.enabled ?? true,
       timeoutMs: input.timeoutMs,
@@ -243,11 +415,16 @@ export function createControlApp(options: ControlAppOptions): express.Express {
       const connector = await ownedConnector(store, patch.connectorId, caller);
       if (!connector.enabled) throw new TunnelError(409, 'connector_disabled', 'Connector is disabled');
     }
-    const candidate = { ...existing, ...patch };
+    const { subdomain, ...restPatch } = patch;
+    const hostname = (patch.hostname !== undefined || subdomain !== undefined)
+      ? resolveRouteHostname(patch.hostname, subdomain, config)
+      : existing.hostname;
+    const candidate = { ...existing, ...restPatch, hostname };
+    await assertDomainAllowed(store, caller, config, candidate.hostname, existing.id);
     if ((await store.listRoutes()).some((route) => route.id !== existing.id && route.hostname === candidate.hostname && route.pathPrefix === candidate.pathPrefix)) {
       throw new TunnelError(409, 'route_exists', 'A route already exists for this hostname and path prefix');
     }
-    const route = await store.updateRoute(req.params.id, patch);
+    const route = await store.updateRoute(req.params.id, { ...restPatch, hostname });
     if (!route) throw new TunnelError(404, 'route_not_found', 'Route not found');
     res.json({ route });
   }));
@@ -257,6 +434,109 @@ export function createControlApp(options: ControlAppOptions): express.Express {
     await store.deleteRoute(req.params.id);
     res.status(204).end();
   }));
+
+  const handleQuickProvision = asyncRoute(async (req, res) => {
+    const caller = principal(res);
+    const input = parseBody(quickTunnelSchema, req.body);
+    const baseDomain = resolveBaseDomain(config);
+    const pathPrefix = input.pathPrefix ?? '';
+    const reuseExisting = input.reuseExisting ?? true;
+
+    let hostname: string;
+    if (input.hostname !== undefined || input.subdomain !== undefined) {
+      hostname = resolveRouteHostname(input.hostname, input.subdomain, config);
+    } else {
+      const existingRoutes = await store.listRoutes();
+      const taken = new Set(existingRoutes.map((route) => route.hostname));
+      const prefix = slugifyPrefix(input.name);
+      let candidate = '';
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        const suffix = randomBytes(3).toString('hex');
+        const label = `${prefix}-${suffix}`;
+        const host = `${label}.${baseDomain}`;
+        if (!taken.has(host)) {
+          candidate = host;
+          break;
+        }
+      }
+      if (!candidate) throw new TunnelError(503, 'subdomain_allocation_failed', 'Unable to allocate an unused subdomain');
+      hostname = candidate;
+    }
+
+    const existingRoute = (await store.listRoutes()).find(
+      (route) => route.hostname === hostname && route.pathPrefix === pathPrefix,
+    );
+    if (existingRoute) {
+      const existingConnector = await store.getConnectorRecord(existingRoute.connectorId);
+      if (!existingConnector || !canAccess(caller, existingConnector)) {
+        throw new TunnelError(409, 'hostname_taken', 'This domain or subdomain is already claimed by another organization');
+      }
+      if (!reuseExisting) {
+        throw new TunnelError(409, 'route_exists', 'A route already exists for this hostname and path prefix');
+      }
+      const token = `st_${randomBytes(32).toString('base64url')}`;
+      await store.updateConnector(existingConnector.id, {
+        ...(input.name ? { name: input.name } : {}),
+        upstreamUrl: input.upstreamUrl,
+        enabled: true,
+      });
+      const updated = await store.rotateConnectorToken(existingConnector.id, token);
+      if (!updated) throw new TunnelError(404, 'connector_not_found', 'Connector not found');
+      registry.disconnect(updated.id);
+      const { tokenHash: _tokenHash, ...safe } = updated;
+      const quota = await computeDomainQuota(store, caller, config);
+      const urls = buildPublicUrls(config, existingRoute.hostname, existingRoute.pathPrefix);
+      logger.info('quick_tunnel_reused', { connectorId: updated.id, routeId: existingRoute.id, hostname });
+      res.status(200).json({
+        connector: withStatus(safe, registry),
+        route: existingRoute,
+        token,
+        ...urls,
+        baseDomain,
+        reused: true,
+        quota,
+      });
+      return;
+    }
+
+    await assertDomainAllowed(store, caller, config, hostname);
+    const token = `st_${randomBytes(32).toString('base64url')}`;
+    const connectorName = input.name ?? hostname.split('.')[0] ?? hostname;
+    const connector = await store.createConnector({
+      name: connectorName,
+      upstreamUrl: input.upstreamUrl,
+      orgId: caller.orgId,
+    }, token);
+    let route: RouteRecord;
+    try {
+      route = await store.createRoute({
+        name: connectorName,
+        hostname,
+        pathPrefix,
+        connectorId: connector.id,
+        enabled: true,
+      });
+    } catch (error) {
+      await store.deleteConnector(connector.id).catch(() => undefined);
+      throw error;
+    }
+    const { tokenHash: _tokenHash, ...safe } = connector;
+    const quota = await computeDomainQuota(store, caller, config);
+    const urls = buildPublicUrls(config, route.hostname, route.pathPrefix);
+    logger.info('quick_tunnel_created', { connectorId: connector.id, routeId: route.id, hostname });
+    res.status(201).json({
+      connector: withStatus(safe, registry),
+      route,
+      token,
+      ...urls,
+      baseDomain,
+      reused: false,
+      quota,
+    });
+  });
+
+  app.post('/v1/quick', handleQuickProvision);
+  app.post('/v1/provision', handleQuickProvision);
 
   app.use((_req, res) => {
     res.status(404).json({ error: 'not_found', message: 'Endpoint not found' });

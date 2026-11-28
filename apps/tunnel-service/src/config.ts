@@ -34,6 +34,12 @@ export interface ServerConfig {
   publicScheme: 'http' | 'https';
   /** Origin advertised to Console/CLI for the public ingress (no path/query). */
   publicOrigin?: string;
+  /** Managed wildcard base domain for auto-provisioned tunnel subdomains. */
+  baseDomain?: string;
+  /** Maximum distinct domains allowed per standard organization. */
+  maxDomainsPerOrg?: number;
+  /** Organization IDs or slugs exempt from the per-org domain limit (Tier 2/3 & platform). */
+  unlimitedOrgIds?: string[];
   logLevel: LogLevel;
 }
 
@@ -81,6 +87,29 @@ function readWsPath(env: Env): string {
   const value = env.SYNAPSETUNNEL_WS_PATH ?? '/_synapse/tunnel/connect';
   if (!value.startsWith('/') || value.length > 128 || /[?#\s]/.test(value)) throw new Error('Invalid SYNAPSETUNNEL_WS_PATH');
   return value;
+}
+
+export const DEFAULT_BASE_DOMAIN = 'synapsetunnel.site';
+export const DEFAULT_MAX_DOMAINS_PER_ORG = 5;
+export const DEFAULT_UNLIMITED_ORG_IDS = [
+  '5e8cbd7b-b659-4944-ab9b-c06b8f56c17c',
+  '0ade6459-2746-4168-accf-4b69af7f306a',
+  'acme',
+  'synapseone-platform',
+];
+
+function readBaseDomain(env: Env): string {
+  const raw = (env.SYNAPSETUNNEL_BASE_DOMAIN ?? DEFAULT_BASE_DOMAIN).trim().toLowerCase().replace(/\.$/, '');
+  if (!raw || raw.length > 200 || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(raw)) {
+    throw new Error('Invalid SYNAPSETUNNEL_BASE_DOMAIN');
+  }
+  return raw;
+}
+
+function readUnlimitedOrgIds(env: Env): string[] {
+  const raw = env.SYNAPSETUNNEL_UNLIMITED_ORG_IDS;
+  if (raw === undefined || !raw.trim()) return [...DEFAULT_UNLIMITED_ORG_IDS];
+  return raw.split(',').map((item) => item.trim()).filter(Boolean);
 }
 
 export function loadServerConfig(mode: ServerMode = 'combined', env: Env = process.env): ServerConfig {
@@ -133,6 +162,9 @@ export function loadServerConfig(mode: ServerMode = 'combined', env: Env = proce
     trustProxy: readBoolean(env, 'SYNAPSETUNNEL_TRUST_PROXY'),
     publicScheme,
     publicOrigin,
+    baseDomain: readBaseDomain(env),
+    maxDomainsPerOrg: readInteger(env, 'SYNAPSETUNNEL_MAX_DOMAINS_PER_ORG', DEFAULT_MAX_DOMAINS_PER_ORG, 1, 10000),
+    unlimitedOrgIds: readUnlimitedOrgIds(env),
     logLevel: readLogLevel(env),
   };
 }
