@@ -1076,13 +1076,14 @@ gateway only exposes `/v1/ai` and `/v1/inference` (the aliases stay internal).
 ## VIC Hackathon registration (`/v1/hackathon`)
 
 `POST /v1/hackathon/registrations` is public and requires no account, JWT or API key.
-It accepts either a 2–3 member team or an individual registration. Each person
-provides their year of study and optional advanced skills (competitive programming,
-practical experience, product experience). Registration closes at **17:00 on 28
-November 2026 (Vietnam time)**. The server validates contact data, rules consent,
-duplicates, rate limits and the configured deadline. API keys are created and
-emailed manually by the organizers; the registration API never stores or returns
-an API-key secret.
+It accepts a solo/individual registration or a team of 2–3 members. Solo is a valid
+standalone entry; finding a team beforehand is not required, and organizers may help
+arrange teammates. Each person provides their year of study and optional advanced
+skills (competitive programming, practical experience, product experience).
+Registration closes at **00:00 on 29 November 2026 (Vietnam time)**. The server
+validates contact data, rules consent, duplicates, rate limits and the configured
+deadline. API keys are created and emailed manually by the organizers; the
+registration API never stores or returns an API-key secret.
 
 ```json
 {
@@ -1153,7 +1154,8 @@ and service-account tokens are rejected.
 | GET/POST/DELETE | `/v1/platform/admins[/:userId]` | Owner-only platform administrator management. |
 | GET | `/v1/platform/hackathon/registrations?q&status&limit&offset` | Hackathon teams/individuals, status and manual API-key delivery counts. |
 | GET | `/v1/platform/hackathon/match-suggestions` | Non-mutating suggestions for individual players, prioritizing a year-2 or skilled anchor plus two members. |
-| GET | `/v1/platform/hackathon/registrations/:id` | Full team registration detail. |
+| GET | `/v1/platform/hackathon/registrations/:id` | Full team/individual registration detail. |
+| PUT | `/v1/platform/hackathon/registrations/:id` | Operator/owner replaces editable registration details with step-up action `hackathon:update` and audit. Accepts `registrationType`, `teamName`, captain contact fields, `members`, captain-first `memberYears`/`memberSkills`, `projectIdea`, and the row's `expectedUpdatedAt`; preserves review and API-key delivery state. Returns `409 registration_conflict` when another admin saved first. |
 | PATCH | `/v1/platform/hackathon/registrations/:id` | Approve/reject with step-up action `hackathon:review` and audit. |
 | POST | `/v1/platform/hackathon/registrations/:id/api-key-sent` | Record manual API-key email delivery with step-up action `hackathon:api-key-sent`; no secret is stored. |
 

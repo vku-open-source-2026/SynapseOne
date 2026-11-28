@@ -7,16 +7,17 @@ Public page: **https://cloud.synapseone.space/hackathon**
 ## Overview
 
 VIC Hackathon #1 is a Vietnamese-first product-building event for members of the
-VIC Programming Club. Teams of **2–3 members** build a product using SynapseOne,
-then pitch it to the jury. Players without a team may register individually and
-BTC will suggest suitable teammates. Registration does not require a SynapseOne
-account.
+VIC Programming Club. Players may register **solo/individually** or as a team of
+**2–3 members**, build a product using SynapseOne, then pitch it to the jury. Solo
+registration is valid on its own; finding a team beforehand is not required. BTC
+may help arrange teammates when requested. Registration does not require a
+SynapseOne account.
 
 ## Schedule — Vietnam time (UTC+7)
 
 | Milestone | Time |
 |---|---|
-| Registration closes | **17:00, 28 November 2026** |
+| Registration closes | **00:00, 29 November 2026** |
 | BTC distributes API keys by email | **12:00, 29 November 2026** |
 | Pitching round | **19:00, 3 December 2026** |
 
@@ -25,9 +26,9 @@ also enforces the deadline so direct API calls cannot bypass it.
 
 ## Rules
 
-1. Each team has 2–3 members and one captain as the contact person. Players
-   without a team can register individually; BTC will arrange teams using the
-   admin suggestions.
+1. Players may register solo/individually or as a team of 2–3 members with one
+   captain as the contact person. Solo players do not have to find a team before
+   registering; BTC may help arrange teammates using the admin suggestions.
 2. The product must be developed from SynapseOne, using its APIs, workflows, data
    services or other platform capabilities.
 3. Teams must respect copyright, avoid malicious behavior and must not share API
@@ -85,24 +86,29 @@ Platform operators and owners can open **Admin → VIC Hackathon** to:
 
 1. Search/filter registrations by team, captain, email, MSV or status.
 2. Inspect team members and the optional product idea.
-3. Approve or reject with a fresh step-up proof (`hackathon:review`).
-4. Create the API key through the normal trusted operator process and email it
+3. Use **Sửa thông tin** to correct the registration type, team name, captain
+   contact details, members, years, advanced skills or product idea. Saving uses
+   step-up action `hackathon:update`; approval, review notes and API-key delivery
+   timestamps are preserved. A warning appears when changing an email that was
+   already marked as sent.
+4. Approve or reject with a fresh step-up proof (`hackathon:review`).
+5. Create the API key through the normal trusted operator process and email it
    manually to the captain.
-5. Open **Gợi ý ghép team** to see non-mutating suggestions for individual players.
+6. Open **Gợi ý ghép team** to see non-mutating suggestions for individual players.
    The algorithm anchors each suggested trio with a second-year student or someone
    with advanced skills, then prefers two first-year students.
-6. Mark the registration as sent with step-up action
+7. Mark the registration as sent with step-up action
    `hackathon:api-key-sent`.
 
-Auditors are read-only. Review and delivery actions are audited. The system stores
-only delivery status/timestamps, never plaintext API keys.
+Auditors are read-only. Detail edits, review and delivery actions are audited. The
+system stores only delivery status/timestamps, never plaintext API keys.
 
 ## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `HACKATHON_REGISTRATION_CLOSE_AT` | `2026-11-28T17:00:00.000Z` | Server-side deadline; ISO timestamp. |
-| `HACKATHON_MAX_REGISTRATIONS` | `500` | Maximum number of teams. |
+| `HACKATHON_MAX_REGISTRATIONS` | `500` | Maximum number of registrations (solo and teams). |
 | `HACKATHON_REGISTRATION_RATE_LIMIT` | `5` | Public submissions allowed per IP/window. |
 | `HACKATHON_REGISTRATION_RATE_WINDOW_MS` | `900000` | Rate-limit window (15 minutes). |
 

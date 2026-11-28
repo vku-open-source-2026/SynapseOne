@@ -29,8 +29,8 @@ const SKILL_OPTIONS = [
 
 const TIMELINE = [
   { at: CLOSE_AT, title: 'Đóng đơn đăng ký', text: 'Hoàn tất form và chờ ban tổ chức xác nhận.', icon: CalendarDays },
-  { at: API_KEY_AT, title: 'Phát API key', text: 'BTC gửi API key đến email đội trưởng đã đăng ký.', icon: ShieldCheck },
-  { at: PITCH_AT, title: 'Vòng pitching', text: 'Các đội trình bày sản phẩm trước ban giám khảo.', icon: Trophy },
+  { at: API_KEY_AT, title: 'Phát API key', text: 'BTC gửi API key đến email đã đăng ký.', icon: ShieldCheck },
+  { at: PITCH_AT, title: 'Vòng pitching', text: 'Thí sinh/đội trình bày sản phẩm trước ban giám khảo.', icon: Trophy },
 ];
 
 const FIELD_CLASS =
@@ -209,10 +209,10 @@ export default function Hackathon() {
     } catch (e) {
       const messages = {
         registration_closed: 'Đã hết thời hạn đăng ký.',
-        registration_exists: 'Tên đội hoặc email đội trưởng đã được đăng ký.',
-        registration_full: 'Số lượng đội đã đủ. Vui lòng liên hệ ban tổ chức.',
+        registration_exists: 'Tên đội hoặc email đăng ký đã được sử dụng.',
+        registration_full: 'Số lượng đơn đăng ký đã đủ. Vui lòng liên hệ ban tổ chức.',
         rate_limited: 'Bạn gửi quá nhiều yêu cầu. Vui lòng thử lại sau.',
-        invalid_body: 'Thông tin đăng ký chưa hợp lệ. Vui lòng kiểm tra tên đội, email, SĐT, MSV và thành viên.',
+        invalid_body: 'Thông tin đăng ký chưa hợp lệ. Vui lòng kiểm tra tên đội (nếu có), email, SĐT, MSV và thành viên.',
       };
       setError(messages[e.body?.error] || e.message || 'Không thể gửi đơn đăng ký. Vui lòng thử lại.');
     } finally {
@@ -237,8 +237,8 @@ export default function Hackathon() {
             <span className="bg-gradient-to-r from-sky-500 to-blue-600 bg-clip-text text-transparent dark:from-sky-400 dark:to-blue-500">sản phẩm thật.</span>
           </h1>
           <p className="hackathon-reveal hackathon-reveal-delay-2 mx-auto mt-6 max-w-2xl text-base leading-relaxed text-s1-muted sm:text-lg">
-            Hành trình 2–3 người, một sản phẩm và hàng trăm API mạnh mẽ từ SynapseOne.
-            Xây dựng giải pháp của riêng bạn và chinh phục ban giám khảo VIC.
+            Đăng ký đội 2–3 người hoặc solo/cá nhân, xây dựng một sản phẩm với hàng trăm API mạnh mẽ từ SynapseOne.
+            Bắt đầu với đội hình của riêng bạn và chinh phục ban giám khảo VIC.
           </p>
           <div className="hackathon-reveal hackathon-reveal-delay-3 mt-8 flex flex-col items-center justify-center gap-3 sm:flex-row">
             <a href="#dang-ky" className={PRIMARY_BTN}>
@@ -261,7 +261,7 @@ export default function Hackathon() {
 
         <section className="mt-16 grid gap-4 sm:grid-cols-3">
           {[
-            { icon: Users, value: '2–3', label: 'thành viên / đội' },
+            { icon: Users, value: 'Solo / 2–3', label: 'cá nhân hoặc thành viên / đội' },
             { icon: Code2, value: 'SynapseOne', label: 'nền tảng phát triển' },
             { icon: Trophy, value: '1.000.000₫', label: 'tổng giá trị giải thưởng' },
           ].map(({ icon: Icon, value, label }) => (
@@ -303,7 +303,7 @@ export default function Hackathon() {
           </div>
           <div className="mt-10 grid gap-4 md:grid-cols-2">
             {[
-              { icon: Users, title: 'Team 2–3 người hoặc đăng ký cá nhân', text: 'Dành cho thành viên CLB Lập trình VIC. Nếu chưa có team, hãy đăng ký cá nhân; BTC sẽ gợi ý ghép đội theo năm học và kỹ năng.' },
+              { icon: Users, title: 'Đăng ký solo/cá nhân hoặc đội 2–3 người', text: 'Bạn được phép đăng ký solo với một người, không bắt buộc tìm đội trước. BTC có thể hỗ trợ ghép đội theo năm học và kỹ năng nếu bạn muốn.' },
               { icon: Code2, title: 'Phát triển sản phẩm từ SynapseOne', text: 'Sử dụng API, workflow, dữ liệu hoặc các dịch vụ của SynapseOne để tạo sản phẩm có giá trị thực tế.' },
               { icon: ShieldCheck, title: 'Làm việc công bằng, an toàn', text: 'Tôn trọng bản quyền, không phá hoại hệ thống, không lạm dụng API key và tuân thủ hướng dẫn của ban tổ chức.' },
               { icon: Trophy, title: 'Pitching trước ban giám khảo', text: 'Trình bày sản phẩm, cách dùng SynapseOne và giá trị mà đội mang lại. Ban tổ chức sẽ hướng dẫn chi tiết thời lượng.' },
@@ -318,7 +318,7 @@ export default function Hackathon() {
             ))}
           </div>
           <div className={`${CARD_CLASS} mt-4 text-sm leading-relaxed text-s1-muted`}>
-            <strong className="text-s1-fg">Lưu ý:</strong> API key được BTC tạo và gửi thủ công đến email đội trưởng sau khi duyệt.
+            <strong className="text-s1-fg">Lưu ý:</strong> API key được BTC tạo và gửi thủ công đến email đã đăng ký sau khi duyệt.
             Không chia sẻ API key công khai. Mọi thay đổi về lịch trình sẽ được ban tổ chức thông báo qua email đã đăng ký.
           </div>
         </section>
@@ -372,13 +372,13 @@ export default function Hackathon() {
           <div className="grid gap-8 lg:grid-cols-[0.8fr_1.2fr] lg:items-start">
             <div>
               <p className="text-xs font-bold uppercase tracking-[0.24em] text-s1-accent">Đăng ký</p>
-              <h2 className="mt-3 text-3xl font-semibold tracking-tight text-balance sm:text-4xl">Tập hợp đội hình,<br />bắt đầu hành trình.</h2>
+              <h2 className="mt-3 text-3xl font-semibold tracking-tight text-balance sm:text-4xl">Tập hợp đội hình,<br />hoặc bắt đầu solo.</h2>
               <p className="mt-4 text-sm leading-relaxed text-s1-muted">
-                Điền thông tin đội trưởng và các thành viên. Ban tổ chức sẽ dùng email của đội trưởng để gửi xác nhận và API key.
+                Điền thông tin đội trưởng/thí sinh và các thành viên nếu có. Ban tổ chức sẽ dùng email đã đăng ký để gửi xác nhận và API key.
               </p>
               <div className="mt-6 space-y-3 text-sm text-s1-fg">
                 <div className="flex items-center gap-3"><CheckCircle2 className="h-4 w-4 text-s1-accent" /> Không cần đăng nhập</div>
-                <div className="flex items-center gap-3"><CheckCircle2 className="h-4 w-4 text-s1-accent" /> Mỗi đội 2–3 thành viên</div>
+                <div className="flex items-center gap-3"><CheckCircle2 className="h-4 w-4 text-s1-accent" /> Đăng ký solo hoặc đội 2–3 người</div>
                 <div className="flex items-center gap-3"><CheckCircle2 className="h-4 w-4 text-s1-accent" /> BTC gửi API key qua email</div>
               </div>
               <div className={`${CARD_CLASS} mt-8 text-sm text-s1-muted`}>
@@ -396,7 +396,7 @@ export default function Hackathon() {
                   <h3 className="mt-5 text-2xl font-semibold text-s1-fg">Đơn đăng ký đã được gửi!</h3>
                   <p className="mx-auto mt-3 max-w-md text-sm leading-relaxed text-s1-muted">
                     {success.registrationType === 'individual' ? (
-                      <>Thí sinh <strong className="text-s1-accent">{success.captainName}</strong> đang chờ ban tổ chức sắp xếp team.</>
+                      <>Thí sinh <strong className="text-s1-accent">{success.captainName}</strong> đã đăng ký solo và đang chờ ban tổ chức xác nhận. BTC có thể liên hệ để hỗ trợ ghép đội nếu cần.</>
                     ) : (
                       <>Đội <strong className="text-s1-accent">{success.teamName}</strong> đang chờ ban tổ chức xác nhận.</>
                     )}
@@ -427,14 +427,14 @@ export default function Hackathon() {
                       <span className="mt-1 block text-[11px]">Đăng ký 2–3 thành viên</span>
                     </button>
                     <button type="button" onClick={() => update('registrationType', 'individual')} className={`rounded-2xl border px-4 py-3 text-left text-sm transition ${form.registrationType === 'individual' ? 'border-s1-accent bg-s1-accent-soft text-s1-accent' : 'border-s1-line bg-s1-surface text-s1-muted hover:border-s1-accent'}`}>
-                      <strong className="block">Chưa có team</strong>
-                      <span className="mt-1 block text-[11px]">BTC sẽ sắp xếp team phù hợp</span>
+                      <strong className="block">Đăng ký solo / cá nhân</strong>
+                      <span className="mt-1 block text-[11px]">Một người, không bắt buộc tìm đội</span>
                     </button>
                   </div>
 
                   {form.registrationType === 'individual' && (
                     <div className="mb-5 rounded-2xl border border-s1-accent/20 bg-s1-accent-soft p-4 text-xs leading-relaxed text-s1-accent">
-                      Hệ thống sẽ gợi ý ghép team cho admin dựa trên năm học và kỹ năng nâng cao, ưu tiên một sinh viên năm 2 hoặc người có kỹ năng nổi bật làm anchor.
+                      Bạn được phép tham gia với tư cách solo/cá nhân. Nếu muốn, BTC có thể gợi ý ghép đội dựa trên năm học và kỹ năng nâng cao, ưu tiên một sinh viên năm 2 hoặc người có kỹ năng nổi bật làm anchor.
                     </div>
                   )}
 
@@ -524,7 +524,7 @@ export default function Hackathon() {
 
                   <label className="mt-5 flex cursor-pointer items-start gap-3 text-xs leading-relaxed text-s1-muted">
                     <input type="checkbox" checked={form.acceptedRules} onChange={(e) => update('acceptedRules', e.target.checked)} className="mt-0.5 h-4 w-4 accent-sky-500" required disabled={closed} />
-                    <span>Tôi xác nhận thông tin chính xác, đồng ý với <a href="#the-le" className="font-semibold text-s1-accent underline underline-offset-2">thể lệ VIC Hackathon #1</a>{form.registrationType === 'individual' ? ' và để BTC hỗ trợ sắp xếp team' : ''}.</span>
+                    <span>Tôi xác nhận thông tin chính xác, đồng ý với <a href="#the-le" className="font-semibold text-s1-accent underline underline-offset-2">thể lệ VIC Hackathon #1</a>{form.registrationType === 'individual' ? ' và đồng ý để BTC liên hệ hỗ trợ ghép đội nếu cần' : ''}.</span>
                   </label>
 
                   <button type="submit" disabled={busy || closed} className={`${PRIMARY_BTN} mt-6 w-full disabled:cursor-not-allowed disabled:opacity-60`}>

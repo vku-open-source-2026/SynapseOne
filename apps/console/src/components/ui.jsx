@@ -175,6 +175,14 @@ const ERROR_COPY = {
     title: 'Cần xác thực step-up',
     message: 'Hành động này cần một mã TOTP mới. Mã step-up chỉ dùng một lần và gắn với đúng hành động hiện tại.',
   },
+  registration_conflict: {
+    title: 'Đơn đã được admin khác sửa',
+    message: 'Dữ liệu đã thay đổi sau khi bạn mở form. Hãy đóng form, mở lại đơn và kiểm tra thông tin mới nhất trước khi lưu.',
+  },
+  registration_exists: {
+    title: 'Tên đội hoặc email đã được dùng',
+    message: 'Một đơn khác đang sử dụng tên đội hoặc email này. Vui lòng kiểm tra lại thông tin.',
+  },
   scope_denied: {
     title: 'API key không đủ scope',
     message: 'API key hiện tại không có quyền cho thao tác này. Dùng user JWT hoặc API key có scope phù hợp.',
@@ -343,6 +351,8 @@ const ERROR_COPY_EN = {
   platform_mfa_required: { title: 'MFA required', message: 'Enable TOTP MFA in Security before opening Platform Administration.' },
   platform_role_required: { title: 'Platform role too low', message: 'This action requires the owner or operator role. Auditors are read-only.' },
   platform_step_up_required: { title: 'Step-up verification required', message: 'Enter a fresh TOTP code. Step-up proofs are single-use and bound to one action.' },
+  registration_conflict: { title: 'Registration changed by another admin', message: 'The record changed after this editor opened. Close the form, reopen the registration, and review the latest values before saving.' },
+  registration_exists: { title: 'Team name or email already in use', message: 'Another registration uses this team name or email. Review the values and try again.' },
   scope_denied: { title: 'Credential scope denied', message: 'The API key or credential does not have the required scope for this action.' },
   access_denied: { title: 'Access denied', message: 'The current role or policy does not allow this action.' },
   last_admin: { title: 'Last organization administrator', message: 'Each organization must keep at least one active Organization Administrator.' },

@@ -72,6 +72,7 @@ and from the internal `SYNAPSEONE_INTERNAL_SECRET` platform caller.
 | Usage | `GET /v1/platform/usage/summary`, `/v1/platform/usage/events` |
 | Audit & Security | `GET /v1/platform/audit` |
 | Platform Admins | `GET/POST /v1/platform/admins`, `DELETE /v1/platform/admins/:id` |
+| VIC Hackathon | `/admin/hackathon`; `GET/PUT/PATCH /v1/platform/hackathon/registrations[/:id]`, match suggestions and manual API-key delivery tracking. Operators/owners can edit details with step-up `hackathon:update`; auditors are read-only. |
 
 ## Configuration
 

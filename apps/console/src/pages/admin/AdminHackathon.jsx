@@ -3,6 +3,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { usePlatformAuth } from '../../lib/platform-auth.jsx';
 import { Badge, Btn, Card, Empty, Err, Field, Input, Modal, PageTitle, Table, TableSkeleton } from '../../components/ui.jsx';
+import AdminHackathonRegistrationEditor from './AdminHackathonRegistrationEditor.jsx';
 
 const PAGE = 25;
 const STATUS_LABELS = { pending: 'Chờ duyệt', approved: 'Đã duyệt', rejected: 'Từ chối' };
@@ -31,6 +32,9 @@ export default function AdminHackathon() {
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState(null);
   const [detail, setDetail] = useState(null);
+  const [editor, setEditor] = useState(null);
+  const [editorLoading, setEditorLoading] = useState(false);
+  const [editorErr, setEditorErr] = useState(null);
   const [action, setAction] = useState(null);
   const [code, setCode] = useState('');
   const [reviewNote, setReviewNote] = useState('');
@@ -41,6 +45,7 @@ export default function AdminHackathon() {
   const [suggestionsLoading, setSuggestionsLoading] = useState(false);
   const [suggestionsErr, setSuggestionsErr] = useState(null);
   const seqRef = useRef(0);
+  const editorSeqRef = useRef(0);
   const canReview = platform.role === 'operator' || platform.role === 'owner';
 
   const load = useCallback(async (nextOffset = offset) => {
@@ -86,6 +91,39 @@ export default function AdminHackathon() {
     } finally {
       setSuggestionsLoading(false);
     }
+  };
+
+  const openEditor = async (registration) => {
+    const seq = ++editorSeqRef.current;
+    setDetail(null);
+    setEditor(registration);
+    setEditorLoading(true);
+    setEditorErr(null);
+    try {
+      const out = await platform.request(`/v1/platform/hackathon/registrations/${registration.id}`);
+      if (seq !== editorSeqRef.current) return;
+      setEditor(out.registration);
+    } catch (e) {
+      if (seq !== editorSeqRef.current) return;
+      setEditor(null);
+      setEditorErr(e);
+    } finally {
+      if (seq === editorSeqRef.current) setEditorLoading(false);
+    }
+  };
+
+  const closeEditor = () => {
+    editorSeqRef.current++;
+    setEditor(null);
+    setEditorLoading(false);
+  };
+
+  const saveEditor = async (registration) => {
+    editorSeqRef.current++;
+    setEditor(null);
+    setEditorLoading(false);
+    setDetail(registration);
+    await load();
   };
 
   const openAction = (registration, type) => {
@@ -135,12 +173,12 @@ export default function AdminHackathon() {
         sub="Đơn đăng ký team/cá nhân, gợi ý ghép đội và trạng thái gửi API key"
         right={<><Btn kind="secondary" onClick={loadSuggestions} loading={suggestionsLoading}>Gợi ý ghép team</Btn><Btn kind="secondary" onClick={() => load()} loading={loading}>Làm mới</Btn></>}
       />
-      {!canReview && <div className="mb-4 rounded-2xl bg-amber-500/10 px-4 py-3 text-sm text-amber-700">Tài khoản auditor chỉ có thể xem đơn. Cần operator hoặc owner để duyệt và cập nhật API key.</div>}
+      {!canReview && <div className="mb-4 rounded-2xl bg-amber-500/10 px-4 py-3 text-sm text-amber-700">Tài khoản auditor chỉ có thể xem đơn. Cần operator hoặc owner để sửa thông tin, duyệt và cập nhật API key.</div>}
       <div className="mb-4 grid gap-3 sm:grid-cols-5">
         {[
           ['Chờ duyệt', data.counts.pending || 0],
           ['Đã duyệt', data.counts.approved || 0],
-          ['Chưa có team', data.counts.individuals || 0],
+          ['Đăng ký solo', data.counts.individuals || 0],
           ['Đã gửi API key', data.counts.apiKeySent || 0],
           ['Từ chối', data.counts.rejected || 0],
         ].map(([label, value]) => (
@@ -148,6 +186,7 @@ export default function AdminHackathon() {
         ))}
       </div>
       <Err e={err} />
+      <Err e={editorErr} />
       <Card className="mb-4">
         <form onSubmit={search} className="flex flex-wrap items-end gap-2">
           <Field label="Tìm tên đội, đội trưởng, email hoặc MSV">
@@ -171,7 +210,7 @@ export default function AdminHackathon() {
             {data.items.map((row) => (
               <tr key={row.id} className="border-t border-slate-100 align-top">
                 <td className="py-3 pr-4">
-                  <button type="button" onClick={() => setDetail(row)} className="text-left font-semibold text-main-blue hover:underline">{row.registrationType === 'individual' ? `Cá nhân: ${row.captainName}` : row.teamName}</button>
+                  <button type="button" disabled={editorLoading} onClick={() => { editorSeqRef.current++; setDetail(row); }} className="text-left font-semibold text-main-blue hover:underline disabled:opacity-50">{row.registrationType === 'individual' ? `Cá nhân: ${row.captainName}` : row.teamName}</button>
                   <p className="max-w-[220px] truncate text-xs text-normal-text">{row.registrationType === 'individual' ? `Năm ${row.memberYears?.[0] || '–'} · ${(row.memberSkills?.[0] || []).map((skill) => SKILL_LABELS[skill] || skill).join(', ') || 'Chưa có kỹ năng nâng cao'}` : (row.projectIdea || 'Chưa có ý tưởng')}</p>
                 </td>
                 <td className="py-3 pr-4"><div>{row.captainName}</div><div className="font-mono text-xs text-normal-text">{row.captainStudentId}</div></td>
@@ -197,7 +236,7 @@ export default function AdminHackathon() {
       </Card>
 
       {detail && (
-        <Modal title={detail.teamName} onClose={() => setDetail(null)}>
+        <Modal title={detail.registrationType === 'individual' ? `Cá nhân: ${detail.captainName}` : detail.teamName} onClose={() => setDetail(null)}>
           <div className="space-y-4 text-sm">
             <div className="flex flex-wrap gap-2"><Badge tone={detail.status === 'approved' ? 'green' : detail.status === 'rejected' ? 'red' : 'amber'}>{STATUS_LABELS[detail.status] || detail.status}</Badge>{detail.apiKeySentAt && <Badge tone="green">Đã gửi API key</Badge>}</div>
             <div className="rounded-2xl bg-background p-4">
@@ -214,6 +253,7 @@ export default function AdminHackathon() {
             <div className="text-xs text-normal-text">Gửi lúc {formatDate(detail.createdAt)}{detail.reviewedAt ? ` · Duyệt lúc ${formatDate(detail.reviewedAt)}` : ''}{detail.apiKeySentAt ? ` · API key gửi lúc ${formatDate(detail.apiKeySentAt)}` : ''}</div>
             {canReview && (
               <div className="flex flex-wrap gap-2 border-t border-slate-100 pt-4">
+                <Btn kind="secondary" onClick={() => openEditor(detail)}>Sửa thông tin</Btn>
                 {detail.status !== 'approved' && <Btn kind="success" onClick={() => openAction(detail, 'approve')}>Duyệt đơn</Btn>}
                 {detail.status !== 'rejected' && <Btn kind="danger" onClick={() => openAction(detail, 'reject')}>Từ chối</Btn>}
                 {detail.status === 'approved' && !detail.apiKeySentAt && <Btn onClick={() => openAction(detail, 'sent')}>Đánh dấu đã gửi API key</Btn>}
@@ -222,6 +262,15 @@ export default function AdminHackathon() {
             )}
           </div>
         </Modal>
+      )}
+
+      {editor && !editorLoading && (
+        <AdminHackathonRegistrationEditor
+          platform={platform}
+          registration={editor}
+          onClose={closeEditor}
+          onSaved={saveEditor}
+        />
       )}
 
       {suggestionsOpen && (
@@ -256,7 +305,7 @@ export default function AdminHackathon() {
       {action && (
         <Modal title={action.type === 'approve' ? 'Duyệt đơn đăng ký' : action.type === 'reject' ? 'Từ chối đơn đăng ký' : 'Xác nhận đã gửi API key'} onClose={() => !busy && setAction(null)}>
           <form onSubmit={performAction}>
-            <p className="mb-4 text-sm text-normal-text">Đội <strong className="text-main-text">{action.registration.teamName}</strong> · {action.registration.captainEmail}</p>
+            <p className="mb-4 text-sm text-normal-text"><strong className="text-main-text">{action.registration.registrationType === 'individual' ? `Cá nhân: ${action.registration.captainName}` : action.registration.teamName}</strong> · {action.registration.captainEmail}</p>
             {action.type !== 'sent' && <Field label="Ghi chú (không bắt buộc)"><textarea value={reviewNote} onChange={(e) => setReviewNote(e.target.value)} maxLength={1000} className="w-full min-h-[90px] px-3 py-2 rounded-2xl border border-slate-200 text-sm outline-none focus:border-main-blue" /></Field>}
             {platform.stepUpRequired && <Field label="Mã authenticator để xác nhận"><Input value={code} onChange={(e) => setCode(e.target.value)} autoComplete="one-time-code" placeholder="123456" required autoFocus /></Field>}
             <Err e={actionErr} />

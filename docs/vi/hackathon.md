@@ -7,15 +7,16 @@ Trang công khai: **https://cloud.synapseone.space/hackathon**
 ## Tổng quan
 
 VIC Hackathon #1 là sự kiện xây dựng sản phẩm dành cho thành viên CLB Lập trình
-VIC. Mỗi đội **2–3 thành viên** phát triển sản phẩm từ SynapseOne và pitching trước
-ban giám khảo. Thí sinh chưa có team có thể đăng ký cá nhân và BTC sẽ gợi ý đồng
-đội phù hợp. Đăng ký không cần tài khoản SynapseOne.
+VIC. Thí sinh có thể đăng ký **solo/cá nhân** hoặc theo đội **2–3 thành viên**, phát
+triển sản phẩm từ SynapseOne và pitching trước ban giám khảo. Đăng ký solo là một
+hình thức tham gia hợp lệ, không bắt buộc phải tìm đội trước. BTC có thể hỗ trợ
+sắp xếp đồng đội khi thí sinh muốn. Đăng ký không cần tài khoản SynapseOne.
 
 ## Lịch trình — giờ Việt Nam (UTC+7)
 
 | Mốc sự kiện | Thời gian |
 |---|---|
-| Đóng đơn đăng ký | **17:00 ngày 28/11/2026** |
+| Đóng đơn đăng ký | **00:00 ngày 29/11/2026** |
 | BTC phát API key qua email | **12:00 ngày 29/11/2026** |
 | Vòng pitching | **19:00 ngày 03/12/2026** |
 
@@ -24,8 +25,9 @@ chót nên gọi API trực tiếp không thể vượt qua thời hạn.
 
 ## Thể lệ
 
-1. Mỗi đội có 2–3 thành viên và một đội trưởng làm đầu mối liên hệ. Thí sinh chưa
-   có team có thể đăng ký cá nhân; BTC sẽ sắp xếp dựa trên gợi ý của admin.
+1. Thí sinh có thể đăng ký solo/cá nhân hoặc theo đội 2–3 thành viên với một đội
+   trưởng làm đầu mối liên hệ. Thí sinh solo không bắt buộc tìm đội trước khi đăng
+   ký; BTC có thể hỗ trợ sắp xếp đồng đội dựa trên gợi ý của admin.
 2. Sản phẩm phải được phát triển từ SynapseOne, sử dụng API, workflow, dữ liệu
    hoặc các năng lực khác của nền tảng.
 3. Tôn trọng bản quyền, không phá hoại hệ thống và không chia sẻ API key công khai.
@@ -81,23 +83,28 @@ Platform operator/owner mở **Admin → VIC Hackathon** để:
 
 1. Tìm/lọc đơn theo đội, đội trưởng, email, MSV hoặc trạng thái.
 2. Xem danh sách thành viên và ý tưởng sản phẩm.
-3. Duyệt/từ chối bằng step-up `hackathon:review`.
-4. Tạo API key theo quy trình vận hành tin cậy hiện có và tự gửi email cho đội
+3. Chọn **Sửa thông tin** để chỉnh loại đăng ký, tên đội, thông tin liên hệ đội
+   trưởng, thành viên, năm học, kỹ năng nâng cao hoặc ý tưởng sản phẩm. Thao tác
+   lưu dùng step-up `hackathon:update`; trạng thái duyệt, ghi chú và thời điểm gửi
+   API key được giữ nguyên. Nếu đổi email đã được đánh dấu gửi, giao diện sẽ cảnh
+   báo để admin kiểm tra lại việc gửi key.
+4. Duyệt/từ chối bằng step-up `hackathon:review`.
+5. Tạo API key theo quy trình vận hành tin cậy hiện có và tự gửi email cho đội
    trưởng.
-5. Mở **Gợi ý ghép team** để xem gợi ý không thay đổi dữ liệu cho thí sinh cá nhân.
+6. Mở **Gợi ý ghép team** để xem gợi ý không thay đổi dữ liệu cho thí sinh cá nhân.
    Thuật toán chọn một sinh viên năm 2 hoặc người có kỹ năng nâng cao làm anchor,
    sau đó ưu tiên hai sinh viên năm 1.
-6. Đánh dấu đã gửi bằng step-up `hackathon:api-key-sent`.
+7. Đánh dấu đã gửi bằng step-up `hackathon:api-key-sent`.
 
-Auditor chỉ được xem. Hành động duyệt và gửi key đều được audit. Hệ thống chỉ lưu
-trạng thái/thời điểm gửi, không lưu API key plaintext.
+Auditor chỉ được xem. Hành động sửa thông tin, duyệt và gửi key đều được audit. Hệ
+thống chỉ lưu trạng thái/thời điểm gửi, không lưu API key plaintext.
 
 ## Cấu hình
 
 | Biến | Mặc định | Mục đích |
 |---|---|---|
 | `HACKATHON_REGISTRATION_CLOSE_AT` | `2026-11-28T17:00:00.000Z` | Hạn đóng đơn phía server; ISO timestamp. |
-| `HACKATHON_MAX_REGISTRATIONS` | `500` | Số đội tối đa. |
+| `HACKATHON_MAX_REGISTRATIONS` | `500` | Số đơn đăng ký tối đa (solo và đội). |
 | `HACKATHON_REGISTRATION_RATE_LIMIT` | `5` | Số đơn công khai mỗi IP/window. |
 | `HACKATHON_REGISTRATION_RATE_WINDOW_MS` | `900000` | Cửa sổ giới hạn (15 phút). |
 

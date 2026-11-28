@@ -266,6 +266,21 @@ try {
   setItem: () => undefined,
   removeItem: () => undefined,
 };
+try {
+  const html = renderToString(
+    <MemoryRouter initialEntries={['/hackathon']}>
+      <AuthProvider><App /></AuthProvider>
+    </MemoryRouter>,
+  );
+  for (const copy of ['Đăng ký solo / cá nhân', 'không bắt buộc tìm đội', 'Đăng ký solo hoặc đội 2–3 người', 'BTC gửi API key đến email đã đăng ký.']) {
+    if (!html.includes(copy)) throw new Error(`missing solo registration copy: ${copy}`);
+  }
+  console.log(`ok [hackathon-solo-rules] (${html.length} chars)`);
+} catch (e: any) {
+  failures++;
+  console.error(`FAIL [hackathon-solo-rules]: ${e?.message || e}`);
+}
+
 for (const [name, Page, path, docsTab] of [
   ['SynapseDNS', SynapseDNS, '/dns', 'dns'],
   ['Synapse Tunnel', SynapseTunnel, '/tunnel', 'tunnel'],
