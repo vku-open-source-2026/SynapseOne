@@ -8,7 +8,7 @@ Format based on Keep a Changelog; versioning follows SemVer.
 ## [Unreleased]
 
 ### Added
-- **CLI 0.11.0 release channel:** `cli-v<version>` tags test and publish the
+- **CLI 0.11.1 release channel:** `cli-v<version>` tags test and publish the
   single-install CLI independently of the full platform image release.
 - **SynapseDNS and Synapse Tunnel:** standalone Tier-1 edge services with
   authoritative UDP/TCP DNS, zone/record management, an outbound-only HTTP

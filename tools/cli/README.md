@@ -119,7 +119,7 @@ synapseone tunnel run --help
 ## Stable releases
 
 Stable CLI packages are published from `cli-v<version>` tags (for example
-`cli-v0.11.0`). The tag must match this package's version. The release workflow
+`cli-v0.11.1`). The tag must match this package's version. The release workflow
 runs the CLI tests, publishes `@synapseone/cli` to npm and verifies the registry
 version before the release is considered complete.
 

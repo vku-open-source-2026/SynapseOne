@@ -9,7 +9,7 @@ của từng bản phát hành nằm trong `CHANGELOG.md` tiếng Anh.
 
 ### Thêm
 
-- **Kênh phát hành CLI 0.11.0:** tag `cli-v<version>` kiểm thử và publish CLI cài
+- **Kênh phát hành CLI 0.11.1:** tag `cli-v<version>` kiểm thử và publish CLI cài
   một lần độc lập với bản phát hành toàn bộ image nền tảng.
 - **SynapseDNS và Synapse Tunnel:** dịch vụ edge Tầng 1 chạy độc lập với DNS
   authoritative UDP/TCP, API quản lý zone/record, connector tunnel HTTP chỉ kết
