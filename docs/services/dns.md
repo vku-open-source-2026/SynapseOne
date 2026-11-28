@@ -6,25 +6,26 @@
 ## Purpose
 
 SynapseDNS is the Tier-1 authoritative DNS capability. It serves DNS over UDP and
-TCP and manages zones/records through a standalone HTTP API. It does not recurse
-or forward queries. Existing gateway integration is intentionally pending.
+TCP and manages organization-owned zones/records through the SynapseOne gateway.
+It does not recurse or forward queries. Platform operators can still use the
+standalone admin API.
 
 See [SynapseDNS operations](../synapsedns.md) and the
 [service README](../../apps/dns-service/README.md).
 
 ## Main gateway routes
 
-These routes are currently served directly by SynapseDNS on port `4014`; they are
-not mounted on the existing SynapseOne gateway yet.
+Tenant Console calls the `/v1/dns` gateway namespace. The gateway rewrites to the
+standalone service paths below and stamps verified organization identity.
 
 | Method | Route | Behavior |
 | --- | --- | --- |
 | GET | `/health` | Public liveness and version. |
 | GET | `/ready` | Public readiness; `503` until DNS listeners/store are ready. |
-| GET/POST | `/v1/zones` | List or create a zone with SOA/NS defaults. |
-| GET/DELETE | `/v1/zones/:zone` | Read or delete a zone. |
-| GET/POST | `/v1/zones/:zone/records` | List or create records. |
-| PATCH/DELETE | `/v1/zones/:zone/records/:recordId` | Update or delete a record. |
+| GET/POST | `/v1/dns/zones` | List or create an org-owned zone with SOA/NS defaults. |
+| GET/DELETE | `/v1/dns/zones/:zone` | Read or delete an org-owned zone. |
+| GET/POST | `/v1/dns/zones/:zone/records` | List or create records in that zone. |
+| PATCH/DELETE | `/v1/dns/zones/:zone/records/:recordId` | Update or delete a record. |
 
 ## Important semantics and limits
 
@@ -35,23 +36,31 @@ not mounted on the existing SynapseOne gateway yet.
   UDP truncation are implemented.
 - One JSON writer/instance per data file. There is no DNSSEC, AXFR, recursion,
   database, or HA in the MVP.
+- Zones carry `orgId`; cross-org access returns `404`. Version-1 zones migrate as
+  platform-owned and are not assigned to a tenant automatically.
 - Do not delegate production NS until every record is migrated and verified.
 
 ## Authentication and scopes
 
-All `/v1/*` management routes require:
+Tenant management accepts a SynapseOne JWT or API key at `/v1/dns/*` and requires
+`dns:read` or `dns:write`. The gateway validates the credential and stamps the
+verified org plus `x-synapseone-internal`; the service validates that secret
+before trusting ownership. DNS queries themselves are unauthenticated.
+
+The standalone `/v1/*` API retains operator access:
 
 ```http
 Authorization: Bearer <SYNAPSEDNS_ADMIN_TOKEN>
 ```
 
-DNS queries themselves are unauthenticated. Keep the management API private.
-The token is an operator credential, not a tenant API key.
+Keep that API private. The admin token is an operator credential, not a tenant
+API key, and is never sent to the browser.
 
 ## SDK usage
 
 The SDKs do not yet wrap SynapseDNS, so these examples use their generic HTTP
-escape hatches.
+escape hatches against the direct operator API. Tenant applications should call
+the gateway `/v1/dns/*` routes with their normal SynapseOne credential instead.
 
 ### JavaScript/TypeScript
 

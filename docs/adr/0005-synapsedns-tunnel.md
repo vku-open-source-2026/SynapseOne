@@ -3,7 +3,7 @@
 
 # ADR 0005 — Standalone SynapseDNS and Synapse Tunnel edge services
 
-Status: Accepted for the OLP MVP; gateway and Tier-2/3 integration pending.
+Status: Accepted for the OLP MVP; organization-scoped management is integrated with the gateway, while Tier-2/3 application integration remains pending.
 
 ## Context
 
@@ -18,8 +18,11 @@ DNS or application tunnel transport.
   bearer-protected zone/record API.
 - Implement Synapse Tunnel as a standalone control plane, HTTP ingress and
   outbound-only WebSocket connector.
-- Keep both services outside the existing gateway and Tier-2/3 runtime until
-  routing, identity propagation and operational ownership are designed.
+- Keep DNS wire traffic, Tunnel ingress and connector WebSockets outside the
+  management gateway. Expose organization-scoped management through `/v1/dns`
+  and `/v1/tunnel`, with gateway scope checks, verified owner-org headers and a
+  shared internal secret. Keep separate platform-admin routes for global
+  operators.
 - Use one atomic JSON writer per service for the MVP. This favors simple,
   inspectable deployment and deterministic tests over premature HA.
 - Publish standalone Compose files and Docker images; bind management APIs to
@@ -34,6 +37,8 @@ DNS or application tunnel transport.
 - Public DNS cutover requires complete record migration, TTL/DS review and a
   rollback plan. Tunnel ingress requires trusted TLS termination before public
   exposure.
-- Future integration should route public application traffic through the Tier-1
-  gateway or a unified edge control plane, preserving identity, scope, quota and
-  audit invariants.
+- Zones and connectors carry `orgId`; routes inherit connector ownership and
+  cross-organization access returns `404`. Version-1 records migrate as
+  platform-owned so existing data is never silently assigned to a tenant.
+- Future Tier-2/3 integration may use the organization-scoped APIs while keeping
+  public application traffic on a dedicated HTTPS/WSS edge.

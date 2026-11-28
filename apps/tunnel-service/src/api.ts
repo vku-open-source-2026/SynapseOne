@@ -13,7 +13,7 @@ import { TunnelError, sendError } from './errors';
 import type { Logger } from './logger';
 import type { TunnelRegistry } from './registry';
 import { JsonStore } from './store';
-import type { PublicConnector, RouteRecord } from './types';
+import type { ConnectorRecord, ManagementPrincipal, PublicConnector, RouteRecord } from './types';
 import { connectorCreateSchema, connectorUpdateSchema, routeCreateSchema, routeUpdateSchema } from './validation';
 
 export interface ControlAppOptions {
@@ -23,10 +23,59 @@ export interface ControlAppOptions {
   logger: Logger;
 }
 
+const ORG_ID_PATTERN = /^[A-Za-z0-9-]{1,64}$/;
+
 function secureEqual(actual: string, expected: string): boolean {
   const left = Buffer.from(actual, 'utf8');
   const right = Buffer.from(expected, 'utf8');
   return left.length === right.length && timingSafeEqual(left, right);
+}
+
+function singleHeader(value: string | string[] | undefined): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+function authenticateManagement(config: ServerConfig, req: Request, res: Response, next: NextFunction): void {
+  const authorization = singleHeader(req.headers.authorization) ?? '';
+  const match = /^Bearer (.+)$/.exec(authorization);
+  if (config.adminToken && match && secureEqual(match[1], config.adminToken)) {
+    res.locals.principal = { orgId: null } satisfies ManagementPrincipal;
+    return next();
+  }
+
+  const internalSecret = config.internalSecret?.trim() ? config.internalSecret : undefined;
+  if (!internalSecret) {
+    res.status(503).json({
+      error: 'internal_auth_unavailable',
+      message: 'Internal management authentication is not configured',
+    });
+    return;
+  }
+
+  const suppliedSecret = singleHeader(req.headers['x-synapseone-internal']);
+  if (!suppliedSecret || !secureEqual(suppliedSecret, internalSecret)) {
+    res.setHeader('WWW-Authenticate', 'Bearer');
+    res.status(401).json({
+      error: 'unauthorized',
+      message: 'A valid admin bearer token or internal gateway credential is required',
+    });
+    return;
+  }
+
+  // Service-account principals may have no direct organization. The gateway
+  // stamps their verified attribution separately; either header is usable only
+  // after the shared internal credential has been validated.
+  const orgId = singleHeader(req.headers['x-synapseone-org']) || singleHeader(req.headers['x-synapseone-owner-org']);
+  if (!orgId || !ORG_ID_PATTERN.test(orgId)) {
+    res.status(403).json({
+      error: 'forbidden',
+      message: 'A valid organization header is required',
+    });
+    return;
+  }
+
+  res.locals.principal = { orgId } satisfies ManagementPrincipal;
+  next();
 }
 
 function parseBody<T>(schema: ZodType<T>, body: unknown): T {
@@ -37,6 +86,41 @@ function parseBody<T>(schema: ZodType<T>, body: unknown): T {
     throw new TunnelError(400, 'validation_error', `Invalid ${field}: ${issue?.message ?? 'invalid value'}`);
   }
   return result.data;
+}
+
+function principal(res: Response): ManagementPrincipal {
+  const value = res.locals.principal as ManagementPrincipal | undefined;
+  if (!value) throw new TunnelError(401, 'unauthorized', 'Authentication is required');
+  return value;
+}
+
+function canAccess(principal: ManagementPrincipal, connector: Pick<ConnectorRecord, 'orgId'>): boolean {
+  return principal.orgId === null || connector.orgId === principal.orgId;
+}
+
+async function ownedConnector(store: JsonStore, id: string, principal: ManagementPrincipal): Promise<ConnectorRecord> {
+  const connector = await store.getConnectorRecord(id);
+  if (!connector || !canAccess(principal, connector)) {
+    throw new TunnelError(404, 'connector_not_found', 'Connector not found');
+  }
+  return connector;
+}
+
+async function ownedRoute(store: JsonStore, id: string, principal: ManagementPrincipal): Promise<RouteRecord> {
+  const route = await store.getRoute(id);
+  if (!route) throw new TunnelError(404, 'route_not_found', 'Route not found');
+  const connector = await store.getConnectorRecord(route.connectorId);
+  if (!connector || !canAccess(principal, connector)) {
+    throw new TunnelError(404, 'route_not_found', 'Route not found');
+  }
+  return route;
+}
+
+async function visibleRoutes(store: JsonStore, principal: ManagementPrincipal): Promise<RouteRecord[]> {
+  const [connectors, routes] = await Promise.all([store.listConnectors(), store.listRoutes()]);
+  if (principal.orgId === null) return routes;
+  const connectorIds = new Set(connectors.filter((connector) => connector.orgId === principal.orgId).map((connector) => connector.id));
+  return routes.filter((route) => connectorIds.has(route.connectorId));
 }
 
 function withStatus(connector: PublicConnector, registry: TunnelRegistry): PublicConnector & { connected: boolean; connectedAt?: string } {
@@ -65,19 +149,7 @@ export function createControlApp(options: ControlAppOptions): express.Express {
     res.json({ status: 'ready', service: 'synapse-tunnel', storage: store.persistent ? 'json' : 'memory' });
   });
 
-  app.use('/v1', (req, res, next) => {
-    if (config.adminToken) {
-      const authorization = req.headers.authorization ?? '';
-      const match = /^Bearer (.+)$/.exec(authorization);
-      if (!match || !secureEqual(match[1], config.adminToken)) {
-        res.setHeader('WWW-Authenticate', 'Bearer');
-        return res.status(401).json({ error: 'unauthorized', message: 'A valid admin token is required' });
-      }
-      return next();
-    }
-    if (config.allowInsecure && !config.isProduction) return next();
-    return res.status(503).json({ error: 'admin_auth_unavailable', message: 'Admin authentication is not configured' });
-  });
+  app.use('/v1', (req, res, next) => authenticateManagement(config, req, res, next));
 
   app.use(express.json({ limit: '64kb', strict: true }));
 
@@ -90,29 +162,30 @@ export function createControlApp(options: ControlAppOptions): express.Express {
   });
 
   app.get('/v1/connectors', asyncRoute(async (_req, res) => {
-    const connectors = await store.listConnectors();
+    const caller = principal(res);
+    const connectors = (await store.listConnectors()).filter((connector) => canAccess(caller, connector));
     res.json({ connectors: connectors.map((connector) => withStatus(connector, registry)) });
   }));
 
   app.post('/v1/connectors', asyncRoute(async (req, res) => {
     const input = parseBody(connectorCreateSchema, req.body);
     const token = `st_${randomBytes(32).toString('base64url')}`;
-    const connector = await store.createConnector(input, token);
+    const connector = await store.createConnector({ ...input, orgId: principal(res).orgId }, token);
     const { tokenHash: _tokenHash, ...safe } = connector;
     logger.info('connector_created', { connectorId: connector.id });
     res.status(201).json({ connector: withStatus(safe, registry), token });
   }));
 
   app.get('/v1/connectors/:id', asyncRoute(async (req, res) => {
-    const connector = await store.getConnector(req.params.id);
-    if (!connector) throw new TunnelError(404, 'connector_not_found', 'Connector not found');
-    res.json({ connector: withStatus(connector, registry) });
+    const connector = await ownedConnector(store, req.params.id, principal(res));
+    const { tokenHash: _tokenHash, ...safe } = connector;
+    res.json({ connector: withStatus(safe, registry) });
   }));
 
   app.patch('/v1/connectors/:id', asyncRoute(async (req, res) => {
+    const caller = principal(res);
+    await ownedConnector(store, req.params.id, caller);
     const patch = parseBody(connectorUpdateSchema, req.body);
-    const existing = await store.getConnectorRecord(req.params.id);
-    if (!existing) throw new TunnelError(404, 'connector_not_found', 'Connector not found');
     const connector = await store.updateConnector(req.params.id, patch);
     if (!connector) throw new TunnelError(404, 'connector_not_found', 'Connector not found');
     if (patch.upstreamUrl !== undefined || patch.enabled === false) registry.disconnect(connector.id);
@@ -121,8 +194,8 @@ export function createControlApp(options: ControlAppOptions): express.Express {
   }));
 
   app.delete('/v1/connectors/:id', asyncRoute(async (req, res) => {
-    const existing = await store.getConnectorRecord(req.params.id);
-    if (!existing) throw new TunnelError(404, 'connector_not_found', 'Connector not found');
+    const caller = principal(res);
+    await ownedConnector(store, req.params.id, caller);
     if ((await store.routesForConnector(req.params.id)).length > 0) {
       throw new TunnelError(409, 'connector_in_use', 'Delete the connector routes before deleting the connector');
     }
@@ -133,13 +206,13 @@ export function createControlApp(options: ControlAppOptions): express.Express {
   }));
 
   app.get('/v1/routes', asyncRoute(async (_req, res) => {
-    res.json({ routes: await store.listRoutes() });
+    res.json({ routes: await visibleRoutes(store, principal(res)) });
   }));
 
   app.post('/v1/routes', asyncRoute(async (req, res) => {
+    const caller = principal(res);
     const input = parseBody(routeCreateSchema, req.body);
-    const connector = await store.getConnectorRecord(input.connectorId);
-    if (!connector) throw new TunnelError(404, 'connector_not_found', 'Connector not found');
+    const connector = await ownedConnector(store, input.connectorId, caller);
     if (!connector.enabled) throw new TunnelError(409, 'connector_disabled', 'Connector is disabled');
     if ((await store.listRoutes()).some((route) => route.hostname === input.hostname && route.pathPrefix === (input.pathPrefix ?? ''))) {
       throw new TunnelError(409, 'route_exists', 'A route already exists for this hostname and path prefix');
@@ -159,18 +232,15 @@ export function createControlApp(options: ControlAppOptions): express.Express {
   }));
 
   app.get('/v1/routes/:id', asyncRoute(async (req, res) => {
-    const route = await store.getRoute(req.params.id);
-    if (!route) throw new TunnelError(404, 'route_not_found', 'Route not found');
-    res.json({ route });
+    res.json({ route: await ownedRoute(store, req.params.id, principal(res)) });
   }));
 
   app.patch('/v1/routes/:id', asyncRoute(async (req, res) => {
+    const caller = principal(res);
+    const existing = await ownedRoute(store, req.params.id, caller);
     const patch = parseBody(routeUpdateSchema, req.body);
-    const existing = await store.getRoute(req.params.id);
-    if (!existing) throw new TunnelError(404, 'route_not_found', 'Route not found');
     if (patch.connectorId) {
-      const connector = await store.getConnectorRecord(patch.connectorId);
-      if (!connector) throw new TunnelError(404, 'connector_not_found', 'Connector not found');
+      const connector = await ownedConnector(store, patch.connectorId, caller);
       if (!connector.enabled) throw new TunnelError(409, 'connector_disabled', 'Connector is disabled');
     }
     const candidate = { ...existing, ...patch };
@@ -183,7 +253,7 @@ export function createControlApp(options: ControlAppOptions): express.Express {
   }));
 
   app.delete('/v1/routes/:id', asyncRoute(async (req, res) => {
-    if (!(await store.getRoute(req.params.id))) throw new TunnelError(404, 'route_not_found', 'Route not found');
+    await ownedRoute(store, req.params.id, principal(res));
     await store.deleteRoute(req.params.id);
     res.status(204).end();
   }));

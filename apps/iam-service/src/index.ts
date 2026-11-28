@@ -4648,6 +4648,8 @@ async function auditMutation(req: express.Request, action: string, resource: str
     'ai:read', 'ai:write', 'ai:*', 'ai:Invoke',
     'secrets:read', 'secrets:write', 'secrets:*',
     'notifications:read', 'notifications:write', 'notifications:*',
+    'dns:read', 'dns:write', 'dns:*',
+    'tunnel:read', 'tunnel:write', 'tunnel:*',
   ] as const;
   const TENANT_SCOPE_ALLOWLIST = new Set<string>(TENANT_KEY_SCOPE_OPTIONS);
   const MAX_TENANT_KEY_SCOPES = TENANT_KEY_SCOPE_OPTIONS.length;

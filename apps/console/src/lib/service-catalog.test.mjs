@@ -42,9 +42,17 @@ test('every service has a valid Console route, Docs target and active route matc
   }
 });
 
-test('DNS and Tunnel sidebar links open management pages, not API Docs', () => {
-  assert.equal(SERVICE_CATALOG.find((service) => service.id === 'dns').consoleRoute, '/admin/dns');
-  assert.equal(SERVICE_CATALOG.find((service) => service.id === 'tunnel').consoleRoute, '/admin/tunnel');
+test('DNS and Tunnel sidebar links open tenant management pages, not API Docs', () => {
+  const dns = SERVICE_CATALOG.find((service) => service.id === 'dns');
+  const tunnel = SERVICE_CATALOG.find((service) => service.id === 'tunnel');
+  assert.equal(dns.consoleRoute, '/dns');
+  assert.deepEqual(dns.activePaths, ['/dns']);
+  assert.equal(tunnel.consoleRoute, '/tunnel');
+  assert.deepEqual(tunnel.activePaths, ['/tunnel']);
+  assert.equal(matchesService(dns, '/dns/zones/example.com'), true);
+  assert.equal(matchesService(tunnel, '/tunnel'), true);
+  assert.equal(matchesService(dns, '/admin/dns'), false);
+  assert.equal(matchesService(tunnel, '/admin/tunnel'), false);
 });
 
 test('English and Vietnamese Docs/service locale shapes stay in parity', () => {

@@ -18,10 +18,14 @@ test('tenant key scope normalization removes platform permissions and duplicates
 });
 
 test('tenant key scopes are grouped in catalog order with friendly labels', () => {
-  const groups = groupTenantKeyScopes(['*', 'base:read', 'base:write', 'workflow:Execute', 'platform:Admin']);
+  const groups = groupTenantKeyScopes([
+    '*', 'base:read', 'base:write', 'dns:read', 'dns:write', 'tunnel:*', 'workflow:Execute', 'platform:Admin',
+  ]);
   assert.deepEqual(groups.map((group) => [group.prefix, group.label, group.scopes]), [
     ['*', 'All tenant services', ['*']],
     ['base', 'SynapseBase', ['base:read', 'base:write']],
+    ['dns', 'SynapseDNS', ['dns:read', 'dns:write']],
+    ['tunnel', 'Synapse Tunnel', ['tunnel:*']],
     ['workflow', 'Workflow', ['workflow:Execute']],
   ]);
 });

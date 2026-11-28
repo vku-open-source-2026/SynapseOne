@@ -13,8 +13,8 @@ import { notFound, ServiceError } from './errors';
 import type { Logger } from './logger';
 import { silentLogger } from './logger';
 import type { ZoneStore } from './store';
-import type { CreateZoneInput, RecordInput } from './types';
-import { normalizeZoneName, parseRecordPatch } from './validation';
+import type { CreateZoneInput, Principal, RecordInput } from './types';
+import { isValidOrgId, normalizeZoneName, parseRecordPatch } from './validation';
 
 export interface CreateAppOptions {
   store: ZoneStore;
@@ -26,8 +26,16 @@ export interface CreateAppOptions {
 const RECORD_ID = z.string().uuid();
 const REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 
-function requireZone(store: ZoneStore, name: string) {
-  const zone = store.getZone(name);
+type AuthenticatedRequest = Request & { principal: Principal };
+
+function principal(req: Request): Principal {
+  const value = (req as AuthenticatedRequest).principal;
+  if (!value) throw new ServiceError(401, 'unauthorized', 'Authentication is required');
+  return value;
+}
+
+function requireZone(store: ZoneStore, name: string, orgId: string | null) {
+  const zone = store.getZone(name, orgId);
   if (!zone) notFound('Zone');
   return zone;
 }
@@ -44,19 +52,53 @@ function tokenMatches(provided: string, expected: string): boolean {
   return actual.length === wanted.length && timingSafeEqual(actual, wanted);
 }
 
-function adminAuth(config: ServiceConfig): (req: Request, res: Response, next: NextFunction) => void {
+function singleHeader(req: Request, name: string): string | undefined {
+  const value = req.headers[name];
+  return typeof value === 'string' ? value : undefined;
+}
+
+function hasGatewayHeaders(req: Request): boolean {
+  return Object.keys(req.headers).some((name) => name.startsWith('x-synapseone-'));
+}
+
+function managementAuth(config: ServiceConfig): (req: Request, res: Response, next: NextFunction) => void {
   return (req, res, next) => {
-    if (!config.adminToken) {
-      // loadConfig permits this only with an explicit, non-production opt-in.
+    const authorization = singleHeader(req, 'authorization');
+    const bearer = typeof authorization === 'string' ? /^Bearer[ \t]+(.+)$/i.exec(authorization) : undefined;
+    if (config.adminToken && bearer && tokenMatches(bearer[1], config.adminToken)) {
+      // A direct platform-admin credential always wins over gateway identity headers.
+      (req as AuthenticatedRequest).principal = { orgId: null };
       next();
       return;
     }
-    const header = req.headers.authorization;
-    const match = typeof header === 'string' ? /^Bearer[ \t]+(.+)$/i.exec(header) : undefined;
-    if (!match || !tokenMatches(match[1], config.adminToken)) {
+
+    const gatewayAuthenticated = hasGatewayHeaders(req);
+    if (!config.adminToken && config.allowInsecure && !gatewayAuthenticated) {
+      // Preserve the explicit non-production direct API opt-in.
+      (req as AuthenticatedRequest).principal = { orgId: null };
+      next();
+      return;
+    }
+    if (!config.internalSecret) {
+      if (gatewayAuthenticated) {
+        throw new ServiceError(503, 'internal_auth_unavailable', 'Internal gateway authentication is not configured');
+      }
       res.setHeader('WWW-Authenticate', 'Bearer');
       throw new ServiceError(401, 'unauthorized', 'A valid admin bearer token is required');
     }
+
+    const internal = singleHeader(req, 'x-synapseone-internal');
+    if (!internal || !tokenMatches(internal, config.internalSecret)) {
+      res.setHeader('WWW-Authenticate', 'Bearer');
+      throw new ServiceError(401, 'unauthorized', 'A valid admin bearer token or internal gateway credential is required');
+    }
+    // Service-account principals may have no principal.org; the gateway then
+    // supplies their verified attribution organization as owner-org instead.
+    const orgId = singleHeader(req, 'x-synapseone-org') || singleHeader(req, 'x-synapseone-owner-org');
+    if (!orgId || !isValidOrgId(orgId)) {
+      throw new ServiceError(403, 'forbidden', 'A valid organization ID is required');
+    }
+    (req as AuthenticatedRequest).principal = { orgId };
     next();
   };
 }
@@ -112,44 +154,50 @@ export function createApp(options: CreateAppOptions): express.Express {
     });
   });
 
-  app.use('/v1', adminAuth(config));
+  app.use('/v1', managementAuth(config));
 
-  app.get('/v1/zones', (_req, res) => {
-    res.json({ zones: store.listZones() });
+  app.get('/v1/zones', (req, res) => {
+    res.json({ zones: store.listZones(principal(req).orgId) });
   });
 
   app.post('/v1/zones', asyncRoute(async (req, res) => {
-    const zone = await store.createZone(req.body as CreateZoneInput);
+    const zone = await store.createZone(req.body as CreateZoneInput, principal(req).orgId);
     res.status(201).location(`/v1/zones/${encodeURIComponent(zone.name)}`).json(zone);
   }));
 
   app.get('/v1/zones/:zone', (req, res) => {
-    res.json(requireZone(store, req.params.zone));
+    res.json(requireZone(store, req.params.zone, principal(req).orgId));
   });
 
   app.delete('/v1/zones/:zone', asyncRoute(async (req, res) => {
-    await store.deleteZone(req.params.zone);
+    await store.deleteZone(req.params.zone, principal(req).orgId);
     res.status(204).end();
   }));
 
   app.get('/v1/zones/:zone/records', (req, res) => {
-    res.json({ records: requireZone(store, req.params.zone).records });
+    res.json({ records: requireZone(store, req.params.zone, principal(req).orgId).records });
   });
 
   app.post('/v1/zones/:zone/records', asyncRoute(async (req, res) => {
-    const record = await store.createRecord(req.params.zone, req.body as RecordInput);
+    const owner = principal(req).orgId;
+    requireZone(store, req.params.zone, owner);
+    const record = await store.createRecord(req.params.zone, req.body as RecordInput, owner);
     const zoneName = normalizeZoneName(req.params.zone);
     res.status(201).location(`/v1/zones/${encodeURIComponent(zoneName)}/records/${record.id}`).json(record);
   }));
 
   app.patch('/v1/zones/:zone/records/:recordId', asyncRoute(async (req, res) => {
+    const owner = principal(req).orgId;
+    requireZone(store, req.params.zone, owner);
     const patch = parseRecordPatch(req.body);
-    const record = await store.patchRecord(req.params.zone, recordId(req.params.recordId), patch);
+    const record = await store.patchRecord(req.params.zone, recordId(req.params.recordId), patch, owner);
     res.json(record);
   }));
 
   app.delete('/v1/zones/:zone/records/:recordId', asyncRoute(async (req, res) => {
-    await store.deleteRecord(req.params.zone, recordId(req.params.recordId));
+    const owner = principal(req).orgId;
+    requireZone(store, req.params.zone, owner);
+    await store.deleteRecord(req.params.zone, recordId(req.params.recordId), owner);
     res.status(204).end();
   }));
 

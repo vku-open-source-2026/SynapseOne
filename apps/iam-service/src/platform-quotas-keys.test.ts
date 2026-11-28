@@ -207,6 +207,8 @@ describe('platform api keys and quotas', () => {
     assert.ok(allScopes.length > 20, 'the catalog must support a real Select all operation');
     assert.ok(allScopes.includes('base:read'));
     assert.ok(allScopes.includes('workflow:Execute'));
+    assert.ok(allScopes.includes('dns:write'));
+    assert.ok(allScopes.includes('tunnel:write'));
     assert.ok(allScopes.includes('*'));
     assert.ok(!allScopes.some((scope: string) => scope.startsWith('platform:')));
 

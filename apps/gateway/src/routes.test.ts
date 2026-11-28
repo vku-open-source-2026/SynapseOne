@@ -356,6 +356,9 @@ describe('per-route scope enforcement (#23)', () => {
     assert.equal(scopeAllows(['workflow:execute'], '/v1/workflows/w1/execute', 'POST'), true);
     assert.equal(scopeAllows(['iam:write'], '/v1/orgs/o1/accounts', 'POST'), true);
     assert.equal(scopeAllows(['iam:read'], '/v1/orgs/o1/accounts', 'POST'), false);
+    assert.equal(scopeAllows(['tunnel:write'], '/v1/tunnel/routes', 'DELETE', { service: 'tunnel', action: 'tunnel:Write' }), true);
+    assert.equal(scopeAllows(['tunnel:read'], '/v1/tunnel/routes', 'DELETE', { service: 'tunnel', action: 'tunnel:Write' }), false);
+    assert.equal(scopeAllows(['dns:write'], '/v1/dns/zones', 'DELETE', { service: 'dns', action: 'dns:Write' }), true);
     // Public/auth routes are not scope-gated.
     assert.equal(scopeAllows([], '/v1/auth/login', 'POST'), true);
     assert.equal(scopeAllows([], '/health', 'GET'), true);

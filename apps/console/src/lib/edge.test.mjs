@@ -18,9 +18,10 @@ function shape(value) {
   return typeof value;
 }
 
-test('edge management paths stay inside the platform namespace', () => {
-  assert.equal(edgePath('dns', '/v1/zones'), '/v1/platform/edge/dns/v1/zones');
-  assert.equal(edgePath('tunnel', 'v1/routes'), '/v1/platform/edge/tunnel/v1/routes');
+test('edge management paths use tenant gateway namespaces', () => {
+  assert.equal(edgePath('dns', '/v1/zones'), '/v1/dns/zones');
+  assert.equal(edgePath('tunnel', 'v1/routes'), '/v1/tunnel/routes');
+  assert.equal(edgePath('dns', '/ready'), '/v1/dns/ready');
   assert.throws(() => edgePath('iam'), /Unknown edge service/);
 });
 

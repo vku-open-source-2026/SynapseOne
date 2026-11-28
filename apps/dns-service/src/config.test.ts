@@ -23,7 +23,23 @@ test('configuration defaults and explicit local insecure mode', () => {
   assert.equal(config.dataFile, DEFAULT_DATA_FILE);
   assert.equal(config.allowInsecure, true);
   assert.equal(config.production, false);
+  assert.equal(config.internalSecret, undefined);
   configError(() => loadConfig({ NODE_ENV: 'test' }));
+});
+
+test('the optional internal gateway secret is normalized and validated', () => {
+  const config = loadConfig({
+    NODE_ENV: 'test',
+    SYNAPSEDNS_ALLOW_INSECURE: 'true',
+    SYNAPSEONE_INTERNAL_SECRET: '  internal-test-secret  ',
+  });
+  assert.equal(config.internalSecret, 'internal-test-secret');
+  assert.equal(loadConfig({ NODE_ENV: 'test', SYNAPSEDNS_ALLOW_INSECURE: 'true', SYNAPSEONE_INTERNAL_SECRET: '   ' }).internalSecret, undefined);
+  configError(() => loadConfig({
+    NODE_ENV: 'test',
+    SYNAPSEDNS_ALLOW_INSECURE: 'true',
+    SYNAPSEONE_INTERNAL_SECRET: 'bad\nsecret',
+  }));
 });
 
 test('a configured token is enforced even when insecure mode is explicitly enabled', () => {

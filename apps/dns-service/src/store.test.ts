@@ -27,6 +27,7 @@ test('zone creation normalizes names and installs SOA and NS defaults', async ()
   const store = new ZoneStore({ memory: true });
   const zone = await store.createZone({ name: 'ExAmPlE.TEST', nameservers: ['NS1.Example.Test', 'NS2.Example.NET'], ttl: 600 });
   assert.equal(zone.name, 'example.test.');
+  assert.equal(zone.orgId, null);
   assert.equal(zone.records.length, 3);
   assert.equal(soa(zone).primary, 'ns1.example.test.');
   assert.equal(soa(zone).admin, 'hostmaster.example.test.');
@@ -34,9 +35,34 @@ test('zone creation normalizes names and installs SOA and NS defaults', async ()
   assert.equal(soa(zone).minimum, 600);
   assert.deepEqual(zone.records.filter((record) => record.type === 'NS').map((record) => record.type === 'NS' && record.target), ['ns1.example.test.', 'ns2.example.net.']);
   assert.equal(store.getZone('EXAMPLE.TEST')?.name, 'example.test.');
-  assert.deepEqual(store.listZones(), [{ id: zone.id, name: zone.name, createdAt: zone.createdAt, updatedAt: zone.updatedAt, recordCount: 3 }]);
+  assert.deepEqual(store.listZones(), [{ id: zone.id, name: zone.name, orgId: null, createdAt: zone.createdAt, updatedAt: zone.updatedAt, recordCount: 3 }]);
   await assert.rejects(store.createZone({ name: 'example.test.' }), isError(409, 'zone_exists'));
   await assert.rejects(store.createZone({ name: 'duplicate.test', nameservers: ['ns1.duplicate.test', 'NS1.DUPLICATE.TEST'] }), isError(400));
+});
+
+test('zone ownership filters reads and atomically protects every mutation', async () => {
+  const store = new ZoneStore({ memory: true });
+  const owned = await store.createZone({ name: 'owned.test', orgId: 'org-b' } as never, 'org-a');
+  const other = await store.createZone({ name: 'other.test' }, 'org-b');
+  const platform = await store.createZone({ name: 'platform.test' });
+  assert.equal(owned.orgId, 'org-a');
+  assert.equal(other.orgId, 'org-b');
+  assert.equal(platform.orgId, null);
+  assert.deepEqual(store.listZones('org-a').map((zone) => zone.name), ['owned.test.']);
+  assert.deepEqual(store.listZones('org-b').map((zone) => zone.name), ['other.test.']);
+  assert.deepEqual(store.listZones().map((zone) => zone.name), ['other.test.', 'owned.test.', 'platform.test.']);
+  assert.equal(store.getZone('owned.test', 'org-b'), undefined);
+  assert.equal(store.getZone('owned.test', 'org-a')?.orgId, 'org-a');
+  assert.equal(store.getZone('owned.test')?.orgId, 'org-a');
+
+  const record = await store.createRecord(owned.name, { type: 'A', name: 'www.owned.test', address: '192.0.2.1' }, 'org-a');
+  const before = store.getZone(owned.name)!;
+  await assert.rejects(store.deleteZone(owned.name, 'org-b'), isError(404, 'not_found'));
+  await assert.rejects(store.createRecord(owned.name, { type: 'A', name: 'new.owned.test', address: '192.0.2.2' }, 'org-b'), isError(404, 'not_found'));
+  await assert.rejects(store.patchRecord(owned.name, record.id, { address: '192.0.2.3' }, 'org-b'), isError(404, 'not_found'));
+  await assert.rejects(store.deleteRecord(owned.name, record.id, 'org-b'), isError(404, 'not_found'));
+  assert.deepEqual(store.getZone(owned.name), before, 'cross-organization attempts must not mutate the zone');
+  await assert.rejects(store.createZone({ name: 'invalid-owner.test' }, 'bad_org'), isError(400));
 });
 
 test('all record types can be created and SOA serial advances on mutation', async () => {
@@ -119,7 +145,7 @@ test('persistent store survives restart and leaves no temporary files', async ()
   try {
     const first = new ZoneStore({ filePath: file });
     await first.initialize();
-    const zone = await first.createZone({ name: 'Example.Test' });
+    const zone = await first.createZone({ name: 'Example.Test' }, 'org-a');
     await first.createRecord(zone.name, { type: 'A', name: 'www.example.test', address: '192.0.2.1' });
     await first.createRecord(zone.name, { type: 'TXT', name: 'txt.example.test', data: ['persisted'] });
     await first.close();
@@ -127,13 +153,52 @@ test('persistent store survives restart and leaves no temporary files', async ()
     const second = new ZoneStore({ filePath: file });
     const restored = second.getZone('example.test')!;
     assert.equal(restored.id, zone.id);
+    assert.equal(restored.orgId, 'org-a');
     assert.equal(restored.records.length, 5);
     assert.equal(restored.records.find((record) => record.type === 'A')?.name, 'www.example.test.');
-    assert.deepEqual((await readFile(file, 'utf8')).includes('"version": 1'), true);
+    assert.deepEqual(second.listZones('org-b'), []);
+    assert.equal(second.listZones('org-a').length, 1);
+    assert.deepEqual((await readFile(file, 'utf8')).includes('"version": 2'), true);
     assert.deepEqual(await readdir(join(directory, 'nested')), ['synapsedns.json']);
     assert.equal((await stat(file)).mode & 0o777, 0o600);
     await second.deleteZone('example.test');
     assert.equal(new ZoneStore({ filePath: file }).listZones().length, 0);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('version 1 snapshots migrate to platform ownership without losing records', async () => {
+  const directory = await mkdtemp(join(process.cwd(), '.test-data-'));
+  const file = join(directory, 'nested', 'synapsedns.json');
+  try {
+    const original = new ZoneStore({ filePath: file });
+    await original.initialize();
+    const zone = await original.createZone({ name: 'legacy.test' }, 'org-a');
+    await original.createRecord(zone.name, { type: 'A', name: 'www.legacy.test', address: '192.0.2.10' });
+    await original.createRecord(zone.name, { type: 'TXT', name: 'txt.legacy.test', data: ['legacy-record'] });
+    await original.close();
+
+    const version2 = JSON.parse(await readFile(file, 'utf8'));
+    const legacy = {
+      version: 1,
+      zones: version2.zones.map(({ orgId: _orgId, ...storedZone }: any) => storedZone),
+    };
+    await writeFile(file, `${JSON.stringify(legacy, null, 2)}\n`, 'utf8');
+
+    const migrated = new ZoneStore({ filePath: file });
+    assert.deepEqual(migrated.getZone('legacy.test'), { ...version2.zones[0], orgId: null });
+    await migrated.initialize();
+    const persisted = JSON.parse(await readFile(file, 'utf8'));
+    assert.equal(persisted.version, 2);
+    assert.deepEqual(persisted.zones, [{ ...version2.zones[0], orgId: null }]);
+    assert.deepEqual(await readdir(join(directory, 'nested')), ['synapsedns.json']);
+    assert.equal((await stat(file)).mode & 0o777, 0o600);
+
+    const restarted = new ZoneStore({ filePath: file });
+    assert.equal(restarted.getZone('legacy.test')?.orgId, null);
+    assert.equal(restarted.getZone('legacy.test')?.records.length, 5);
+    await restarted.close();
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -162,6 +227,22 @@ test('corrupt persistent state fails closed', async () => {
   try {
     await writeFile(file, '{"version":1,"zones":[{"name":"bad"}]}', 'utf8');
     assert.throws(() => new ZoneStore({ filePath: file }), isError(503, 'store_unavailable'));
+    await writeFile(file, '{"version":2,"zones":[{"name":"bad"}]}', 'utf8');
+    assert.throws(() => new ZoneStore({ filePath: file }), isError(503, 'store_unavailable'));
+    await writeFile(file, '{"version":3,"zones":[]}', 'utf8');
+    assert.throws(() => new ZoneStore({ filePath: file }), isError(503, 'store_unavailable'));
+
+    await writeFile(file, '{"version":2,"zones":[]}', 'utf8');
+    const seed = new ZoneStore({ filePath: file });
+    await seed.initialize();
+    await seed.createZone({ name: 'valid.test' }, 'org-a');
+    await seed.close();
+    const valid = JSON.parse(await readFile(file, 'utf8'));
+    const { orgId: _orgId, ...withoutOwner } = valid.zones[0];
+    for (const zones of [[withoutOwner], [{ ...valid.zones[0], orgId: 'bad_org' }], [{ ...valid.zones[0], orgId: 'a'.repeat(65) }]]) {
+      await writeFile(file, JSON.stringify({ version: 2, zones }), 'utf8');
+      assert.throws(() => new ZoneStore({ filePath: file }), isError(503, 'store_unavailable'));
+    }
     await writeFile(file, '{not json', 'utf8');
     assert.throws(() => new ZoneStore({ filePath: file }), isError(503, 'store_unavailable'));
   } finally {

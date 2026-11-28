@@ -17,6 +17,11 @@ của từng bản phát hành nằm trong `CHANGELOG.md` tiếng Anh.
   Docker/Compose, tài liệu vận hành song ngữ và hướng dẫn bốn ngôn ngữ. Quản lý
   giờ có qua trang Platform Admin được bảo vệ MFA và route gateway hẹp; tích hợp
   Tầng 2/3 vẫn để sau.
+- **Quản lý edge theo tổ chức:** zone SynapseDNS và connector Synapse Tunnel có
+  ownership org. Route Console tenant `/dns` và `/tunnel` dùng API gateway có
+  scope, truy cập khác org trả 404, và bản ghi version-1 được chuyển thành thuộc
+  platform. Platform Admin giữ route vận hành global riêng thay vì sở hữu mọi
+  tunnel của tổ chức.
 - **Quy trình Tunnel kiểu Cloudflare:** Console tạo connector, route hostname và
   bản ghi SynapseDNS tùy chọn trong một luồng hướng dẫn, hiển thị token connector
   một lần và tạo lệnh `synapseone tunnel run` an toàn. CLI chạy connector

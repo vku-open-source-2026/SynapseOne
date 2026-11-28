@@ -42,6 +42,7 @@
 | [adr/](adr/) | Architecture decisions (Lakehouse, search, runtime parity, workflow security) | — |
 | [production-readiness.md](production-readiness.md) | Current verification matrix, release blockers and operator prerequisites | — |
 | [migration-0.9.0-hardening.md](migration-0.9.0-hardening.md) | Deployment order, migration compatibility and rollback for the hardening pass | — |
+| [migration-edge-org.md](migration-edge-org.md) | Organization ownership migration, verification and rollback for DNS/Tunnel | — |
 | [migration-synapseone.md](migration-synapseone.md) | Upgrade an existing SynapseDX deployment to SynapseOne 0.9.0 | — |
 | [agents/services.md](agents/services.md) | Per-service endpoint, data, rule and environment reference | [vi/agents/services.md](vi/agents/services.md) |
 | [org-quota-api-key-ui.md](org-quota-api-key-ui.md) | Quota/API-key feature deployment, verification, limitations and rollback | [vi/org-quota-api-key-ui.md](vi/org-quota-api-key-ui.md) |

@@ -138,6 +138,11 @@ describe('iam principal authorization', () => {
     const m = await decide({ kind: 'user', sub: memberId }, 'base:Read');
     assert.equal(m.json.allowed, true);
     assert.equal(m.json.reason, 'member-data-plane');
+    for (const action of ['dns:Read', 'dns:Write', 'tunnel:Read', 'tunnel:Write']) {
+      const edge = await decide({ kind: 'user', sub: memberId }, action);
+      assert.equal(edge.json.allowed, true, action);
+      assert.equal(edge.json.reason, 'member-data-plane', action);
+    }
     const iam = await decide({ kind: 'user', sub: memberId }, 'iam:Write');
     assert.equal(iam.json.allowed, false);
     assert.equal(iam.json.reason, 'implicit-deny');

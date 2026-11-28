@@ -6,25 +6,26 @@
 ## Purpose
 
 Synapse Tunnel is the Tier-1 edge capability for publishing HTTP applications
-behind NAT or private networks. It has a control plane, public HTTP ingress, and
-an outbound-only connector. Existing gateway and Tier-2/3 integration are
-intentionally pending.
+behind NAT or private networks. It has an organization-scoped control plane,
+public HTTP ingress, and an outbound-only connector. Tier-2/3 application
+integration remains intentionally pending.
 
 See [Synapse Tunnel operations](../synapse-tunnel.md) and the
 [service README](../../apps/tunnel-service/README.md).
 
 ## Main gateway routes
 
-These routes are currently served directly by the tunnel control plane on port
-`4015`; they are not mounted on the existing SynapseOne gateway yet.
+Tenant Console calls the `/v1/tunnel` gateway namespace. The gateway rewrites to
+the standalone control-plane paths below and stamps verified organization
+identity. Public ingress and connector WebSockets bypass this management route.
 
 | Method | Route | Behavior |
 | --- | --- | --- |
 | GET | `/health`, `/ready` | Public control-plane health/readiness. |
-| GET/POST | `/v1/connectors` | List or create a connector; create returns its token once. |
-| GET/PATCH/DELETE | `/v1/connectors/:id` | Read, update, disable, or delete a connector. |
-| GET/POST | `/v1/routes` | List or create hostname/path routes. |
-| GET/PATCH/DELETE | `/v1/routes/:id` | Read, update, or delete a route. |
+| GET/POST | `/v1/tunnel/connectors` | List or create an org-owned connector; create returns its token once. |
+| GET/PATCH/DELETE | `/v1/tunnel/connectors/:id` | Read, update, disable, or delete an org-owned connector. |
+| GET/POST | `/v1/tunnel/routes` | List or create hostname/path routes owned by that org's connectors. |
+| GET/PATCH/DELETE | `/v1/tunnel/routes/:id` | Read, update, or delete a route. |
 | WS | `/_synapse/tunnel/connect` | Authenticated outbound connector protocol. |
 
 ## Important semantics and limits
@@ -35,11 +36,19 @@ These routes are currently served directly by the tunnel control plane on port
 - Unknown hosts return `404`; offline connectors `502`; header timeout `504`.
 - Request bodies are buffered; responses stream with a cumulative size cap.
 - One JSON writer/instance. No HA, shared rate-limit store, or database.
-- TLS termination and existing API Gateway integration are external/future work.
+- Connectors carry `orgId`; routes inherit ownership and cross-org access returns
+  `404`. Version-1 connectors migrate as platform-owned.
+- TLS termination remains an operator responsibility; management gateway
+  integration does not proxy public tunnel traffic.
 
 ## Authentication and scopes
 
-Management routes require:
+Tenant management accepts a SynapseOne JWT or API key at `/v1/tunnel/*` and
+requires `tunnel:read` or `tunnel:write`. The gateway validates the credential and
+stamps the verified org plus `x-synapseone-internal`; the service validates that
+secret before trusting ownership.
+
+The standalone `/v1/*` API retains operator access:
 
 ```http
 Authorization: Bearer <SYNAPSETUNNEL_ADMIN_TOKEN>
@@ -51,7 +60,9 @@ end-user authentication and authorization.
 
 ## SDK usage
 
-The SDKs do not yet wrap Synapse Tunnel, so these examples use generic HTTP.
+The SDKs do not yet wrap Synapse Tunnel, so these examples use generic HTTP
+against the direct operator API. Tenant applications should call the gateway
+`/v1/tunnel/*` routes with their normal SynapseOne credential instead.
 
 ### JavaScript/TypeScript
 

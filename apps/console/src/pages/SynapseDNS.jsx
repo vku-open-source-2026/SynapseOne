@@ -6,7 +6,8 @@
  */
 import React, { useCallback, useEffect, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { usePlatformAuth } from '../lib/platform-auth.jsx';
+import { useAuth } from '../lib/auth.jsx';
+import { api } from '../lib/api.js';
 import { useI18n } from '../lib/i18n-context.js';
 import { EDGE_COPY } from '../lib/edge-i18n.js';
 import { buildRecordInput, edgePath, recordValue } from '../lib/edge.js';
@@ -20,7 +21,11 @@ function errorText(error) {
 }
 
 export default function SynapseDNSPage() {
-  const { request } = usePlatformAuth();
+  const { headers } = useAuth();
+  const request = useCallback(
+    (path, { method = 'GET', body } = {}) => api.call(method, path, body, headers),
+    [headers],
+  );
   const { lang } = useI18n();
   const t = EDGE_COPY[lang];
   const d = t.dns;
@@ -158,7 +163,7 @@ export default function SynapseDNSPage() {
         title={d.title}
         sub={d.subtitle}
         right={<>
-          <Badge tone="blue">{t.adminOnly}</Badge>
+          <Badge tone="blue">{t.organizationScoped}</Badge>
           <Link to="/docs?tab=dns" className="px-3 py-2 text-sm text-main-blue hover:underline">{t.docs}</Link>
           <Btn kind="secondary" onClick={load} loading={loading}>{t.refresh}</Btn>
           <Btn onClick={() => { setShowZone(true); setFormError(''); }}>{d.newZone}</Btn>

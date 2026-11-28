@@ -60,8 +60,9 @@ các `*_QUOTA_REQUESTS_PER_5H` (minute × 300), `*_QUOTA_REQUESTS_PER_DAY`
 
 ## SynapseDNS — `apps/dns-service` (:53 UDP/TCP, API :4014)
 
-**Mục đích:** dịch vụ Tier-1 độc lập cho DNS authoritative và quản lý zone/record.
-Không recurse hoặc forward. Chưa tích hợp gateway hiện tại.
+**Mục đích:** dịch vụ Tier-1 độc lập cho DNS authoritative với zone/record thuộc
+tổ chức. Không recurse hoặc forward. Quản lý tenant qua gateway tại `/v1/dns`;
+admin trực tiếp vẫn mang phạm vi platform.
 
 **File:** `src/dns-server.ts` (UDP/TCP authority), `src/api.ts` (CRUD zone/record),
 `src/store.ts` (JSON persistence nguyên tử), `src/validation.ts`.
@@ -75,11 +76,15 @@ Không recurse hoặc forward. Chưa tích hợp gateway hiện tại.
 - Hỗ trợ A, AAAA, CNAME, MX, TXT, NS, SOA, SRV, CAA và PTR.
 - Zone lạ trả REFUSED; NXDOMAIN/NODATA kèm SOA; UDP có thể truncate.
 - Một JSON writer/instance. Không có DNSSEC, AXFR, recursion, rate limit hoặc HA.
-- Management bearer token bắt buộc trong production; giữ API ở private network.
+- Tenant cần `dns:read`/`dns:write`; service chỉ tin header org sau khi validate
+  `SYNAPSEONE_INTERNAL_SECRET`. Truy cập khác org trả 404.
+- Management admin bearer token vẫn bắt buộc production; giữ API private.
+- Zone version-1 chuyển thành platform-owned (`orgId=null`).
 - Chưa delegate NS production cho tới khi migrate và verify toàn bộ record.
 
 **Env:** `SYNAPSEDNS_DNS_HOST/PORT`, `SYNAPSEDNS_API_HOST/PORT`,
-`SYNAPSEDNS_DATA_FILE`, `SYNAPSEDNS_ADMIN_TOKEN`, `SYNAPSEDNS_ALLOW_INSECURE`,
+`SYNAPSEDNS_DATA_FILE`, `SYNAPSEDNS_ADMIN_TOKEN`, `SYNAPSEONE_INTERNAL_SECRET`,
+`SYNAPSEDNS_ALLOW_INSECURE`,
 `SYNAPSEDNS_LOG_LEVEL`, `SYNAPSEDNS_SHUTDOWN_TIMEOUT_MS`.
 
 ---
@@ -87,7 +92,8 @@ Không recurse hoặc forward. Chưa tích hợp gateway hiện tại.
 ## Synapse Tunnel — `apps/tunnel-service` (API :4015, ingress :4016)
 
 **Mục đích:** dịch vụ Tier-1 độc lập để expose ứng dụng HTTP sau NAT/private
-network. Chưa tích hợp gateway và Tầng 2/3.
+network. Quản lý tenant qua gateway tại `/v1/tunnel`; tích hợp ứng dụng Tầng 2/3
+vẫn đang chờ.
 
 **File:** `src/index.ts` (combined server), `src/control-plane.ts`,
 `src/ingress.ts`, `src/connector.ts`, `src/registry.ts` (WebSocket multiplex),
@@ -100,14 +106,21 @@ CRUD route tại `/v1/routes`; connector WebSocket `/_synapse/tunnel/connect`.
 - Connector chỉ kết nối outbound, không mở inbound listener.
 - Hỗ trợ HTTP/SSE streaming; chưa hỗ trợ raw WebSocket, TCP hoặc UDP.
 - Unknown host 404, connector offline 502, timeout response header 504.
-- Admin token bảo vệ management; connector token trả một lần và chỉ lưu SHA-256.
-  Ứng dụng public vẫn phải tự kiểm tra authorization người dùng cuối.
-- Một JSON writer/instance. TLS termination và API Gateway là phần tích hợp ngoài.
+- Tenant cần `tunnel:read`/`tunnel:write`; service chỉ tin header org sau khi
+  validate `SYNAPSEONE_INTERNAL_SECRET`. Connector có `orgId`, route kế thừa
+  ownership, truy cập khác org trả 404.
+- Admin token bảo vệ management trực tiếp; connector token trả một lần và chỉ lưu
+  SHA-256. Ứng dụng public vẫn phải tự kiểm tra authorization người dùng cuối.
+- Connector version-1 chuyển thành platform-owned (`orgId=null`).
+- Một JSON writer/instance. TLS termination vẫn là phần ngoài; traffic tunnel
+  public không đi qua management gateway.
 - Request body được buffer; response stream với giới hạn kích thước tích lũy.
 
 **Env:** `SYNAPSETUNNEL_HOST`, `SYNAPSETUNNEL_API_PORT`,
 `SYNAPSETUNNEL_INGRESS_PORT`, `SYNAPSETUNNEL_DATA_FILE`,
-`SYNAPSETUNNEL_ADMIN_TOKEN`, `SYNAPSETUNNEL_PUBLIC_SCHEME`,
+`SYNAPSETUNNEL_ADMIN_TOKEN`, `SYNAPSEONE_INTERNAL_SECRET`,
+`SYNAPSETUNNEL_PUBLIC_SCHEME`, `SYNAPSETUNNEL_PUBLIC_ORIGIN`,
+`SYNAPSETUNNEL_INGRESS_BIND_IP`,
 `SYNAPSETUNNEL_WS_PATH`, `SYNAPSETUNNEL_MAX_REQUEST_BYTES`,
 `SYNAPSETUNNEL_MAX_RESPONSE_BYTES`, `SYNAPSETUNNEL_REQUEST_TIMEOUT_MS`;
 connector dùng `SYNAPSETUNNEL_CONNECTOR_TOKEN` và `SYNAPSETUNNEL_SERVER_URL`.

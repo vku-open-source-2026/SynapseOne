@@ -17,6 +17,11 @@ Format based on Keep a Changelog; versioning follows SemVer.
   guides. Management is now available through MFA-protected Platform Admin
   Console pages and narrow gateway proxy routes; Tier-2/3 integration remains
   intentionally pending.
+- **Organization-owned edge management:** SynapseDNS zones and Synapse Tunnel
+  connectors now carry organization ownership. Tenant Console routes `/dns` and
+  `/tunnel` use scoped gateway APIs, cross-org access returns 404, and version-1
+  records migrate as platform-owned. Platform Admin keeps separate global
+  operator routes rather than owning every organization's tunnels.
 - **Cloudflare-style Tunnel workflow:** Console creates a connector, hostname
   route and optional SynapseDNS record in one guided flow, shows the connector
   token once and renders a secure `synapseone tunnel run` command. The CLI runs

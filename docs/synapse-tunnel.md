@@ -9,7 +9,7 @@ to Tier-2/3 applications yet.
 
 ## Cloudflare-style connection flow
 
-1. Open **Platform Admin → Synapse Tunnel** at `/admin/tunnel` and choose
+1. Open **Synapse Tunnel** in the organization Console at `/tunnel` and choose
    **Create tunnel**.
 2. Enter the local application URL, for example `http://localhost:3000`.
 3. Add the public hostname. Choose SynapseDNS to create an A/AAAA/CNAME record in
@@ -30,11 +30,18 @@ The CLI opens only an outbound WebSocket. No inbound listener is required on the
 application machine. `--token-file` is also available for a root-only token file.
 The connector ID is a label; the secret token authenticates the connection.
 
-Console calls `/v1/platform/edge/tunnel/*` through the gateway. This namespace is
-restricted to Platform Administrator sessions with MFA, rewrites to the Tunnel
-control API and injects the server-side admin credential. Admin/connector tokens
-are never stored in browser storage. DNS management uses the equivalent
-`/v1/platform/edge/dns/*` namespace.
+Console calls `/v1/tunnel/*` through the gateway with the signed-in organization
+credential. Scoped API keys need `tunnel:read` or `tunnel:write`. The gateway
+enforces scopes and stamps verified organization identity plus the internal
+shared secret; Tunnel validates that secret and stores `orgId` on every connector.
+Routes inherit ownership from their connector, and cross-organization access
+returns `404`. Admin/connector tokens are never stored in browser storage.
+
+Platform operators retain direct admin-token access and the separate
+`/v1/platform/edge/tunnel/*` namespace for global operations. Existing version-1
+connectors migrate to version 2 as platform-owned (`orgId=null`); new connectors
+always belong to the authenticated organization. DNS management uses the
+organization-scoped `/v1/dns/*` namespace.
 
 Set `SYNAPSETUNNEL_PUBLIC_ORIGIN=https://tunnel.example.com` on the server so
 Console can render the correct CLI command. This must be an HTTP(S) origin without
@@ -119,9 +126,10 @@ curl -fsS -H 'Host: city.example.com' http://127.0.0.1:18082/
 ## Security and limits
 
 - HTTP/SSE streaming is supported; raw WebSocket, TCP, and UDP passthrough are not.
-- Management is integrated with the existing gateway under the platform-admin
-  namespace; public application traffic and connector WebSockets must bypass the
-  management gateway and use a dedicated HTTPS/WSS reverse proxy.
+- Tenant management uses `/v1/tunnel` with organization ownership; platform
+  operators retain separate `/v1/platform/edge/tunnel` admin routes. Public
+  application traffic and connector WebSockets bypass the management gateway and
+  use a dedicated HTTPS/WSS reverse proxy.
 - The MVP supports one JSON writer and one service instance; it is not HA.
 - Request bodies are buffered up to the configured limit. Responses stream with a
   cumulative size cap.

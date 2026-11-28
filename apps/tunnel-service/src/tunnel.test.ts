@@ -273,13 +273,13 @@ test('management API enforces auth, validates CRUD, and persists only token hash
 
   assert.equal((await fetch(`${service.apiUrl}/health`)).status, 200);
   assert.equal((await fetch(`${service.apiUrl}/ready`)).status, 200);
-  assert.equal((await admin(service, '/v1/connectors', {}, null)).status, 401);
-  assert.equal((await admin(service, '/v1/config', {}, null)).status, 401);
+  assert.equal((await admin(service, '/v1/connectors', {}, null)).status, 503);
+  assert.equal((await admin(service, '/v1/config', {}, null)).status, 503);
   const advertised = await (await admin(service, '/v1/config')).json() as Record<string, unknown>;
   assert.equal(advertised.publicOrigin, 'https://tunnel.example.com');
   assert.equal(advertised.connectorPath, '/_synapse/tunnel/connect');
   assert.equal(advertised.protocolVersion, 1);
-  assert.equal((await admin(service, '/v1/connectors', {}, 'wrong-token')).status, 401);
+  assert.equal((await admin(service, '/v1/connectors', {}, 'wrong-token')).status, 503);
   assert.equal((await admin(service, '/v1/connectors', { method: 'POST', body: '{}' })).status, 400);
 
   const invalidUpstream = await admin(service, '/v1/connectors', {

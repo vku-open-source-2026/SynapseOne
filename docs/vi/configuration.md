@@ -308,13 +308,15 @@ Xem `../notifications.md`. Biến chính: `DATABASE_URL`,
 | `SYNAPSEDNS_DNS_HOST` / `SYNAPSEDNS_DNS_PORT` | `0.0.0.0` / `53` | bind DNS authoritative UDP/TCP |
 | `SYNAPSEDNS_API_HOST` / `SYNAPSEDNS_API_PORT` | `0.0.0.0` / `4014` | bind API quản trị |
 | `SYNAPSEDNS_DATA_FILE` | `./data/synapsedns.json` | JSON store bền vững; một writer |
-| `SYNAPSEDNS_ADMIN_TOKEN` | bắt buộc production | bearer token quản trị |
+| `SYNAPSEDNS_ADMIN_TOKEN` | bắt buộc production | bearer token quản trị platform/operator |
+| `SYNAPSEONE_INTERNAL_SECRET` | chưa đặt | secret gateway dùng chung; bắt buộc để tin header org tenant trên `/v1/dns` |
 | `SYNAPSEDNS_ALLOW_INSECURE` | `false` | bỏ auth chỉ cho test local; cấm production |
 | `SYNAPSEDNS_LOG_LEVEL` | `info` | mức log structured |
 | `SYNAPSEDNS_SHUTDOWN_TIMEOUT_MS` | `15000` | thời gian shutdown graceful |
 
-Compose độc lập: `docker-compose.dns.yml`. Giữ API private và chưa delegate NS
-production cho tới khi migrate/verify toàn bộ record.
+Compose độc lập: `docker-compose.dns.yml`. Quản lý tenant tại `/v1/dns` với
+`dns:read`/`dns:write`; admin trực tiếp vẫn mang phạm vi platform. Giữ API private
+và chưa delegate NS production cho tới khi migrate/verify toàn bộ record.
 
 ## Synapse Tunnel (`apps/tunnel-service`, chạy độc lập)
 
@@ -324,7 +326,8 @@ production cho tới khi migrate/verify toàn bộ record.
 | `SYNAPSETUNNEL_API_PORT` | `4015` | API quản trị |
 | `SYNAPSETUNNEL_INGRESS_PORT` | `4016` | ingress HTTP/WebSocket public |
 | `SYNAPSETUNNEL_DATA_FILE` | `./data/synapse-tunnel.json` | JSON store bền vững; một writer |
-| `SYNAPSETUNNEL_ADMIN_TOKEN` | bắt buộc production | bearer token quản trị |
+| `SYNAPSETUNNEL_ADMIN_TOKEN` | bắt buộc production | bearer token quản trị platform/operator |
+| `SYNAPSEONE_INTERNAL_SECRET` | chưa đặt | secret gateway dùng chung; bắt buộc để tin header org tenant trên `/v1/tunnel` |
 | `SYNAPSETUNNEL_PUBLIC_SCHEME` | `http` | scheme forwarded; đặt `https` sau TLS |
 | `SYNAPSETUNNEL_WS_PATH` | `/_synapse/tunnel/connect` | đường dẫn WebSocket connector |
 | `SYNAPSETUNNEL_MAX_REQUEST_BYTES` | `10485760` | giới hạn request body buffer |
@@ -332,9 +335,12 @@ production cho tới khi migrate/verify toàn bộ record.
 | `SYNAPSETUNNEL_REQUEST_TIMEOUT_MS` | `30000` | timeout tới response header upstream |
 | `SYNAPSETUNNEL_CONNECTOR_TOKEN` | bắt buộc cho connector | credential connector dùng một lần |
 | `SYNAPSETUNNEL_SERVER_URL` | `http://127.0.0.1:4016` | đích connector kết nối outbound |
+| `SYNAPSETUNNEL_PUBLIC_ORIGIN` | chưa đặt | origin HTTP(S) public được quảng bá cho Console/CLI |
+| `SYNAPSETUNNEL_INGRESS_BIND_IP` | `127.0.0.1` | địa chỉ bind ingress; chỉ đặt IP public khi có chủ đích |
 
-Compose độc lập: `docker-compose.tunnel.yml`. TLS termination, routing qua API
-Gateway hiện tại và tích hợp Tầng 2/3 vẫn để sau.
+Compose độc lập: `docker-compose.tunnel.yml`. Quản lý tenant tại `/v1/tunnel` với
+`tunnel:read`/`tunnel:write`; admin trực tiếp vẫn mang phạm vi platform. TLS
+termination và tích hợp ứng dụng Tầng 2/3 vẫn là việc của operator/tương lai.
 
 ## Console (`apps/console`, runtime qua `config.js`)
 

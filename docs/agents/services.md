@@ -76,8 +76,9 @@ defaults, `AI_QUOTA_TOKENS_PER_DAY`, `INFERENCE_QUOTA_TOKENS_PER_DAY` (1M),
 
 ## SynapseDNS — `apps/dns-service` (:53 UDP/TCP, API :4014)
 
-**Purpose:** standalone Tier-1 authoritative DNS and zone/record management.
-It never recurses or forwards queries. Existing gateway integration is pending.
+**Purpose:** standalone Tier-1 authoritative DNS with organization-owned
+zone/record management. It never recurses or forwards queries. Tenant management
+is gateway-routed at `/v1/dns`; direct admin access remains platform-wide.
 
 **Files:** `src/dns-server.ts` (UDP/TCP authority), `src/api.ts` (zone/record
 CRUD), `src/store.ts` (atomic JSON persistence), `src/validation.ts`.
@@ -91,11 +92,15 @@ CRUD), `src/store.ts` (atomic JSON persistence), `src/validation.ts`.
 - Supports A, AAAA, CNAME, MX, TXT, NS, SOA, SRV, CAA and PTR.
 - Unknown zones return REFUSED; NXDOMAIN/NODATA include SOA; UDP may truncate.
 - One JSON writer/instance. No DNSSEC, AXFR, recursion, rate limiting or HA.
-- Management bearer token is mandatory in production; keep API private.
+- Tenant calls require `dns:read`/`dns:write`; the service trusts org headers only
+  after validating `SYNAPSEONE_INTERNAL_SECRET`. Cross-org access returns 404.
+- Management admin bearer token remains mandatory in production; keep API private.
+- Version-1 zones migrate as platform-owned (`orgId=null`).
 - Do not delegate production NS until every record is migrated and verified.
 
 **Env:** `SYNAPSEDNS_DNS_HOST/PORT`, `SYNAPSEDNS_API_HOST/PORT`,
-`SYNAPSEDNS_DATA_FILE`, `SYNAPSEDNS_ADMIN_TOKEN`, `SYNAPSEDNS_ALLOW_INSECURE`,
+`SYNAPSEDNS_DATA_FILE`, `SYNAPSEDNS_ADMIN_TOKEN`, `SYNAPSEONE_INTERNAL_SECRET`,
+`SYNAPSEDNS_ALLOW_INSECURE`,
 `SYNAPSEDNS_LOG_LEVEL`, `SYNAPSEDNS_SHUTDOWN_TIMEOUT_MS`.
 
 ---
@@ -103,7 +108,8 @@ CRUD), `src/store.ts` (atomic JSON persistence), `src/validation.ts`.
 ## Synapse Tunnel — `apps/tunnel-service` (API :4015, ingress :4016)
 
 **Purpose:** standalone Tier-1 HTTP reverse tunnel for applications behind NAT
-or private networks. Existing gateway and Tier-2/3 integration is pending.
+or private networks. Tenant management is gateway-routed at `/v1/tunnel`;
+Tier-2/3 application integration remains pending.
 
 **Files:** `src/index.ts` (combined server), `src/control-plane.ts`,
 `src/ingress.ts`, `src/connector.ts`, `src/registry.ts` (WebSocket multiplex),
@@ -116,14 +122,21 @@ route CRUD under `/v1/routes`; connector WebSocket `/_synapse/tunnel/connect`.
 - Connector is outbound-only and opens no inbound listener.
 - HTTP/SSE streaming is supported; raw WebSocket, TCP and UDP are not.
 - Unknown host 404, offline connector 502, response-header timeout 504.
-- Admin token protects management; connector token is returned once and stored
-  only as SHA-256. Public apps still enforce end-user authorization.
-- One JSON writer/instance. TLS termination and API Gateway wiring are external.
+- Tenant calls require `tunnel:read`/`tunnel:write`; the service trusts org headers
+  only after validating `SYNAPSEONE_INTERNAL_SECRET`. Connectors carry `orgId`,
+  routes inherit ownership, and cross-org access returns 404.
+- Admin token protects direct operator management; connector token is returned
+  once and stored only as SHA-256. Public apps still enforce end-user authorization.
+- Version-1 connectors migrate as platform-owned (`orgId=null`).
+- One JSON writer/instance. TLS termination remains external; public tunnel
+  traffic does not use the management gateway.
 - Request bodies are buffered; responses stream with a cumulative size cap.
 
 **Env:** `SYNAPSETUNNEL_HOST`, `SYNAPSETUNNEL_API_PORT`,
 `SYNAPSETUNNEL_INGRESS_PORT`, `SYNAPSETUNNEL_DATA_FILE`,
-`SYNAPSETUNNEL_ADMIN_TOKEN`, `SYNAPSETUNNEL_PUBLIC_SCHEME`,
+`SYNAPSETUNNEL_ADMIN_TOKEN`, `SYNAPSEONE_INTERNAL_SECRET`,
+`SYNAPSETUNNEL_PUBLIC_SCHEME`, `SYNAPSETUNNEL_PUBLIC_ORIGIN`,
+`SYNAPSETUNNEL_INGRESS_BIND_IP`,
 `SYNAPSETUNNEL_WS_PATH`, `SYNAPSETUNNEL_MAX_REQUEST_BYTES`,
 `SYNAPSETUNNEL_MAX_RESPONSE_BYTES`, `SYNAPSETUNNEL_REQUEST_TIMEOUT_MS`;
 connector uses `SYNAPSETUNNEL_CONNECTOR_TOKEN` and `SYNAPSETUNNEL_SERVER_URL`.

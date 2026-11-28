@@ -17,6 +17,8 @@ export interface ServerConfig {
   apiPort: number;
   ingressPort: number;
   adminToken?: string;
+  /** Shared secret stamped by the trusted management gateway for tenant requests. */
+  internalSecret?: string;
   allowInsecure: boolean;
   dataFile: string | null;
   wsPath: string;
@@ -84,6 +86,8 @@ function readWsPath(env: Env): string {
 export function loadServerConfig(mode: ServerMode = 'combined', env: Env = process.env): ServerConfig {
   const isProduction = isProductionEnvironment(env);
   const adminToken = env.SYNAPSETUNNEL_ADMIN_TOKEN || undefined;
+  const rawInternalSecret = env.SYNAPSEONE_INTERNAL_SECRET;
+  const internalSecret = rawInternalSecret?.trim() ? rawInternalSecret : undefined;
   const allowInsecure = readBoolean(env, 'SYNAPSETUNNEL_ALLOW_INSECURE');
   if (isProduction && allowInsecure) throw new Error('SYNAPSETUNNEL_ALLOW_INSECURE is forbidden in production');
   if (!adminToken && !(allowInsecure && !isProduction)) throw new Error('SYNAPSETUNNEL_ADMIN_TOKEN is required');
@@ -114,6 +118,7 @@ export function loadServerConfig(mode: ServerMode = 'combined', env: Env = proce
     apiPort: readInteger(env, 'SYNAPSETUNNEL_API_PORT', readInteger(env, 'PORT', 4015, 0, 65535), 0, 65535),
     ingressPort: readInteger(env, 'SYNAPSETUNNEL_INGRESS_PORT', readInteger(env, 'INGRESS_PORT', 4016, 0, 65535), 0, 65535),
     adminToken,
+    internalSecret,
     allowInsecure,
     dataFile,
     wsPath: readWsPath(env),

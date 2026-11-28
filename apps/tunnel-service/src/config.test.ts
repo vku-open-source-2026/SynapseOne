@@ -33,6 +33,16 @@ test('server configuration fails closed and applies documented defaults', () => 
   assert.equal(defaults.maxRequestBytes, 10485760);
   assert.equal(defaults.maxResponseBytes, 16777216);
   assert.equal(defaults.publicOrigin, undefined);
+  assert.equal(defaults.internalSecret, undefined);
+
+  const gateway = loadServerConfig('combined', {
+    SYNAPSETUNNEL_ADMIN_TOKEN: 'test-token',
+    SYNAPSEONE_INTERNAL_SECRET: 'gateway-shared-secret',
+  });
+  assert.equal(gateway.internalSecret, 'gateway-shared-secret');
+  assert.equal(loadServerConfig('combined', {
+    SYNAPSETUNNEL_ADMIN_TOKEN: 'test-token', SYNAPSEONE_INTERNAL_SECRET: '   ',
+  }).internalSecret, undefined);
 
   const advertised = loadServerConfig('combined', {
     SYNAPSETUNNEL_ADMIN_TOKEN: 'test-token',
@@ -45,7 +55,11 @@ test('server configuration fails closed and applies documented defaults', () => 
 });
 
 test('hostname, route, and upstream validation reject unsafe input', () => {
-  assert.equal(connectorCreateSchema.parse({ name: 'local', upstreamUrl: 'http://localhost:3000/base' }).upstreamUrl, 'http://localhost:3000/base');
+  const connectorInput = connectorCreateSchema.parse({
+    name: 'local', upstreamUrl: 'http://localhost:3000/base', orgId: 'spoofed-org',
+  });
+  assert.equal(connectorInput.upstreamUrl, 'http://localhost:3000/base');
+  assert.equal('orgId' in connectorInput, false);
   assert.equal(routeCreateSchema.parse({ hostname: 'App.Example.com.', pathPrefix: '/api/', connectorId: randomUUID() }).hostname, 'app.example.com');
   assert.equal(routeCreateSchema.parse({ hostname: 'app.example.com', pathPrefix: '/', connectorId: randomUUID() }).pathPrefix, '');
 

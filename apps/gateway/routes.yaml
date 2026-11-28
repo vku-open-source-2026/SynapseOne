@@ -99,8 +99,27 @@ routes:
       - { method: DELETE, path: /v1/platform/runners/*, action: platform:Admin }
       - { method: DELETE, path: /v1/platform/runners/*/*/*, action: platform:Admin }
 
-  # Edge management is platform-admin-only. The caller JWT is verified by the
-  # gateway, then replaced with the edge service's server-side admin credential.
+  # Organization-scoped edge management. The gateway authenticates the tenant
+  # credential and stamps verified org identity plus the internal shared secret;
+  # each service enforces ownership in its own store.
+  - path: /v1/dns
+    target: ${SYNAPSEDNS_SERVICE_URL:-http://synapsedns:4014}
+    auth: either
+    service: dns
+    stripPrefix: /v1/dns
+    actions:
+      - { method: DELETE, path: /v1/dns/*, action: dns:Write }
+
+  - path: /v1/tunnel
+    target: ${SYNAPSETUNNEL_SERVICE_URL:-http://synapsetunnel:4015}
+    auth: either
+    service: tunnel
+    stripPrefix: /v1/tunnel
+    actions:
+      - { method: DELETE, path: /v1/tunnel/*, action: tunnel:Write }
+
+  # Platform operator access remains separate and global. The caller JWT is
+  # verified by the gateway, then replaced with the edge service's admin token.
   # Blank admin tokens disable these optional routes with 503 edge_not_configured.
   - path: /v1/platform/edge/dns
     target: ${SYNAPSEDNS_SERVICE_URL:-http://synapsedns:4014}

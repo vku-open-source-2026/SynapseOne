@@ -24,6 +24,8 @@ import {
   parseCreateZoneInput,
   parseRecordInput,
   recordInputSchema,
+  isValidOrgId,
+  orgIdSchema,
   MAX_ZONES,
 } from './validation';
 
@@ -36,16 +38,28 @@ const metadataSchema = z.object({
   updatedAt: isoDateTime,
 }).passthrough();
 const storedRecordSchema = z.intersection(recordInputSchema, metadataSchema);
-const snapshotSchema = z.object({
-  version: z.literal(1),
-  zones: z.array(z.object({
-    id: z.string().uuid(),
-    name: z.string(),
-    createdAt: isoDateTime,
-    updatedAt: isoDateTime,
-    records: z.array(storedRecordSchema),
-  }).strict()).max(MAX_ZONES),
+const zoneSnapshotSchema = z.object({
+  id: z.string().uuid(),
+  name: z.string(),
+  createdAt: isoDateTime,
+  updatedAt: isoDateTime,
+  records: z.array(storedRecordSchema),
 }).strict();
+const snapshotSchema = z.discriminatedUnion('version', [
+  z.object({
+    version: z.literal(1),
+    zones: z.array(zoneSnapshotSchema).max(MAX_ZONES),
+  }).strict(),
+  z.object({
+    version: z.literal(2),
+    zones: z.array(zoneSnapshotSchema.extend({ orgId: orgIdSchema.nullable() })).max(MAX_ZONES),
+  }).strict(),
+]);
+
+interface DecodedSnapshot {
+  version: 1 | 2;
+  zones: Map<string, Zone>;
+}
 
 export interface ZoneStoreOptions {
   /** Omit for the default persistent store. Tests can explicitly request memory. */
@@ -74,7 +88,7 @@ function materializeRecord(input: RecordInput, timestamp = now()): DnsRecord {
 
 function toSnapshot(zones: Map<string, Zone>): StoreSnapshot {
   return {
-    version: 1,
+    version: 2,
     zones: [...zones.values()]
       .sort((a, b) => a.name.localeCompare(b.name))
       .map((zone) => ({
@@ -85,9 +99,17 @@ function toSnapshot(zones: Map<string, Zone>): StoreSnapshot {
   };
 }
 
-function decodeSnapshot(value: unknown): Map<string, Zone> {
+function serializeSnapshot(zones: Map<string, Zone>): string {
+  const serialized = `${JSON.stringify(toSnapshot(zones), null, 2)}\n`;
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_STORE_BYTES) {
+    conflict('store_limit', `DNS snapshot exceeds the ${MAX_STORE_BYTES}-byte persistence limit`);
+  }
+  return serialized;
+}
+
+function decodeSnapshot(value: unknown): DecodedSnapshot {
   const parsed = snapshotSchema.safeParse(value);
-  if (!parsed.success) throw new Error('DNS data file does not match snapshot schema version 1');
+  if (!parsed.success) throw new Error('DNS data file does not match a supported snapshot schema');
 
   const zones = new Map<string, Zone>();
   const zoneIds = new Set<string>();
@@ -115,12 +137,13 @@ function decodeSnapshot(value: unknown): Map<string, Zone> {
     zones.set(zoneName, {
       id: rawZone.id,
       name: zoneName,
+      orgId: 'orgId' in rawZone ? rawZone.orgId : null,
       createdAt: rawZone.createdAt,
       updatedAt: rawZone.updatedAt,
       records,
     });
   }
-  return zones;
+  return { version: parsed.data.version, zones };
 }
 
 /**
@@ -133,12 +156,18 @@ export class ZoneStore {
   private readonly logger: Logger;
   private writeQueue: Promise<void> = Promise.resolve();
   private healthy = true;
+  private migrationPending = false;
 
   constructor(options: ZoneStoreOptions = {}) {
     this.logger = options.logger ?? silentLogger;
     this.filePath = options.memory ? undefined : resolve(options.filePath ?? './data/synapsedns.json');
-    this.zones = new Map();
-    if (this.filePath) this.zones = this.loadSync();
+    if (this.filePath) {
+      const decoded = this.loadSync();
+      this.zones = decoded.zones;
+      this.migrationPending = decoded.version === 1;
+    } else {
+      this.zones = new Map();
+    }
   }
 
   get isHealthy(): boolean {
@@ -155,30 +184,42 @@ export class ZoneStore {
       this.logger.error('store_initialize_failed', { error: error instanceof Error ? error.name : 'Error' });
       throw new ServiceError(503, 'store_unavailable', 'DNS data directory is not readable and writable');
     }
+    if (this.migrationPending) {
+      try {
+        // Upgrade legacy platform-owned zones before the service becomes ready.
+        await this.writeSnapshot(serializeSnapshot(this.zones));
+        this.migrationPending = false;
+      } catch (error) {
+        this.healthy = false;
+        this.logger.error('store_migration_failed', { error: error instanceof Error ? error.name : 'Error' });
+        throw new ServiceError(503, 'store_unavailable', 'Unable to migrate DNS data to snapshot version 2');
+      }
+    }
   }
 
-  private loadSync(): Map<string, Zone> {
+  private loadSync(): DecodedSnapshot {
     try {
       const contents = readFileSync(this.filePath!, 'utf8');
       if (Buffer.byteLength(contents, 'utf8') > MAX_STORE_BYTES) throw new Error('DNS data file is too large');
       return decodeSnapshot(JSON.parse(contents));
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return new Map();
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { version: 2, zones: new Map() };
       throw new ServiceError(503, 'store_unavailable', 'Unable to load a valid DNS data file');
     }
   }
 
-  listZones(): ZoneSummary[] {
+  listZones(orgId: string | null = null): ZoneSummary[] {
     return [...this.zones.values()]
+      .filter((zone) => orgId === null || zone.orgId === orgId)
       .sort((a, b) => a.name.localeCompare(b.name))
-      .map(({ id, name, createdAt, updatedAt, records }) => ({
-        id, name, createdAt, updatedAt, recordCount: records.length,
+      .map(({ id, name, orgId: owner, createdAt, updatedAt, records }) => ({
+        id, name, orgId: owner, createdAt, updatedAt, recordCount: records.length,
       }));
   }
 
-  getZone(name: string): Zone | undefined {
+  getZone(name: string, orgId: string | null = null): Zone | undefined {
     const zone = this.zones.get(normalizeZoneName(name));
-    return zone ? clone(zone) : undefined;
+    return zone && (orgId === null || zone.orgId === orgId) ? clone(zone) : undefined;
   }
 
   /** Internal read-only lookup for the DNS hot path; longest suffix wins. */
@@ -193,8 +234,9 @@ export class ZoneStore {
     return match;
   }
 
-  async createZone(input: CreateZoneInput): Promise<Zone> {
+  async createZone(input: CreateZoneInput, orgId: string | null = null): Promise<Zone> {
     const parsed = parseCreateZoneInput(input);
+    if (orgId !== null && !isValidOrgId(orgId)) invalid('Organization ID must be 1..64 alphanumeric or hyphen characters');
     return this.enqueue((zones) => {
       if (zones.size >= MAX_ZONES) invalid(`The store cannot contain more than ${MAX_ZONES} zones`);
       if (zones.has(parsed.name)) conflict('zone_exists', `Zone ${parsed.name} already exists`);
@@ -207,6 +249,7 @@ export class ZoneStore {
       const zone: Zone = {
         id: randomUUID(),
         name: parsed.name,
+        orgId,
         createdAt: timestamp,
         updatedAt: timestamp,
         records: [
@@ -231,18 +274,19 @@ export class ZoneStore {
     });
   }
 
-  async deleteZone(name: string): Promise<void> {
+  async deleteZone(name: string, orgId: string | null = null): Promise<void> {
     const zoneName = normalizeZoneName(name);
     await this.enqueue((zones) => {
-      if (!zones.delete(zoneName)) notFound('Zone');
+      const zone = requireZone(zones, zoneName, orgId);
+      zones.delete(zone.name);
     });
   }
 
-  async createRecord(zoneName: string, input: RecordInput): Promise<DnsRecord> {
+  async createRecord(zoneName: string, input: RecordInput, orgId: string | null = null): Promise<DnsRecord> {
     const normalizedZone = normalizeZoneName(zoneName);
-    const parsed = parseRecordInput(input, normalizedZone);
     return this.enqueue((zones) => {
-      const zone = requireZone(zones, normalizedZone);
+      const zone = requireZone(zones, normalizedZone, orgId);
+      const parsed = parseRecordInput(input, zone.name);
       const timestamp = now();
       const record = materializeRecord(parsed, timestamp);
       const nextRecords = [...zone.records, record];
@@ -254,10 +298,10 @@ export class ZoneStore {
     });
   }
 
-  async patchRecord(zoneName: string, recordId: string, patch: RecordPatch): Promise<DnsRecord> {
+  async patchRecord(zoneName: string, recordId: string, patch: RecordPatch, orgId: string | null = null): Promise<DnsRecord> {
     const normalizedZone = normalizeZoneName(zoneName);
     return this.enqueue((zones) => {
-      const zone = requireZone(zones, normalizedZone);
+      const zone = requireZone(zones, normalizedZone, orgId);
       const index = zone.records.findIndex((record) => record.id === recordId);
       if (index < 0) notFound('Record');
       const existing = zone.records[index];
@@ -280,10 +324,10 @@ export class ZoneStore {
     });
   }
 
-  async deleteRecord(zoneName: string, recordId: string): Promise<void> {
+  async deleteRecord(zoneName: string, recordId: string, orgId: string | null = null): Promise<void> {
     const normalizedZone = normalizeZoneName(zoneName);
     await this.enqueue((zones) => {
-      const zone = requireZone(zones, normalizedZone);
+      const zone = requireZone(zones, normalizedZone, orgId);
       const index = zone.records.findIndex((record) => record.id === recordId);
       if (index < 0) notFound('Record');
       const existing = zone.records[index];
@@ -309,13 +353,10 @@ export class ZoneStore {
       const draft = clone(this.zones);
       const result = operation(draft);
       if (this.filePath) {
-        const snapshot = toSnapshot(draft);
-        const serialized = `${JSON.stringify(snapshot, null, 2)}\n`;
-        if (Buffer.byteLength(serialized, 'utf8') > MAX_STORE_BYTES) {
-          conflict('store_limit', `DNS snapshot exceeds the ${MAX_STORE_BYTES}-byte persistence limit`);
-        }
+        const serialized = serializeSnapshot(draft);
         try {
           await this.writeSnapshot(serialized);
+          this.migrationPending = false;
         } catch (error) {
           this.healthy = false;
           this.logger.error('store_write_failed', { error: error instanceof Error ? error.name : 'Error' });
@@ -362,9 +403,9 @@ export class ZoneStore {
   }
 }
 
-function requireZone(zones: Map<string, Zone>, name: string): Zone {
+function requireZone(zones: Map<string, Zone>, name: string, orgId: string | null): Zone {
   const zone = zones.get(name);
-  if (!zone) notFound('Zone');
+  if (!zone || (orgId !== null && zone.orgId !== orgId)) notFound('Zone');
   return zone;
 }
 

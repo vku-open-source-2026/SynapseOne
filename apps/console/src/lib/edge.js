@@ -5,12 +5,15 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
 
-export const EDGE_ROOT = '/v1/platform/edge';
+export const EDGE_ROOT = '/v1';
 
+/** Tenant management routes exposed by the gateway. The standalone services
+ * use the same resource suffixes on their own origins without this prefix. */
 export function edgePath(service, path = '') {
   if (!['dns', 'tunnel'].includes(service)) throw new Error('Unknown edge service');
   const suffix = path ? (path.startsWith('/') ? path : `/${path}`) : '';
-  return `${EDGE_ROOT}/${service}${suffix}`;
+  const resourcePath = suffix.replace(/^\/v1(?=\/|$)/, '');
+  return `${EDGE_ROOT}/${service}${resourcePath}`;
 }
 
 export function normalizeHostname(value) {

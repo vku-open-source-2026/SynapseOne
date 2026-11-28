@@ -6,7 +6,8 @@
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { usePlatformAuth } from '../lib/platform-auth.jsx';
+import { useAuth } from '../lib/auth.jsx';
+import { api } from '../lib/api.js';
 import { useI18n } from '../lib/i18n-context.js';
 import { EDGE_COPY } from '../lib/edge-i18n.js';
 import { addressRecordConflict, connectorScript, defaultAddressRecord, edgePath, normalizeHostname, zoneForHostname } from '../lib/edge.js';
@@ -40,7 +41,11 @@ function Step({ number, active, complete, children }) {
 }
 
 export default function SynapseTunnelPage() {
-  const { request } = usePlatformAuth();
+  const { headers } = useAuth();
+  const request = useCallback(
+    (path, { method = 'GET', body } = {}) => api.call(method, path, body, headers),
+    [headers],
+  );
   const { lang } = useI18n();
   const t = EDGE_COPY[lang];
   const d = t.tunnel;
@@ -269,7 +274,7 @@ export default function SynapseTunnelPage() {
         title={d.title}
         sub={d.subtitle}
         right={<>
-          <Badge tone="blue">{t.adminOnly}</Badge>
+          <Badge tone="blue">{t.organizationScoped}</Badge>
           <Link to="/docs?tab=tunnel" className="px-3 py-2 text-sm text-main-blue hover:underline">{t.docs}</Link>
           <Btn kind="secondary" onClick={() => loadStatus()} loading={loading}>{t.refresh}</Btn>
           <Btn onClick={openWizard}>{d.newTunnel}</Btn>
@@ -411,7 +416,7 @@ export default function SynapseTunnelPage() {
         <Card>
           <div className="mb-4 flex items-center justify-between gap-3">
             <h2 className="font-semibold text-main-text">{d.routes}</h2>
-            <Link to="/admin/dns" className="text-sm text-main-blue hover:underline">SynapseDNS</Link>
+            <Link to="/dns" className="text-sm text-main-blue hover:underline">SynapseDNS</Link>
           </div>
           {loading ? <Skeleton className="h-48 w-full" /> : routes.length ? (
             <div className="space-y-3">

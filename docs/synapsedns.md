@@ -24,16 +24,22 @@ recursive resolution or forwards queries.
 
 ## Console management
 
-Open **Platform Admin → SynapseDNS** at `/admin/dns`. The page uses the existing
-Platform Administrator session and MFA; it lists zones, creates SOA/NS records,
-manages application records and shows the current SOA serial. The browser never
-receives `SYNAPSEDNS_ADMIN_TOKEN`.
+Open **SynapseDNS** in the organization Console at `/dns`. Any signed-in
+organization user can manage only that organization's zones; scoped API keys need
+`dns:read` or `dns:write`. The page creates SOA/NS records, manages application
+records and shows the current SOA serial. The browser never receives
+`SYNAPSEDNS_ADMIN_TOKEN` or the gateway internal secret.
 
-The gateway exposes this narrow management surface at
-`/v1/platform/edge/dns/*`. It accepts platform-admin JWTs only, rewrites the
-prefix to the service's `/v1/*` API and injects the server-side admin credential.
-Tenant JWTs, API keys and anonymous callers are rejected. Direct loopback API
-access remains available for operators.
+The gateway exposes tenant management at `/v1/dns/*`. It authenticates the JWT or
+API key, enforces `dns` scopes and stamps the verified organization identity plus
+`x-synapseone-internal`. SynapseDNS validates that internal credential before
+trusting ownership headers. Cross-organization reads and mutations return `404`.
+Anonymous callers are rejected.
+
+Platform operators retain direct admin-token access and the separate
+`/v1/platform/edge/dns/*` namespace for global operations. Existing version-1
+zones migrate to version 2 as platform-owned (`orgId=null`) and are not exposed to
+tenant users; new zones always inherit the authenticated organization.
 
 ## Standalone deployment
 

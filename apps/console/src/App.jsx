@@ -209,6 +209,8 @@ function AppRoutes() {
           <Route path="/faststore" element={<Guard><ConsoleLayout><SynapseFaststore /></ConsoleLayout></Guard>} />
           <Route path="/ocs" element={<Guard><ConsoleLayout><SynapseOCS /></ConsoleLayout></Guard>} />
           <Route path="/inference" element={<Guard><ConsoleLayout><SynapseInference /></ConsoleLayout></Guard>} />
+          <Route path="/dns" element={<Guard><ConsoleLayout><SynapseDNS /></ConsoleLayout></Guard>} />
+          <Route path="/tunnel" element={<Guard><ConsoleLayout><SynapseTunnel /></ConsoleLayout></Guard>} />
           <Route path="/notifications" element={<Guard><ConsoleLayout><Notifications /></ConsoleLayout></Guard>} />
           <Route path="/lds" element={<Guard><ConsoleLayout><LinkedData /></ConsoleLayout></Guard>} />
           <Route path="/authorize" element={<Guard><ConsoleLayout><Authorize /></ConsoleLayout></Guard>} />
@@ -222,8 +224,8 @@ function AppRoutes() {
           <Route path="/admin/users" element={<PlatformGuard><AdminLayout><AdminUsers /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/users/:userId" element={<PlatformGuard><AdminLayout><AdminUserDetail /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/health" element={<PlatformGuard><AdminLayout><AdminServiceHealth /></AdminLayout></PlatformGuard>} />
-          <Route path="/admin/dns" element={<PlatformGuard><AdminLayout><SynapseDNS /></AdminLayout></PlatformGuard>} />
-          <Route path="/admin/tunnel" element={<PlatformGuard><AdminLayout><SynapseTunnel /></AdminLayout></PlatformGuard>} />
+          <Route path="/admin/dns" element={<Navigate to="/dns" replace />} />
+          <Route path="/admin/tunnel" element={<Navigate to="/tunnel" replace />} />
           <Route path="/admin/usage" element={<PlatformGuard><AdminLayout><AdminUsage /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/quotas" element={<PlatformGuard><AdminLayout><AdminQuotas /></AdminLayout></PlatformGuard>} />
           <Route path="/admin/audit" element={<PlatformGuard><AdminLayout><AdminAudit /></AdminLayout></PlatformGuard>} />

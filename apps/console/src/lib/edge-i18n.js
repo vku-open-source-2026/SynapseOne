@@ -7,7 +7,7 @@
 
 export const EDGE_COPY = {
   en: {
-    adminOnly: 'Platform Administrator · MFA protected',
+    organizationScoped: 'Organization-scoped service',
     docs: 'Documentation',
     refresh: 'Refresh',
     loading: 'Loading edge configuration…',
@@ -129,7 +129,7 @@ export const EDGE_COPY = {
     },
   },
   vi: {
-    adminOnly: 'Platform Administrator · bảo vệ bằng MFA',
+    organizationScoped: 'Dịch vụ trong phạm vi tổ chức',
     docs: 'Tài liệu',
     refresh: 'Làm mới',
     loading: 'Đang tải cấu hình edge…',

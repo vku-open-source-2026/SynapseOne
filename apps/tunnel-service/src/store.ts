@@ -9,10 +9,11 @@ import { createHash, randomUUID, timingSafeEqual } from 'crypto';
 import { mkdir, open, readFile, rename, rm, stat } from 'fs/promises';
 import { dirname } from 'path';
 import { z } from 'zod';
-import type { ConnectorRecord, PublicConnector, RouteRecord, StoreData } from './types';
+import type { ConnectorRecord, PublicConnector, RouteRecord, StoreSnapshot } from './types';
 
 const tokenHashSchema = z.string().regex(/^[a-f0-9]{64}$/);
-const connectorSchema = z.object({
+const orgIdSchema = z.string().regex(/^[A-Za-z0-9-]{1,64}$/).nullable();
+const legacyConnectorSchema = z.object({
   id: z.string().uuid(),
   name: z.string().min(1).max(80),
   upstreamUrl: z.string().min(1).max(2048),
@@ -21,6 +22,7 @@ const connectorSchema = z.object({
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
 }).strict();
+const connectorSchema = legacyConnectorSchema.extend({ orgId: orgIdSchema });
 
 const routeSchema = z.object({
   id: z.string().uuid(),
@@ -37,10 +39,25 @@ const routeSchema = z.object({
 }).strict();
 
 const storeSchema = z.object({
-  version: z.literal(1),
+  version: z.literal(2),
   connectors: z.array(connectorSchema).max(10000),
   routes: z.array(routeSchema).max(10000),
 }).strict();
+
+const legacyStoreSchema = z.object({
+  version: z.literal(1),
+  connectors: z.array(legacyConnectorSchema).max(10000),
+  routes: z.array(routeSchema).max(10000),
+}).strict();
+
+interface StoreReadResult {
+  data: StoreSnapshot;
+  migrated: boolean;
+}
+
+function emptyStore(): StoreSnapshot {
+  return { version: 2, connectors: [], routes: [] };
+}
 
 function clone<T>(value: T): T {
   return structuredClone(value);
@@ -51,28 +68,38 @@ function publicConnector(connector: ConnectorRecord): PublicConnector {
   return safe;
 }
 
-async function readStoreFile(filePath: string, allowMissing: boolean): Promise<StoreData> {
+async function readStoreFile(filePath: string, allowMissing: boolean): Promise<StoreReadResult> {
   let raw: string;
   try {
     const info = await stat(filePath);
     if (info.size > 8 * 1024 * 1024) throw new Error('Tunnel data file is too large');
     raw = await readFile(filePath, 'utf8');
   } catch (error) {
-    if (allowMissing && (error as NodeJS.ErrnoException).code === 'ENOENT') return { version: 1, connectors: [], routes: [] };
+    if (allowMissing && (error as NodeJS.ErrnoException).code === 'ENOENT') return { data: emptyStore(), migrated: false };
     throw error;
   }
   let parsed: unknown;
   try { parsed = JSON.parse(raw); } catch { throw new Error('Tunnel data file contains invalid JSON'); }
   const result = storeSchema.safeParse(parsed);
-  if (!result.success) throw new Error('Tunnel data file has an invalid schema');
-  return result.data;
+  if (result.success) return { data: result.data, migrated: false };
+
+  const legacy = legacyStoreSchema.safeParse(parsed);
+  if (!legacy.success) throw new Error('Tunnel data file has an invalid schema');
+  return {
+    data: {
+      version: 2,
+      connectors: legacy.data.connectors.map((connector) => ({ ...connector, orgId: null })),
+      routes: legacy.data.routes,
+    },
+    migrated: true,
+  };
 }
 
 export function hashConnectorToken(token: string): string {
   return createHash('sha256').update(token, 'utf8').digest('hex');
 }
 
-async function atomicWrite(filePath: string, data: StoreData): Promise<void> {
+async function atomicWrite(filePath: string, data: StoreSnapshot): Promise<void> {
   const directory = dirname(filePath);
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
@@ -91,17 +118,21 @@ async function atomicWrite(filePath: string, data: StoreData): Promise<void> {
 }
 
 export class JsonStore {
-  private data: StoreData;
+  private data: StoreSnapshot;
   private queue: Promise<unknown> = Promise.resolve();
   private closed = false;
 
-  private constructor(data: StoreData, private readonly filePath: string | null, private readonly refreshFromDisk: boolean) {
+  private constructor(data: StoreSnapshot, private readonly filePath: string | null, private readonly refreshFromDisk: boolean) {
     this.data = data;
   }
 
   static async open(filePath: string | null, refreshFromDisk = true): Promise<JsonStore> {
-    const data: StoreData = filePath ? await readStoreFile(filePath, true) : { version: 1, connectors: [], routes: [] };
-    return new JsonStore(data, filePath, refreshFromDisk);
+    if (!filePath) return new JsonStore(emptyStore(), null, refreshFromDisk);
+    const result = await readStoreFile(filePath, true);
+    // Persist migrations through the same write/fsync/rename path as normal
+    // mutations so a v1 file is never partially rewritten in place.
+    if (result.migrated) await atomicWrite(filePath, result.data);
+    return new JsonStore(result.data, filePath, refreshFromDisk);
   }
 
   get ready(): boolean { return !this.closed; }
@@ -111,7 +142,9 @@ export class JsonStore {
     if (!this.filePath) return;
     // A missing file represents an empty store. Atomic replacement means readers
     // never observe partial JSON; malformed existing files still fail closed.
-    this.data = await readStoreFile(this.filePath, true);
+    const result = await readStoreFile(this.filePath, true);
+    if (result.migrated) await atomicWrite(this.filePath, result.data);
+    this.data = result.data;
   }
 
   private async refresh(): Promise<void> {
@@ -122,7 +155,7 @@ export class JsonStore {
     await result;
   }
 
-  private mutate<T>(operation: (draft: StoreData) => T): Promise<T> {
+  private mutate<T>(operation: (draft: StoreSnapshot) => T): Promise<T> {
     if (this.closed) return Promise.reject(new Error('Store is closed'));
     const result = this.queue.then(async () => {
       if (this.closed) throw new Error('Store is closed');
@@ -165,11 +198,12 @@ export class JsonStore {
     return null;
   }
 
-  async createConnector(input: { name: string; upstreamUrl: string }, token: string): Promise<ConnectorRecord> {
+  async createConnector(input: { name: string; upstreamUrl: string; orgId: string | null }, token: string): Promise<ConnectorRecord> {
+    if (!orgIdSchema.safeParse(input.orgId).success) throw new Error('Invalid connector organization ID');
     return this.mutate((draft) => {
       const now = new Date().toISOString();
       const connector: ConnectorRecord = {
-        id: randomUUID(), name: input.name, upstreamUrl: input.upstreamUrl,
+        id: randomUUID(), name: input.name, upstreamUrl: input.upstreamUrl, orgId: input.orgId,
         tokenHash: hashConnectorToken(token), enabled: true, createdAt: now, updatedAt: now,
       };
       draft.connectors.push(connector);

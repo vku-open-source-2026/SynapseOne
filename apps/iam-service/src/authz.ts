@@ -149,7 +149,7 @@ async function decideForUser(userId: string, action: string, resource: string, c
   const family = String(action).split(':')[0]?.toLowerCase() || '';
   const memberDataPlane = !docs.length && [
     'base', 'faststore', 'queue', 'stream', 'storage', 'lds', 'warehouse',
-    'notifications', 'ai', 'inference', 'ocs',
+    'notifications', 'ai', 'inference', 'ocs', 'dns', 'tunnel',
   ].includes(family);
   if (memberDataPlane) return { allowed: true, reason: 'member-data-plane', ...who };
   return verdict.allowed

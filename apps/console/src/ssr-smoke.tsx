@@ -18,7 +18,6 @@ import App from './App.jsx';
 import Docs from './pages/Docs.jsx';
 import SynapseDNS from './pages/SynapseDNS.jsx';
 import SynapseTunnel from './pages/SynapseTunnel.jsx';
-import { PlatformAuthProvider } from './lib/platform-auth.jsx';
 import { LanguageProvider } from './lib/i18n.jsx';
 import WorkflowEditor from './components/WorkflowEditor.jsx';
 import { OrganizationTable } from './pages/Orgs.jsx';
@@ -63,6 +62,8 @@ const ROUTES = [
   '/authorize',
   '/audit',
   '/security',
+  '/dns',
+  '/tunnel',
   '/api-docs',
   '/docs',
   '/nope-not-a-route',
@@ -84,6 +85,8 @@ const SESSIONS = {
   anon: null,
   key: { apiKey: 'synapseone_test' },
 };
+
+const LEGACY_EDGE_REDIRECTS = new Set(['/admin/dns', '/admin/tunnel']);
 
 const GUARDED = new Set([
   '/dashboard',
@@ -112,12 +115,12 @@ const GUARDED = new Set([
   '/authorize',
   '/audit',
   '/security',
+  '/dns',
+  '/tunnel',
   '/admin/overview',
   '/admin/orgs',
   '/admin/users',
   '/admin/health',
-  '/admin/dns',
-  '/admin/tunnel',
   '/admin/usage',
   '/admin/quotas',
   '/admin/audit',
@@ -146,7 +149,9 @@ for (const [label, session] of Object.entries(SESSIONS)) {
       // Anonymous hits on guarded routes render <Navigate> (empty in SSR) —
       // the client performs the redirect. Same for /login with a live session.
       // Everything else must produce HTML.
-      const expectHtml = (session || !GUARDED.has(path)) && !(session && path === '/login');
+      const expectHtml = !LEGACY_EDGE_REDIRECTS.has(path)
+        && (session || !GUARDED.has(path))
+        && !(session && path === '/login');
       if (expectHtml && (typeof html !== 'string' || html.length === 0)) throw new Error('empty render');
       console.log(`ok [${label}] ${path} (${html.length} chars)`);
     } catch (e: any) {
@@ -156,19 +161,28 @@ for (const [label, session] of Object.entries(SESSIONS)) {
   }
 }
 
-for (const [name, Page] of [['SynapseDNS', SynapseDNS], ['Synapse Tunnel', SynapseTunnel]] as const) {
+(globalThis as any).localStorage = {
+  getItem: (k: string) => (k === 'synapseone.lang' ? 'en' : null),
+  setItem: () => undefined,
+  removeItem: () => undefined,
+};
+for (const [name, Page, path, docsTab] of [
+  ['SynapseDNS', SynapseDNS, '/dns', 'dns'],
+  ['Synapse Tunnel', SynapseTunnel, '/tunnel', 'tunnel'],
+] as const) {
   try {
     const html = renderToString(
-      <MemoryRouter initialEntries={['/admin/edge']}>
+      <MemoryRouter initialEntries={[path]}>
         <AuthProvider>
-          <PlatformAuthProvider>
-            <LanguageProvider><Page /></LanguageProvider>
-          </PlatformAuthProvider>
+          <LanguageProvider><Page /></LanguageProvider>
         </AuthProvider>
       </MemoryRouter>,
     );
     if (!html.includes(name)) throw new Error('missing page heading');
-    console.log(`ok [edge-page] ${name} (${html.length} chars)`);
+    if (!html.includes('Organization-scoped service')) throw new Error('missing organization-scoped service copy');
+    if (html.includes('Platform Administrator')) throw new Error('platform-admin copy leaked into tenant page');
+    if (!html.includes(`href="/docs?tab=${docsTab}"`)) throw new Error('missing Docs link');
+    console.log(`ok [tenant-edge-page] ${name} (${html.length} chars)`);
   } catch (e: any) {
     failures++;
     console.error(`FAIL [edge-page] ${name}: ${e?.message || e}`);

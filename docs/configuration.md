@@ -318,13 +318,16 @@ See `docs/notifications.md`. Key settings: `DATABASE_URL` (required in productio
 | `SYNAPSEDNS_DNS_HOST` / `SYNAPSEDNS_DNS_PORT` | `0.0.0.0` / `53` | authoritative UDP/TCP bind |
 | `SYNAPSEDNS_API_HOST` / `SYNAPSEDNS_API_PORT` | `0.0.0.0` / `4014` | management API bind |
 | `SYNAPSEDNS_DATA_FILE` | `./data/synapsedns.json` | persistent JSON store; one writer |
-| `SYNAPSEDNS_ADMIN_TOKEN` | required in production | management bearer token |
+| `SYNAPSEDNS_ADMIN_TOKEN` | required in production | platform/operator management bearer token |
+| `SYNAPSEONE_INTERNAL_SECRET` | unset | shared gateway secret; required to trust tenant org headers on `/v1/dns` |
 | `SYNAPSEDNS_ALLOW_INSECURE` | `false` | local-only explicit auth bypass; forbidden in production |
 | `SYNAPSEDNS_LOG_LEVEL` | `info` | structured log level |
 | `SYNAPSEDNS_SHUTDOWN_TIMEOUT_MS` | `15000` | graceful shutdown budget |
 
-Standalone Compose: `docker-compose.dns.yml`. Keep the API private and do not
-delegate production NS until all records are migrated and verified.
+Standalone Compose: `docker-compose.dns.yml`. Tenant management is available at
+`/v1/dns` with `dns:read`/`dns:write`; direct admin access remains platform-wide.
+Keep the API private and do not delegate production NS until all records are
+migrated and verified.
 
 ## Synapse Tunnel (`apps/tunnel-service`, standalone)
 
@@ -334,7 +337,8 @@ delegate production NS until all records are migrated and verified.
 | `SYNAPSETUNNEL_API_PORT` | `4015` | management API |
 | `SYNAPSETUNNEL_INGRESS_PORT` | `4016` | public HTTP/WebSocket ingress |
 | `SYNAPSETUNNEL_DATA_FILE` | `./data/synapse-tunnel.json` | persistent JSON store; one writer |
-| `SYNAPSETUNNEL_ADMIN_TOKEN` | required in production | management bearer token |
+| `SYNAPSETUNNEL_ADMIN_TOKEN` | required in production | platform/operator management bearer token |
+| `SYNAPSEONE_INTERNAL_SECRET` | unset | shared gateway secret; required to trust tenant org headers on `/v1/tunnel` |
 | `SYNAPSETUNNEL_PUBLIC_SCHEME` | `http` | forwarded scheme; set `https` behind TLS |
 | `SYNAPSETUNNEL_WS_PATH` | `/_synapse/tunnel/connect` | connector WebSocket path |
 | `SYNAPSETUNNEL_MAX_REQUEST_BYTES` | `10485760` | buffered request limit |
@@ -342,9 +346,13 @@ delegate production NS until all records are migrated and verified.
 | `SYNAPSETUNNEL_REQUEST_TIMEOUT_MS` | `30000` | upstream response-header timeout |
 | `SYNAPSETUNNEL_CONNECTOR_TOKEN` | required for connector | one-time connector credential |
 | `SYNAPSETUNNEL_SERVER_URL` | `http://127.0.0.1:4016` | outbound connector target |
+| `SYNAPSETUNNEL_PUBLIC_ORIGIN` | unset | public HTTP(S) origin advertised to Console/CLI |
+| `SYNAPSETUNNEL_INGRESS_BIND_IP` | `127.0.0.1` | ingress host bind; set a public IP only deliberately |
 
-Standalone Compose: `docker-compose.tunnel.yml`. TLS termination, existing API
-Gateway routing and Tier-2/3 integration are intentionally pending.
+Standalone Compose: `docker-compose.tunnel.yml`. Tenant management is available
+at `/v1/tunnel` with `tunnel:read`/`tunnel:write`; direct admin access remains
+platform-wide. TLS termination and Tier-2/3 application integration remain
+operator/future work.
 
 ## Console (`apps/console`, runtime via `config.js`)
 

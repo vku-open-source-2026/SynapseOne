@@ -6,9 +6,9 @@ All four SDKs cover the platform's gateway-routed service groups. They do not
 expose every endpoint through an identical convenience method. Use the generic
 request method for a route that does not have a wrapper yet:
 `client.call` (JavaScript), `client.call` (Python), `Client.Call` (Go), or
-`client.client().request` (Rust). Standalone SynapseDNS and Synapse Tunnel APIs
-are currently demonstrated with direct HTTP because gateway integration is
-pending.
+`client.client().request` (Rust). SynapseDNS and Synapse Tunnel management is
+gateway-routed and organization-scoped, but the examples also show direct
+operator HTTP because typed service wrappers are not available yet.
 
 | Area | JavaScript / TypeScript | Python | Go | Rust |
 | --- | --- | --- | --- | --- |

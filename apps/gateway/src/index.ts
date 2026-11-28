@@ -692,6 +692,7 @@ export function propagatePrincipal(req: express.Request): void {
   delete h['x-synapseone-user'];
   delete h['x-synapseone-org'];
   delete h['x-synapseone-quota-org'];
+  delete h['x-synapseone-owner-org'];
   delete h['x-synapseone-account'];
   delete h['x-synapseone-scopes'];
   delete h['x-synapseone-kind'];
@@ -713,7 +714,11 @@ export function propagatePrincipal(req: express.Request): void {
   // but BEFORE the principal check — unauthenticated routes (/v1/auth/*) need it too.
   if (INTERNAL_SECRET) h['x-synapseone-internal'] = INTERNAL_SECRET;
   const p = (req as any).principal;
-  if (p?.attributionOrg) h['x-synapseone-quota-org'] = String(p.attributionOrg);
+  if (p?.attributionOrg) {
+    h['x-synapseone-quota-org'] = String(p.attributionOrg);
+    // Verified resource-owning org, separate from service-account auth scope.
+    h['x-synapseone-owner-org'] = String(p.attributionOrg);
+  }
   if (p?.type === 'jwt') {
     if (p.sub) h['x-synapseone-user'] = String(p.sub);
     if (p.org) h['x-synapseone-org'] = String(p.org);

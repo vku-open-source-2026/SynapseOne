@@ -13,10 +13,12 @@ import type { RouteRule } from './index';
 const SECRET = 'gateway-edge-parity-test-secret-0123456789abcdef';
 const TOKEN_ENV = 'SYNAPSEONE_GATEWAY_TEST_EDGE_ADMIN_TOKEN';
 const EDGE_TOKEN = 'dns-server-admin-token';
+const INTERNAL_SECRET = 'gateway-edge-internal-secret';
 const ENV_KEYS = [
   'NODE_ENV',
   'IAM_SERVICE_URL',
   'IAM_JWT_SECRET',
+  'SYNAPSEONE_INTERNAL_SECRET',
   'AUTHZ_MODE',
   'AUTHZ_MODE_REQUIRED',
   'GATEWAY_VERIFY_APIKEY',
@@ -48,8 +50,12 @@ describe('platform edge route parity', () => {
   let operatorToken = '';
   let auditorToken = '';
   let tenantToken = '';
+  let serviceAccountToken = '';
   let upstreamHits = 0;
-  let seen: { url?: string; authorization?: string; apiKey?: string | string[] } = {};
+  let seen: {
+    url?: string; authorization?: string; apiKey?: string | string[];
+    org?: string | string[]; ownerOrg?: string | string[]; internal?: string | string[]; kind?: string | string[]; scopes?: string | string[];
+  } = {};
   let api: typeof import('./index');
   const savedEnv: Partial<Record<typeof ENV_KEYS[number], string>> = {};
 
@@ -59,7 +65,7 @@ describe('platform edge route parity', () => {
     iam = http.createServer((req, res) => {
       if (req.url === '/v1/auth/verify') {
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end('{"valid":true,"type":"jwt"}');
+        res.end('{"valid":true,"type":"jwt","org_id":"org-1"}');
         return;
       }
       res.writeHead(404, { 'content-type': 'application/json' });
@@ -74,6 +80,11 @@ describe('platform edge route parity', () => {
         url: req.url,
         authorization: req.headers.authorization,
         apiKey: req.headers['x-api-key'],
+        org: req.headers['x-synapseone-org'],
+        ownerOrg: req.headers['x-synapseone-owner-org'],
+        internal: req.headers['x-synapseone-internal'],
+        kind: req.headers['x-synapseone-kind'],
+        scopes: req.headers['x-synapseone-scopes'],
       };
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end('{"ok":true,"upstream":true}');
@@ -95,12 +106,20 @@ describe('platform edge route parity', () => {
       '      - { method: GET, path: /v1/platform/edge/dns/*, action: platform:Read }',
       '      - { method: POST, path: /v1/platform/edge/dns/*, action: platform:Write }',
       '      - { method: DELETE, path: /v1/platform/edge/dns/*, action: platform:Write }',
+      '  - path: /v1/tunnel',
+      `    target: http://127.0.0.1:${upstreamPort}`,
+      '    auth: either',
+      '    service: tunnel',
+      '    stripPrefix: /v1/tunnel',
+      '    actions:',
+      '      - { method: DELETE, path: /v1/tunnel/*, action: tunnel:Write }',
       '',
     ].join('\n'));
 
     process.env.NODE_ENV = 'test';
     process.env.IAM_SERVICE_URL = `http://127.0.0.1:${iamPort}`;
     process.env.IAM_JWT_SECRET = SECRET;
+    process.env.SYNAPSEONE_INTERNAL_SECRET = INTERNAL_SECRET;
     process.env.AUTHZ_MODE = 'off';
     process.env.AUTHZ_MODE_REQUIRED = 'false';
     process.env.GATEWAY_VERIFY_APIKEY = 'true';
@@ -128,6 +147,9 @@ describe('platform edge route parity', () => {
       issuer: 'synapseone-iam',
       algorithm: 'HS256',
       expiresIn: 120,
+    });
+    serviceAccountToken = jwt.sign({ sub: 'service-edge', account: 'acct-1', kind: 'service-account', scopes: ['tunnel:read', 'tunnel:write'] }, SECRET, {
+      issuer: 'synapseone-iam', algorithm: 'HS256', expiresIn: 120,
     });
   });
 
@@ -158,6 +180,52 @@ describe('platform edge route parity', () => {
       assert.equal(route.adminTokenEnv, tokenEnv);
       assert.ok(route.actions.some((action: any) => action.method === 'DELETE' && action.action === 'platform:Write'));
     }
+  });
+
+  it('ships organization-scoped DNS and Tunnel routes without admin-token rewriting', () => {
+    const doc = yaml.load(fs.readFileSync(path.resolve(__dirname, '../routes.yaml'), 'utf8')) as any;
+    for (const [routePath, service] of [['/v1/dns', 'dns'], ['/v1/tunnel', 'tunnel']]) {
+      const route = doc.routes.find((candidate: any) => candidate.path === routePath);
+      assert.ok(route, routePath);
+      assert.equal(route.auth, 'either');
+      assert.equal(route.service, service);
+      assert.equal(route.adminTokenEnv, undefined);
+      assert.equal(route.stripPrefix, routePath);
+      assert.ok(route.actions.some((action: any) => action.method === 'DELETE' && action.action === `${service}:Write`));
+    }
+  });
+
+  it('stamps verified organization identity on tenant Tunnel requests and rejects platform tokens', async () => {
+    const path = `${base}/v1/tunnel/v1/connectors`;
+    const response = await fetch(path, {
+      headers: {
+        Authorization: `Bearer ${tenantToken}`,
+        'X-SynapseOne-Org': 'attacker-org',
+        'X-SynapseOne-Internal': 'attacker-secret',
+        'X-SynapseOne-Kind': 'platform-admin',
+      },
+    });
+    assert.equal(response.status, 200);
+    assert.equal(seen.url, '/v1/connectors');
+    assert.equal(seen.authorization, `Bearer ${tenantToken}`);
+    assert.equal(seen.org, 'org-1');
+    assert.equal(seen.ownerOrg, 'org-1');
+    assert.equal(seen.internal, INTERNAL_SECRET);
+    assert.equal(seen.kind, 'user');
+    assert.equal(seen.scopes, '*');
+    const beforeHits = upstreamHits;
+    const platform = await fetch(path, { headers: { Authorization: `Bearer ${adminToken}` } });
+    assert.equal(platform.status, 403);
+    assert.equal((await platform.json() as any).error, 'platform_token_tenant_forbidden');
+    assert.equal(upstreamHits, beforeHits);
+
+    const serviceAccount = await fetch(path, {
+      headers: { Authorization: `Bearer ${serviceAccountToken}`, 'X-SynapseOne-Org': 'attacker-org' },
+    });
+    assert.equal(serviceAccount.status, 200);
+    assert.equal(seen.org, undefined);
+    assert.equal(seen.ownerOrg, 'org-1');
+    assert.equal(seen.kind, 'service-account');
   });
 
   it('rewrites only the pathname and preserves the query byte-for-byte', () => {

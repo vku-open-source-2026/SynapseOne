@@ -21,6 +21,7 @@ export interface ServiceConfig {
   dataFile?: string;
   memoryStore: boolean;
   adminToken?: string;
+  internalSecret?: string;
   allowInsecure: boolean;
   logLevel: LogLevel;
   shutdownTimeoutMs: number;
@@ -65,6 +66,7 @@ export function loadConfig(env: Environment = process.env): ServiceConfig {
   const production = isProductionEnvironment(env);
   const allowInsecure = env.SYNAPSEDNS_ALLOW_INSECURE?.trim().toLowerCase() === 'true';
   const adminToken = env.SYNAPSEDNS_ADMIN_TOKEN?.trim() || undefined;
+  const internalSecret = env.SYNAPSEONE_INTERNAL_SECRET?.trim() || undefined;
   const dataFile = env.SYNAPSEDNS_DATA_FILE?.trim() || DEFAULT_DATA_FILE;
   const memoryStore = dataFile === ':memory:';
 
@@ -83,6 +85,9 @@ export function loadConfig(env: Environment = process.env): ServiceConfig {
   if (adminToken && /[\r\n]/.test(adminToken)) {
     throw new ServiceError(503, 'configuration_error', 'SYNAPSEDNS_ADMIN_TOKEN must be a single line');
   }
+  if (internalSecret && /[\r\n]/.test(internalSecret)) {
+    throw new ServiceError(503, 'configuration_error', 'SYNAPSEONE_INTERNAL_SECRET must be a single line');
+  }
 
   const logLevel = (env.SYNAPSEDNS_LOG_LEVEL ?? 'info').trim().toLowerCase();
   if (!['debug', 'info', 'warn', 'error'].includes(logLevel)) {
@@ -98,6 +103,7 @@ export function loadConfig(env: Environment = process.env): ServiceConfig {
     dataFile: memoryStore ? undefined : dataFile,
     memoryStore,
     adminToken,
+    internalSecret,
     allowInsecure,
     logLevel: logLevel as LogLevel,
     shutdownTimeoutMs: clampInteger(env.SYNAPSEDNS_SHUTDOWN_TIMEOUT_MS, 15_000, 1_000, 60_000),

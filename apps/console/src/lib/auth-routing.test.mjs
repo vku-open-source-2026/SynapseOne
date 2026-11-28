@@ -25,6 +25,8 @@ test('deep links survive only for the matching area', () => {
   assert.equal(landingPath(platform, '/admin/overview?range=7d'), '/admin/overview?range=7d');
   assert.equal(landingPath(platform, '/dashboard'), '/admin/overview');
   assert.equal(landingPath(tenant, '/workflows?tab=1'), '/workflows?tab=1');
+  assert.equal(landingPath(tenant, '/dns?zone=example.com'), '/dns?zone=example.com');
+  assert.equal(landingPath(tenant, '/tunnel'), '/tunnel');
   assert.equal(landingPath(tenant, '/admin/overview'), '/dashboard');
 });
 

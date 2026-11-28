@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
-const SERVICE_BY_PREFIX: [(&str, &str); 36] = [
+const SERVICE_BY_PREFIX: [(&str, &str); 38] = [
     ("/v1/orgs", "iam"),
     ("/v1/accounts", "iam"),
     ("/v1/roles", "iam"),
@@ -50,6 +50,8 @@ const SERVICE_BY_PREFIX: [(&str, &str); 36] = [
     ("/v1/storage", "storage"),
     ("/v1/notifications", "notifications"),
     ("/v1/secrets", "secrets"),
+    ("/v1/dns", "dns"),
+    ("/v1/tunnel", "tunnel"),
     ("/v1/platform", "platform"),
 ];
 

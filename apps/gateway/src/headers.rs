@@ -52,6 +52,10 @@ pub fn propagate_principal(
     if let Some(principal) = principal {
         if let Some(org) = &principal.attribution_org {
             insert(headers, "x-synapseone-quota-org", org);
+            // Verified owning organization for tenant-scoped services. Kept
+            // separate from principal.org so service-account authorization
+            // remains account-bound while resource ownership is still isolated.
+            insert(headers, "x-synapseone-owner-org", org);
         }
         if principal.r#type == "jwt" {
             if let Some(sub) = &principal.sub {

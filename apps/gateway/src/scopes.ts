@@ -53,6 +53,8 @@ const SERVICE_BY_PREFIX: Array<[string, string]> = [
   ['/v1/storage', 'storage'],
   ['/v1/notifications', 'notifications'],
   ['/v1/secrets', 'secrets'],
+  ['/v1/dns', 'dns'],
+  ['/v1/tunnel', 'tunnel'],
   ['/v1/platform', 'platform'],
 ];
 

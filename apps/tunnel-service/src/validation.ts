@@ -153,7 +153,10 @@ export const connectorCreateSchema = z.object({
   upstreamUrl: z.string().transform((value, ctx) => {
     try { return normalizeUpstreamUrl(value); } catch { ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Invalid upstream URL' }); return z.NEVER; }
   }),
-}).strict();
+  // Ownership comes only from the authenticated principal. Accept and discard
+  // this field so a caller cannot use it to select another organization.
+  orgId: z.unknown().optional(),
+}).strict().transform(({ orgId: _orgId, ...connector }) => connector);
 
 export const connectorUpdateSchema = z.object({
   name: z.string().trim().min(1).max(80).refine((value) => !CONTROL_CHARS.test(value), 'Invalid name').optional(),

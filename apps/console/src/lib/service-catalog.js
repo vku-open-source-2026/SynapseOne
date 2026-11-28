@@ -16,14 +16,14 @@ export const SERVICE_CATALOG = [
   },
   {
     id: 'dns', docsTab: 'dns', group: 'platform', label: 'SynapseDNS',
-    consoleRoute: '/admin/dns', activePaths: ['/admin/dns'], port: '53 / 4014', prefix: '/v1/zones',
+    consoleRoute: '/dns', activePaths: ['/dns'], port: '53 / 4014', prefix: '/v1/zones',
     category: 'Networking & Edge', desc: 'Standalone authoritative UDP/TCP DNS with zone and record management',
     keywords: ['synapsedns', 'dns', 'authoritative', 'udp', 'tcp', 'zone', 'record', 'nameserver', 'soa', 'ns', 'mx', 'txt', 'edge', 'standalone'],
     iconColor: 'from-cyan-400 to-sky-600', bgGradient: 'linear-gradient(135deg, #22d3ee 0%, #0284c7 100%)', shadowColor: 'rgba(6, 182, 212, 0.28)',
   },
   {
     id: 'tunnel', docsTab: 'tunnel', group: 'platform', label: 'Synapse Tunnel',
-    consoleRoute: '/admin/tunnel', activePaths: ['/admin/tunnel'], port: '4015 / 4016', prefix: '/v1/connectors, /v1/routes',
+    consoleRoute: '/tunnel', activePaths: ['/tunnel'], port: '4015 / 4016', prefix: '/v1/connectors, /v1/routes',
     category: 'Networking & Edge', desc: 'Standalone HTTP/SSE reverse tunnels through an outbound-only connector',
     keywords: ['synapse tunnel', 'tunnel', 'reverse tunnel', 'http', 'sse', 'ingress', 'connector', 'control plane', 'edge', 'standalone'],
     iconColor: 'from-violet-400 to-indigo-600', bgGradient: 'linear-gradient(135deg, #a78bfa 0%, #4f46e5 100%)', shadowColor: 'rgba(139, 92, 246, 0.28)',

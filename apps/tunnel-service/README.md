@@ -10,9 +10,9 @@ applications. It has three roles in one Node 20 + TypeScript package:
   and forwards requests to a local HTTP upstream.
 
 The default server command runs the API and ingress in one process. Management is
-available through the SynapseOne gateway only under the MFA-protected
-`/v1/platform/edge/tunnel/*` namespace; public ingress and connector WebSockets
-remain separate from the management gateway.
+available through the SynapseOne gateway for platform administrators and tenant
+organizations; public ingress and connector WebSockets remain separate from the
+management gateway.
 
 ## Architecture
 
@@ -49,13 +49,16 @@ Requires Node 20 and npm.
 cd apps/tunnel-service
 npm install
 export SYNAPSETUNNEL_ADMIN_TOKEN='replace-with-a-long-random-admin-secret'
+export SYNAPSEONE_INTERNAL_SECRET='replace-with-the-gateway-shared-secret'
 export SYNAPSETUNNEL_DATA_FILE='./data/synapse-tunnel.json'
 npm start
 ```
 
-The admin token is mandatory unless
-`SYNAPSETUNNEL_ALLOW_INSECURE=true` is explicitly set outside production. The
-insecure switch is intended only for disposable local tests.
+The admin token provides direct platform-administrator access. The optional
+`SYNAPSEONE_INTERNAL_SECRET` enables tenant requests forwarded by the trusted
+gateway. The admin token remains mandatory unless
+`SYNAPSETUNNEL_ALLOW_INSECURE=true` is explicitly set outside production; that
+switch only permits local startup and does not bypass management authentication.
 
 Create a connector (the bearer token is returned **exactly once**):
 
@@ -74,6 +77,7 @@ Example response:
     "id": "2d5539ce-7f77-4ec4-a0eb-4b0d8d32dd0f",
     "name": "docs-app",
     "upstreamUrl": "http://127.0.0.1:3000/",
+    "orgId": null,
     "enabled": true,
     "connected": false
   },
@@ -120,16 +124,35 @@ session. Re-enable it and the connector reconnects to receive the new config.
 
 ## Management API
 
-All `/v1` endpoints require `Authorization: Bearer <admin-token>` unless the
-explicit non-production insecure mode is active. Request bodies are JSON and
-limited to 64 KiB. Errors use
+All `/v1` endpoints, including `/v1/config`, require management authentication.
+A valid `Authorization: Bearer <admin-token>` creates a platform principal with
+`orgId=null` and full access. Otherwise, `SYNAPSEONE_INTERNAL_SECRET` must be
+configured and the request must carry a timing-safe match in
+`x-synapseone-internal`. The tenant organization comes from
+`x-synapseone-org`, with `x-synapseone-owner-org` as the fallback for verified
+service-account attribution. Organization IDs contain 1–64 ASCII alphanumeric or
+hyphen characters. Neither organization header is trusted without the internal
+secret.
+
+Missing internal-auth configuration fails closed with
+`503 internal_auth_unavailable`; a bad or missing internal credential returns
+401, and a missing or invalid organization returns 403. The trusted gateway must
+strip client-supplied `x-synapseone-*` headers and stamp the internal credential,
+organization, owner organization, user, kind, and scopes. Connector tokens are
+not management credentials.
+
+Tenant callers see and manage only connectors owned by their organization.
+Routes inherit ownership from their connector, and cross-organization resource
+IDs return 404. Connector creation ignores any client-supplied `orgId` and uses
+the authenticated principal. Platform administrators can see and manage all
+connectors and routes. Request bodies are JSON and limited to 64 KiB. Errors use
 `{"error":"code","message":"human-readable message"}`.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | Liveness; no authentication |
 | `GET` | `/ready` | Readiness and storage mode; no authentication |
-| `GET` | `/v1/config` | Advertised public ingress origin, connector path and protocol version; admin authentication required |
+| `GET` | `/v1/config` | Advertised public ingress origin, connector path and protocol version; platform or tenant authentication required |
 | `GET` | `/v1/connectors` | List connectors and live connection status |
 | `POST` | `/v1/connectors` | Create `{name, upstreamUrl}`; returns token once |
 | `GET` | `/v1/connectors/:id` | Read one connector |
@@ -184,8 +207,9 @@ avoids filesystem coordination entirely.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SYNAPSETUNNEL_ADMIN_TOKEN` | required | Management bearer token; minimum 32 characters in production |
-| `SYNAPSETUNNEL_ALLOW_INSECURE` | `false` | Permit unauthenticated management only outside production; forbidden in production |
+| `SYNAPSETUNNEL_ADMIN_TOKEN` | required | Platform-management bearer token; minimum 32 characters in production |
+| `SYNAPSEONE_INTERNAL_SECRET` | unset | Shared secret for gateway-authenticated tenant management requests |
+| `SYNAPSETUNNEL_ALLOW_INSECURE` | `false` | Permit startup without an admin token only outside production; does not bypass management authentication; forbidden in production |
 | `SYNAPSETUNNEL_API_PORT` | `4015` | Control-plane port (`PORT` fallback) |
 | `SYNAPSETUNNEL_INGRESS_PORT` | `4016` | Ingress/WebSocket port (`INGRESS_PORT` fallback) |
 | `SYNAPSETUNNEL_HOST` | `0.0.0.0` | Server bind address |
@@ -247,8 +271,13 @@ or ingress-only deployments should similarly use a role-appropriate probe.
 
 ## Security model
 
-- Admin authentication fails closed. Production also requires a persistent data
-  file and rejects the insecure switch and short admin tokens.
+- Platform-admin and gateway-internal authentication fail closed. Organization
+  headers are accepted only after the internal secret matches. Production also
+  requires a persistent data file and rejects the insecure switch and short admin
+  tokens.
+- Connector records persist an `orgId`; `null` denotes platform ownership.
+  Version 1 stores migrate atomically to version 2 with all existing connectors
+  assigned to the platform, preserving token hashes and routes.
 - Connector tokens are 256 random bits. Only SHA-256 hashes are persisted; the
   JSON file is written with mode `0600` using write/fsync/rename. There is no
   pepper or external secret manager in this MVP.
@@ -283,8 +312,9 @@ or ingress-only deployments should similarly use a role-appropriate probe.
   should handle 502/504 and must not assume exactly-once delivery.
 - Public tunneled applications receive ordinary forwarded HTTP headers and must
   enforce their own end-user authentication and authorization.
-- The existing SynapseOne gateway, IAM, Compose, and Kubernetes are not wired to
-  this service yet.
+- Tenant management requires the trusted SynapseOne gateway to strip spoofed
+  `x-synapseone-*` headers and stamp the agreed internal-auth headers. Keep the
+  management port private even when gateway authentication is enabled.
 
 ## Build and test
 
@@ -297,8 +327,10 @@ npm run build
 npm test
 ```
 
-The suite covers management auth/CRUD, one-time token return and hashed storage,
-atomic persistence and standalone refresh, corrupt-store failure, real connector
-WebSocket auth, request forwarding, binary bodies, concurrent multiplexing,
-streaming/SSE, response headers, unknown hosts, offline connectors, timeouts,
-rate/size limits, protocol message limits, and scheme-relative path isolation.
+The suite covers platform and gateway-tenant management auth, owner-org fallback,
+header spoofing, organization isolation, v1-to-v2 migration, management CRUD,
+one-time token return and hashed storage, atomic persistence and standalone
+refresh, corrupt-store failure, real connector WebSocket auth, request forwarding,
+binary bodies, concurrent multiplexing, streaming/SSE, response headers, unknown
+hosts, offline connectors, timeouts, rate/size limits, protocol message limits,
+and scheme-relative path isolation.

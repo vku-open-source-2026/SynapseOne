@@ -55,6 +55,8 @@ export interface Zone {
   id: string;
   /** Canonical lower-case fully-qualified zone apex, including the trailing dot. */
   name: string;
+  /** Owning tenant organization, or null for platform-owned zones. */
+  orgId: string | null;
   createdAt: string;
   updatedAt: string;
   records: DnsRecord[];
@@ -63,14 +65,20 @@ export interface Zone {
 export interface ZoneSummary {
   id: string;
   name: string;
+  orgId: string | null;
   createdAt: string;
   updatedAt: string;
   recordCount: number;
 }
 
 export interface StoreSnapshot {
-  version: 1;
+  version: 2;
   zones: Zone[];
+}
+
+/** Authenticated management caller. Platform administrators have orgId=null. */
+export interface Principal {
+  orgId: string | null;
 }
 
 export interface CreateZoneInput {

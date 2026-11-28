@@ -26,6 +26,8 @@ describe('scope completeness for newer services', () => {
     ['/v1/human-tasks', 'POST'],
     ['/v1/search/reindex', 'POST'],
     ['/v1/accounts/a1/credentials', 'POST'],
+    ['/v1/dns/zones', 'POST'],
+    ['/v1/tunnel/connectors', 'POST'],
   ];
   it('rejects a read-only scope on every write route', () => {
     for (const [path, method] of writes) {
@@ -37,6 +39,8 @@ describe('scope completeness for newer services', () => {
     assert.equal(scopeAllows(['storage:write'], '/v1/ocs/buckets/b/objects/k', 'PUT'), true);
     assert.equal(scopeAllows(['notifications:write'], '/v1/notifications', 'POST'), true);
     assert.equal(scopeAllows(['warehouse:write'], '/v1/warehouse/datasets', 'POST'), true);
+    assert.equal(scopeAllows(['dns:write'], '/v1/dns/zones', 'POST'), true);
+    assert.equal(scopeAllows(['tunnel:write'], '/v1/tunnel/connectors', 'POST'), true);
   });
   it('uses the route service for ambiguous account credential paths', () => {
     assert.equal(scopeAllows(['workflow:write'], '/v1/accounts/a1/credentials', 'POST', {
@@ -194,6 +198,8 @@ describe('exec-delegated path policy', () => {
       '/v1/audit',
       '/v1/usage',
       '/v1/secrets',
+      '/v1/dns/zones',
+      '/v1/tunnel/connectors',
       '/v1/scim/tokens',
       '/v1/queue/queues',
       '/v1/queue/queues/q/purge',

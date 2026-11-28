@@ -11,6 +11,7 @@ import { ServiceError } from './errors';
 import type { DnsRecord } from './types';
 import {
   assertRecordSetValid,
+  isValidOrgId,
   normalizeDnsName,
   normalizeZoneName,
   parseCreateZoneInput,
@@ -53,14 +54,21 @@ test('DNS names are absolute, lower-case, and length limited', () => {
   expectError(() => normalizeDnsName(`${Array.from({ length: 4 }, () => 'a'.repeat(63)).join('.')}.example.test`), 400);
 });
 
-test('zone creation validates nameservers and TTL', () => {
-  assert.deepEqual(parseCreateZoneInput({ name: 'Example.Test', nameservers: ['NS1.Example.Test'] }), {
+test('zone creation validates nameservers and TTL while discarding client ownership', () => {
+  assert.deepEqual(parseCreateZoneInput({ name: 'Example.Test', nameservers: ['NS1.Example.Test'], orgId: 'spoofed-org' }), {
     name: 'example.test.', nameservers: ['ns1.example.test.'], ttl: undefined,
   });
   expectError(() => parseCreateZoneInput({ name: 'example.test', ttl: -1 }), 400);
   expectError(() => parseCreateZoneInput({ name: 'example.test', ttl: 0x80000000 }), 400);
   expectError(() => parseCreateZoneInput({ name: 'example.test', nameservers: [] }), 400);
   expectError(() => parseCreateZoneInput({ name: 'example.test', extra: true }), 400);
+});
+
+test('organization IDs accept only one to 64 alphanumeric or hyphen characters', () => {
+  for (const valid of ['a', 'org-123', 'ABC', 'a'.repeat(64)]) assert.equal(isValidOrgId(valid), true);
+  for (const invalid of ['', 'a'.repeat(65), 'org_name', 'org/name', ' org', 'org ', null, 42]) {
+    assert.equal(isValidOrgId(invalid), false);
+  }
 });
 
 test('all supported record types normalize and validate their RDATA', () => {

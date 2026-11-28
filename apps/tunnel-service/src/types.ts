@@ -9,6 +9,7 @@ export interface ConnectorRecord {
   id: string;
   name: string;
   upstreamUrl: string;
+  orgId: string | null;
   tokenHash: string;
   enabled: boolean;
   createdAt: string;
@@ -19,9 +20,15 @@ export interface PublicConnector {
   id: string;
   name: string;
   upstreamUrl: string;
+  orgId: string | null;
   enabled: boolean;
   createdAt: string;
   updatedAt: string;
+}
+
+/** Authenticated management caller. A null organization denotes the platform administrator. */
+export interface ManagementPrincipal {
+  orgId: string | null;
 }
 
 export interface RouteRecord {
@@ -38,11 +45,14 @@ export interface RouteRecord {
   updatedAt: string;
 }
 
-export interface StoreData {
-  version: 1;
+export interface StoreSnapshot {
+  version: 2;
   connectors: ConnectorRecord[];
   routes: RouteRecord[];
 }
+
+/** @deprecated Use StoreSnapshot. Retained as an alias for existing consumers. */
+export type StoreData = StoreSnapshot;
 
 export type HeaderMap = Record<string, string[]>;
 

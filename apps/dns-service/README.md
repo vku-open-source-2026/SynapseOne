@@ -86,7 +86,7 @@ The image runs as `node`, grants that binary only `CAP_NET_BIND_SERVICE`, stores
 
 ## Management API
 
-All `/v1/*` routes require `Authorization: Bearer $SYNAPSEDNS_ADMIN_TOKEN` unless explicit non-production insecure mode is active. `/health` and `/ready` are public. The API is direct HTTP, not TLS; terminate TLS at a trusted gateway or private network boundary.
+A valid `Authorization: Bearer $SYNAPSEDNS_ADMIN_TOKEN` is a platform administrator and can access every zone. Tenant requests require the trusted gateway to stamp `x-synapseone-internal` with `$SYNAPSEONE_INTERNAL_SECRET` and either `x-synapseone-org` or `x-synapseone-owner-org` with the verified organization ID. The owner-org header is the fallback for service-account principals whose primary organization is unset. Neither organization header is trusted without a timing-safe match on the internal secret. Explicit non-production insecure mode retains its direct, unauthenticated platform behavior when no gateway identity headers are supplied. `/health` and `/ready` are public. The API is direct HTTP, not TLS; terminate TLS at a trusted gateway or private network boundary.
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -102,6 +102,8 @@ All `/v1/*` routes require `Authorization: Bearer $SYNAPSEDNS_ADMIN_TOKEN` unles
 | `DELETE` | `/v1/zones/:zone/records/:recordId` | Delete a record |
 
 Zone paths accept names with or without a trailing dot. JSON request bodies are limited to 32 KiB. Successful creates return `201`; deletes return `204`. Errors use `{ "error": "code", "message": "...", "requestId": "..." }`; validation errors may include field details.
+
+Tenant zone lists contain only that organization's zones. Zone and record operations return `404` when the zone belongs to another organization, and a client-supplied `orgId` in a create body is ignored in favor of the authenticated principal's ownership.
 
 ### Create a zone
 
@@ -173,18 +175,19 @@ dig @127.0.0.1 -p 1053 www.unknown.test A +norecurse           # REFUSED
 | `SYNAPSEDNS_API_HOST` | `0.0.0.0` | Management bind address |
 | `SYNAPSEDNS_API_PORT` | `4014` | Integer `0..65535` |
 | `SYNAPSEDNS_DATA_FILE` | `./data/synapsedns.json` | Persistent JSON path; `:memory:` is forbidden in production |
-| `SYNAPSEDNS_ADMIN_TOKEN` | unset | Required in production (minimum 32 characters) and whenever insecure mode is off |
+| `SYNAPSEDNS_ADMIN_TOKEN` | unset | Required in production (minimum 32 characters) and whenever insecure mode is off; valid bearers are platform administrators |
+| `SYNAPSEONE_INTERNAL_SECRET` | unset | Optional shared gateway secret; required for tenant access, with a constant-time header match |
 | `SYNAPSEDNS_ALLOW_INSECURE` | `false` | Only exact `true`; permits no-token startup outside production; rejected in production |
 | `SYNAPSEDNS_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, or `error` |
 | `SYNAPSEDNS_SHUTDOWN_TIMEOUT_MS` | `15000` | Clamped to `1000..60000` |
 
 `NODE_ENV=production`, `SYNAPSEONE_ENV`, `SYNAPSEDX_ENV`, `APP_ENV`, or `ENVIRONMENT` set to `production`/`prod` enables fail-closed production checks.
 
-The store writes mode-0600 JSON through a fsynced temporary file and atomic rename. It creates the parent directory when needed and aborts startup on corrupt state. A write failure marks the store unhealthy and `/ready` returns 503. Run exactly **one instance per data file**: there is no inter-process lock or database transaction log. Back up the JSON file and retain normal operational monitoring.
+The store writes version-2, mode-0600 JSON through a fsynced temporary file and atomic rename. It creates the parent directory when needed and aborts startup on corrupt state. Legacy version-1 snapshots are decoded as platform-owned (`orgId: null`) and safely rewritten as version 2 during initialization without dropping records. A migration or write failure marks the store unhealthy and startup fails; `/ready` returns 503 if a later write fails. Run exactly **one instance per data file**: there is no inter-process lock or database transaction log. Back up the JSON file and retain normal operational monitoring.
 
 ## Security and operational notes
 
-- Keep port 4014 private. Put a TLS-capable, authenticating reverse proxy in front of it; this MVP does not implement TLS or gateway/internal-secret integration.
+- Keep port 4014 private. Put a TLS-capable, authenticating reverse proxy in front of it; this MVP does not implement TLS. The gateway must strip client-supplied `x-synapseone-*` headers and stamp the verified internal secret, organization/owner-organization, user, kind, and scopes before forwarding tenant requests.
 - Use a high-entropy token from a secret manager. Authorization headers and request bodies are never logged. HTTP logs are JSON lines with sanitized request IDs, method, path, status, and duration.
 - Never enable insecure mode on a reachable interface. It exists only for local tests.
 - Authoritative UDP services can be used for amplification. Restrict ingress to expected resolvers/clients where practical and add network/DNS-level rate limiting before public exposure.

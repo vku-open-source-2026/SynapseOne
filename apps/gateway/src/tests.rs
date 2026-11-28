@@ -991,6 +991,13 @@ fn routes_yaml_loads_and_validates() {
         find_route(&routes, "/v1/platform/me").unwrap().auth,
         AuthMode::Jwt
     );
+    for (path, service) in [("/v1/dns", "dns"), ("/v1/tunnel", "tunnel")] {
+        let tenant = find_route(&routes, path).unwrap();
+        assert_eq!(tenant.auth, AuthMode::Either);
+        assert_eq!(tenant.service.as_deref(), Some(service));
+        assert_eq!(tenant.admin_token_env, None);
+        assert_eq!(tenant.strip_prefix.as_deref(), Some(path));
+    }
     for (path, url_env, default_target, token_env) in [
         (
             "/v1/platform/edge/dns",
@@ -1834,6 +1841,27 @@ fn scope_rules_match_typescript_suite() {
     assert!(!requirement.read);
     assert!(scope_requirement("/v1/auth/login", "POST", None).is_none());
     assert!(scope_requirement("/health", "GET", None).is_none());
+    assert!(scope_allows(
+        &["tunnel:write".into()],
+        "/v1/tunnel/routes",
+        "DELETE",
+        Some("tunnel"),
+        Some("tunnel:Write"),
+    ));
+    assert!(!scope_allows(
+        &["tunnel:read".into()],
+        "/v1/tunnel/routes",
+        "DELETE",
+        Some("tunnel"),
+        Some("tunnel:Write"),
+    ));
+    assert!(scope_allows(
+        &["dns:write".into()],
+        "/v1/dns/zones",
+        "DELETE",
+        Some("dns"),
+        Some("dns:Write"),
+    ));
 }
 
 // ---------- authz mapping ----------

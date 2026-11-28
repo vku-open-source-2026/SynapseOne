@@ -11,6 +11,8 @@ export const TENANT_KEY_SCOPE_GROUP_LABELS = {
   queue: 'SynapseQueue',
   stream: 'SynapseStream',
   storage: 'Storage',
+  dns: 'SynapseDNS',
+  tunnel: 'Synapse Tunnel',
   ocs: 'SynapseOCS',
   warehouse: 'SynapseWarehouse',
   lakehouse: 'SynapseLakehouse',

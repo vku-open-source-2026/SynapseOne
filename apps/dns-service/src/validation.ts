@@ -15,6 +15,12 @@ export const MAX_U32 = 0xffffffff;
 export const MAX_RECORDS_PER_ZONE = 10_000;
 export const MAX_ZONES = 1_000;
 
+export const orgIdSchema = z.string().min(1).max(64).regex(/^[A-Za-z0-9-]+$/);
+
+export function isValidOrgId(value: unknown): value is string {
+  return orgIdSchema.safeParse(value).success;
+}
+
 const nameSchema = z.string().min(1).max(255);
 const ttlSchema = z.number().int().min(0).max(MAX_TTL);
 const u16Schema = z.number().int().min(0).max(0xffff);
@@ -25,6 +31,9 @@ export const createZoneSchema = z.object({
   name: nameSchema,
   nameservers: z.array(nameSchema).min(1).max(8).optional(),
   ttl: ttlSchema.optional(),
+  // Ownership comes from the authenticated principal, never the request body.
+  // Accept and discard this field so client-supplied orgId cannot affect ownership.
+  orgId: z.unknown().optional(),
 }).strict();
 
 const recordSchemas = [
