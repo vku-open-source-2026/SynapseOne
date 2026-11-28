@@ -18,7 +18,7 @@ export interface HackathonRegistrationInput {
   members: string[];
   memberYears: number[];
   memberSkills: string[][];
-  projectIdea?: string;
+  projectIdea?: string | null;
 }
 
 const memory = new Map<string, HackathonRegistration>();
@@ -187,6 +187,46 @@ export async function countHackathonRegistrations(): Promise<number> {
   if (!useDb()) return memory.size;
   const [row] = await getDb()!.select({ value: count() }).from(hackathonRegistrations);
   return Number(row?.value || 0);
+}
+
+export async function updateHackathonRegistration(
+  id: string,
+  input: HackathonRegistrationInput,
+  expectedUpdatedAt?: string,
+) {
+  const values = normalize(input);
+  const now = new Date();
+  const expectedMs = expectedUpdatedAt ? new Date(expectedUpdatedAt).getTime() : null;
+  if (expectedUpdatedAt && !Number.isFinite(expectedMs)) {
+    throw Object.assign(new Error('invalid expectedUpdatedAt'), { code: 'invalid_body' });
+  }
+  if (!useDb()) {
+    const row = memory.get(id);
+    if (!row) return null;
+    if (expectedMs != null && row.updatedAt.getTime() !== expectedMs) {
+      throw Object.assign(new Error('hackathon registration was modified by another admin'), { code: 'hackathon_conflict' });
+    }
+    const duplicate = [...memory.values()].some((other) => other.id !== id && (
+      (values.teamName != null && other.teamName?.toLowerCase() === values.teamName.toLowerCase())
+      || other.captainEmail.toLowerCase() === values.captainEmail
+    ));
+    if (duplicate) throw Object.assign(new Error('duplicate hackathon registration'), { code: '23505' });
+    const next = { ...row, ...values, updatedAt: now };
+    memory.set(id, next);
+    return publicRow(next);
+  }
+  const conditions = [eq(hackathonRegistrations.id, id)];
+  // API timestamps are ISO milliseconds while PostgreSQL stores microseconds.
+  // Compare at the same precision so a normal GET -> PUT round-trip remains valid.
+  if (expectedMs != null) {
+    conditions.push(sql`floor(extract(epoch from ${hackathonRegistrations.updatedAt}) * 1000) = ${expectedMs}`);
+  }
+  const [row] = await getDb()!.update(hackathonRegistrations).set({ ...values, updatedAt: now })
+    .where(and(...conditions)).returning();
+  if (row) return publicRow(row);
+  const current = await getHackathonRegistration(id);
+  if (!current) return null;
+  throw Object.assign(new Error('hackathon registration was modified by another admin'), { code: 'hackathon_conflict' });
 }
 
 export async function reviewHackathonRegistration(input: {

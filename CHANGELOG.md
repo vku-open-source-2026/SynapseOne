@@ -38,10 +38,13 @@ Format based on Keep a Changelog; versioning follows SemVer.
   the outbound-only HTTP/SSE connector locally with reconnect and streaming
   support; live connector status refreshes in Console.
 - **VIC Hackathon #1:** public Vietnamese `/hackathon` page with animation,
-  countdown, timeline, rules, prizes, jury and anonymous team/individual
-  registration with per-member year and advanced skills; superadmin review
-  dashboard with team-matching suggestions, step-up/audit and manual API-key
-  delivery tracking. Includes bilingual operator documentation.
+  countdown, timeline, rules, prizes, jury and anonymous solo/individual or
+  2–3 member team registration with per-member year and advanced skills; superadmin
+  review dashboard with team-matching suggestions, step-up/audit and manual API-key
+  delivery tracking. Operators/owners can now correct registration type, team,
+  captain contact, member/year/skill and product-idea details through an audited
+  editor with `hackathon:update` step-up; review and delivery state is preserved.
+  Includes bilingual operator documentation.
 - **Organization quotas and API-key control plane.** Platform admins can inspect
   tenant API-key metadata, create/rotate keys with one-time secrets, and manage
   nullable per-org `ai`/`inference`/`workflow` overrides. Tenants can read their

@@ -68,6 +68,7 @@ tách biệt với `users.is_org_admin` (phạm vi tenant) và caller nền tả
 | Usage | `GET /v1/platform/usage/summary`, `/v1/platform/usage/events` |
 | Audit & bảo mật | `GET /v1/platform/audit` |
 | Quản trị viên nền tảng | `GET/POST /v1/platform/admins`, `DELETE /v1/platform/admins/:id` |
+| VIC Hackathon | `/admin/hackathon`; `GET/PUT/PATCH /v1/platform/hackathon/registrations[/:id]`, gợi ý ghép đội và theo dõi gửi API key thủ công. Operator/owner có thể sửa thông tin bằng step-up `hackathon:update`; auditor chỉ được xem. |
 
 ## Cấu hình
 

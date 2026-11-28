@@ -4,8 +4,8 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import { createApp } from './index';
-import { createOrganization, grantPlatformAdmin, queryAudit, upsertUser } from './db';
-import { signPlatformAccess } from './tokens';
+import { createOrganization, grantPlatformAdmin, queryAudit, registerPlatformStepUp, upsertUser } from './db';
+import { signPlatformAccess, signPlatformStepUp } from './tokens';
 
 const saved: Record<string, string | undefined> = {};
 const suffix = () => `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -14,14 +14,19 @@ describe('VIC Hackathon registration', () => {
   let base = '';
   let server: Server | null = null;
   let adminToken = '';
+  let adminUserId = '';
+  let adminSessionJti = '';
+  let operatorToken = '';
+  let auditorToken = '';
   let registrationId = '';
 
-  const call = async (method: string, path: string, body?: any, token?: string) => {
+  const call = async (method: string, path: string, body?: any, token?: string, stepUpToken?: string) => {
     const response = await fetch(base + path, {
       method,
       headers: {
         'Content-Type': 'application/json',
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(stepUpToken ? { 'x-platform-step-up': stepUpToken } : {}),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
@@ -44,6 +49,21 @@ describe('VIC Hackathon registration', () => {
     projectIdea: 'Xây dựng sản phẩm sử dụng SynapseOne.',
     acceptedRules: true,
     website: '',
+  });
+
+  const editPayload = (registration: any, overrides: Record<string, unknown> = {}) => ({
+    registrationType: registration.registrationType,
+    teamName: registration.teamName,
+    captainName: registration.captainName,
+    captainEmail: registration.captainEmail,
+    captainPhone: registration.captainPhone,
+    captainStudentId: registration.captainStudentId,
+    members: registration.registrationType === 'team' ? registration.memberNames.slice(1) : [],
+    memberYears: registration.memberYears,
+    memberSkills: registration.memberSkills,
+    projectIdea: registration.projectIdea || null,
+    expectedUpdatedAt: registration.updatedAt,
+    ...overrides,
   });
 
   const individualBody = (name: string, year: number, skills: string[] = []) => ({
@@ -87,7 +107,16 @@ describe('VIC Hackathon registration', () => {
         const org = await createOrganization('hackathon-platform', 'Hackathon Platform', 'platform');
         const user = await upsertUser(org.id, 'hackathon-admin@test.local', 'Hackathon Admin');
         await grantPlatformAdmin({ userId: user.id, role: 'owner', reason: 'hackathon test' });
-        adminToken = signPlatformAccess({ userId: user.id, role: 'owner' }).token;
+        const session = signPlatformAccess({ userId: user.id, role: 'owner' });
+        adminToken = session.token;
+        adminUserId = user.id;
+        adminSessionJti = session.jti;
+        const operator = await upsertUser(org.id, 'hackathon-operator@test.local', 'Hackathon Operator');
+        await grantPlatformAdmin({ userId: operator.id, role: 'operator', reason: 'hackathon test' });
+        operatorToken = signPlatformAccess({ userId: operator.id, role: 'operator' }).token;
+        const auditor = await upsertUser(org.id, 'hackathon-auditor@test.local', 'Hackathon Auditor');
+        await grantPlatformAdmin({ userId: auditor.id, role: 'auditor', reason: 'hackathon test' });
+        auditorToken = signPlatformAccess({ userId: auditor.id, role: 'auditor' }).token;
         resolve();
       } catch (error) {
         reject(error);
@@ -226,6 +255,173 @@ describe('VIC Hackathon registration', () => {
 
     const audit = await queryAudit({ limit: 50, action: 'platform:hackathon:review' });
     assert.ok(audit.some((row: any) => row.context?.registrationId === registrationId && row.decision === true));
+  });
+
+  it('updates registration details without changing review or delivery state', async () => {
+    const before = await call('GET', `/v1/platform/hackathon/registrations/${registrationId}`, undefined, adminToken);
+    assert.equal(before.status, 200, JSON.stringify(before.json));
+    const current = before.json.registration;
+    const email = `updated-${suffix()}@example.com`;
+    const result = await call('PUT', `/v1/platform/hackathon/registrations/${registrationId}`, editPayload(current, {
+      teamName: `Updated Team ${suffix()}`,
+      captainName: '  Nguyen Van Updated  ',
+      captainEmail: `  ${email.toUpperCase()}  `,
+      captainPhone: '+84 (334) 082-946',
+      captainStudentId: 'sv-updated-001',
+      members: ['Tran Thi Updated', 'Le Van Three'],
+      memberYears: [3, 2, 1],
+      memberSkills: [['practical-experience', 'practical-experience'], [], ['product-experience']],
+      projectIdea: '  Updated product idea.  ',
+    }), adminToken);
+    assert.equal(result.status, 200, JSON.stringify(result.json));
+    const updated = result.json.registration;
+    assert.equal(updated.captainEmail, email);
+    assert.equal(updated.captainStudentId, 'SV-UPDATED-001');
+    assert.equal(updated.captainName, 'Nguyen Van Updated');
+    assert.deepEqual(updated.memberNames, ['Nguyen Van Updated', 'Tran Thi Updated', 'Le Van Three']);
+    assert.deepEqual(updated.memberYears, [3, 2, 1]);
+    assert.deepEqual(updated.memberSkills, [['practical-experience'], [], ['product-experience']]);
+    assert.equal(updated.projectIdea, 'Updated product idea.');
+    for (const field of ['status', 'reviewNote', 'reviewedBy', 'reviewedAt', 'apiKeySentAt', 'createdAt']) {
+      assert.equal(updated[field], current[field], `${field} must be preserved`);
+    }
+
+    const audit = await queryAudit({ limit: 50, action: 'platform:hackathon:update' });
+    const entry = audit.find((row: any) => row.context?.registrationId === registrationId && row.decision === true);
+    assert.ok(entry, 'update must be audited');
+    assert.ok(entry.context.changedFields.includes('captainEmail'));
+    assert.equal(entry.context.captainEmail, undefined);
+    assert.equal(entry.context.captainPhone, undefined);
+    assert.equal(entry.context.captainStudentId, undefined);
+
+    const unchanged = await call('PUT', `/v1/platform/hackathon/registrations/${registrationId}`, editPayload(updated), operatorToken);
+    assert.equal(unchanged.status, 200, 'operator can save unchanged self-duplicate team/email');
+
+    const stale = await call('PUT', `/v1/platform/hackathon/registrations/${registrationId}`, editPayload(current, {
+      projectIdea: 'Stale editor must not overwrite.',
+    }), adminToken);
+    assert.equal(stale.status, 409);
+    assert.equal(stale.json.error, 'registration_conflict');
+    const missingVersion = editPayload(updated);
+    delete missingVersion.expectedUpdatedAt;
+    assert.equal((await call('PUT', `/v1/platform/hackathon/registrations/${registrationId}`, missingVersion, adminToken)).status, 400);
+  });
+
+  it('validates admin edits and rejects lifecycle fields and duplicate conflicts', async () => {
+    const current = (await call('GET', `/v1/platform/hackathon/registrations/${registrationId}`, undefined, adminToken)).json.registration;
+    const invalidPayloads = [
+      editPayload(current, { status: 'rejected' }),
+      editPayload(current, { members: [] }),
+      editPayload(current, { memberYears: [2] }),
+      editPayload(current, { registrationType: 'individual' }),
+      editPayload(current, { captainEmail: 'not-an-email' }),
+      editPayload(current, { captainName: '<>' }),
+      editPayload(current, { teamName: '<>' }),
+      editPayload(current, { members: ['<>', 'Le Van Three'] }),
+      editPayload(current, { captainPhone: 'abc' }),
+      editPayload(current, { memberYears: [6, 2, 1] }),
+      editPayload(current, { memberSkills: [['unknown-skill'], [], []] }),
+    ];
+    for (const payload of invalidPayloads) {
+      const result = await call('PUT', `/v1/platform/hackathon/registrations/${registrationId}`, payload, adminToken);
+      assert.equal(result.status, 400, JSON.stringify(payload));
+    }
+    assert.equal((await call('PUT', '/v1/platform/hackathon/registrations/not-a-uuid', editPayload(current), adminToken)).status, 400);
+    assert.equal((await call('PUT', `/v1/platform/hackathon/registrations/${registrationId}`, editPayload(current))).status, 401);
+    assert.equal((await call('PUT', `/v1/platform/hackathon/registrations/${registrationId}`, editPayload(current), auditorToken)).status, 403);
+
+    const other = await call('POST', '/v1/hackathon/registrations', validBody());
+    assert.equal(other.status, 201, JSON.stringify(other.json));
+    const duplicateTeam = await call('PUT', `/v1/platform/hackathon/registrations/${registrationId}`, editPayload(current, {
+      teamName: other.json.registration.teamName,
+    }), adminToken);
+    assert.equal(duplicateTeam.status, 409);
+    assert.equal(duplicateTeam.json.error, 'registration_exists');
+    const duplicateEmail = await call('PUT', `/v1/platform/hackathon/registrations/${registrationId}`, editPayload(current, {
+      captainEmail: other.json.registration.captainEmail.toUpperCase(),
+    }), adminToken);
+    assert.equal(duplicateEmail.status, 409);
+    assert.equal(duplicateEmail.json.error, 'registration_exists');
+    const after = (await call('GET', `/v1/platform/hackathon/registrations/${registrationId}`, undefined, adminToken)).json.registration;
+    assert.equal(after.teamName, current.teamName);
+    assert.equal(after.captainEmail, current.captainEmail);
+  });
+
+  it('allows admins to correct registration type and edit after closing', async () => {
+    const created = await call('POST', '/v1/hackathon/registrations', individualBody('Type Correction', 2));
+    assert.equal(created.status, 201, JSON.stringify(created.json));
+    const id = created.json.registration.id;
+    const individual = created.json.registration;
+    const toTeam = await call('PUT', `/v1/platform/hackathon/registrations/${id}`, editPayload(individual, {
+      registrationType: 'team',
+      teamName: `Corrected Team ${suffix()}`,
+      members: ['Second Member'],
+      memberYears: [2, 1],
+      memberSkills: [[], []],
+    }), adminToken);
+    assert.equal(toTeam.status, 200, JSON.stringify(toTeam.json));
+    assert.equal(toTeam.json.registration.registrationType, 'team');
+    assert.deepEqual(toTeam.json.registration.memberNames, ['Type Correction', 'Second Member']);
+
+    process.env.HACKATHON_REGISTRATION_CLOSE_AT = '2000-01-01T00:00:00.000Z';
+    process.env.HACKATHON_MAX_REGISTRATIONS = '1';
+    try {
+      const toIndividual = await call('PUT', `/v1/platform/hackathon/registrations/${id}`, editPayload(toTeam.json.registration, {
+        registrationType: 'individual',
+        teamName: null,
+        members: [],
+        memberYears: [4],
+        memberSkills: [['competitive-programming']],
+        projectIdea: null,
+      }), adminToken);
+      assert.equal(toIndividual.status, 200, JSON.stringify(toIndividual.json));
+      assert.equal(toIndividual.json.registration.registrationType, 'individual');
+      assert.equal(toIndividual.json.registration.teamName, null);
+      assert.deepEqual(toIndividual.json.registration.memberNames, ['Type Correction']);
+      assert.equal(toIndividual.json.registration.projectIdea, '');
+    } finally {
+      process.env.HACKATHON_REGISTRATION_CLOSE_AT = '2999-01-01T00:00:00.000Z';
+      process.env.HACKATHON_MAX_REGISTRATIONS = '500';
+    }
+  });
+
+  it('requires a single-use hackathon:update step-up proof when enabled', async () => {
+    const current = (await call('GET', `/v1/platform/hackathon/registrations/${registrationId}`, undefined, adminToken)).json.registration;
+    const payload = editPayload(current, { projectIdea: 'Step-up protected update.' });
+    process.env.PLATFORM_ADMIN_REQUIRE_STEP_UP = 'true';
+    try {
+      const missing = await call('PUT', `/v1/platform/hackathon/registrations/${registrationId}`, payload, adminToken);
+      assert.equal(missing.status, 403);
+      assert.equal(missing.json.error, 'platform_step_up_required');
+
+      const proof = signPlatformStepUp({ userId: adminUserId, role: 'owner', sessionJti: adminSessionJti, action: 'hackathon:update' });
+      await registerPlatformStepUp({
+        jti: proof.jti,
+        userId: adminUserId,
+        sessionJti: adminSessionJti,
+        action: 'hackathon:update',
+        expiresAt: new Date(Date.now() + proof.expiresIn * 1000),
+      });
+      const accepted = await call('PUT', `/v1/platform/hackathon/registrations/${registrationId}`, payload, adminToken, proof.token);
+      assert.equal(accepted.status, 200, JSON.stringify(accepted.json));
+      const replay = await call('PUT', `/v1/platform/hackathon/registrations/${registrationId}`, payload, adminToken, proof.token);
+      assert.equal(replay.status, 403);
+      assert.equal(replay.json.error, 'platform_step_up_required');
+
+      const wrongAction = signPlatformStepUp({ userId: adminUserId, role: 'owner', sessionJti: adminSessionJti, action: 'hackathon:review' });
+      await registerPlatformStepUp({
+        jti: wrongAction.jti,
+        userId: adminUserId,
+        sessionJti: adminSessionJti,
+        action: 'hackathon:review',
+        expiresAt: new Date(Date.now() + wrongAction.expiresIn * 1000),
+      });
+      const wrong = await call('PUT', `/v1/platform/hackathon/registrations/${registrationId}`, payload, adminToken, wrongAction.token);
+      assert.equal(wrong.status, 403);
+      assert.equal(wrong.json.error, 'platform_step_up_required');
+    } finally {
+      process.env.PLATFORM_ADMIN_REQUIRE_STEP_UP = 'false';
+    }
   });
 
   it('requires step-up for review when enabled', async () => {

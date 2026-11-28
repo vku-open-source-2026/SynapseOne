@@ -59,7 +59,7 @@ import { decideForPrincipal, managedPolicyList, MANAGED_POLICIES, type Principal
 import { secretsEqual, hashCandidates, withTransaction } from './db';
 import {
   createHackathonRegistration, getHackathonRegistration, listHackathonRegistrations,
-  reviewHackathonRegistration, markHackathonApiKeySent, suggestHackathonTeams,
+  updateHackathonRegistration, reviewHackathonRegistration, markHackathonApiKeySent, suggestHackathonTeams,
 } from './hackathon';
 import { ingestUsageEvents, listUsageEvents, purgeUsage, usageMeter, usageSummary, type UsageFilter } from './usage';
 import {
@@ -463,6 +463,7 @@ const PLATFORM_STEP_UP_ACTIONS = new Set([
   'admin:grant',
   'admin:revoke',
   'hackathon:review',
+  'hackathon:update',
   'hackathon:api-key-sent',
 ]);
 
@@ -471,6 +472,60 @@ function hackathonCloseAt(): number {
   const raw = String(process.env.HACKATHON_REGISTRATION_CLOSE_AT || '').trim();
   const parsed = raw ? Date.parse(raw) : Number.NaN;
   return Number.isFinite(parsed) ? parsed : HACKATHON_DEFAULT_CLOSE_AT;
+}
+
+const HACKATHON_SKILLS = ['competitive-programming', 'practical-experience', 'product-experience'] as const;
+const hackathonRegistrationShape = {
+  registrationType: z.enum(['team', 'individual']),
+  teamName: z.string().trim().min(2).max(100).nullish(),
+  captainName: z.string().trim().min(2).max(100),
+  captainEmail: z.string().trim().toLowerCase().email().max(320),
+  captainPhone: z.string().trim().regex(/^[0-9+().\-\s]{8,20}$/),
+  captainStudentId: z.string().trim().regex(/^[A-Za-z0-9._-]{3,32}$/),
+  members: z.array(z.string().trim().min(2).max(100)).max(2),
+  memberYears: z.array(z.number().int().min(1).max(5)).min(1).max(3),
+  memberSkills: z.array(z.array(z.enum(HACKATHON_SKILLS)).max(3)).min(1).max(3),
+  projectIdea: z.string().trim().max(2000).nullish(),
+};
+const publicHackathonRegistrationSchema = z.object({
+  ...hackathonRegistrationShape,
+  registrationType: z.enum(['team', 'individual']).default('team'),
+  members: z.array(z.string().trim().min(2).max(100)).max(2).default([]),
+  acceptedRules: z.literal(true),
+  website: z.string().max(200).nullish(),
+});
+const adminHackathonRegistrationSchema = z.object({
+  ...hackathonRegistrationShape,
+  expectedUpdatedAt: z.string().datetime(),
+}).strict();
+
+function validHackathonMemberShape(input: Omit<z.infer<typeof adminHackathonRegistrationSchema>, 'expectedUpdatedAt'>): boolean {
+  const expectedMembers = input.registrationType === 'team' ? input.members.length + 1 : 1;
+  return input.memberYears.length === expectedMembers
+    && input.memberSkills.length === expectedMembers
+    && (input.registrationType === 'team'
+      ? !!input.teamName && input.members.length >= 1
+      : input.members.length === 0 && !input.teamName);
+}
+
+function sanitizedHackathonInput(input: Omit<z.infer<typeof adminHackathonRegistrationSchema>, 'expectedUpdatedAt'>) {
+  const captainName = sanitizeName(input.captainName, 100);
+  const teamName = input.registrationType === 'team' ? sanitizeName(input.teamName || '', 100) : '';
+  const members = input.members.map((name) => sanitizeName(name, 100));
+  if (captainName.length < 2 || (input.registrationType === 'team' && teamName.length < 2)
+    || members.some((name) => name.length < 2)) return null;
+  return {
+    registrationType: input.registrationType,
+    teamName,
+    captainName,
+    captainEmail: input.captainEmail,
+    captainPhone: input.captainPhone,
+    captainStudentId: input.captainStudentId,
+    members,
+    memberYears: input.memberYears,
+    memberSkills: input.memberSkills,
+    projectIdea: input.projectIdea ? input.projectIdea.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f<>]/g, '').trim() : undefined,
+  };
 }
 
 /**
@@ -4254,58 +4309,33 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (Date.now() >= hackathonCloseAt()) {
       return res.status(410).json({ error: 'registration_closed', message: 'Đã hết thời hạn đăng ký VIC Hackathon #1.' });
     }
-    const parsed = z.object({
-      registrationType: z.enum(['team', 'individual']).default('team'),
-      teamName: z.string().trim().min(2).max(100).nullish(),
-      captainName: z.string().trim().min(2).max(100),
-      captainEmail: z.string().trim().toLowerCase().email().max(320),
-      captainPhone: z.string().trim().regex(/^[0-9+().\-\s]{8,20}$/),
-      captainStudentId: z.string().trim().regex(/^[A-Za-z0-9._-]{3,32}$/),
-      members: z.array(z.string().trim().min(2).max(100)).max(2).default([]),
-      memberYears: z.array(z.number().int().min(1).max(5)).min(1).max(3),
-      memberSkills: z.array(z.array(z.enum(['competitive-programming', 'practical-experience', 'product-experience'])).max(3)).min(1).max(3),
-      projectIdea: z.string().trim().max(2000).nullish(),
-      acceptedRules: z.literal(true),
-      website: z.string().max(200).nullish(),
-    }).safeParse(req.body);
+    const parsed = publicHackathonRegistrationSchema.safeParse(req.body);
     if (!parsed.success || parsed.data.website) {
       return res.status(400).json({ error: 'invalid_body', message: parsed.success ? 'Invalid submission' : parsed.error.message });
     }
     const b = parsed.data;
-    const expectedMembers = b.registrationType === 'team' ? b.members.length + 1 : 1;
-    const invalidShape = b.memberYears.length !== expectedMembers
-      || b.memberSkills.length !== expectedMembers
-      || (b.registrationType === 'team' && (!b.teamName || b.members.length < 1))
-      || (b.registrationType === 'individual' && (b.members.length > 0 || b.teamName));
-    if (invalidShape) {
+    if (!validHackathonMemberShape(b)) {
       return res.status(400).json({ error: 'invalid_body', message: 'Thông tin thành viên, năm học và kỹ năng chưa phù hợp với loại đăng ký.' });
+    }
+    const values = sanitizedHackathonInput(b);
+    if (!values) {
+      return res.status(400).json({ error: 'invalid_body', message: 'Tên đội hoặc thành viên không hợp lệ.' });
     }
     const maxRegistrations = Math.max(1, Number(process.env.HACKATHON_MAX_REGISTRATIONS) || 500);
     try {
-      const registration = await createHackathonRegistration({
-        registrationType: b.registrationType,
-        teamName: b.teamName || '',
-        captainName: sanitizeName(b.captainName, 100),
-        captainEmail: b.captainEmail,
-        captainPhone: b.captainPhone,
-        captainStudentId: b.captainStudentId,
-        members: b.members.map((name) => sanitizeName(name, 100)),
-        memberYears: b.memberYears,
-        memberSkills: b.memberSkills,
-        projectIdea: b.projectIdea ? b.projectIdea.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f<>]/g, '').trim() : undefined,
-      }, maxRegistrations);
+      const registration = await createHackathonRegistration(values, maxRegistrations);
       return res.status(201).json({
         registration,
         message: b.registrationType === 'individual'
-          ? 'Đăng ký cá nhân thành công! Ban tổ chức sẽ liên hệ để sắp xếp team.'
-          : 'Đăng ký thành công! Ban tổ chức sẽ liên hệ qua email của đội trưởng.',
+          ? 'Đăng ký solo/cá nhân thành công! Ban tổ chức sẽ liên hệ để hỗ trợ ghép đội nếu cần.'
+          : 'Đăng ký thành công! Ban tổ chức sẽ liên hệ qua email đã đăng ký.',
       });
     } catch (e: any) {
       if (isUniqueViolation(e)) {
-        return res.status(409).json({ error: 'registration_exists', message: 'Tên đội hoặc email đội trưởng đã được đăng ký.' });
+        return res.status(409).json({ error: 'registration_exists', message: 'Tên đội hoặc email đăng ký đã được sử dụng.' });
       }
       if (e?.code === 'hackathon_full') {
-        return res.status(409).json({ error: 'registration_full', message: 'Số lượng đội đã đủ. Vui lòng liên hệ ban tổ chức.' });
+        return res.status(409).json({ error: 'registration_full', message: 'Số lượng đơn đăng ký đã đủ. Vui lòng liên hệ ban tổ chức.' });
       }
       throw e;
     }
@@ -4514,6 +4544,61 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (!registration) return res.status(404).json({ error: 'not_found' });
     noStore(res);
     res.json({ registration });
+  });
+
+  app.put('/v1/platform/hackathon/registrations/:id', async (req, res) => {
+    const ctx = await currentPlatformAdmin(req, res, 'operator');
+    if (!ctx) return;
+    if (!isUuid(req.params.id)) return res.status(400).json({ error: 'invalid_id' });
+    const parsed = adminHackathonRegistrationSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid_body', message: parsed.error.message });
+    const b = parsed.data;
+    if (!validHackathonMemberShape(b)) {
+      return res.status(400).json({ error: 'invalid_body', message: 'Thông tin thành viên, năm học và kỹ năng chưa phù hợp với loại đăng ký.' });
+    }
+    const existing = await getHackathonRegistration(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'not_found' });
+    const values = sanitizedHackathonInput(b);
+    if (!values) {
+      return res.status(400).json({ error: 'invalid_body', message: 'Tên đội hoặc thành viên không hợp lệ.' });
+    }
+    if (!(await requirePlatformStepUp(req, res, ctx, 'hackathon:update'))) return;
+    try {
+      const registration = await withTransaction(async () => {
+        const updated = await updateHackathonRegistration(req.params.id, values, b.expectedUpdatedAt);
+        if (!updated) return null;
+        const comparisons: Array<[string, unknown, unknown]> = [
+          ['registrationType', existing.registrationType, updated.registrationType],
+          ['teamName', existing.teamName, updated.teamName],
+          ['captainName', existing.captainName, updated.captainName],
+          ['captainEmail', existing.captainEmail, updated.captainEmail],
+          ['captainPhone', existing.captainPhone, updated.captainPhone],
+          ['captainStudentId', existing.captainStudentId, updated.captainStudentId],
+          ['members', existing.memberNames.slice(1), updated.memberNames.slice(1)],
+          ['memberYears', existing.memberYears, updated.memberYears],
+          ['memberSkills', existing.memberSkills, updated.memberSkills],
+          ['projectIdea', existing.projectIdea, updated.projectIdea],
+        ];
+        await auditPlatformAction(req, ctx.user.id, 'platform:hackathon:update', null, {
+          registrationId: updated.id,
+          previousTeamName: existing.teamName,
+          teamName: updated.teamName,
+          changedFields: comparisons.filter(([, before, after]) => JSON.stringify(before) !== JSON.stringify(after)).map(([field]) => field),
+        });
+        return updated;
+      });
+      if (!registration) return res.status(404).json({ error: 'not_found' });
+      noStore(res);
+      res.json({ registration });
+    } catch (e: any) {
+      if (isUniqueViolation(e)) {
+        return res.status(409).json({ error: 'registration_exists', message: 'Tên đội hoặc email đăng ký đã được sử dụng.' });
+      }
+      if (e?.code === 'hackathon_conflict') {
+        return res.status(409).json({ error: 'registration_conflict', message: 'Đơn đã được admin khác sửa. Vui lòng tải lại thông tin và kiểm tra lại trước khi lưu.' });
+      }
+      throw e;
+    }
   });
 
   app.patch('/v1/platform/hackathon/registrations/:id', async (req, res) => {

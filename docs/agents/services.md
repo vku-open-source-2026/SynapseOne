@@ -179,6 +179,12 @@ accessors + seed), `src/tokens.ts` (JWT/refresh/API keys), `src/policy.ts`
   `POST /v1/service-accounts/:id/token`.
 - Usage: `POST /v1/usage/ingest` (internal), `GET /v1/usage/summary`,
   `GET /v1/usage/events`.
+- VIC Hackathon: public `POST /v1/hackathon/registrations`; platform
+  `GET/PUT/PATCH /v1/platform/hackathon/registrations[/:id]`,
+  `GET /v1/platform/hackathon/match-suggestions` and
+  `POST /v1/platform/hackathon/registrations/:id/api-key-sent`. Detail edits
+  require operator/owner, step-up `hackathon:update` and audit; they preserve
+  review/delivery state.
 - Platform Super Admin: `/v1/platform/session`, `/step-up` (one-time,
   session/action-bound), `/me`, `/overview`, `/orgs`, `/orgs/:id/accounts`,
   `/orgs/:id/keys` (create/rotate tenant API key; metadata-only listing,
@@ -198,7 +204,9 @@ accessors + seed), `src/tokens.ts` (JWT/refresh/API keys), `src/policy.ts`
 `org_quotas` (nullable per-org `ai`/`inference`/`workflow` overrides; NULL =
 global default; request windows are fixed minute/5h/UTC-day),
 `refresh_tokens` (hash, expiry, `revoked_at`, `consumed_at` for rotation-replay
-detection), legacy `workflows`, `usage_events`, `audit_log`.
+detection), `hackathon_registrations` (captain-first member/year/skill arrays,
+review and manual delivery metadata), legacy `workflows`, `usage_events`,
+`audit_log`.
 Migrations seed demo org `acme` and account `prod`; the memory fallback seeds
 `acme` too. Demo users are created on demand (dev login).
 

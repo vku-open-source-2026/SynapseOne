@@ -31,10 +31,11 @@ export const GROUPS = [
   {
     name: 'VIC Hackathon',
     endpoints: [
-      { method: 'POST', path: '/v1/hackathon/registrations', auth: 'none', desc: 'Public team (2–3) or individual registration; per-member year and advanced skills', body: { registrationType: 'team', teamName: 'Synapse Builders', captainName: 'Nguyen Van A', captainEmail: 'captain@example.com', captainPhone: '0912345678', captainStudentId: '123456789', members: ['Tran Thi B'], memberYears: [2, 1], memberSkills: [[], []], acceptedRules: true } },
+      { method: 'POST', path: '/v1/hackathon/registrations', auth: 'none', desc: 'Public solo/individual or team (2–3) registration; per-member year and advanced skills', body: { registrationType: 'team', teamName: 'Synapse Builders', captainName: 'Nguyen Van A', captainEmail: 'captain@example.com', captainPhone: '0912345678', captainStudentId: '123456789', members: ['Tran Thi B'], memberYears: [2, 1], memberSkills: [[], []], acceptedRules: true } },
       { method: 'GET', path: '/v1/platform/hackathon/registrations', auth: 'platform', desc: 'Superadmin list/search registrations and delivery counts' },
       { method: 'GET', path: '/v1/platform/hackathon/match-suggestions', auth: 'platform', desc: 'Non-mutating individual-team suggestions: year-2/skilled anchor + two members' },
       { method: 'GET', path: '/v1/platform/hackathon/registrations/:id', auth: 'platform', desc: 'Superadmin registration detail' },
+      { method: 'PUT', path: '/v1/platform/hackathon/registrations/:id', auth: 'platform', desc: 'Operator/owner edits registration details with hackathon:update step-up and audit; review/delivery state is preserved', body: { registrationType: 'team', teamName: 'Synapse Builders', captainName: 'Nguyen Van A', captainEmail: 'captain@example.com', captainPhone: '0912345678', captainStudentId: '123456789', members: ['Tran Thi B'], memberYears: [2, 1], memberSkills: [[], []], projectIdea: 'A product built with SynapseOne', expectedUpdatedAt: '2026-11-28T15:00:00.000Z' } },
       { method: 'PATCH', path: '/v1/platform/hackathon/registrations/:id', auth: 'platform', desc: 'Approve/reject with step-up and audit', body: { status: 'approved', reviewNote: 'Eligible' } },
       { method: 'POST', path: '/v1/platform/hackathon/registrations/:id/api-key-sent', auth: 'platform', desc: 'Mark manual API-key email delivery (no secret stored)' },
     ],
