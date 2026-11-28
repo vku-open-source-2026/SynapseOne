@@ -209,7 +209,7 @@ jobs:
           else
             echo "npm: @synapseone/cli@$PKG_VER already published — skipping."
           fi
-          for attempt in $(seq 1 12); do
+          for attempt in $(seq 1 60); do
             FOUND=$(npm view "@synapseone/cli@$PKG_VER" version 2>/dev/null || true)
             if [ "$FOUND" = "$PKG_VER" ]; then
               echo "npm registry verified @synapseone/cli@$PKG_VER"
