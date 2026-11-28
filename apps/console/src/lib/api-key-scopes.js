@@ -5,7 +5,7 @@ export const TENANT_KEY_SCOPE_GROUP_LABELS = {
   '*': 'All tenant services',
   iam: 'Identity & access',
   base: 'SynapseBase',
-  search: 'Search',
+  search: 'SynapseSearch',
   lds: 'SynapseLDS',
   faststore: 'SynapseFaststore',
   queue: 'SynapseQueue',

@@ -6,7 +6,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { CLIENT_TABS, DOC_GROUPS, DOC_TABS, SERVICE_CATALOG, matchesService } from './service-catalog.js';
+import { CLIENT_TABS, DOC_GROUPS, DOC_TABS, SERVICE_CATALOG, SERVICE_TRAY_CATALOG, matchesService } from './service-catalog.js';
 import { en } from '../locales/en.js';
 import { vi } from '../locales/vi.js';
 import { SERVICE_ICONS } from './service-icons.js';
@@ -40,6 +40,13 @@ test('every service has a valid Console route, Docs target and active route matc
     assert.equal(matchesService(service, service.consoleRoute), true, `${service.id} active route`);
     assert.equal(matchesService(service, '/not-a-service-route'), false, `${service.id} inactive route`);
   }
+});
+
+test('service tray hides Gateway & Ops while Docs keeps the Gateway guide', () => {
+  assert.equal(SERVICE_TRAY_CATALOG.some((service) => service.id === 'gateway'), false);
+  assert.equal(SERVICE_TRAY_CATALOG.length, SERVICE_CATALOG.length - 1);
+  assert.equal(SERVICE_CATALOG.some((service) => service.id === 'gateway'), true);
+  assert.equal(DOC_TABS.some((tab) => tab.id === 'gateway'), true);
 });
 
 test('DNS and Tunnel sidebar links open tenant management pages, not API Docs', () => {

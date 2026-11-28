@@ -48,7 +48,7 @@ routes are intentionally outside that catalog.
 | Graph | node/edge upsert, node get/delete, query, stats | implemented; no independent graph database |
 | Geo | feature upsert/list/delete, near, within, stats | implemented; not full GIS |
 | Vector | vector field search, top-k, filters, scores | implemented; dimensions declared in mapping |
-| Search | full-text, semantic, hybrid, filters (`status`/`type`), facets, reindex, status | bounded (50k candidate scan; metrics disclose bounds) |
+| SynapseSearch | full-text, semantic, hybrid, filters (`status`/`type`), facets, reindex, status | bounded (50k candidate scan; metrics disclose bounds) |
 
 ## Faststore (`faststore-service`, Rust)
 

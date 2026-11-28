@@ -126,7 +126,7 @@ chết; scope không được mở rộng quyền caller.
 - `POST /v1/human-tasks/:id/approve|reject|submit`.
 Task gắn execution/pause checkpoint; API-created task không thể giả mạo checkpoint.
 
-## Search
+## SynapseSearch
 
 - `POST /v1/search {query,mode?,limit?,offset?}`.
 - `GET /v1/search/status`, `POST /v1/search/reindex`.

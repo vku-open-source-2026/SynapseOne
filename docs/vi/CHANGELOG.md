@@ -17,6 +17,8 @@ của từng bản phát hành nằm trong `CHANGELOG.md` tiếng Anh.
   Docker/Compose, tài liệu vận hành song ngữ và hướng dẫn bốn ngôn ngữ. Quản lý
   giờ có qua trang Platform Admin được bảo vệ MFA và route gateway hẹp; tích hợp
   Tầng 2/3 vẫn để sau.
+- **Tên dịch vụ Console:** ẩn Gateway & Ops khỏi service tray nhưng vẫn giữ trong
+  Docs, và đổi tên dịch vụ tìm kiếm tenant thành **SynapseSearch**.
 - **Quản lý edge theo tổ chức:** zone SynapseDNS và connector Synapse Tunnel có
   ownership org. Route Console tenant `/dns` và `/tunnel` dùng API gateway có
   scope, truy cập khác org trả 404, và bản ghi version-1 được chuyển thành thuộc

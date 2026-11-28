@@ -13,11 +13,11 @@ import {
   faXmark,
 } from '@fortawesome/free-solid-svg-icons';
 import { useI18n } from '../lib/i18n-context.js';
-import { SERVICE_CATALOG, matchesService } from '../lib/service-catalog.js';
+import { SERVICE_TRAY_CATALOG, matchesService } from '../lib/service-catalog.js';
 import { SERVICE_ICONS } from '../lib/service-icons.js';
 
 // Kept as a named export for Topbar and existing imports.
-export const PLATFORM_SERVICES = SERVICE_CATALOG;
+export const PLATFORM_SERVICES = SERVICE_TRAY_CATALOG;
 
 export default function ServicesSidebar({ open = true, onToggle }) {
   const { pathname } = useLocation();
@@ -28,7 +28,7 @@ export default function ServicesSidebar({ open = true, onToggle }) {
   if (!open) return null;
 
   const q = query.trim().toLowerCase();
-  const filtered = SERVICE_CATALOG.filter((svc) => {
+  const filtered = SERVICE_TRAY_CATALOG.filter((svc) => {
     if (!q) return true;
     const localized = copy(svc);
     return [svc.label, localized.label, svc.category, localized.category, svc.desc, localized.desc, ...svc.keywords]

@@ -104,7 +104,7 @@ export default function Search() {
   return (
     <div>
       <PageTitle
-        title="Search"
+        title="SynapseSearch"
         sub="Tenant-scoped full-text, semantic and hybrid search over SynapseBase documents."
         right={<Btn kind="secondary" onClick={reindex} loading={reindexing}>
           <FontAwesomeIcon icon={faRotateRight} /> Reindex

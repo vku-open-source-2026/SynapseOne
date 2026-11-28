@@ -22,7 +22,7 @@ import { LanguageProvider } from './lib/i18n.jsx';
 import WorkflowEditor from './components/WorkflowEditor.jsx';
 import { OrganizationTable } from './pages/Orgs.jsx';
 import { keyStatus as apiKeyStatus, quotaFieldSource, organizationDetailKey } from './pages/admin/OrganizationDetail.jsx';
-import { DOC_TABS, SERVICE_CATALOG } from './lib/service-catalog.js';
+import { DOC_TABS, SERVICE_CATALOG, SERVICE_TRAY_CATALOG } from './lib/service-catalog.js';
 import { MobileServiceLinks } from './components/Topbar.jsx';
 import ServicesSidebar from './components/ServicesSidebar.jsx';
 import TenantKeyScopePicker from './components/TenantKeyScopePicker.jsx';
@@ -241,8 +241,8 @@ for (const [lang, dict] of [['en', en], ['vi', vi]] as const) {
       </MemoryRouter>,
     );
     const links = (html.match(/<a /g) || []).length;
-    if (links !== SERVICE_CATALOG.length) throw new Error(`expected ${SERVICE_CATALOG.length} mobile service links, received ${links}`);
-    for (const service of SERVICE_CATALOG) {
+    if (links !== SERVICE_TRAY_CATALOG.length) throw new Error(`expected ${SERVICE_TRAY_CATALOG.length} mobile service links, received ${links}`);
+    for (const service of SERVICE_TRAY_CATALOG) {
       if (!html.includes(`href="${service.consoleRoute}"`)) throw new Error(`missing mobile link ${service.id}`);
     }
     console.log(`ok [mobile-services-${lang}] ${links} links`);

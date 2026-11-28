@@ -22,7 +22,7 @@ wrapper coverage and escape-hatch rules.
 | AI | [Inference](inference.md) | Chat, embeddings, decisions, semantic routing, queued inference jobs |
 | Linked data | [LDS](lds.md) | Licensed NGSI-LD datasources, attributes, ingestion, public exports |
 | Documents | [Base](base.md) | Databases, collections, mapping, queries, concurrency, graph/GIS |
-| Search | [Search](search.md) | Full-text, semantic, and hybrid search over Base documents |
+| SynapseSearch | [SynapseSearch](search.md) | Full-text, semantic, and hybrid search over Base documents |
 | State | [Faststore](faststore.md) | KV/TTL, counters, data structures, batches, locks |
 | Messaging | [Queue](queue.md) | At-least-once work queues, leases, retries, dead letters |
 | Messaging | [Stream](stream.md) | Event log, retention, fan-out reads, consumer groups |

@@ -8,7 +8,7 @@
 /** Shared service registry for Docs and the Console services sidebar. */
 export const SERVICE_CATALOG = [
   {
-    id: 'gateway', docsTab: 'gateway', group: 'platform', label: 'Gateway & Ops',
+    id: 'gateway', docsTab: 'gateway', group: 'platform', label: 'Gateway & Ops', showInTray: false,
     consoleRoute: '/api-docs', activePaths: ['/api-docs'], port: '8080', prefix: '/, /health, /ready, /metrics',
     category: 'Platform', desc: 'Single public API entry point, routing, auth, scopes and readiness',
     keywords: ['gateway', 'ops', 'health', 'ready', 'metrics', 'proxy', 'routes'],
@@ -78,10 +78,10 @@ export const SERVICE_CATALOG = [
     iconColor: 'from-blue-500 to-indigo-600', bgGradient: 'linear-gradient(135deg, #3b82f6 0%, #4338ca 100%)', shadowColor: 'rgba(59, 130, 246, 0.28)',
   },
   {
-    id: 'search', docsTab: 'search', group: 'data', label: 'Search',
+    id: 'search', docsTab: 'search', group: 'data', label: 'SynapseSearch',
     consoleRoute: '/search', activePaths: ['/search'], port: '—', prefix: '/v1/search',
     category: 'Document Database', desc: 'Tenant-scoped full-text, semantic and hybrid search over Base documents',
-    keywords: ['search', 'full-text', 'semantic', 'hybrid', 'facets', 'index', 'reindex', 'base'],
+    keywords: ['synapsesearch', 'search', 'full-text', 'semantic', 'hybrid', 'facets', 'index', 'reindex', 'base'],
     iconColor: 'from-indigo-400 to-blue-600', bgGradient: 'linear-gradient(135deg, #818cf8 0%, #2563eb 100%)', shadowColor: 'rgba(99, 102, 241, 0.28)',
   },
   {
@@ -134,6 +134,10 @@ export const SERVICE_CATALOG = [
     iconColor: 'from-teal-400 to-cyan-600', bgGradient: 'linear-gradient(135deg, #2dd4bf 0%, #0891b2 100%)', shadowColor: 'rgba(20, 184, 166, 0.28)',
   },
 ];
+
+/** Service tray entries. Gateway remains in Docs/API reference but is not a
+ *  tenant-facing managed service, so it is intentionally hidden here. */
+export const SERVICE_TRAY_CATALOG = SERVICE_CATALOG.filter((service) => service.showInTray !== false);
 
 export const CLIENT_TABS = [
   { id: 'javascript', group: 'clients' },

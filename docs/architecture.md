@@ -133,7 +133,7 @@ cleanup is an explicit operator action.
   per tenant; presigned URLs carry a signed tenant/bucket/key payload.
 - Faststore/Queue/Stream namespace Valkey keys by tenant.
 
-## Search
+## SynapseSearch
 
 Base Search (`/v1/search`) is the only product search API: PostgreSQL full-text
 + pgvector, full-text/semantic/hybrid modes, collection/metadata filters,

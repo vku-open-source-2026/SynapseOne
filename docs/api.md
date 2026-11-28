@@ -270,7 +270,7 @@ conditional status transition, so duplicate decisions and double resumes return
 `409`. Task state lives in Postgres (`synapseone_human_tasks`) and survives
 restarts. All mutations flow through the audit trail.
 
-## Search (`base-service`, gateway `/v1/search`)
+## SynapseSearch (`base-service`, gateway `/v1/search`)
 | Method | Route | Description |
 | --- | --- | --- |
 | POST | `/v1/search` | `{query, mode:"fulltext"\|"semantic"\|"hybrid", collection?, collections?, filters?, limit?, cursor?}`. |

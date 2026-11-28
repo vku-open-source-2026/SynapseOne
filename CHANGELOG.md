@@ -17,6 +17,8 @@ Format based on Keep a Changelog; versioning follows SemVer.
   guides. Management is now available through MFA-protected Platform Admin
   Console pages and narrow gateway proxy routes; Tier-2/3 integration remains
   intentionally pending.
+- **Console service naming:** Gateway & Ops is hidden from the service tray but
+  remains in Docs, and the tenant search service is branded **SynapseSearch**.
 - **Organization-owned edge management:** SynapseDNS zones and Synapse Tunnel
   connectors now carry organization ownership. Tenant Console routes `/dns` and
   `/tunnel` use scoped gateway APIs, cross-org access returns 404, and version-1

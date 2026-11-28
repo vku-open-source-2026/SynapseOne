@@ -15,7 +15,7 @@ operator HTTP because typed service wrappers are not available yet.
 | IAM | Full namespace, including usage analytics | Usage analytics not wrapped | Usage analytics not wrapped; some API-key/SCIM options are narrower | Usage analytics not wrapped |
 | Workflow | Runners, human tasks, secrets, cancellation, `expectedRevision` | Runners, human tasks, secrets, cancellation; no `expectedRevision` | Core workflows/executions/human tasks/secrets; runners and revision preconditions use `Call` | Runners, human tasks, secrets; cancellation/revision preconditions use `request` |
 | Base | Typed mapping, graph/GIS, paged reads | Typed mapping, graph/GIS | Typed mapping, documents/vector search; graph/GIS use `Call` | Documents, graph/GIS; raw `data` writes rather than typed model mapping |
-| Search | `client.search` | `client.base.search_*` | `Client.Search*` | `client.base().search_*` |
+| SynapseSearch | `client.search` | `client.base.search_*` | `Client.Search*` | `client.base().search_*` |
 | Lakehouse | Namespaces, tables, append/query, snapshots, evolution | Same | Same | Same |
 | SynapseDNS | Direct HTTP zone/record API; no typed wrapper | Direct HTTP; no typed wrapper | Direct HTTP; no typed wrapper | Direct HTTP; no typed wrapper |
 | Synapse Tunnel | Direct HTTP connector/route API; connector CLI | Direct HTTP; no typed wrapper | Direct HTTP; no typed wrapper | Direct HTTP; no typed wrapper |
