@@ -31,7 +31,7 @@ export const SERVICE_CATALOG = [
   {
     id: 'iam', docsTab: 'iam', group: 'platform', label: 'IAM & Auth',
     consoleRoute: '/orgs', activePaths: ['/orgs', '/accounts', '/users', '/roles', '/policies', '/keys', '/service-accounts', '/authorize', '/audit', '/security'], port: '4001', prefix: '/v1/auth, /v1/orgs, /v1/accounts, …',
-    category: 'Identity & Access', desc: 'Organizations, accounts, users, roles, policies, keys, OIDC, MFA, audit and usage',
+    category: 'Identity & Access', desc: 'Organizations, accounts, users, roles, policies, keys, OIDC, optional MFA, audit and usage',
     keywords: ['iam', 'auth', 'identity', 'org', 'account', 'user', 'role', 'policy', 'api key', 'oidc', 'mfa', 'scim'],
     iconColor: 'from-emerald-400 to-teal-600', bgGradient: 'linear-gradient(135deg, #34d399 0%, #0f766e 100%)', shadowColor: 'rgba(16, 185, 129, 0.28)',
   },

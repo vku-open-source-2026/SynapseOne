@@ -9,6 +9,7 @@ import { useAuth } from '../lib/auth.jsx';
 import { api } from '../lib/api.js';
 import { Badge, Btn, Card, Empty, Err, Field, InlineLoader, Input, Modal, PageTitle, Pager, SearchBox, Table, TableSkeleton } from '../components/ui.jsx';
 import { ScopeBar, useScope } from '../components/Scope.jsx';
+import { mfaEnabled } from '../lib/site.js';
 
 export default function Users() {
   const { headers, auth } = useAuth();
@@ -193,6 +194,7 @@ export default function Users() {
 }
 
 function Row({ u, headers, onUnassign, tick, canAdmin, onChanged }) {
+  const mfa = mfaEnabled();
   const [n, setN] = useState(null);
   const [expanded, setExpanded] = useState(false);
   const [assigned, setAssigned] = useState(null);
@@ -224,6 +226,7 @@ function Row({ u, headers, onUnassign, tick, canAdmin, onChanged }) {
 
   // Org admins: lost authenticator / locked-out user.
   const security = async (kind) => {
+    if (kind === 'mfa' && !mfa) return;
     if (kind === 'mfa' && !window.confirm('Reset MFA for this user? This also revokes all of their sessions and API keys.')) return;
     setSecBusy(kind);
     setSecMsg(null);
@@ -306,9 +309,9 @@ function Row({ u, headers, onUnassign, tick, canAdmin, onChanged }) {
               <button onClick={rename} disabled={!!secBusy} className="text-main-blue disabled:opacity-50">
                 {secBusy === 'rename' ? 'Saving…' : 'Rename'}
               </button>
-              <button onClick={() => security('mfa')} disabled={!!secBusy} className="text-main-blue disabled:opacity-50">
+              {mfa && <button onClick={() => security('mfa')} disabled={!!secBusy} className="text-main-blue disabled:opacity-50">
                 {secBusy === 'mfa' ? 'Resetting…' : 'Reset MFA'}
-              </button>
+              </button>}
               <button onClick={() => security('unlock')} disabled={!!secBusy} className="text-main-blue disabled:opacity-50">
                 {secBusy === 'unlock' ? 'Unlocking…' : 'Unlock sign-in'}
               </button>

@@ -44,7 +44,9 @@ synapseone notifications send a@b.c --channel email --subject Hi --body Hello
 
 For local container development: add `--base http://localhost:8080` (or `export SYNAPSEONE_BASE_URL=http://localhost:8080`).
 
-Accounts with MFA: `synapseone login --email … --password … --code 123456`.
+MFA is disabled by default in the current deployment. If an operator sets
+`SYNAPSEONE_MFA_ENABLED=true`, enrolled accounts can use
+`synapseone login --email … --password … --code 123456`.
 Manage it with `synapseone mfa status|setup|enable|recovery-codes|disable`
 (org admins: `mfa reset|unlock <user-id>`).
 

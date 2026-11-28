@@ -6,6 +6,12 @@ The Platform Super Admin is a **human-operated, cross-tenant control plane** for
 SynapseOne. It is deliberately separate from `users.is_org_admin` (tenant-scoped)
 and from the internal `SYNAPSEONE_INTERNAL_SECRET` platform caller.
 
+> **MFA switch:** this deployment sets `SYNAPSEONE_MFA_ENABLED=false`, so
+> password/SSO sign-in is sufficient and platform actions do not ask for TOTP or
+> step-up. Set the switch to `true` to restore the stricter flow described below.
+> Revoke active sessions (or bump `auth_version`) when re-enabling so existing
+> password-only sessions cannot silently retain the old assurance level.
+
 ## Security model
 
 - A platform administrator is a user in the reserved platform organization

@@ -6,6 +6,9 @@ This feature adds tenant-safe organization visibility, metadata-only API-key
 management for platform operators, and shared request quotas for `ai`,
 `inference` and `workflow`. The English documents under `docs/` are canonical.
 
+> Current deployment has `SYNAPSEONE_MFA_ENABLED=false`; the step-up prompts
+> described below are skipped unless MFA is re-enabled.
+
 ## User workflows
 
 ### Platform administrator

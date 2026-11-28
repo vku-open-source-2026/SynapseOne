@@ -15,7 +15,7 @@ wrapper coverage and escape-hatch rules.
 | Gateway | [Gateway](gateway.md) | Public routing, authentication, principal propagation, readiness |
 | Edge | [SynapseDNS](dns.md) | Authoritative UDP/TCP DNS and zone/record management |
 | Edge | [Synapse Tunnel](tunnel.md) | Outbound-only HTTP application exposure and host/path routing |
-| Identity | [IAM](iam.md) | Users, orgs/accounts, roles/policies, keys, service accounts, MFA |
+| Identity | [IAM](iam.md) | Users, orgs/accounts, roles/policies, keys, service accounts, optional MFA |
 | Automation | [Workflow](workflow.md) | Definitions, triggers, executions, human tasks, credentials, secrets |
 | Compute | [Workflow runners](workflow-runners.md) | Runner registration, connector health, workflow/inference job protocol |
 | AI | [AI assistant](ai-assistant.md) | Natural-language endpoint guidance and draft requests |

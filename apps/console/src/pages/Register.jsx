@@ -5,6 +5,7 @@ import { Link, Navigate, useNavigate } from 'react-router-dom';
 import { useAuth } from '../lib/auth.jsx';
 import { Btn, Card, Err, Field, Input } from '../components/ui.jsx';
 import SiteToggles from '../components/SiteToggles.jsx';
+import { mfaEnabled } from '../lib/site.js';
 
 export default function Register() {
   const { auth, acceptInvite } = useAuth();
@@ -15,7 +16,7 @@ export default function Register() {
   const [activating, setActivating] = useState(false);
 
   // Once activation succeeds, the new auth state must not race the explicit
-  // /security redirect back to the dashboard (MFA setup prompt).
+  // redirect. Offer MFA setup only on deployments where MFA is enabled.
   if (auth && !activating) return <Navigate to="/dashboard" replace />;
 
   const submit = async (e) => {
@@ -33,7 +34,7 @@ export default function Register() {
     setActivating(true);
     try {
       await acceptInvite(form.token.trim(), form.password, form.displayName.trim() || undefined);
-      nav('/security', { replace: true });
+      nav(mfaEnabled() ? '/security' : '/dashboard', { replace: true });
     } catch (ex) {
       setActivating(false);
       setErr(ex);

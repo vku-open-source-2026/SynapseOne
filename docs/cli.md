@@ -143,9 +143,10 @@ synapseone login --email alice@acme.local --org acme
 synapseone login --email <email> [--org <slug>] [--password <pw>] [--code <123456> | --recovery-code <code>] [--base <url>]
 ```
 Signs in and saves token + refresh token to config. Without `--password` it uses the
-dev login (disabled when `IAM_ALLOW_DEV_LOGIN=false`). When the account has MFA, pass
-the authenticator code (or a recovery code); otherwise the command explains that MFA
-is required.
+dev login (disabled when `IAM_ALLOW_DEV_LOGIN=false`). MFA is disabled in the current
+deployment (`SYNAPSEONE_MFA_ENABLED=false`). When an operator enables MFA and the
+account is enrolled, pass the authenticator code (or a recovery code); otherwise the
+command explains that MFA is required.
 
 ```bash
 synapseone login --email demo@acme.local
@@ -153,6 +154,10 @@ synapseone login --email alice@acme.local --org acme --password '...' --code 492
 ```
 
 #### `mfa`
+
+These commands are available only when `SYNAPSEONE_MFA_ENABLED=true`; the current
+deployment returns `403 mfa_disabled` for self-service MFA mutations.
+
 ```bash
 synapseone mfa [status]                      # enabled? recovery codes left
 synapseone mfa setup                         # prints the secret + otpauth:// URL

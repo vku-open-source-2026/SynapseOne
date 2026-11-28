@@ -46,13 +46,15 @@ an opaque `code` + `state` from the IdP and POSTs them to IAM.
   that org. A new slug is self-service only when it is not the reserved platform
   slug (`PLATFORM_ORG_SLUG`, default `synapseone-platform`). A different IdP
   identity can never attach itself to another tenant by guessing a slug.
-- **Local MFA is not bypassed.** If the mapped user has an enrolled TOTP factor,
-  the callback returns `401 mfa_required` with a short-lived `mfaToken`; the
-  Console must complete `/v1/auth/mfa/verify` before an access token is issued.
-  Upstream IdP MFA can be additional assurance, never a replacement.
+- **Local MFA follows the global switch.** When `SYNAPSEONE_MFA_ENABLED=true`, an
+  enrolled TOTP factor is not bypassed: the callback returns `401 mfa_required`
+  with a short-lived `mfaToken`, and Console completes `/v1/auth/mfa/verify`
+  before an access token is issued. Upstream IdP MFA can be additional assurance,
+  never a replacement. The current deployment sets the switch to `false`.
 - **Platform separation.** OIDC signs in a normal user session. Platform Admin
-  privileges still require the Platform Owner account, its local MFA, and the
-  `/admin/*` platform guard. SSO cannot mint platform privileges.
+  privileges still require the Platform Owner account and the `/admin/*` platform
+  guard; local MFA is required only when the global switch is enabled. SSO cannot
+  mint platform privileges directly.
 
 Relevant code: `apps/iam-service/src/oidc.ts`,
 `apps/iam-service/src/index.ts` (`/v1/auth/oidc/*`, `/v1/auth/mfa/verify`),

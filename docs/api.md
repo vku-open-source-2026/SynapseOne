@@ -68,7 +68,7 @@ tenant. Platform calls without a tenant fail with `400 tenant_required`.
 - `GET /v1/auth/verify` (Bearer or X-API-Key) → `{valid, ...}`; API-key responses include the verified owning `org_id`
 - `GET /v1/auth/me` (Bearer) → `{user, kind}` (`user.is_org_admin` tells whether the caller administers its org)
 - `GET /v1/auth/contexts` (Bearer) → `{current, contexts, preferred}` — the caller's own context is always included; other same-email contexts are included only after `email_verified` (password login alone does not verify). Suspended organizations are omitted.
-- `POST /v1/auth/contexts/switch {orgId, password}` (Bearer) → tenant token only after the **target row's own** password is verified (and its TOTP/recovery challenge completed, when enrolled). User-bound rows with no password return `403 target_login_required`; a suspended caller is refused. Platform context is never minted here; it returns `409 platform_context_login_required` and requires the platform-org login + MFA.
+- `POST /v1/auth/contexts/switch {orgId, password}` (Bearer) → tenant token only after the **target row's own** password is verified (and its TOTP/recovery challenge completed when both the user is enrolled and `SYNAPSEONE_MFA_ENABLED=true`). User-bound rows with no password return `403 target_login_required`; a suspended caller is refused. Platform context is never minted here; it returns `409 platform_context_login_required` and requires platform-org login, plus MFA only when enabled.
 - `GET /v1/auth/sessions` (user Bearer) → `[{id, created_at, expires_at}]` — your active sessions (one per live refresh token), newest first
 - `DELETE /v1/auth/sessions/:id` (user Bearer) → `{ok}` — revoke one session (its refresh token stops working); other users' ids → `404`
 - `GET /v1/auth/oidc/config` → `{issuer, clientId, redirectUri, codeExchange, ...}`
@@ -83,7 +83,11 @@ tenant. Platform calls without a tenant fail with `400 tenant_required`.
 
 ### Multi-factor authentication (TOTP) and lockout
 
-When a user has MFA enabled, `POST /v1/auth/login` (password or dev login) never
+MFA endpoints are optional. The current deployment sets
+`SYNAPSEONE_MFA_ENABLED=false`; status reports `available:false`, mutations return
+`403 mfa_disabled`, and login never emits `mfa_required`.
+
+When MFA is enabled on the deployment and a user has enrolled, `POST /v1/auth/login` (password or dev login) never
 returns a session. It answers `401 {error: "mfa_required", mfaToken, expiresIn: 300,
 methods: ["totp","recovery"]}` and the client finishes with:
 
@@ -93,7 +97,7 @@ methods: ["totp","recovery"]}` and the client finishes with:
 
 Self-service (user Bearer; API keys, service accounts and delegated tokens get `403`):
 
-- `GET /v1/auth/mfa` → `{enabled, pending, methods, recoveryCodesRemaining, enabledAt}`
+- `GET /v1/auth/mfa` → `{enabled, available, pending, methods, recoveryCodesRemaining, enabledAt}`
 - `POST /v1/auth/mfa/totp/setup` → `{secret, otpauthUrl, period: 30, digits: 6, algorithm: "SHA1"}`
   (`409 mfa_already_enabled` while a factor is active)
 - `POST /v1/auth/mfa/totp/enable {code}` → `{enabled: true, recoveryCodes: [10 codes, shown once]}`
@@ -1104,13 +1108,14 @@ superadmin review workflow.
 These routes are **not** part of the tenant API catalog and are not exposed to
 the AI assistant. They require a platform-administrator token
 (`kind=platform-admin`, audience `synapseone-platform-admin`) obtained from
-`POST /v1/platform/session` with a normal user JWT **and a fresh TOTP code**.
-Tenant JWTs, API keys and service-account tokens are rejected.
+`POST /v1/platform/session` with a normal platform-org user JWT. A fresh TOTP
+code is required only when `SYNAPSEONE_MFA_ENABLED=true`. Tenant JWTs, API keys
+and service-account tokens are rejected.
 
 | Method | Route | Description |
 | --- | --- | --- |
-| POST | `/v1/platform/session` | Exchange a normal user JWT + TOTP for a 15-minute platform token. |
-| POST | `/v1/platform/step-up` | `{code|recoveryCode, action}` → one-time step-up proof bound to this platform session and action (`x-platform-step-up`). |
+| POST | `/v1/platform/session` | Exchange a normal platform-org user JWT for a 15-minute platform token; TOTP only when MFA is enabled. |
+| POST | `/v1/platform/step-up` | Only when MFA is enabled: `{code|recoveryCode, action}` → one-time proof. Returns `403 mfa_disabled` in password-only mode. |
 | GET | `/v1/platform/me` | Current platform role, user and MFA state. |
 | GET | `/v1/platform/overview?from&to` | Cross-tenant counts, usage totals and audit signals. |
 | GET | `/v1/platform/orgs?q&limit&offset` | Tenant organizations with counts. |

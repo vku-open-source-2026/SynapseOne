@@ -66,7 +66,8 @@ Platform callers of Faststore/Queue set the tenant explicitly:
 c.SetTenant("acme") // x-synapseone-tenant
 ```
 
-MFA: `SetupTOTP`, `EnableTOTP`, `VerifyMFA` (after a `401 mfa_required` login),
+MFA is disabled by default (`SYNAPSEONE_MFA_ENABLED=false`). When enabled:
+`SetupTOTP`, `EnableTOTP`, `VerifyMFA` (after a `401 mfa_required` login),
 `MFAStatus`, `RegenerateRecoveryCodes`, `DisableMFA`, and for org admins
 `ResetUserMFA` / `UnlockUser`.
 

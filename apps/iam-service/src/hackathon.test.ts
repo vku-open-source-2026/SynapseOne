@@ -65,13 +65,14 @@ describe('VIC Hackathon registration', () => {
       'NODE_ENV', 'DATABASE_URL', 'SYNAPSEONE_INTERNAL_SECRET', 'IAM_ALLOW_DEV_LOGIN',
       'PLATFORM_ADMIN_ENABLED', 'PLATFORM_ADMIN_REQUIRE_MFA', 'PLATFORM_ADMIN_REQUIRE_STEP_UP',
       'PLATFORM_ORG_SLUG', 'HACKATHON_REGISTRATION_CLOSE_AT', 'HACKATHON_MAX_REGISTRATIONS',
-      'HACKATHON_REGISTRATION_RATE_LIMIT',
+      'HACKATHON_REGISTRATION_RATE_LIMIT', 'SYNAPSEONE_MFA_ENABLED',
     ]) saved[key] = process.env[key];
     delete process.env.NODE_ENV;
     delete process.env.DATABASE_URL;
     delete process.env.SYNAPSEONE_INTERNAL_SECRET;
     process.env.IAM_ALLOW_DEV_LOGIN = 'true';
     process.env.PLATFORM_ADMIN_ENABLED = 'true';
+    process.env.SYNAPSEONE_MFA_ENABLED = 'true';
     process.env.PLATFORM_ADMIN_REQUIRE_MFA = 'false';
     process.env.PLATFORM_ADMIN_REQUIRE_STEP_UP = 'false';
     process.env.PLATFORM_ORG_SLUG = 'hackathon-platform';

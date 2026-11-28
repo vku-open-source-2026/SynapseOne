@@ -37,7 +37,7 @@
 
 | Layer | Service | Description |
 | :--- | :--- | :--- |
-| **Edge & Auth** | **Gateway & IAM** | Single entry point (`:8080`), JWT/API-key auth, Organization → Account → Role → JSON Policy (`Allow`/`Deny` + Conditions), TOTP MFA, OIDC federation (Authentik/Keycloak), and audit trail. |
+| **Edge & Auth** | **Gateway & IAM** | Single entry point (`:8080`), JWT/API-key auth, Organization → Account → Role → JSON Policy (`Allow`/`Deny` + Conditions), optional TOTP MFA (disabled by default in the current deployment), OIDC federation (Authentik/Keycloak), and audit trail. |
 | **Documents & KV** | **SynapseBase & Faststore** | Validated document collections with cursors, optimistic concurrency, and change feeds (`/v1/base`); Valkey-backed TTL KV, data structures, and distributed locks (`/v1/faststore`). |
 | **Messaging & Events** | **SynapseQueue & Stream** | At-least-once queues with leases, retries, and DLQ (`/v1/queue`); tenant-scoped event streams with consumer groups (`/v1/stream`). |
 | **Analytics & Storage** | **Warehouse, Lakehouse & OCS** | DuckDB OLAP SQL & stream ETL (`/v1/warehouse`); Apache Iceberg v2 Parquet tables (`/v1/lakehouse`); S3-compatible SeaweedFS buckets & presigned URLs (`/v1/ocs`). |

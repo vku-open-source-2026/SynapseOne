@@ -26,6 +26,17 @@ export const keyStatus = (key) => key.revoked_at ? 'revoked' : key.expires_at &&
 export const quotaFieldSource = (quota, field) => quota?.overrides?.[field] === true ? 'override' : 'default';
 
 export const organizationDetailKey = (orgId) => String(orgId || '');
+
+function StepUpCodeField({ value, onChange }) {
+  const platform = usePlatformAuth();
+  if (!platform.stepUpRequired) return null;
+  return (
+    <Field label="Authenticator code">
+      <Input value={value} onChange={onChange} autoComplete="one-time-code" required />
+    </Field>
+  );
+}
+
 export default function AdminOrganizationDetail() {
   const { orgId } = useParams();
   // Remount on tenant navigation so one-time secrets/notices/forms can never be
@@ -58,6 +69,7 @@ function OrganizationDetailContent({ orgId }) {
   const [quotaForm, setQuotaForm] = useState({ requestsPerMin: '', requestsPer5h: '', requestsPerDay: '', tokensPerDay: '', executionsPerHour: '', concurrentExecutions: '', reason: '', code: '' });
   const [policyForm, setPolicyForm] = useState({ accountId: '', slug: '', description: '', document: '{\n  "Version": "2026-01-01",\n  "Statement": [\n    { "Effect": "Deny", "Action": ["*"], "Resource": ["*"] }\n  ]\n}', code: '' });
   const canWrite = platform.role === 'owner' || platform.role === 'operator';
+  const authorizeStepUp = (code, action) => platform.stepUpRequired ? platform.stepUp(code, action) : Promise.resolve(null);
   const dataSeq = useRef(0);
   const auditSeq = useRef(0);
 
@@ -101,11 +113,11 @@ function OrganizationDetailContent({ orgId }) {
   const createAccount = async (e) => {
     e.preventDefault(); if (busy) return; setBusy(true); setErr(null); setModalErr(null);
     try {
-      const step = await platform.stepUp(form.code.trim(), 'org:account:create');
+      const step = await authorizeStepUp(form.code.trim(), 'org:account:create');
       await platform.request(`/v1/platform/orgs/${encodeURIComponent(orgId)}/accounts`, {
         method: 'POST',
         body: { slug: form.slug.trim().toLowerCase(), displayName: form.displayName.trim(), reason: form.reason.trim() || undefined },
-        stepUpToken: step.token,
+        stepUpToken: step?.token,
       });
       setCreateAccountOpen(false); setForm({ slug: '', displayName: '', reason: '', code: '' });
       setNotice('Account created.'); await load(); await loadAudit();
@@ -115,11 +127,11 @@ function OrganizationDetailContent({ orgId }) {
   const createRole = async (e) => {
     e.preventDefault(); if (busy) return; setBusy(true); setErr(null); setModalErr(null);
     try {
-      const step = await platform.stepUp(roleForm.code.trim(), 'org:role:create');
+      const step = await authorizeStepUp(roleForm.code.trim(), 'org:role:create');
       await platform.request(`/v1/platform/orgs/${encodeURIComponent(orgId)}/roles`, {
         method: 'POST',
         body: { accountId: roleForm.accountId, slug: roleForm.slug.trim(), description: roleForm.description.trim() || undefined },
-        stepUpToken: step.token,
+        stepUpToken: step?.token,
       });
       setCreateRoleOpen(false); setRoleForm({ accountId: '', slug: '', description: '', code: '' });
       setNotice('Role created.'); await load(); await loadAudit();
@@ -130,11 +142,11 @@ function OrganizationDetailContent({ orgId }) {
     e.preventDefault(); if (busy) return; setBusy(true); setErr(null); setModalErr(null);
     try {
       const document = JSON.parse(policyForm.document);
-      const step = await platform.stepUp(policyForm.code.trim(), 'org:policy:create');
+      const step = await authorizeStepUp(policyForm.code.trim(), 'org:policy:create');
       await platform.request(`/v1/platform/orgs/${encodeURIComponent(orgId)}/policies`, {
         method: 'POST',
         body: { accountId: policyForm.accountId, slug: policyForm.slug.trim(), description: policyForm.description.trim() || undefined, document },
-        stepUpToken: step.token,
+        stepUpToken: step?.token,
       });
       setCreatePolicyOpen(false); setPolicyForm({ accountId: '', slug: '', description: '', document: '{\n  "Version": "2026-01-01",\n  "Statement": [\n    { "Effect": "Deny", "Action": ["*"], "Resource": ["*"] }\n  ]\n}', code: '' });
       setNotice('Policy created.'); await load(); await loadAudit();
@@ -150,7 +162,7 @@ function OrganizationDetailContent({ orgId }) {
       if (!keyForm.accountId) throw { body: { error: 'invalid_body', message: 'Select an account for the new key' } };
       if (!scopes.length) throw { body: { error: 'invalid_body', message: 'Select at least one tenant scope for the new key' } };
       if (scopes.length !== selectedScopes.length) throw { body: { error: 'invalid_scopes', message: 'One or more selected scopes are no longer available for this organization' } };
-      const step = await platform.stepUp(keyForm.code.trim(), 'org:key:create');
+      const step = await authorizeStepUp(keyForm.code.trim(), 'org:key:create');
       const out = await platform.request(`/v1/platform/orgs/${encodeURIComponent(orgId)}/keys`, {
         method: 'POST',
         body: {
@@ -160,7 +172,7 @@ function OrganizationDetailContent({ orgId }) {
           ...(keyForm.expiresInDays.trim() ? { expiresInDays: Number(keyForm.expiresInDays) } : {}),
           ...(keyForm.reason.trim() ? { reason: keyForm.reason.trim() } : {}),
         },
-        stepUpToken: step.token,
+        stepUpToken: step?.token,
       });
       setCreateKeyOpen(false);
       setKeyForm({ accountId: '', name: '', scopes: [], expiresInDays: '90', reason: '', code: '' });
@@ -172,15 +184,15 @@ function OrganizationDetailContent({ orgId }) {
 
   const rotateKey = async (key) => {
     if (busy) return;
-    const code = window.prompt(`Enter your authenticator code to rotate ${key.name || key.prefix}:`);
-    if (!code) return;
+    const code = platform.stepUpRequired ? window.prompt(`Enter your authenticator code to rotate ${key.name || key.prefix}:`) : '';
+    if (platform.stepUpRequired && !code) return;
     setBusy(true); setErr(null); setModalErr(null);
     try {
-      const step = await platform.stepUp(code.trim(), 'org:key:rotate');
+      const step = await authorizeStepUp(code.trim(), 'org:key:rotate');
       const out = await platform.request(`/v1/platform/orgs/${encodeURIComponent(orgId)}/keys/${encodeURIComponent(key.id)}/rotate`, {
         method: 'POST',
         body: { graceSeconds: 0 },
-        stepUpToken: step.token,
+        stepUpToken: step?.token,
       });
       setCreatedKey(out);
       setNotice('API key rotated. The previous key is revoked; copy the new secret now.');
@@ -199,7 +211,7 @@ function OrganizationDetailContent({ orgId }) {
           throw { body: { error: 'invalid_body', message: `${k} must be a positive integer or empty (empty = global default)` } };
         }
       }
-      const step = await platform.stepUp(quotaForm.code.trim(), 'org:quota:update');
+      const step = await authorizeStepUp(quotaForm.code.trim(), 'org:quota:update');
       await platform.request(`/v1/platform/orgs/${encodeURIComponent(orgId)}/quotas`, {
         method: 'PUT',
         body: {
@@ -212,7 +224,7 @@ function OrganizationDetailContent({ orgId }) {
           concurrentExecutions: emptyToNull(quotaForm.concurrentExecutions),
           ...(quotaForm.reason.trim() ? { reason: quotaForm.reason.trim() } : {}),
         },
-        stepUpToken: step.token,
+        stepUpToken: step?.token,
       });
       setQuotaForm({ requestsPerMin: '', requestsPer5h: '', requestsPerDay: '', tokensPerDay: '', executionsPerHour: '', concurrentExecutions: '', reason: '', code: '' });
       setNotice(`Quota override saved for ${quotaService}. Effective at the edge within ~30 seconds.`);
@@ -223,10 +235,10 @@ function OrganizationDetailContent({ orgId }) {
   const resetQuota = async (service, code) => {
     if (busy) return; setBusy(true); setErr(null); setModalErr(null);
     try {
-      const step = await platform.stepUp(String(code || '').trim(), 'org:quota:update');
+      const step = await authorizeStepUp(String(code || '').trim(), 'org:quota:update');
       await platform.request(`/v1/platform/orgs/${encodeURIComponent(orgId)}/quotas/${encodeURIComponent(service)}`, {
         method: 'DELETE',
-        stepUpToken: step.token,
+        stepUpToken: step?.token,
       });
       setNotice(`Quota override for ${service} reset to global defaults.`);
       await load(); await loadAudit();
@@ -326,12 +338,12 @@ function OrganizationDetailContent({ orgId }) {
                 {quotaService === 'workflow' && <Field label="Concurrent flows (empty = default)"><Input value={quotaForm.concurrentExecutions} onChange={(e) => setQuotaForm({ ...quotaForm, concurrentExecutions: e.target.value })} placeholder={String(data.quotaDefaults?.workflow?.concurrentExecutions ?? '')} inputMode="numeric" /></Field>}
               </div>
               <Field label="Reason (audit log)"><Input value={quotaForm.reason} onChange={(e) => setQuotaForm({ ...quotaForm, reason: e.target.value })} placeholder="Campaign launch" /></Field>
-              <Field label="Authenticator code"><Input value={quotaForm.code} onChange={(e) => setQuotaForm({ ...quotaForm, code: e.target.value })} autoComplete="one-time-code" required /></Field>
+              <StepUpCodeField value={quotaForm.code} onChange={(e) => setQuotaForm({ ...quotaForm, code: e.target.value })} />
               <div className="flex gap-2">
                 <Btn type="submit" loading={busy}>Save override</Btn>
                 {current.overridden && <Btn type="button" kind="secondary" loading={busy} onClick={() => {
-                  const code = window.prompt('Enter your authenticator code to reset this override to global defaults:');
-                  if (code) resetQuota(quotaService, code);
+                  const code = platform.stepUpRequired ? window.prompt('Enter your authenticator code to reset this override to global defaults:') : '';
+                  if (!platform.stepUpRequired || code) resetQuota(quotaService, code);
                 }}>Reset to default</Btn>}
               </div>
             </form>
@@ -355,11 +367,11 @@ function OrganizationDetailContent({ orgId }) {
       </div>
       <div role="tabpanel">{tabBody()}</div>
 
-      {createAccountOpen && <Modal title="New tenant account" onClose={() => { setCreateAccountOpen(false); setModalErr(null); }}><form onSubmit={createAccount}><Err e={modalErr} /><Field label="Slug"><Input value={form.slug} onChange={(e) => setForm({ ...form, slug: e.target.value })} required /></Field><Field label="Display name"><Input value={form.displayName} onChange={(e) => setForm({ ...form, displayName: e.target.value })} required /></Field><Field label="Reason"><Input value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })} /></Field><Field label="Authenticator code"><Input value={form.code} onChange={(e) => setForm({ ...form, code: e.target.value })} autoComplete="one-time-code" required /></Field><Btn type="submit" loading={busy}>Create account</Btn></form></Modal>}
+      {createAccountOpen && <Modal title="New tenant account" onClose={() => { setCreateAccountOpen(false); setModalErr(null); }}><form onSubmit={createAccount}><Err e={modalErr} /><Field label="Slug"><Input value={form.slug} onChange={(e) => setForm({ ...form, slug: e.target.value })} required /></Field><Field label="Display name"><Input value={form.displayName} onChange={(e) => setForm({ ...form, displayName: e.target.value })} required /></Field><Field label="Reason"><Input value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })} /></Field><StepUpCodeField value={form.code} onChange={(e) => setForm({ ...form, code: e.target.value })} /><Btn type="submit" loading={busy}>Create account</Btn></form></Modal>}
 
-      {createRoleOpen && <Modal title="New organization role" onClose={() => { setCreateRoleOpen(false); setModalErr(null); }}><form onSubmit={createRole}><Err e={modalErr} /><Field label="Account"><select value={roleForm.accountId} onChange={(e) => setRoleForm({ ...roleForm, accountId: e.target.value })} required className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm">{<option value="">Select account</option>}{data?.accounts?.map((a) => <option key={a.id} value={a.id}>{a.slug}</option>)}</select></Field><Field label="Role slug"><Input value={roleForm.slug} onChange={(e) => setRoleForm({ ...roleForm, slug: e.target.value })} required /></Field><Field label="Description"><Input value={roleForm.description} onChange={(e) => setRoleForm({ ...roleForm, description: e.target.value })} /></Field><Field label="Authenticator code"><Input value={roleForm.code} onChange={(e) => setRoleForm({ ...roleForm, code: e.target.value })} autoComplete="one-time-code" required /></Field><Btn type="submit" loading={busy}>Create role</Btn></form></Modal>}
+      {createRoleOpen && <Modal title="New organization role" onClose={() => { setCreateRoleOpen(false); setModalErr(null); }}><form onSubmit={createRole}><Err e={modalErr} /><Field label="Account"><select value={roleForm.accountId} onChange={(e) => setRoleForm({ ...roleForm, accountId: e.target.value })} required className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm">{<option value="">Select account</option>}{data?.accounts?.map((a) => <option key={a.id} value={a.id}>{a.slug}</option>)}</select></Field><Field label="Role slug"><Input value={roleForm.slug} onChange={(e) => setRoleForm({ ...roleForm, slug: e.target.value })} required /></Field><Field label="Description"><Input value={roleForm.description} onChange={(e) => setRoleForm({ ...roleForm, description: e.target.value })} /></Field><StepUpCodeField value={roleForm.code} onChange={(e) => setRoleForm({ ...roleForm, code: e.target.value })} /><Btn type="submit" loading={busy}>Create role</Btn></form></Modal>}
 
-      {createPolicyOpen && <Modal title="New organization policy" onClose={() => { setCreatePolicyOpen(false); setModalErr(null); }}><form onSubmit={createPolicy}><Err e={modalErr} /><Field label="Account"><select value={policyForm.accountId} onChange={(e) => setPolicyForm({ ...policyForm, accountId: e.target.value })} required className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm">{<option value="">Select account</option>}{data?.accounts?.map((a) => <option key={a.id} value={a.id}>{a.slug}</option>)}</select></Field><Field label="Policy slug"><Input value={policyForm.slug} onChange={(e) => setPolicyForm({ ...policyForm, slug: e.target.value })} required /></Field><Field label="Description"><Input value={policyForm.description} onChange={(e) => setPolicyForm({ ...policyForm, description: e.target.value })} /></Field><Field label="Policy JSON"><textarea value={policyForm.document} onChange={(e) => setPolicyForm({ ...policyForm, document: e.target.value })} rows={10} className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-xs font-mono" /></Field><Field label="Authenticator code"><Input value={policyForm.code} onChange={(e) => setPolicyForm({ ...policyForm, code: e.target.value })} autoComplete="one-time-code" required /></Field><Btn type="submit" loading={busy}>Create policy</Btn></form></Modal>}
+      {createPolicyOpen && <Modal title="New organization policy" onClose={() => { setCreatePolicyOpen(false); setModalErr(null); }}><form onSubmit={createPolicy}><Err e={modalErr} /><Field label="Account"><select value={policyForm.accountId} onChange={(e) => setPolicyForm({ ...policyForm, accountId: e.target.value })} required className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-sm">{<option value="">Select account</option>}{data?.accounts?.map((a) => <option key={a.id} value={a.id}>{a.slug}</option>)}</select></Field><Field label="Policy slug"><Input value={policyForm.slug} onChange={(e) => setPolicyForm({ ...policyForm, slug: e.target.value })} required /></Field><Field label="Description"><Input value={policyForm.description} onChange={(e) => setPolicyForm({ ...policyForm, description: e.target.value })} /></Field><Field label="Policy JSON"><textarea value={policyForm.document} onChange={(e) => setPolicyForm({ ...policyForm, document: e.target.value })} rows={10} className="w-full px-3 py-2 rounded-2xl border border-slate-200 text-xs font-mono" /></Field><StepUpCodeField value={policyForm.code} onChange={(e) => setPolicyForm({ ...policyForm, code: e.target.value })} /><Btn type="submit" loading={busy}>Create policy</Btn></form></Modal>}
 
       {createKeyOpen && (
         <Modal title="New tenant API key" onClose={() => { setCreateKeyOpen(false); setModalErr(null); }}>
@@ -392,9 +404,7 @@ function OrganizationDetailContent({ orgId }) {
             <Field label="Reason">
               <Input value={keyForm.reason} onChange={(e) => setKeyForm({ ...keyForm, reason: e.target.value })} />
             </Field>
-            <Field label="Authenticator code">
-              <Input value={keyForm.code} onChange={(e) => setKeyForm({ ...keyForm, code: e.target.value })} autoComplete="one-time-code" required />
-            </Field>
+            <StepUpCodeField value={keyForm.code} onChange={(e) => setKeyForm({ ...keyForm, code: e.target.value })} />
             <Btn type="submit" loading={busy} disabled={!keyForm.accountId || !keyForm.scopes.length}>Create key</Btn>
           </form>
         </Modal>

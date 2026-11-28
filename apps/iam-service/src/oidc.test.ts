@@ -22,7 +22,7 @@ let base = '';
 let server: Server | null = null;
 
 const savedEnv: Record<string, string | undefined> = {};
-for (const k of ['OIDC_ISSUER', 'OIDC_CLIENT_ID', 'OIDC_CLIENT_SECRET', 'OIDC_REDIRECT_URI', 'OIDC_PROVIDER']) {
+for (const k of ['OIDC_ISSUER', 'OIDC_CLIENT_ID', 'OIDC_CLIENT_SECRET', 'OIDC_REDIRECT_URI', 'OIDC_PROVIDER', 'SYNAPSEONE_MFA_ENABLED']) {
   savedEnv[k] = process.env[k];
 }
 function setIdp(baseUrl: string) {
@@ -44,6 +44,7 @@ after(() => {
 before(
   () =>
     new Promise<void>((resolve) => {
+      process.env.SYNAPSEONE_MFA_ENABLED = 'true';
       const app = createApp();
       server = app.listen(0, '127.0.0.1', () => {
         const a = server!.address();
@@ -344,6 +345,34 @@ describe('oidc authorization code flow (stub IdP)', () => {
       assert.equal(verify.status, 200);
       assert.ok(verify.data.accessToken);
     } finally {
+      await stub.close();
+    }
+  });
+
+  it('lets an enrolled OIDC user sign in without a challenge when global MFA is disabled', async () => {
+    const previousMfa = process.env.SYNAPSEONE_MFA_ENABLED;
+    const stub = await startStubIdp('RS256', { email: 'mfa-disabled-sso@example.com', sub: 'mfa-disabled-sso-sub' });
+    try {
+      setIdp(stub.url);
+      await ensureTables();
+      const org = await createOrganization(`mfadisabledoidc${Date.now()}`, 'MFA Disabled OIDC', 'tenant');
+      const user = await upsertUser(org.id, 'mfa-disabled-sso@example.com', 'MFA Disabled SSO');
+      const start = await beginTotpEnrolment(user.id);
+      assert.ok(start);
+      await enableTotp(user.id);
+
+      process.env.SYNAPSEONE_MFA_ENABLED = 'off';
+      const callback = await begin(stub, org.slug);
+      const cb = await call('POST', '/v1/auth/oidc/callback', { code: 'opaque-code', state: callback.data.state }, callback.cookie);
+      assert.equal(cb.status, 200, JSON.stringify(cb.data));
+      assert.ok(cb.data.accessToken);
+      assert.equal(cb.data.error, undefined);
+      assert.equal(cb.data.mfaToken, undefined);
+      assert.equal(stub.stats.tokenRequests, 1);
+      assert.equal(stub.stats.pkceFailures, 0);
+    } finally {
+      if (previousMfa === undefined) delete process.env.SYNAPSEONE_MFA_ENABLED;
+      else process.env.SYNAPSEONE_MFA_ENABLED = previousMfa;
       await stub.close();
     }
   });

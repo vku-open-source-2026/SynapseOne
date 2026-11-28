@@ -103,6 +103,9 @@ platform callers of the tenant-scoped services (faststore/queue).
 
 ## Sign-in with MFA
 
+MFA is optional and disabled by default in the current deployment
+(`SYNAPSEONE_MFA_ENABLED=false`). The following applies only when enabled.
+
 ```python
 from synapseone_sdk import SynapseOneError
 

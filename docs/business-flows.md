@@ -99,7 +99,7 @@ request that created it.
 
 - **Actors:** user, service account, API-key client.
 - **Triggers:** password/OIDC login, refresh, logout, MFA setup/verify, context switch.
-- **Success:** short access JWT + rotating refresh token; MFA challenge completed before session; gateway revalidates the session against IAM within the cache TTL.
+- **Success:** short access JWT + rotating refresh token; when `SYNAPSEONE_MFA_ENABLED=true`, the MFA challenge completes before session; the current deployment disables MFA; gateway revalidates the session against IAM within the cache TTL.
 - **Exceptions:** invalid credentials `401`; inactive `403`; suspended org `403 org_suspended`; lockout `429`; refresh reuse revokes the family.
 - **Idempotency:** consumed refresh tokens cannot be replayed; explicit logout does not revoke sibling sessions.
 - **Acceptance:** suspension/deactivation/revocation takes effect for new requests; a wrong password does not reveal suspension.

@@ -11,6 +11,7 @@ import { signAccess } from './tokens';
 
 let server: Server; let base = '';
 let savedInternalSecret: string | undefined;
+let savedGlobalMfa: string | undefined;
 const PASSWORD = 'context-switch-strong-password';
 const TARGET_PASSWORD = 'target-tenant-strong-password';
 const EMAIL = `context-${Date.now()}@example.test`;
@@ -30,13 +31,17 @@ before(async () => {
   // dotenv may have loaded a deployment secret from .env; this suite models a
   // direct IAM integration test, so do not require the gateway stamp.
   savedInternalSecret = process.env.SYNAPSEONE_INTERNAL_SECRET;
+  savedGlobalMfa = process.env.SYNAPSEONE_MFA_ENABLED;
   delete process.env.SYNAPSEONE_INTERNAL_SECRET;
+  process.env.SYNAPSEONE_MFA_ENABLED = 'true';
   server = createApp().listen(0, '127.0.0.1');
   await new Promise<void>((resolve) => server.once('listening', () => resolve()));
   const a = server.address(); base = `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`;
 });
 after(() => new Promise<void>((resolve) => server.close(() => {
   if (savedInternalSecret !== undefined) process.env.SYNAPSEONE_INTERNAL_SECRET = savedInternalSecret;
+  if (savedGlobalMfa === undefined) delete process.env.SYNAPSEONE_MFA_ENABLED;
+  else process.env.SYNAPSEONE_MFA_ENABLED = savedGlobalMfa;
   resolve();
 })));
 
@@ -173,6 +178,24 @@ describe('authorized identity contexts', () => {
     assert.equal(targetVerified.status, 200, JSON.stringify(targetVerified.data));
     assert.equal(targetVerified.data.user.org_id, orgB.id);
     const switchedToken = targetVerified.data.accessToken;
+
+    // The global kill switch bypasses the target row's enrolled factor too,
+    // without bypassing its password or the caller's session checks.
+    const previousGlobalMfa = process.env.SYNAPSEONE_MFA_ENABLED;
+    process.env.SYNAPSEONE_MFA_ENABLED = 'false';
+    try {
+      const withoutMfa = await call('POST', '/v1/auth/contexts/switch', { orgId: orgB.id, password: TARGET_PASSWORD }, token);
+      assert.equal(withoutMfa.status, 200, JSON.stringify(withoutMfa.data));
+      assert.ok(withoutMfa.data.accessToken);
+      assert.equal(withoutMfa.data.user.org_id, orgB.id);
+      assert.equal(withoutMfa.data.mfaToken, undefined);
+      const wrongTargetPassword = await call('POST', '/v1/auth/contexts/switch', { orgId: orgB.id, password: 'wrong-password-123' }, token);
+      assert.equal(wrongTargetPassword.status, 401);
+      assert.equal(wrongTargetPassword.data.error, 'invalid_credentials');
+    } finally {
+      if (previousGlobalMfa === undefined) delete process.env.SYNAPSEONE_MFA_ENABLED;
+      else process.env.SYNAPSEONE_MFA_ENABLED = previousGlobalMfa;
+    }
 
     // A self-registered row in another org with the same email but no password
     // cannot be selected as a context.

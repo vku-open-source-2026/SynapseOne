@@ -51,12 +51,13 @@ describe('platform super admin', () => {
       new Promise<void>((resolve, reject) => {
         for (const k of ['NODE_ENV', 'DATABASE_URL', 'SYNAPSEONE_INTERNAL_SECRET', 'IAM_ALLOW_DEV_LOGIN',
           'PLATFORM_ADMIN_ENABLED', 'PLATFORM_ADMIN_REQUIRE_MFA', 'PLATFORM_BOOTSTRAP_SECRET', 'PLATFORM_ORG_SLUG',
-          'PLATFORM_SESSION_TTL_SECONDS']) {
+          'PLATFORM_SESSION_TTL_SECONDS', 'SYNAPSEONE_MFA_ENABLED']) {
           saved[k] = process.env[k];
         }
         delete process.env.NODE_ENV;
         delete process.env.DATABASE_URL;
         delete process.env.SYNAPSEONE_INTERNAL_SECRET;
+        process.env.SYNAPSEONE_MFA_ENABLED = 'true';
         process.env.IAM_ALLOW_DEV_LOGIN = 'true';
         process.env.PLATFORM_ADMIN_ENABLED = 'true';
         process.env.PLATFORM_ADMIN_REQUIRE_MFA = 'true';

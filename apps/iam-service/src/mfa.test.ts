@@ -11,19 +11,26 @@ import type { Server } from 'node:http';
 import { createApp } from './index';
 import { verifyAccess } from './tokens';
 import {
-  base32Decode, base32Encode, hotp, openSecret, sealSecret, totp, verifyTotp, verifyMfaChallenge, signMfaChallenge,
+  base32Decode, base32Encode, hotp, isGlobalMfaEnabled, openSecret, sealSecret, totp, verifyTotp, verifyMfaChallenge, signMfaChallenge,
 } from './mfa';
 
 let base = '';
 let server: Server;
+let savedMfaEnabled: string | undefined;
 
 before(async () => {
+  savedMfaEnabled = process.env.SYNAPSEONE_MFA_ENABLED;
+  process.env.SYNAPSEONE_MFA_ENABLED = 'true';
   const app = createApp();
   await new Promise<void>((resolve) => { server = app.listen(0, '127.0.0.1', () => resolve()); });
   const a = server.address();
   base = `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`;
 });
-after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+after(() => new Promise<void>((resolve) => server.close(() => {
+  if (savedMfaEnabled === undefined) delete process.env.SYNAPSEONE_MFA_ENABLED;
+  else process.env.SYNAPSEONE_MFA_ENABLED = savedMfaEnabled;
+  resolve();
+})));
 
 async function call(method: string, path: string, body?: any, token?: string) {
   const r = await fetch(base + path, {
@@ -59,6 +66,25 @@ async function enrol(token: string) {
 }
 
 describe('TOTP primitives', () => {
+  it('enables MFA by default and accepts explicit false-like kill-switch values', () => {
+    const previous = process.env.SYNAPSEONE_MFA_ENABLED;
+    try {
+      delete process.env.SYNAPSEONE_MFA_ENABLED;
+      assert.equal(isGlobalMfaEnabled(), true);
+      for (const value of ['false', '0', 'off', 'no', ' OFF ', 'No']) {
+        process.env.SYNAPSEONE_MFA_ENABLED = value;
+        assert.equal(isGlobalMfaEnabled(), false, value);
+      }
+      for (const value of ['true', '1', 'on', 'yes']) {
+        process.env.SYNAPSEONE_MFA_ENABLED = value;
+        assert.equal(isGlobalMfaEnabled(), true, value);
+      }
+    } finally {
+      if (previous === undefined) delete process.env.SYNAPSEONE_MFA_ENABLED;
+      else process.env.SYNAPSEONE_MFA_ENABLED = previous;
+    }
+  });
+
   it('matches the RFC 6238 SHA-1 test vector', () => {
     const secret = Buffer.from('12345678901234567890');
     assert.equal(hotp(secret, Math.floor(59 / 30), 8), '94287082');
@@ -110,6 +136,7 @@ describe('MFA sign-in flow', () => {
     const reg = await register('mfa-flow', 'alice@mfa.local');
     const status0 = await call('GET', '/v1/auth/mfa', undefined, reg.accessToken);
     assert.equal(status0.data.enabled, false);
+    assert.equal(status0.data.available, true);
 
     const { secret, recoveryCodes } = await enrol(reg.accessToken);
     assert.equal(recoveryCodes.length, 10);

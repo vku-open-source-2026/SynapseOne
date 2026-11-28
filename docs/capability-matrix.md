@@ -30,7 +30,7 @@ routes are intentionally outside that catalog.
 | API key | create, list, get by id, rotate, revoke, verify | verified; secret is returned only at create/rotate |
 | Service account | create, list, get by id, mint token, grant/revoke role, revoke | verified; tokens are account-bound |
 | Session | list, revoke one, revoke all, refresh rotation | verified |
-| MFA | status, TOTP setup/enable, recovery codes, disable, admin reset | verified |
+| MFA | optional status, TOTP setup/enable, recovery codes, disable, admin reset | verified; disabled by default via `SYNAPSEONE_MFA_ENABLED=false` |
 | SCIM | users/groups/tokens | implemented; not claimed as full SCIM 2.0 compliance |
 | Platform admin | list, grant/revoke, last-owner guard | verified; step-up for sensitive mutations |
 | Audit / usage | list, filter, export, ingest (internal) | verified; tenant-scoped |

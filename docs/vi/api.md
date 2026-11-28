@@ -44,6 +44,10 @@ rate/quota vượt trả 429; upstream lỗi 502/504.
 
 ### MFA TOTP và lockout
 
+MFA là tùy chọn. Deployment hiện đặt `SYNAPSEONE_MFA_ENABLED=false`; status trả
+`available:false`, mutation trả `403 mfa_disabled`, và đăng nhập không phát
+`mfa_required`.
+
 - `GET /v1/auth/mfa`;
 - `POST /v1/auth/mfa/totp/setup`;
 - `POST /v1/auth/mfa/totp/enable {code}` → recovery codes một lần;
@@ -228,7 +232,7 @@ Provider key server-side. AI assistant guidance-only, không thay thế authz.
 ## Platform Super Admin (`/v1/platform`)
 
 Chỉ human platform token; tenant token chỉ dùng `/v1/platform/session` để đổi.
-Mutation cần step-up.
+Mutation cần step-up khi `SYNAPSEONE_MFA_ENABLED=true`; deployment hiện tặt MFA.
 
 | Method | Path | Mô tả |
 |---|---|---|

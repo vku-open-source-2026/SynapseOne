@@ -6,6 +6,12 @@ Platform Super Admin là **mặt điều khiển cross-tenant do con người v�
 tách biệt với `users.is_org_admin` (phạm vi tenant) và caller nền tảng nội bộ
 `SYNAPSEONE_INTERNAL_SECRET`.
 
+> **Switch MFA:** deployment hiện đặt `SYNAPSEONE_MFA_ENABLED=false`, nên đăng
+> nhập mật khẩu/SSO là đủ và các thao tác platform không hỏi TOTP/step-up. Đặt
+> switch về `true` để khôi phục luồng bảo mật chặt chẽ bên dưới. Khi bật lại,
+> thu hồi session đang hoạt động (hoặc tăng `auth_version`) để session chỉ mật
+> khẩu cũ không giữ nguyên mức bảo đảm trước đó.
+
 ## Mô hình bảo mật
 
 - Quản trị viên nền tảng là user trong tổ chức nền tảng dành riêng

@@ -158,6 +158,9 @@ Returns the user record behind the current Bearer token.
 
 ### Multi-factor authentication (`c.iam`)
 
+MFA is optional and disabled in the current deployment
+(`SYNAPSEONE_MFA_ENABLED=false`). The following applies only when enabled.
+
 When an account has MFA, `loginWithPassword` (or dev `login`) rejects with a
 `SynapseOneError` whose `status` is `401` and `body.error` is `'mfa_required'`;
 finish with the `mfaToken` from that body.
@@ -175,7 +178,7 @@ try {
 
 const { secret, otpauthUrl } = await c.iam.setupTotp();     // show otpauthUrl as a QR code
 const { recoveryCodes } = await c.iam.enableTotp('123456'); // shown once
-await c.iam.mfaStatus();                                    // {enabled, recoveryCodesRemaining, ...}
+await c.iam.mfaStatus();                                    // {enabled, available, recoveryCodesRemaining, ...}
 await c.iam.regenerateRecoveryCodes('123456');
 await c.iam.disableMfa({ code: '123456' });                 // or { recoveryCode }
 await c.iam.resetUserMfa(userId);                           // org admins: lost device

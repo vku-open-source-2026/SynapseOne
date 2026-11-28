@@ -14,9 +14,9 @@ Format based on Keep a Changelog; versioning follows SemVer.
   authoritative UDP/TCP DNS, zone/record management, an outbound-only HTTP
   tunnel connector, host/path ingress routing, atomic JSON persistence,
   Docker/Compose deployment, bilingual operations docs and four-language service
-  guides. Management is now available through MFA-protected Platform Admin
-  Console pages and narrow gateway proxy routes; Tier-2/3 integration remains
-  intentionally pending.
+  guides. Management is now available through Platform Admin Console pages and
+  narrow gateway proxy routes; MFA is optional and disabled in the current
+  deployment. Tier-2/3 integration remains intentionally pending.
 - **Console service naming:** Gateway & Ops is hidden from the service tray but
   remains in Docs, and the tenant search service is branded **SynapseSearch**.
 - **Organization-owned edge management:** SynapseDNS zones and Synapse Tunnel
@@ -62,6 +62,10 @@ Format based on Keep a Changelog; versioning follows SemVer.
   `sdk-rust-v*` continues to publish the Rust crate.
 
 ### Security
+- **Password/SSO-only mode:** `SYNAPSEONE_MFA_ENABLED=false` is now the
+  Compose/K8s default. It skips TOTP login challenges, platform MFA exchange and
+  step-up proofs while retaining password lockout, session revocation and audit.
+  Set it to `true` to restore MFA without code changes.
 - **Workflow approval checkpoints:** a paused execution now stores the exact
   engine-created `pause_task_id`/`pause_node`; API-created or legacy tasks can no
   longer resume it (`not_pause_checkpoint`). Inline webhook/cron/test runs now

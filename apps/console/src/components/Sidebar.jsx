@@ -24,6 +24,7 @@ import {
   faGauge,
 } from '@fortawesome/free-solid-svg-icons';
 import { useI18n } from '../lib/i18n-context.js';
+import { mfaEnabled } from '../lib/site.js';
 import BrandSymbol from './BrandSymbol.jsx';
 
 const CORE_ITEMS = [
@@ -46,9 +47,14 @@ const DOC_ITEMS = [
   { to: '/docs', key: 'docs', icon: faBook, match: (p) => p.startsWith('/docs') },
 ];
 
+export function coreNavItems() {
+  return CORE_ITEMS.filter((item) => item.to !== '/security' || mfaEnabled());
+}
+
 export default function Sidebar() {
   const { pathname } = useLocation();
   const { m } = useI18n();
+  const items = coreNavItems();
   return (
     <aside
       aria-label="Core Navigation"
@@ -64,7 +70,7 @@ export default function Sidebar() {
         <div className="px-3 pb-1 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
           {m.console.core}
         </div>
-        {CORE_ITEMS.map((it) => {
+        {items.map((it) => {
           const active = it.match(pathname);
           return (
             <Link

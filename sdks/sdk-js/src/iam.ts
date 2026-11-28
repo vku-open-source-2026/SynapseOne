@@ -280,7 +280,7 @@ export class IamService {
     );
   }
   mfaStatus() {
-    return this.http.req<{ enabled: boolean; pending: boolean; methods: string[]; recoveryCodesRemaining: number; enabledAt: string | null }>('/v1/auth/mfa');
+    return this.http.req<{ enabled: boolean; available: boolean; pending: boolean; methods: string[]; recoveryCodesRemaining: number; enabledAt: string | null }>('/v1/auth/mfa');
   }
   /** Start TOTP enrolment: show `otpauthUrl` as a QR code, then call enableTotp. */
   setupTotp() {

@@ -1,5 +1,8 @@
 # Platform Super Admin — account and login
 
+> Current Compose default: `SYNAPSEONE_MFA_ENABLED=false`. Password/SSO is
+> sufficient; the TOTP and step-up steps below apply only after re-enabling MFA.
+
 This page documents the **real Platform Owner account** created on the isolated
 local development stack. It contains no secrets. The password, TOTP secret and
 recovery codes are stored only in the Git-ignored file:

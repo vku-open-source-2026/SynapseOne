@@ -28,6 +28,16 @@ export const TOTP_PERIOD = 30;
 export const TOTP_DIGITS = 6;
 const TOTP_WINDOW = 1; // accept one step of clock drift either side
 
+/**
+ * Global MFA feature switch. Unset keeps the historical MFA behaviour; only
+ * explicit false-like values disable it. Read the environment on every call so
+ * the flag remains consistent with the service's other runtime settings.
+ */
+export function isGlobalMfaEnabled(): boolean {
+  const value = String(process.env.SYNAPSEONE_MFA_ENABLED ?? 'true').trim().toLowerCase();
+  return value !== 'false' && value !== '0' && value !== 'off' && value !== 'no';
+}
+
 export function base32Encode(buf: Buffer): string {
   let bits = 0;
   let value = 0;

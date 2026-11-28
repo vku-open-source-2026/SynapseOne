@@ -4,20 +4,26 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Link, Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../lib/auth.jsx';
 import { usePlatformAuth } from '../lib/platform-auth.jsx';
+import { mfaEnabled } from '../lib/site.js';
+import { platformMfaFormRequired } from '../lib/mfa.js';
+import { useI18n } from '../lib/i18n-context.js';
 import { Badge, Btn, Card, Err, Field, Input, PageTitle } from './ui.jsx';
 
 export default function PlatformGuard({ children }) {
   const { auth, logout } = useAuth();
   const platform = usePlatformAuth();
+  const { m } = useI18n();
+  const t = m.platform;
+  const mfa = mfaEnabled();
   const loc = useLocation();
   const nav = useNavigate();
   const [code, setCode] = useState('');
   const [localErr, setLocalErr] = useState(null);
   const attemptedAutoExchange = useRef(false);
 
-  // A platform administrator who just completed password/TOTP login already
-  // has a fresh second factor. Try the exchange without a code first; only
-  // fall back to the code form when the backend asks for a new factor.
+  // A platform administrator who just completed sign-in already has the
+  // authentication this deployment requires. Try the exchange without a code
+  // first; a server MFA challenge overrides the runtime feature hint.
   useEffect(() => {
     if (!auth || platform.session || attemptedAutoExchange.current) return;
     const contexts = Array.isArray(auth.contexts) ? auth.contexts : [];
@@ -34,9 +40,9 @@ export default function PlatformGuard({ children }) {
   if (platform.busy && !platform.exchangeError) {
     return (
       <div className="mx-auto max-w-xl px-4 pt-24">
-        <PageTitle title="Platform Super Admin" sub="Opening your isolated administrator session" />
+        <PageTitle title={t.title} sub={t.openingSub} />
         <Card>
-          <p className="text-sm text-normal-text">Verifying the MFA you just completed at sign-in…</p>
+          <p className="text-sm text-normal-text">{mfa ? t.verifyingMfa : t.verifyingSession}</p>
         </Card>
       </div>
     );
@@ -48,21 +54,22 @@ export default function PlatformGuard({ children }) {
   if (contextsLoaded && hasPlatformContext && auth.currentContext?.type !== 'platform') {
     return (
       <div className="mx-auto max-w-xl px-4 pt-24">
-        <PageTitle title="Platform administration" sub="Sign in with the platform organization" />
+        <PageTitle title={t.contextTitle} sub={t.contextSub} />
         <Card>
           <p className="text-sm text-normal-text">
-            Your current session belongs to a tenant organization. Platform administration is bound to the
-            platform organization account and requires its own sign-in plus a fresh MFA code. Sign in to{' '}
-            <code className="font-mono">{platformCtx.slug}</code> to continue.
+            {t.tenantContextBefore}{' '}
+            <code className="font-mono">{platformCtx.slug}</code>{' '}
+            {mfa ? t.tenantContextMfa : t.tenantContextNoMfa}{' '}
+            {t.signInPrompt}
           </p>
           <Btn className="mt-4" onClick={() => {
             try { sessionStorage.setItem('synapseone.login.prefillOrg', platformCtx.slug); } catch { /* storage blocked */ }
             logout();
             nav('/login', { replace: true, state: { prefillOrg: platformCtx.slug, platformContext: true } });
           }}>
-            Sign in with the platform organization
+            {t.signInPlatform}
           </Btn>
-          <Link to="/dashboard" className="block mt-3 text-sm text-main-blue">Return to the tenant console</Link>
+          <Link to="/dashboard" className="block mt-3 text-sm text-main-blue">{t.returnTenant}</Link>
         </Card>
       </div>
     );
@@ -70,12 +77,10 @@ export default function PlatformGuard({ children }) {
   if (contextsLoaded && !hasPlatformContext) {
     return (
       <div className="mx-auto max-w-xl px-4 pt-24">
-        <PageTitle title="Platform administration" sub="Platform Administrator required" />
+        <PageTitle title={t.contextTitle} sub={t.adminRequiredSub} />
         <Card>
-          <p className="text-sm text-normal-text">
-            This account is not an active Platform Administrator. Use the tenant console for organization resources.
-          </p>
-          <Link to="/dashboard"><Btn className="mt-4">Return to tenant console</Btn></Link>
+          <p className="text-sm text-normal-text">{t.notAdmin}</p>
+          <Link to="/dashboard"><Btn className="mt-4">{t.returnTenant}</Btn></Link>
         </Card>
       </div>
     );
@@ -84,13 +89,11 @@ export default function PlatformGuard({ children }) {
   if (auth.apiKey) {
     return (
       <div className="mx-auto max-w-xl px-4 pt-24">
-        <PageTitle title="Platform administration" sub="A human user session is required" />
+        <PageTitle title={t.contextTitle} sub={t.humanSub} />
         <Card>
-          <p className="text-sm text-normal-text">
-            API-key sessions cannot open the platform console. Sign in with a password or SSO user, then enrol TOTP MFA.
-          </p>
+          <p className="text-sm text-normal-text">{mfa ? t.apiKeyWithMfa : t.apiKeyNoMfa}</p>
           <Btn className="mt-4" onClick={() => { logout(); nav('/login', { replace: true }); }}>
-            Sign out and sign in as a user
+            {t.signOutUser}
           </Btn>
         </Card>
       </div>
@@ -107,43 +110,48 @@ export default function PlatformGuard({ children }) {
     }
   };
 
+  const retryExchange = () => {
+    setLocalErr(null);
+    platform.exchange('').catch((err) => setLocalErr(err));
+  };
+
   const error = localErr || platform.exchangeError;
   const errCode = error?.code;
   const errorMessage = String(error?.body?.message || '');
-  const mfaNotEnabled = errCode === 'platform_mfa_required' && /enable TOTP/i.test(errorMessage);
-  const knownState = ['platform_admin_required', 'platform_admin_inactive', 'platform_admin_org_required', 'platform_mfa_required', 'not_found'].includes(errCode);
+  const showMfaForm = platformMfaFormRequired(mfa, error);
+  const mfaNotEnabled = mfa && errCode === 'platform_mfa_required' && /enable TOTP/i.test(errorMessage);
+  const knownState = ['platform_admin_required', 'platform_admin_inactive', 'platform_admin_org_required', 'not_found'].includes(errCode)
+    || (mfa && errCode === 'platform_mfa_required');
 
   return (
     <div className="mx-auto max-w-xl px-4 pt-24">
-      <PageTitle title="Platform Super Admin" sub="Step-up authentication required" />
+      <PageTitle title={t.title} sub={showMfaForm ? t.stepUpSub : t.exchangeSub} />
       <Card>
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            <p className="text-sm text-main-text font-medium">Enter a fresh authenticator code</p>
-            <p className="text-xs text-normal-text mt-1">
-              The platform console uses a short-lived, isolated administrator session.
-            </p>
+        {showMfaForm && (
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <p className="text-sm text-main-text font-medium">{t.enterCode}</p>
+              <p className="text-xs text-normal-text mt-1">{t.isolatedSession}</p>
+            </div>
+            <Badge tone="amber">{t.mfaBadge}</Badge>
           </div>
-          <Badge tone="amber">MFA</Badge>
-        </div>
+        )}
         {error && !knownState && <div className="mt-4"><Err e={error} /></div>}
         {mfaNotEnabled && (
           <p className="mt-3 text-sm text-amber-600">
-            TOTP MFA must be enabled on your account first. <Link to="/security" className="underline">Open Security</Link>.
+            {t.enrollMfa} <Link to="/security" className="underline">{t.openSecurity}</Link>.
           </p>
         )}
         {errCode === 'not_found' ? (
-          <p className="mt-3 text-sm text-amber-600">Platform administration is disabled on this deployment.</p>
+          <p className="mt-3 text-sm text-amber-600">{t.deploymentDisabled}</p>
         ) : errCode === 'platform_admin_org_required' ? (
-          <p className="mt-3 text-sm text-red-600">This account is not a member of the reserved platform organization.</p>
+          <p className="mt-3 text-sm text-red-600">{t.reservedOrg}</p>
         ) : errCode === 'platform_admin_required' || errCode === 'platform_admin_inactive' ? (
-          <p className="mt-3 text-sm text-red-600">
-            This account is not an active platform administrator.
-          </p>
-        ) : (
+          <p className="mt-3 text-sm text-red-600">{t.notActiveAdmin}</p>
+        ) : showMfaForm ? (
           <form onSubmit={submit} className="mt-4 flex flex-col sm:flex-row gap-2 sm:items-end">
             <div className="sm:w-52">
-              <Field label="Authenticator or recovery code">
+              <Field label={t.codeLabel}>
                 <Input
                   value={code}
                   onChange={(e) => setCode(e.target.value)}
@@ -154,11 +162,16 @@ export default function PlatformGuard({ children }) {
                 />
               </Field>
             </div>
-            <Btn type="submit" loading={platform.busy} className="mb-3" disabled={!code.trim()}>Continue</Btn>
+            <Btn type="submit" loading={platform.busy} className="mb-3" disabled={!code.trim()}>{t.continue}</Btn>
           </form>
+        ) : !knownState && (
+          <div className="mt-4">
+            {!error && <p className="text-sm text-normal-text">{t.exchangeReady}</p>}
+            <Btn onClick={retryExchange} loading={platform.busy}>{t.retry}</Btn>
+          </div>
         )}
         <p className="mt-4 text-xs text-normal-text">
-          Not a platform administrator? <Link to="/dashboard" className="text-main-blue">Return to the tenant console</Link>.
+          {t.notAdminQuestion} <Link to="/dashboard" className="text-main-blue">{t.returnTenant}</Link>.
         </p>
       </Card>
     </div>

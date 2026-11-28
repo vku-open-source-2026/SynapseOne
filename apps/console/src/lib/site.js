@@ -41,3 +41,19 @@ export function appLoginUrl() {
 export function appDashboardUrl() {
   return `${appUrl()}/dashboard`;
 }
+
+// Runtime config is authoritative; VITE_SYNAPSEONE_MFA_ENABLED is the build-time
+// fallback for local development. MFA stays opt-out so older config.js files do
+// not accidentally weaken sign-in.
+export function mfaEnabled() {
+  const runtime = typeof window !== 'undefined' ? window.SYNAPSEONE_CONFIG?.MFA_ENABLED : undefined;
+  const configured = runtime ?? import.meta.env?.VITE_SYNAPSEONE_MFA_ENABLED;
+  if (configured === undefined || configured === null || configured === '') return true;
+  if (typeof configured === 'boolean') return configured;
+  if (typeof configured === 'number') return configured !== 0;
+
+  const value = String(configured).trim().toLowerCase();
+  if (['false', '0', 'off', 'no'].includes(value)) return false;
+  if (['true', '1', 'on', 'yes'].includes(value)) return true;
+  return true;
+}

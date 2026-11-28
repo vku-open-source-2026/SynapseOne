@@ -26,6 +26,7 @@ import { PLATFORM_SERVICES } from './ServicesSidebar.jsx';
 import { SERVICE_ICONS } from '../lib/service-icons.js';
 import SiteToggles from './SiteToggles.jsx';
 import StableLabel from './StableLabel.jsx';
+import { coreNavItems } from './Sidebar.jsx';
 import { useI18n } from '../lib/i18n-context.js';
 
 const PICK = 'px-2 py-1.5 rounded-2xl border border-slate-200 text-xs bg-white outline-none w-32 truncate';
@@ -60,6 +61,20 @@ function ScopePicks({ scope, onDone }) {
   );
 }
 
+
+export function MobileCoreLinks({ onNavigate }) {
+  const { m } = useI18n();
+  return coreNavItems().map((item) => (
+    <Link
+      key={item.to}
+      to={item.to}
+      onClick={onNavigate}
+      className="block py-1.5 text-main-text text-sm hover:text-main-blue"
+    >
+      {m.console.nav[item.key]}
+    </Link>
+  ));
+}
 
 export function MobileServiceLinks({ onNavigate }) {
   const { m } = useI18n();
@@ -218,18 +233,7 @@ export default function Topbar({ servicesOpen = true, onToggleServices }) {
             <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 py-1">
               {m.console.core}
             </div>
-            {['dashboard', 'orgs', 'accounts', 'users', 'roles', 'policies', 'keys', 'service-accounts', 'authorize', 'audit', 'security'].map(
-              (r) => (
-                <Link
-                  key={r}
-                  to={`/${r}`}
-                  onClick={() => setOpen(false)}
-                  className="block py-1.5 text-main-text text-sm hover:text-main-blue"
-                >
-                  {m.console.nav[r.replace(/-(\w)/g, (_, c) => c.toUpperCase())]}
-                </Link>
-              ),
-            )}
+            <MobileCoreLinks onNavigate={() => setOpen(false)} />
 
             {/* Services Section */}
             <div className="mt-3 pt-2 border-t border-slate-100 text-[11px] font-semibold uppercase tracking-wider text-main-blue py-1">

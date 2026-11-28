@@ -95,6 +95,9 @@ emit a `DeprecationWarning` pointing at the namespaced replacement.
 
 ## Sign-in with MFA
 
+MFA is optional and disabled by default in the current deployment
+(`SYNAPSEONE_MFA_ENABLED=false`). The following applies only when enabled.
+
 ```ts
 import { SynapseOneError } from '@synapseone/sdk';
 

@@ -6,7 +6,7 @@
 ## Purpose
 
 IAM owns users, organizations, accounts, roles, policies, API keys, service
-accounts, sessions, MFA, SCIM provisioning, audit records, and usage telemetry.
+accounts, sessions, optional MFA, SCIM provisioning, audit records, and usage telemetry.
 It is also the authority used by the gateway for scope and policy decisions.
 
 See [API reference](../api.md), [IAM model](../iam-model.md), and
@@ -18,7 +18,7 @@ See [API reference](../api.md), [IAM model](../iam-model.md), and
 | --- | --- | --- |
 | POST | `/v1/auth/login` | Password or development passwordless login. |
 | POST | `/v1/auth/register` | First-party registration. |
-| POST | `/v1/auth/mfa/verify` | Complete an MFA challenge. |
+| POST | `/v1/auth/mfa/verify` | Complete an MFA challenge when MFA is enabled. |
 | POST | `/v1/auth/refresh`, `/v1/auth/logout`, `/v1/auth/logout-all` | Rotate or revoke refresh sessions. |
 | GET | `/v1/auth/verify`, `/v1/auth/me`, `/v1/auth/sessions`, `/v1/auth/contexts` | Current identity and sessions. |
 | GET/POST/PATCH | `/v1/orgs[/:orgId]` | List, create, and rename organizations. |

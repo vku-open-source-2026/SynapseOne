@@ -51,7 +51,7 @@ import {
   revokeExecutionDelegations,
 } from './tokens';
 import {
-  beginTotpEnrolment, checkSecondFactor, clearLoginFailures, enableTotp, getMfa, lockRemaining, mfaEnabled,
+  beginTotpEnrolment, checkSecondFactor, clearLoginFailures, enableTotp, getMfa, isGlobalMfaEnabled, lockRemaining, mfaEnabled,
   otpauthUrl, recordLoginFailure, regenerateRecoveryCodes, removeMfa, signMfaChallenge, verifyMfaChallenge,
   TOTP_DIGITS, TOTP_PERIOD,
 } from './mfa';
@@ -431,6 +431,15 @@ function platformFeatureEnabled(): boolean {
   return (process.env.PLATFORM_ADMIN_ENABLED ?? (IS_PROD ? 'false' : 'true')) === 'true';
 }
 
+/** The global kill switch overrides both platform-specific MFA settings. */
+function platformMfaRequired(): boolean {
+  return isGlobalMfaEnabled() && (process.env.PLATFORM_ADMIN_REQUIRE_MFA ?? 'true') === 'true';
+}
+
+function platformStepUpRequired(): boolean {
+  return isGlobalMfaEnabled() && (process.env.PLATFORM_ADMIN_REQUIRE_STEP_UP ?? 'true') === 'true';
+}
+
 const PLATFORM_ROLE_RANK: Record<string, number> = { auditor: 1, operator: 2, owner: 3 };
 const PLATFORM_STEP_UP_ACTIONS = new Set([
   'org:create',
@@ -527,7 +536,7 @@ async function currentPlatformAdmin(
     res.status(403).json({ error: 'platform_admin_org_required', message: 'platform administrators must belong to the platform organization' });
     return null;
   }
-  const requireMfa = (process.env.PLATFORM_ADMIN_REQUIRE_MFA ?? 'true') === 'true';
+  const requireMfa = platformMfaRequired();
   if (requireMfa && !(await mfaEnabled(user.id))) {
     await auditPlatformDenied(req, user.id, user.org_id, 'platform:access', 'mfa_not_enabled');
     res.status(403).json({ error: 'platform_mfa_required', message: 'enable TOTP MFA before using the platform console' });
@@ -609,7 +618,7 @@ async function requirePlatformStepUp(
   ctx: { claims: any; user: User },
   action: string,
 ): Promise<boolean> {
-  if ((process.env.PLATFORM_ADMIN_REQUIRE_STEP_UP ?? 'true') !== 'true') return true;
+  if (!platformStepUpRequired()) return true;
   const token = firstHeader(req.headers['x-platform-step-up'] as any);
   const sessionJti = String(ctx.claims?.jti || '');
   const claims = token ? verifyPlatformStepUp(token, ctx.user.id, action, sessionJti) : null;
@@ -840,6 +849,11 @@ function sendMfaChallenge(res: express.Response, userId: string, method: string)
     ...signMfaChallenge(userId, method),
     methods: ['totp', 'recovery'],
   });
+}
+
+function sendMfaDisabled(res: express.Response) {
+  noStore(res);
+  return res.status(403).json({ error: 'mfa_disabled', message: 'MFA is disabled by the server administrator.' });
 }
 
 /** Self-service MFA calls need a real user session (not a key or delegated token). */
@@ -1107,6 +1121,9 @@ function parseUsageFilter(req: express.Request): { filter?: UsageQueryFilter; er
 }
 
 export function createApp(): express.Express {
+  if (!isGlobalMfaEnabled()) {
+    console.warn('[iam][security] SYNAPSEONE_MFA_ENABLED=false: local MFA and platform step-up are disabled deployment-wide.');
+  }
   // Fail-closed production guards (checked at boot, before serving anything).
   if (IS_PROD) {
     if ((process.env.IAM_ALLOW_DEV_LOGIN || 'false') === 'true') {
@@ -1125,11 +1142,13 @@ export function createApp(): express.Express {
       throw new Error('[iam] IAM_SENSITIVE_MUTATION_MODE must be enforce in production (audit/off silently allows member privilege escalation).');
     }
     if (platformFeatureEnabled()) {
-      if ((process.env.PLATFORM_ADMIN_REQUIRE_MFA ?? 'true') !== 'true') {
-        throw new Error('[iam] PLATFORM_ADMIN_REQUIRE_MFA must be true when the platform console is enabled in production.');
-      }
-      if ((process.env.PLATFORM_ADMIN_REQUIRE_STEP_UP ?? 'true') !== 'true') {
-        throw new Error('[iam] PLATFORM_ADMIN_REQUIRE_STEP_UP must be true when the platform console is enabled in production.');
+      if (isGlobalMfaEnabled()) {
+        if ((process.env.PLATFORM_ADMIN_REQUIRE_MFA ?? 'true') !== 'true') {
+          throw new Error('[iam] PLATFORM_ADMIN_REQUIRE_MFA must be true when the platform console is enabled in production.');
+        }
+        if ((process.env.PLATFORM_ADMIN_REQUIRE_STEP_UP ?? 'true') !== 'true') {
+          throw new Error('[iam] PLATFORM_ADMIN_REQUIRE_STEP_UP must be true when the platform console is enabled in production.');
+        }
       }
       const slug = process.env.PLATFORM_ORG_SLUG || 'synapseone-platform';
       if (!/^[a-z0-9-]{1,64}$/.test(slug)) {
@@ -1537,9 +1556,10 @@ async function auditMutation(req: express.Request, action: string, resource: str
           if (user.active === false) return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated.' });
           const oidcOrg = await getOrgById(user.org_id);
           if (oidcOrg && oidcOrg.status === 'suspended') return orgSuspendedResponse(res);
-          // Do not silently bypass local MFA assurance. Users with an enrolled
-          // TOTP factor must complete it even when the upstream IdP signed them in.
-          if (await mfaEnabled(user.id)) {
+          // Do not silently bypass local MFA assurance unless the global kill
+          // switch is off. Enrolled TOTP factors otherwise remain mandatory even
+          // when the upstream IdP signed the user in.
+          if (isGlobalMfaEnabled() && await mfaEnabled(user.id)) {
             const left = await lockRemaining(user.id);
             if (left > 0) return sendLocked(res, left);
             return sendMfaChallenge(res, user.id, 'oidc');
@@ -1584,7 +1604,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       if (user.active === false) return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated.' });
       const demoOrg = await getOrgById(user.org_id);
       if (demoOrg && demoOrg.status === 'suspended') return orgSuspendedResponse(res);
-      if (await mfaEnabled(user.id)) return sendMfaChallenge(res, user.id, 'oidc');
+      if (isGlobalMfaEnabled() && await mfaEnabled(user.id)) return sendMfaChallenge(res, user.id, 'oidc');
       const session = await sessionWithContexts(await issueSession(user), user);
       noStore(res);
       res.json(session);
@@ -2008,9 +2028,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
         return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated by an administrator.' });
       }
       if (org && org.status === 'suspended') return orgSuspendedResponse(res);
-      // Second factor: the password alone never yields a session. Failures
-      // keep counting until the whole login succeeds.
-      if (await mfaEnabled(user.id)) return sendMfaChallenge(res, user.id, 'pwd');
+      // Second factor: when enabled globally, the password alone never yields
+      // a session for an enrolled user. Failures count until login succeeds.
+      if (isGlobalMfaEnabled() && await mfaEnabled(user.id)) return sendMfaChallenge(res, user.id, 'pwd');
       await clearLoginFailures(user.id);
       const session = await sessionWithContexts(await issueSession(user), user);
       await logAudit({
@@ -2037,7 +2057,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (user.active === false) {
       return res.status(403).json({ error: 'account_deactivated', message: 'This account has been deactivated by an administrator.' });
     }
-    if (await mfaEnabled(user.id)) {
+    if (isGlobalMfaEnabled() && await mfaEnabled(user.id)) {
       const left = await lockRemaining(user.id);
       if (left > 0) return sendLocked(res, left);
       return sendMfaChallenge(res, user.id, 'dev');
@@ -2050,6 +2070,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
   // ---------- Multi-factor authentication (TOTP) ----------
   // Step 2 of a login that returned 401 mfa_required.
   app.post('/v1/auth/mfa/verify', mfaLimiter, async (req, res) => {
+    if (!isGlobalMfaEnabled()) return sendMfaDisabled(res);
     const parsed = z.object({
       mfaToken: z.string().min(1).max(4096),
       code: z.string().trim().max(16).nullish(),
@@ -2094,11 +2115,13 @@ async function auditMutation(req: express.Request, action: string, resource: str
   app.get('/v1/auth/mfa', mfaLimiter, async (req, res) => {
     const caller = await requireUserCaller(req, res);
     if (!caller) return;
-    const rec = await getMfa(caller.id);
+    const globallyEnabled = isGlobalMfaEnabled();
+    const rec = globallyEnabled ? await getMfa(caller.id) : null;
     noStore(res);
     res.json({
-      enabled: !!rec?.enabled,
-      pending: !!rec && !rec.enabled,
+      enabled: globallyEnabled && !!rec?.enabled,
+      available: globallyEnabled,
+      pending: globallyEnabled && !!rec && !rec.enabled,
       methods: rec?.enabled ? ['totp', 'recovery'] : [],
       recoveryCodesRemaining: rec?.enabled ? rec.recovery_hashes.length : 0,
       enabledAt: rec?.enabled_at ?? null,
@@ -2106,6 +2129,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
   });
 
   app.post('/v1/auth/mfa/totp/setup', mfaLimiter, async (req, res) => {
+    if (!isGlobalMfaEnabled()) return sendMfaDisabled(res);
     const caller = await requireUserCaller(req, res);
     if (!caller) return;
     const started = await beginTotpEnrolment(caller.id);
@@ -2115,6 +2139,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
   });
 
   app.post('/v1/auth/mfa/totp/enable', mfaLimiter, async (req, res) => {
+    if (!isGlobalMfaEnabled()) return sendMfaDisabled(res);
     const caller = await requireUserCaller(req, res);
     if (!caller) return;
     const parsed = z.object({ code: z.string().trim().max(16) }).safeParse(req.body);
@@ -2134,6 +2159,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
   });
 
   app.post('/v1/auth/mfa/recovery-codes', mfaLimiter, async (req, res) => {
+    if (!isGlobalMfaEnabled()) return sendMfaDisabled(res);
     const caller = await requireUserCaller(req, res);
     if (!caller) return;
     const parsed = z.object({ code: z.string().trim().max(16) }).safeParse(req.body);
@@ -2151,6 +2177,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
   });
 
   app.post('/v1/auth/mfa/disable', mfaLimiter, async (req, res) => {
+    if (!isGlobalMfaEnabled()) return sendMfaDisabled(res);
     const caller = await requireUserCaller(req, res);
     if (!caller) return;
     const parsed = z.object({
@@ -2650,7 +2677,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
     if (targetOrg.kind === 'platform') {
       return res.status(409).json({
         error: 'platform_context_login_required',
-        message: 'Sign in with the platform organization and complete MFA to enter Platform Administration.',
+        message: isGlobalMfaEnabled()
+          ? 'Sign in with the platform organization and complete MFA to enter Platform Administration.'
+          : 'Sign in with the platform organization to enter Platform Administration.',
         orgSlug: targetOrg.slug,
       });
     }
@@ -2686,9 +2715,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
       }).catch(() => undefined);
       return res.status(401).json({ error: 'invalid_credentials', message: 'Email or password is incorrect' });
     }
-    // The target row's own second factor is mandatory; the caller row's MFA
-    // (or a matching email) is never accepted as proof for another identity.
-    if (await mfaEnabled(target.id)) return sendMfaChallenge(res, target.id, 'context');
+    // When MFA is enabled globally, the target row's own second factor is
+    // mandatory; the caller row's MFA is never proof for another identity.
+    if (isGlobalMfaEnabled() && await mfaEnabled(target.id)) return sendMfaChallenge(res, target.id, 'context');
     await clearLoginFailures(target.id);
     const session = await sessionWithContexts(await issueSession(target), target);
     await logAudit({
@@ -4319,7 +4348,7 @@ async function auditMutation(req: express.Request, action: string, resource: str
       }
       return res.status(403).json({ error: 'platform_admin_required' });
     }
-    const requireMfa = (process.env.PLATFORM_ADMIN_REQUIRE_MFA ?? 'true') === 'true';
+    const requireMfa = platformMfaRequired();
     if (requireMfa && !(await mfaEnabled(user.id))) {
       await auditPlatformDenied(req, user.id, user.org_id, 'platform:session:exchange', 'mfa_not_enabled');
       return res.status(403).json({ error: 'platform_mfa_required', message: 'enable TOTP MFA on the platform organization account before using the platform console' });
@@ -4360,15 +4389,19 @@ async function auditMutation(req: express.Request, action: string, resource: str
       expiresIn: session.expiresIn,
       role: identity.admin.role,
       user: publicUser(user),
-      mfa: { enabled: requireMfa ? true : await mfaEnabled(user.id) },
+      mfa: { enabled: isGlobalMfaEnabled() && await mfaEnabled(user.id), available: isGlobalMfaEnabled() },
       mfaRequired: requireMfa,
-      stepUpRequired: (process.env.PLATFORM_ADMIN_REQUIRE_STEP_UP ?? 'true') === 'true',
+      stepUpRequired: platformStepUpRequired(),
     });
   });
 
   app.post('/v1/platform/step-up', mfaLimiter, async (req, res) => {
     const ctx = await currentPlatformAdmin(req, res, 'operator');
     if (!ctx) return;
+    if (!isGlobalMfaEnabled()) {
+      await auditPlatformDenied(req, ctx.user.id, ctx.user.org_id, 'platform:step-up', 'mfa_disabled');
+      return sendMfaDisabled(res);
+    }
     const parsed = z.object({
       code: z.string().trim().max(16).nullish(),
       recoveryCode: z.string().trim().max(32).nullish(),
@@ -4419,9 +4452,9 @@ async function auditMutation(req: express.Request, action: string, resource: str
     res.json({
       user: publicUser(ctx.user),
       role: ctx.admin.role,
-      mfa: { enabled: await mfaEnabled(ctx.user.id) },
-      mfaRequired: (process.env.PLATFORM_ADMIN_REQUIRE_MFA ?? 'true') === 'true',
-      stepUpRequired: (process.env.PLATFORM_ADMIN_REQUIRE_STEP_UP ?? 'true') === 'true',
+      mfa: { enabled: isGlobalMfaEnabled() && await mfaEnabled(ctx.user.id), available: isGlobalMfaEnabled() },
+      mfaRequired: platformMfaRequired(),
+      stepUpRequired: platformStepUpRequired(),
       platformOrgId: ctx.user.org_id,
     });
   });

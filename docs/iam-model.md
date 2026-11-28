@@ -148,7 +148,7 @@ Authenticator, Microsoft Authenticator, 2FAS…):
 | Lockout | `IAM_LOGIN_MAX_FAILURES` (5) wrong passwords **or** MFA codes → `429 account_locked` for `IAM_LOGIN_LOCKOUT_SECONDS` (900); unknown emails are never locked |
 | Rate limit | per IP on login and MFA routes (`IAM_LOGIN_RATE_LIMIT_PER_MIN`, `IAM_MFA_RATE_LIMIT_PER_MIN`, 60) |
 | Lost device | an org admin calls `DELETE /v1/users/:id/mfa`; `POST /v1/users/:id/unlock` clears a lockout |
-| SSO | OIDC sign-ins rely on the identity provider's own MFA |
+| SSO | OIDC sign-ins may use the IdP's MFA; SynapseOne also enforces an enrolled local TOTP factor when `SYNAPSEONE_MFA_ENABLED=true` |
 
 Tables: `user_mfa` and the `users.failed_login_count` / `users.locked_until` columns
 (migration `0006_mfa_lockout`). Every enable, disable, reset, failed second factor and
@@ -167,14 +167,14 @@ users start with **no permissions**. Admins manage admins with
 `is_org_admin` and does not grant tenant data access. A platform administrator:
 
 - must be a member of the reserved `PLATFORM_ORG_SLUG` organization;
-- must have TOTP MFA enabled and provide a fresh code at
-  `POST /v1/platform/session`;
+- when `SYNAPSEONE_MFA_ENABLED=true`, must have TOTP MFA enabled and provide a
+  fresh code at `POST /v1/platform/session`; the current deployment disables MFA;
 - receives a short-lived token (`kind=platform-admin`,
   `aud=synapseone-platform-admin`, no tenant org claim);
 - only reaches `/v1/platform/*`; tenant APIs reject that token;
 - has `owner`, `operator` or `auditor` role, checked server-side.
 
-Destructive actions require a second TOTP step-up
+When MFA is enabled, destructive actions require a second TOTP step-up
 (`POST /v1/platform/step-up {code|recoveryCode, action}`, header
 `x-platform-step-up`). Each proof is one-time, bound to the issuing platform
 session and to one action; it is stored in `platform_step_ups` and cannot be

@@ -3,6 +3,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Link, useLocation, useParams } from 'react-router-dom';
 import { usePlatformAuth } from '../../lib/platform-auth.jsx';
+import { mfaEnabled } from '../../lib/site.js';
+import { useI18n } from '../../lib/i18n-context.js';
 import AdminActionDialog from '../../components/AdminActionDialog.jsx';
 import { Badge, Btn, Card, Code, Empty, Err, Modal, PageTitle, Skeleton, Table } from '../../components/ui.jsx';
 
@@ -11,6 +13,8 @@ export default function AdminUserDetail() {
   const location = useLocation();
   const backTo = typeof location.state?.from === 'string' && location.state.from.startsWith('/admin/') ? location.state.from : '/admin/users';
   const platform = usePlatformAuth();
+  const { m } = useI18n();
+  const mfaFeature = mfaEnabled();
   const [data, setData] = useState(null);
   const [err, setErr] = useState(null);
   const [confirm, setConfirm] = useState(null);
@@ -79,7 +83,7 @@ export default function AdminUserDetail() {
         ? 'Revokes organization-administrator rights. The last active org admin cannot be removed.'
         : 'Grants organization-administrator rights for this organization.',
     },
-    ...(mfa.enabled ? [{
+    ...(mfaFeature && mfa.enabled ? [{
       kind: 'reset-mfa', action: 'user:reset-mfa', label: 'Reset MFA', danger: true,
       message: 'Removes TOTP MFA and revokes all refresh sessions and API keys for this user.',
     }] : []),
@@ -132,7 +136,7 @@ export default function AdminUserDetail() {
             <div className="flex justify-between gap-2"><dt className="text-normal-text">Status</dt><dd><Badge tone={active ? 'green' : 'gray'}>{active ? 'active' : 'inactive'}</Badge></dd></div>
             <div className="flex justify-between gap-2"><dt className="text-normal-text">Org admin</dt><dd><Badge tone={u.is_org_admin ? 'blue' : 'gray'}>{u.is_org_admin ? 'yes' : 'no'}</Badge></dd></div>
             <div className="flex justify-between gap-2"><dt className="text-normal-text">Password</dt><dd><Badge tone={u.passwordSet ? 'green' : 'amber'}>{u.passwordSet ? 'set' : 'activation pending'}</Badge></dd></div>
-            <div className="flex justify-between gap-2"><dt className="text-normal-text">MFA</dt><dd><Badge tone={mfa.enabled ? 'green' : 'amber'}>{mfa.enabled ? `${mfa.recoveryCodesRemaining ?? 0} recovery codes` : 'not enabled'}</Badge></dd></div>
+            {mfaFeature && <div className="flex justify-between gap-2"><dt className="text-normal-text">MFA</dt><dd><Badge tone={mfa.enabled ? 'green' : 'amber'}>{mfa.enabled ? `${mfa.recoveryCodesRemaining ?? 0} recovery codes` : 'not enabled'}</Badge></dd></div>}
             {data.lockedForSeconds > 0 && (
               <div className="flex justify-between gap-2"><dt className="text-normal-text">Sign-in lock</dt><dd><Badge tone="red">{data.lockedForSeconds}s</Badge></dd></div>
             )}
@@ -153,7 +157,7 @@ export default function AdminUserDetail() {
               ))}
             </div>
           ) : <Empty text="Read-only for the auditor role" />}
-          <p className="text-xs text-normal-text mt-3">High-risk actions require a fresh authenticator code. Every action is audited.</p>
+          <p className="text-xs text-normal-text mt-3">{mfaFeature ? m.platform.userActionsWithMfa : m.platform.userActionsNoMfa}</p>
           {lastAdmin && <p className="text-xs text-amber-600 mt-2">This is the last active organization administrator; revoke rights are blocked until another admin is active.</p>}
         </Card>
       </div>

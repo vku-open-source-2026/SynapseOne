@@ -140,6 +140,9 @@ Returns the user record behind the current Bearer token.
 
 ### Multi-factor authentication
 
+MFA is optional and disabled in the current deployment
+(`SYNAPSEONE_MFA_ENABLED=false`). The following applies only when enabled.
+
 When an account has MFA, password login returns an `*APIError` with `StatusCode`
 `401`; its `Body` is the JSON `{"error":"mfa_required","mfaToken":"…"}`. Finish with
 that `mfaToken`.

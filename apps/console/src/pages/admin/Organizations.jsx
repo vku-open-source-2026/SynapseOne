@@ -57,7 +57,7 @@ export default function AdminOrganizations() {
     setBusy(true);
     setFormErr(null);
     try {
-      const step = await platform.stepUp(form.code.trim(), 'org:create');
+      const step = platform.stepUpRequired ? await platform.stepUp(form.code.trim(), 'org:create') : null;
       const out = await platform.request('/v1/platform/orgs', {
         method: 'POST',
         body: {
@@ -67,7 +67,7 @@ export default function AdminOrganizations() {
           adminDisplayName: form.adminDisplayName.trim() || undefined,
           reason: form.reason.trim() || undefined,
         },
-        stepUpToken: step.token,
+        stepUpToken: step?.token,
       });
       setCreated(out);
       setOpen(false);
@@ -202,9 +202,9 @@ export default function AdminOrganizations() {
             <Field label="Reason (audit log)">
               <Input value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })} placeholder="Customer onboarding" />
             </Field>
-            <Field label="Your authenticator code">
+            {platform.stepUpRequired && <Field label="Your authenticator code">
               <Input value={form.code} onChange={(e) => setForm({ ...form, code: e.target.value })} autoComplete="one-time-code" placeholder="123456" required autoFocus />
-            </Field>
+            </Field>}
             <Btn type="submit" loading={busy}>Create organization</Btn>
           </form>
         </Modal>

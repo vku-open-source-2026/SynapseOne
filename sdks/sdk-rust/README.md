@@ -93,7 +93,8 @@ let value = client.request(Method::GET, "/v1/whatever", None).await?;
 * `tenant` → `x-synapseone-tenant` (platform callers of Faststore/Queue)
 * Both token and API key can be supplied; the gateway decides which to verify.
 
-MFA recovery-code rotation requires the current TOTP code:
+MFA is disabled by default (`SYNAPSEONE_MFA_ENABLED=false`). When enabled,
+recovery-code rotation requires the current TOTP code:
 `regenerate_recovery_codes_with_code("492039")`. The older no-argument
 `regenerate_recovery_codes()` remains for source compatibility but is deprecated
 and cannot satisfy the server's TOTP requirement. Disable MFA with either

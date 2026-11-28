@@ -150,7 +150,7 @@ Returns the user record behind the current Bearer token.
 
 ### Multi-factor authentication (`c.iam`)
 
-When an account has MFA, `login_with_password` raises `SynapseOneError` with
+When MFA is enabled on the deployment and an account has enrolled, `login_with_password` raises `SynapseOneError` with
 `status == 401` and `body["error"] == "mfa_required"`; finish with its `mfaToken`.
 
 ```python

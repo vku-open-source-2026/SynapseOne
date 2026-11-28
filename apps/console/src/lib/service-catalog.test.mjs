@@ -62,6 +62,17 @@ test('DNS and Tunnel sidebar links open tenant management pages, not API Docs', 
   assert.equal(matchesService(tunnel, '/admin/tunnel'), false);
 });
 
+test('IAM service and Docs copy describes MFA as optional', () => {
+  const iam = SERVICE_CATALOG.find((service) => service.id === 'iam');
+  assert.match(iam.desc, /optional MFA/);
+  assert.match(en.docsPage.serviceDocs.iam.lead, /optional MFA/);
+  assert.match(en.docsPage.serviceDocs.iam.purposes.login, /optional MFA/);
+  assert.match(en.services.iam.desc, /optional MFA/);
+  assert.match(vi.docsPage.serviceDocs.iam.lead, /MFA tùy chọn/);
+  assert.match(vi.docsPage.serviceDocs.iam.purposes.login, /MFA tùy chọn/);
+  assert.match(vi.services.iam.desc, /MFA tùy chọn/);
+});
+
 test('English and Vietnamese Docs/service locale shapes stay in parity', () => {
   assert.deepEqual(shape(en.docsPage), shape(vi.docsPage));
   assert.deepEqual(shape(en.services), shape(vi.services));

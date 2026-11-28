@@ -2,38 +2,27 @@
 // SPDX-FileCopyrightText: 2026 VKU.VIC
 /*
  * Dedicated platform-administrator session. The normal tenant session proves
- * identity; a fresh TOTP code is exchanged for a short-lived platform token
- * held in sessionStorage (not localStorage) and only used on /v1/platform/*.
+ * identity; when required, a fresh TOTP code is exchanged for a short-lived
+ * platform token held in sessionStorage and only used on /v1/platform/*.
  *
  * Step-up proofs are one-time, session-bound and action-bound. They are never
  * cached or auto-attached: the action dialog passes the proof explicitly to the
  * one request it authorizes.
  */
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
-import { api, baseUrl, authStore } from './api.js';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { api, authStore } from './api.js';
+import {
+  fetchPlatform,
+  isInvalidPlatformSession,
+  mergePlatformSession,
+  needsPlatformSessionRevalidation,
+  PlatformError,
+} from './platform-session.js';
 import { useAuth } from './auth.jsx';
 
-const KEY = 'synapseone.admin.session';
-const SESSION_INVALID = new Set([
-  'invalid_token',
-  'unauthorized',
-  'platform_session_required',
-  'platform_admin_required',
-  'platform_admin_inactive',
-  'platform_admin_org_required',
-  'platform_session_requires_user',
-  'platform_session_revoked',
-]);
+export { PlatformError };
 
-export class PlatformError extends Error {
-  constructor(status, path, body) {
-    super(`platform ${status} ${path}: ${typeof body === 'string' ? body : JSON.stringify(body)}`);
-    this.status = status;
-    this.path = path;
-    this.body = body;
-    this.code = body && typeof body === 'object' ? body.error : undefined;
-  }
-}
+const KEY = 'synapseone.admin.session';
 
 function readSession() {
   try {
@@ -58,6 +47,16 @@ export function PlatformAuthProvider({ children }) {
   const [exchangeError, setExchangeError] = useState(null);
   const [busy, setBusy] = useState(false);
   const tenantUserId = auth?.user?.id || null;
+  const restoredSessionToken = useRef(session?.token || null);
+  const revalidatedSessionToken = useRef(null);
+  const currentSessionToken = useRef(session?.token || null);
+  const mounted = useRef(false);
+  currentSessionToken.current = session?.token || null;
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
 
   useEffect(() => {
     if (session) sessionStorage.setItem(KEY, JSON.stringify(session));
@@ -78,6 +77,23 @@ export function PlatformAuthProvider({ children }) {
     setSession(null);
   }, []);
 
+  // Session flags are cached for fast first paint, but the server is
+  // authoritative. Revalidate only the token restored from sessionStorage;
+  // updating flags keeps the token/expiry dependencies of request() stable.
+  useEffect(() => {
+    const token = session?.token;
+    if (!tenantUserId || !needsPlatformSessionRevalidation(restoredSessionToken.current, token, revalidatedSessionToken.current)) return;
+    revalidatedSessionToken.current = token;
+    fetchPlatform(token, '/v1/platform/me').then((profile) => {
+      if (!mounted.current) return;
+      setSession((current) => current?.token === token ? mergePlatformSession(current, profile) : current);
+    }).catch((error) => {
+      if (!mounted.current || currentSessionToken.current !== token || !isInvalidPlatformSession(error)) return;
+      clear();
+      setExchangeError(error);
+    });
+  }, [session?.token, tenantUserId, clear]);
+
   const request = useCallback(async (path, { method = 'GET', body, platformToken, stepUpToken } = {}) => {
     const token = platformToken || session?.token;
     if (!token) throw new PlatformError(401, path, { error: 'platform_session_required' });
@@ -85,34 +101,15 @@ export function PlatformAuthProvider({ children }) {
       clear();
       throw new PlatformError(401, path, { error: 'platform_session_expired' });
     }
-    const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` };
-    if (stepUpToken) headers['x-platform-step-up'] = stepUpToken;
-    let res;
     try {
-      res = await fetch(`${baseUrl()}${path}`, {
-        method,
-        headers,
-        body: body === undefined ? undefined : JSON.stringify(body),
-      });
-    } catch (e) {
-      throw new Error(`platform network ${path}: ${e.message || e}`);
+      return await fetchPlatform(token, path, { method, body, stepUpToken });
+    } catch (error) {
+      if (isInvalidPlatformSession(error)) {
+        clear();
+        setExchangeError(error);
+      }
+      throw error;
     }
-    const text = await res.text();
-    let json = null;
-    try { json = text ? JSON.parse(text) : null; } catch { json = text; }
-    const code = json && typeof json === 'object' ? json.error : undefined;
-    if (res.status === 401 && SESSION_INVALID.has(code)) {
-      clear();
-      setExchangeError(new PlatformError(res.status, path, json));
-      throw new PlatformError(res.status, path, json);
-    }
-    if (res.status === 403 && SESSION_INVALID.has(code)) {
-      clear();
-      setExchangeError(new PlatformError(res.status, path, json));
-      throw new PlatformError(res.status, path, json);
-    }
-    if (!res.ok) throw new PlatformError(res.status, path, json);
-    return json;
   }, [session?.token, session?.expiresAt, clear]);
 
   const exchange = useCallback(async (code) => {
@@ -143,6 +140,7 @@ export function PlatformAuthProvider({ children }) {
         expiresAt: Date.now() + Number(json.expiresIn || 900) * 1000,
         role: json.role,
         user: json.user,
+        mfa: json.mfa ?? null,
         mfaRequired: json.mfaRequired !== false,
         stepUpRequired: json.stepUpRequired !== false,
       };
@@ -184,6 +182,7 @@ export function PlatformAuthProvider({ children }) {
     session,
     role: session?.role || null,
     user: session?.user || null,
+    mfa: session?.mfa ?? null,
     mfaRequired: session?.mfaRequired !== false,
     stepUpRequired: session?.stepUpRequired !== false,
     exchangeError,

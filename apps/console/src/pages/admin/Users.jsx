@@ -3,12 +3,14 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useLocation, useSearchParams } from 'react-router-dom';
 import { usePlatformAuth } from '../../lib/platform-auth.jsx';
+import { mfaEnabled } from '../../lib/site.js';
 import { Badge, Btn, Card, Empty, Err, Field, Input, PageTitle, Table, TableSkeleton } from '../../components/ui.jsx';
 
 const PAGE = 25;
 
 export default function AdminUsers() {
   const platform = usePlatformAuth();
+  const mfa = mfaEnabled();
   const [params, setParams] = useSearchParams();
   const location = useLocation();
   const [q, setQ] = useState(params.get('q') || '');
@@ -105,15 +107,15 @@ export default function AdminUsers() {
       </Card>
 
       <Card>
-        {!loaded ? <TableSkeleton rows={6} cols={6} /> : data.items.length ? (
-          <Table head={['Email', 'Organization', 'Status', 'Org admin', 'MFA', 'Created']}>
+        {!loaded ? <TableSkeleton rows={6} cols={mfa ? 6 : 5} /> : data.items.length ? (
+          <Table head={['Email', 'Organization', 'Status', 'Org admin', ...(mfa ? ['MFA'] : []), 'Created']}>
             {data.items.map((u) => (
               <tr key={u.id} className="border-t border-slate-100">
                 <td className="py-2 pr-4"><Link to={`/admin/users/${u.id}`} state={{ from: `${location.pathname}${location.search}` }} className="font-medium text-main-blue hover:underline">{u.email}</Link><p className="text-xs text-normal-text">{u.display_name || '–'}</p></td>
                 <td className="py-2 pr-4 text-sm">{u.org_slug || '–'}</td>
                 <td className="py-2 pr-4"><Badge tone={u.active !== false ? 'green' : 'gray'}>{u.active !== false ? 'active' : 'inactive'}</Badge></td>
                 <td className="py-2 pr-4"><Badge tone={u.is_org_admin ? 'blue' : 'gray'}>{u.is_org_admin ? 'admin' : 'member'}</Badge></td>
-                <td className="py-2 pr-4"><Badge tone={u.mfa_enabled ? 'green' : 'amber'}>{u.mfa_enabled ? 'on' : 'off'}</Badge></td>
+                {mfa && <td className="py-2 pr-4"><Badge tone={u.mfa_enabled ? 'green' : 'amber'}>{u.mfa_enabled ? 'on' : 'off'}</Badge></td>}
                 <td className="py-2 pr-4 text-xs text-normal-text">{u.created_at ? new Date(u.created_at).toLocaleDateString() : '–'}</td>
               </tr>
             ))}

@@ -7,6 +7,9 @@ chỉ bằng metadata dành cho operator nền tảng, và hạn mức request d
 `ai`, `inference` cùng `workflow`. Các tài liệu tiếng Anh trong `docs/` là bản
 chuẩn.
 
+> Deployment hiện đặt `SYNAPSEONE_MFA_ENABLED=false`; các bước step-up bên dưới
+> được bỏ qua trừ khi bật lại MFA.
+
 ## Luồng người dùng
 
 ### Quản trị viên nền tảng

@@ -15,8 +15,8 @@ của từng bản phát hành nằm trong `CHANGELOG.md` tiếng Anh.
   authoritative UDP/TCP, API quản lý zone/record, connector tunnel HTTP chỉ kết
   nối outbound, ingress routing theo host/path, JSON persistence nguyên tử,
   Docker/Compose, tài liệu vận hành song ngữ và hướng dẫn bốn ngôn ngữ. Quản lý
-  giờ có qua trang Platform Admin được bảo vệ MFA và route gateway hẹp; tích hợp
-  Tầng 2/3 vẫn để sau.
+  giờ có qua trang Platform Admin và route gateway hẹp; MFA là tùy chọn và đang
+  tắt trên deployment hiện tại. Tích hợp Tầng 2/3 vẫn để sau.
 - **Tên dịch vụ Console:** ẩn Gateway & Ops khỏi service tray nhưng vẫn giữ trong
   Docs, và đổi tên dịch vụ tìm kiếm tenant thành **SynapseSearch**.
 - **Quản lý edge theo tổ chức:** zone SynapseDNS và connector Synapse Tunnel có
@@ -54,6 +54,9 @@ của từng bản phát hành nằm trong `CHANGELOG.md` tiếng Anh.
 
 ### Bảo mật
 
+- **Chế độ chỉ mật khẩu/SSO:** `SYNAPSEONE_MFA_ENABLED=false` là mặc định của
+  Compose/K8s. Switch này bỏ challenge TOTP, MFA khi mở platform và step-up nhưng
+  vẫn giữ lockout mật khẩu, thu hồi session và audit. Đặt `true` để bật lại MFA.
 - Approval checkpoint workflow lưu đúng `pause_task_id`/`pause_node`; task tạo
   qua API/legacy không thể giả mạo checkpoint.
 - Runner audience mặc định `account`; runner org-wide cần grant admin tường minh.

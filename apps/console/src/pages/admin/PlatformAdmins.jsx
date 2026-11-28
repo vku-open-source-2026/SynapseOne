@@ -2,11 +2,15 @@
 // SPDX-FileCopyrightText: 2026 VKU.VIC
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { usePlatformAuth } from '../../lib/platform-auth.jsx';
+import { mfaEnabled } from '../../lib/site.js';
+import { useI18n } from '../../lib/i18n-context.js';
 import AdminActionDialog from '../../components/AdminActionDialog.jsx';
 import { Badge, Btn, Card, Empty, Err, Field, Input, Modal, PageTitle, Table, TableSkeleton } from '../../components/ui.jsx';
 
 export default function AdminPlatformAdmins() {
   const platform = usePlatformAuth();
+  const { m } = useI18n();
+  const mfa = mfaEnabled();
   const [rows, setRows] = useState([]);
   const [err, setErr] = useState(null);
   const [actionErr, setActionErr] = useState(null);
@@ -49,11 +53,11 @@ export default function AdminPlatformAdmins() {
     setErr(null);
     setFormErr(null);
     try {
-      const step = await platform.stepUp(form.code.trim(), 'admin:grant');
+      const step = platform.stepUpRequired ? await platform.stepUp(form.code.trim(), 'admin:grant') : null;
       const out = await platform.request('/v1/platform/admins', {
         method: 'POST',
         body: { email: form.email.trim().toLowerCase(), role: form.role, reason: form.reason.trim() || undefined },
-        stepUpToken: step.token,
+        stepUpToken: step?.token,
       });
       setOpen(false);
       setForm({ email: '', role: 'operator', reason: '', code: '' });
@@ -127,8 +131,7 @@ export default function AdminPlatformAdmins() {
       {open && (
         <Modal title="Grant platform administrator" onClose={() => setOpen(false)}>
           <p className="text-sm text-normal-text mb-3">
-            The account is created in the reserved platform organization. The person must activate the one-time code
-            and enrol TOTP MFA before opening this console.
+            {mfa ? m.platform.grantPromptMfa : m.platform.grantPromptNoMfa}
           </p>
           {formErr && <div className="mb-3"><Err e={formErr} /></div>}
           <form onSubmit={grant}>
@@ -139,7 +142,7 @@ export default function AdminPlatformAdmins() {
               </select>
             </Field>
             <Field label="Reason"><Input value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })} placeholder="Operations onboarding" /></Field>
-            <Field label="Your authenticator code"><Input value={form.code} onChange={(e) => setForm({ ...form, code: e.target.value })} autoComplete="one-time-code" required /></Field>
+            {platform.stepUpRequired && <Field label="Your authenticator code"><Input value={form.code} onChange={(e) => setForm({ ...form, code: e.target.value })} autoComplete="one-time-code" required autoFocus /></Field>}
             <Btn type="submit" loading={busy}>Grant access</Btn>
           </form>
         </Modal>

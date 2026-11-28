@@ -9,6 +9,11 @@ Org/Account switcher, IAM CRUD, authorize simulator, workflows, audit log.
   sessions live in localStorage. All API calls go straight to the gateway (CORS open
   by default) with Bearer / `X-API-Key`.
 
+MFA is disabled by default in the current Compose/K8s configuration
+(`SYNAPSEONE_MFA_ENABLED=false`). The Security page explains the disabled state
+and no TOTP/step-up prompt is shown. Set the switch to `true` on both IAM and
+Console to re-enable it.
+
 ## Run
 
 ```bash
@@ -100,10 +105,11 @@ instead of a white screen.
 A separate, cross-tenant control plane reuses the same React/Tailwind design
 system but has its own `AdminLayout`, `AdminSidebar`, `AdminTopbar` and
 `PlatformGuard`. It is not linked from the tenant console and requires a user
-JWT plus a fresh TOTP code to obtain a short-lived platform token
-(`kind=platform-admin`). The six modules are Overview, Organizations, Users &
-Access, Service Health, Usage, and Audit & Security, plus owner-only Platform
-Admins. Organization creation, account creation, user actions and admin grants
-require a fresh single-use step-up proof. Platform tokens are rejected on tenant
-APIs; API keys cannot open this console. Invited users activate from `/register`.
+JWT to obtain a short-lived platform token (`kind=platform-admin`); a fresh TOTP
+code is added only when `SYNAPSEONE_MFA_ENABLED=true`. The six modules are
+Overview, Organizations, Users & Access, Service Health, Usage, and Audit &
+Security, plus owner-only Platform Admins. Organization creation, account
+creation, user actions and admin grants require a fresh single-use step-up proof
+only when MFA is enabled. Platform tokens are rejected on tenant APIs; API keys
+cannot open this console. Invited users activate from `/register`.
 See [`platform-superadmin.md`](platform-superadmin.md).

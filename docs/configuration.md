@@ -27,9 +27,12 @@ reads which key (audited from source):
 | `AUTHZ_CACHE_TTL_MS` | 30000 | decision cache per principal/action/resource (0 disables, max 300000) — policy changes take effect after at most this long |
 | `AUTHZ_MODE_REQUIRED` | `false` | production fail-closed guard: when `true`, gateway refuses to boot with `AUTHZ_MODE=off` |
 | `AUTHZ_AUDIT_ACK` | unset | production-only, owner/expiry acknowledgement required to run `AUTHZ_MODE=audit` (e.g. `owner=security;expires=2026-12-01;reason=policy-backfill`). Without it the gateway refuses to boot in production |
+| `SYNAPSEONE_MFA_ENABLED` | `false` in Compose/K8s | global MFA switch. `false` skips TOTP login challenges, platform MFA exchange and step-up proofs; password/SSO, lockout and audit remain active. Set `true` to restore MFA. |
+| `VITE_SYNAPSEONE_MFA_ENABLED` | `false` in `.env.example` | local Vite development fallback for the Console; container runtime config remains authoritative. |
 | `PLATFORM_ADMIN_ENABLED` | `true` dev / `false` prod unless set | enables `/v1/platform/*` and the `/admin` console |
-| `PLATFORM_ADMIN_REQUIRE_MFA` | `true` | platform session exchange requires an enrolled TOTP factor and a fresh code |
-| `PLATFORM_ADMIN_REQUIRE_STEP_UP` | `true` | destructive platform actions require `x-platform-step-up` |
+| `PLATFORM_ADMIN_REQUIRE_MFA` | `true` | only applies when `SYNAPSEONE_MFA_ENABLED=true`; otherwise platform session exchange needs no TOTP |
+| `PLATFORM_ADMIN_REQUIRE_STEP_UP` | `true` | only applies when `SYNAPSEONE_MFA_ENABLED=true`; otherwise step-up is bypassed |
+| `PLATFORM_STEP_UP_TTL_SECONDS` | `300` | one-time step-up proof TTL (60–900 seconds), only relevant when MFA is enabled |
 | `PLATFORM_ORG_SLUG` | `synapseone-platform` | reserved organization for platform staff |
 | `PLATFORM_BOOTSTRAP_SECRET` | — | one-time internal first-owner bootstrap; empty disables the endpoint |
 | `PLATFORM_RECOVERY_SECRET` | — | internal break-glass reset for a platform administrator who lost MFA |

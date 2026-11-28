@@ -23,7 +23,12 @@ import WorkflowEditor from './components/WorkflowEditor.jsx';
 import { OrganizationTable } from './pages/Orgs.jsx';
 import { keyStatus as apiKeyStatus, quotaFieldSource, organizationDetailKey } from './pages/admin/OrganizationDetail.jsx';
 import { DOC_TABS, SERVICE_CATALOG, SERVICE_TRAY_CATALOG } from './lib/service-catalog.js';
-import { MobileServiceLinks } from './components/Topbar.jsx';
+import { MobileCoreLinks, MobileServiceLinks } from './components/Topbar.jsx';
+import Sidebar from './components/Sidebar.jsx';
+import Security from './pages/Security.jsx';
+import PlatformGuard from './components/PlatformGuard.jsx';
+import AdminOverview from './pages/admin/Overview.jsx';
+import { PlatformAuthProvider } from './lib/platform-auth.jsx';
 import ServicesSidebar from './components/ServicesSidebar.jsx';
 import TenantKeyScopePicker from './components/TenantKeyScopePicker.jsx';
 import { en } from './locales/en.js';
@@ -161,6 +166,101 @@ for (const [label, session] of Object.entries(SESSIONS)) {
   }
 }
 
+// Runtime MFA switch: navigation, the direct /security route and platform
+// exchange fallback must all agree in both supported languages.
+const hadWindow = Object.prototype.hasOwnProperty.call(globalThis, 'window');
+const previousWindow = (globalThis as any).window;
+try {
+  for (const enabled of [true, false]) {
+    (globalThis as any).window = { SYNAPSEONE_CONFIG: { MFA_ENABLED: enabled } };
+    for (const lang of ['en', 'vi'] as const) {
+      const session = {
+        token: 'synapseone_test',
+        user: { id: 'user-1', email: 'admin@example.test' },
+        contexts: [{ type: 'platform', id: 'platform:1', slug: 'platform' }],
+        currentContext: { type: 'platform', id: 'platform:1', slug: 'platform' },
+      };
+      (globalThis as any).localStorage = {
+        getItem: (k: string) => (k === 'synapseone.lang' ? lang : k === 'synapseone.console.auth' ? JSON.stringify(session) : null),
+        setItem: () => undefined,
+        removeItem: () => undefined,
+      };
+      const label = `mfa-${enabled ? 'enabled' : 'disabled'}-${lang}`;
+      try {
+        const sidebarHtml = renderToString(
+          <MemoryRouter><LanguageProvider><Sidebar /></LanguageProvider></MemoryRouter>,
+        );
+        const mobileHtml = renderToString(
+          <MemoryRouter><LanguageProvider><MobileCoreLinks /></LanguageProvider></MemoryRouter>,
+        );
+        for (const [nav, html] of [['sidebar', sidebarHtml], ['mobile', mobileHtml]] as const) {
+          if (html.includes('href="/security"') !== enabled) throw new Error(`${nav} Security link did not follow MFA_ENABLED`);
+          if (!html.includes('href="/dashboard"')) throw new Error(`${nav} lost the Dashboard link`);
+        }
+
+        const securityHtml = renderToString(
+          <MemoryRouter><AuthProvider><LanguageProvider><Security /></LanguageProvider></AuthProvider></MemoryRouter>,
+        );
+        const normalizedSecurityHtml = securityHtml.replace(/\u00a0/g, ' ');
+        if (enabled) {
+          const heading = lang === 'vi' ? 'Xác thực hai yếu tố' : 'Two-factor authentication';
+          if (!normalizedSecurityHtml.includes(heading)) throw new Error('enabled Security page did not render MFA controls');
+        } else {
+          if (lang === 'en' && !securityHtml.includes('MFA is disabled on this deployment; password/SSO only.')) {
+            throw new Error('disabled Security page is missing its clear state');
+          }
+          if (lang === 'vi' && !securityHtml.includes('MFA bị tắt')) throw new Error('disabled Security page is missing Vietnamese copy');
+          if (securityHtml.includes('<button') || securityHtml.includes('<input')) throw new Error('disabled Security page rendered setup controls');
+        }
+
+        const renderGuard = (authSession: any) => {
+          (globalThis as any).localStorage = {
+            getItem: (k: string) => (k === 'synapseone.lang' ? lang : k === 'synapseone.console.auth' ? JSON.stringify(authSession) : null),
+            setItem: () => undefined,
+            removeItem: () => undefined,
+          };
+          return renderToString(
+            <MemoryRouter><AuthProvider><LanguageProvider><PlatformAuthProvider><PlatformGuard><div>allowed</div></PlatformGuard></PlatformAuthProvider></LanguageProvider></AuthProvider></MemoryRouter>,
+          );
+        };
+        const guardHtml = renderGuard(session);
+        if (enabled) {
+          const normalizedGuardHtml = guardHtml.replace(/\u00a0/g, ' ');
+          const codeLabel = lang === 'vi' ? 'Mã authenticator hoặc mã khôi phục' : 'Authenticator or recovery code';
+          if (!normalizedGuardHtml.includes('MFA') || !normalizedGuardHtml.includes(codeLabel)) throw new Error('enabled platform fallback did not render MFA challenge');
+        } else {
+          if (/mfa|authenticator|\/security/i.test(guardHtml)) throw new Error('MFA copy leaked into disabled platform fallback');
+          if (!guardHtml.includes(lang === 'vi' ? 'Thử lại' : 'Try again')) throw new Error('disabled platform fallback is missing exchange retry');
+        }
+
+        const tenantSession = {
+          ...session,
+          contexts: [{ type: 'tenant', id: 'tenant:1', slug: 'tenant' }, session.contexts[0]],
+          currentContext: { type: 'tenant', id: 'tenant:1', slug: 'tenant' },
+        };
+        const tenantGuardHtml = renderGuard(tenantSession);
+        if (tenantGuardHtml.includes('MFA') !== enabled) throw new Error('tenant platform-context copy did not follow MFA_ENABLED');
+        const apiKeyGuardHtml = renderGuard({ apiKey: 'synapseone_test' });
+        if (apiKeyGuardHtml.includes('MFA') !== enabled) throw new Error('API-key platform copy did not follow MFA_ENABLED');
+        const overviewHtml = renderToString(
+          <MemoryRouter><AuthProvider><PlatformAuthProvider><AdminOverview /></PlatformAuthProvider></AuthProvider></MemoryRouter>,
+        );
+        if (overviewHtml.includes('MFA enabled') !== enabled) throw new Error('admin Overview MFA metric did not follow MFA_ENABLED');
+        console.log(`ok [${label}] navigation, Security, PlatformGuard and admin Overview`);
+      } catch (e: any) {
+        failures++;
+        console.error(`FAIL [${label}]: ${e?.message || e}`);
+      }
+    }
+  }
+} catch (e: any) {
+  failures++;
+  console.error(`FAIL [mfa-runtime]: ${e?.message || e}`);
+} finally {
+  if (hadWindow) (globalThis as any).window = previousWindow;
+  else delete (globalThis as any).window;
+}
+
 (globalThis as any).localStorage = {
   getItem: (k: string) => (k === 'synapseone.lang' ? 'en' : null),
   setItem: () => undefined,
@@ -217,6 +317,10 @@ for (const [lang, dict] of [['en', en], ['vi', vi]] as const) {
         }
         const localizedHeading = lang === 'vi' ? 'Sử dụng SDK' : 'SDK usage';
         if (!html.includes(localizedHeading)) throw new Error(`missing ${lang} SDK heading`);
+      }
+      if (id === 'iam') {
+        const optionalMfa = lang === 'vi' ? 'MFA tùy chọn' : 'optional MFA';
+        if (!html.includes(optionalMfa)) throw new Error(`missing ${lang} optional MFA copy`);
       }
       console.log(`ok [docs-${lang}] ${path} (${html.length} chars)`);
     } catch (e: any) {

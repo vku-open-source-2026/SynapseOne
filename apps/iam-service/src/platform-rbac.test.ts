@@ -54,7 +54,7 @@ describe('platform RBAC matrix', () => {
   before(() => new Promise<void>((resolve, reject) => {
     for (const k of ['NODE_ENV', 'DATABASE_URL', 'SYNAPSEONE_INTERNAL_SECRET', 'IAM_ALLOW_DEV_LOGIN',
       'PLATFORM_ADMIN_ENABLED', 'PLATFORM_ADMIN_REQUIRE_MFA', 'PLATFORM_ADMIN_REQUIRE_STEP_UP',
-      'PLATFORM_BOOTSTRAP_SECRET', 'PLATFORM_ORG_SLUG']) {
+      'PLATFORM_BOOTSTRAP_SECRET', 'PLATFORM_ORG_SLUG', 'SYNAPSEONE_MFA_ENABLED']) {
       saved[k] = process.env[k];
     }
     delete process.env.NODE_ENV;
@@ -62,6 +62,7 @@ describe('platform RBAC matrix', () => {
     delete process.env.SYNAPSEONE_INTERNAL_SECRET;
     process.env.IAM_ALLOW_DEV_LOGIN = 'true';
     process.env.PLATFORM_ADMIN_ENABLED = 'true';
+    process.env.SYNAPSEONE_MFA_ENABLED = 'true';
     process.env.PLATFORM_ADMIN_REQUIRE_MFA = 'true';
     process.env.PLATFORM_ADMIN_REQUIRE_STEP_UP = 'true';
     process.env.PLATFORM_BOOTSTRAP_SECRET = BOOTSTRAP;

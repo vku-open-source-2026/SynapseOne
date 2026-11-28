@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom';
 import { usePlatformAuth } from '../../lib/platform-auth.jsx';
 import { baseUrl } from '../../lib/api.js';
+import { mfaEnabled } from '../../lib/site.js';
 import { Badge, Btn, Card, Empty, Err, PageTitle, Skeleton, StatValue } from '../../components/ui.jsx';
 
 const RANGES = [
@@ -19,6 +20,7 @@ function windowFor(range) {
 
 export default function AdminOverview() {
   const platform = usePlatformAuth();
+  const mfa = mfaEnabled();
   const [range, setRange] = useState(RANGES[0]);
   const [overview, setOverview] = useState(null);
   const [usage, setUsage] = useState(null);
@@ -99,7 +101,7 @@ export default function AdminOverview() {
           { label: 'Users', value: tenancy.users },
           { label: 'Active users', value: tenancy.activeUsers },
           { label: 'Org admins', value: tenancy.orgAdmins },
-          { label: 'MFA enabled', value: tenancy.mfaEnabledUsers },
+          ...(mfa ? [{ label: 'MFA enabled', value: tenancy.mfaEnabledUsers }] : []),
           { label: 'API keys', value: tenancy.activeApiKeys },
           { label: 'Service accounts', value: tenancy.serviceAccounts },
           { label: 'Requests', value: totals.requests },

@@ -35,6 +35,7 @@ services:
       IAM_SENSITIVE_MUTATION_MODE: ${IAM_SENSITIVE_MUTATION_MODE:-enforce}
       IAM_ALLOW_DIRECT_ORG_CREATE: "false"
       # Super Admin control plane; bootstrap the first owner explicitly.
+      SYNAPSEONE_MFA_ENABLED: ${SYNAPSEONE_MFA_ENABLED:-false}
       PLATFORM_ADMIN_ENABLED: ${PLATFORM_ADMIN_ENABLED:-true}
       PLATFORM_ADMIN_REQUIRE_MFA: "true"
       PLATFORM_ADMIN_REQUIRE_STEP_UP: "true"
@@ -174,6 +175,7 @@ services:
   console:
     environment:
       NODE_ENV: production
+      SYNAPSEONE_MFA_ENABLED: ${SYNAPSEONE_MFA_ENABLED:-false}
     networks:
       synapseone-net:
         aliases: [synapseone-console]

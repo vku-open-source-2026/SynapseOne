@@ -27,9 +27,12 @@ Sao chép `.env.example` thành `.env` và thay mọi giá trị `*_change_me_*`
 | `AUTHZ_CACHE_TTL_MS` | 30000 | cache quyết định policy (0 tắt, tối đa 300000) |
 | `AUTHZ_MODE_REQUIRED` | `false` | production từ chối boot khi `AUTHZ_MODE=off` |
 | `AUTHZ_AUDIT_ACK` | unset | bắt buộc owner/expiry khi production chạy `audit` |
+| `SYNAPSEONE_MFA_ENABLED` | `false` trong Compose/K8s | switch MFA toàn cục. `false` bỏ challenge TOTP, MFA khi mở platform và step-up; mật khẩu/SSO, lockout và audit vẫn hoạt động. Đặt `true` để bật lại MFA. |
+| `VITE_SYNAPSEONE_MFA_ENABLED` | `false` trong `.env.example` | fallback Vite dev cho Console; runtime config trong container vẫn là nguồn ưu tiên. |
 | `PLATFORM_ADMIN_ENABLED` | `true` dev / `false` prod | bật `/v1/platform/*` và `/admin` |
-| `PLATFORM_ADMIN_REQUIRE_MFA` | `true` | phiên platform cần TOTP mới |
-| `PLATFORM_ADMIN_REQUIRE_STEP_UP` | `true` | mutation nền tảng cần `x-platform-step-up` |
+| `PLATFORM_ADMIN_REQUIRE_MFA` | `true` | chỉ áp dụng khi `SYNAPSEONE_MFA_ENABLED=true`; nếu false thì phiên platform không cần TOTP |
+| `PLATFORM_ADMIN_REQUIRE_STEP_UP` | `true` | chỉ áp dụng khi `SYNAPSEONE_MFA_ENABLED=true`; nếu false thì bỏ step-up |
+| `PLATFORM_STEP_UP_TTL_SECONDS` | `300` | TTL proof step-up dùng một lần (60–900 giây), chỉ có hiệu lực khi bật MFA |
 | `PLATFORM_ORG_SLUG` | `synapseone-platform` | org nhân sự nền tảng |
 | `PLATFORM_BOOTSTRAP_SECRET` | — | bootstrap owner đầu tiên; trống tắt |
 | `PLATFORM_RECOVERY_SECRET` | — | khôi phục khẩn cấp MFA |
