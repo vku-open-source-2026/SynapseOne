@@ -19,9 +19,12 @@ function shape(value) {
 }
 
 test('edge management paths use tenant gateway namespaces', () => {
-  assert.equal(edgePath('dns', '/v1/zones'), '/v1/dns/zones');
-  assert.equal(edgePath('tunnel', 'v1/routes'), '/v1/tunnel/routes');
+  assert.equal(edgePath('dns', '/v1/zones'), '/v1/dns/v1/zones');
+  assert.equal(edgePath('tunnel', 'v1/routes'), '/v1/tunnel/v1/routes');
   assert.equal(edgePath('dns', '/ready'), '/v1/dns/ready');
+  assert.equal(edgePath('dns', '/v1/zones/example.test/records'), '/v1/dns/v1/zones/example.test/records');
+  assert.equal(edgePath('tunnel', '/v1/config'), '/v1/tunnel/v1/config');
+  assert.equal(edgePath('tunnel', '/v1/connectors/id'), '/v1/tunnel/v1/connectors/id');
   assert.throws(() => edgePath('iam'), /Unknown edge service/);
 });
 

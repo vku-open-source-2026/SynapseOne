@@ -63,6 +63,9 @@ của từng bản phát hành nằm trong `CHANGELOG.md` tiếng Anh.
 
 ### Sửa
 
+- **Flow Console edge tenant:** giữ đúng prefix `/v1` của service trên route
+  gateway DNS/Tunnel, bỏ qua deep-link zone cũ ngoài org và thêm test connector
+  hướng dẫn 60 giây với phản hồi thành công/timeout/lỗi trực tiếp.
 - **Lỗi phát hành SDK 0.10.2:** khôi phục package export JS
   `ocs/search/warehouse/lakehouse`, đồng bộ type/runtime của flat alias, sửa
   Python Search, ghi rõ workflow credential không hỗ trợ expiry thay vì gửi

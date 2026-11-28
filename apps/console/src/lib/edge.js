@@ -12,8 +12,9 @@ export const EDGE_ROOT = '/v1';
 export function edgePath(service, path = '') {
   if (!['dns', 'tunnel'].includes(service)) throw new Error('Unknown edge service');
   const suffix = path ? (path.startsWith('/') ? path : `/${path}`) : '';
-  const resourcePath = suffix.replace(/^\/v1(?=\/|$)/, '');
-  return `${EDGE_ROOT}/${service}${resourcePath}`;
+  // Management resources already include the service's /v1 prefix. Health and
+  // readiness paths do not. The gateway strips only /v1/<service>.
+  return `${EDGE_ROOT}/${service}${suffix}`;
 }
 
 export function normalizeHostname(value) {

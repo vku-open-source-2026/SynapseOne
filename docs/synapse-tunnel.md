@@ -16,8 +16,10 @@ to Tier-2/3 applications yet.
    an existing zone, or External DNS to create the record at your provider.
 4. Save the one-time connector token and run the displayed `synapseone` command
    on the machine that runs the application.
-5. Watch the connector change from **Disconnected** to **Connected** in Console.
-   Live status refreshes every five seconds.
+5. Keep the CLI running and click **Test connection** in the wizard. Console
+   polls the connector for up to 60 seconds and shows Connected, timeout, or a
+   scoped-auth error with troubleshooting guidance. The main tunnel list also
+   refreshes live status every five seconds.
 
 ```bash
 npm install -g @synapseone/cli@latest

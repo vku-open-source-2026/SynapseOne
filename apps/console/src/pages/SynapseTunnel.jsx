@@ -31,6 +31,10 @@ function validateUpstream(value) {
   return url.href;
 }
 
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
 function Step({ number, active, complete, children }) {
   return (
     <div className={`flex items-center gap-2 rounded-2xl px-3 py-2 text-sm ${active ? 'bg-main-blue text-white' : complete ? 'bg-emerald-500/10 text-emerald-700' : 'bg-slate-100 text-normal-text'}`}>
@@ -61,7 +65,9 @@ export default function SynapseTunnelPage() {
   const [form, setForm] = useState(EMPTY_FORM);
   const [formError, setFormError] = useState('');
   const [issued, setIssued] = useState(null);
+  const [connectionTest, setConnectionTest] = useState({ status: 'idle', attempts: 0, error: '' });
   const inFlight = useRef(false);
+  const connectionGeneration = useRef(0);
 
   const publicOrigin = config?.publicOrigin
     || (typeof window !== 'undefined' && window.SYNAPSEONE_CONFIG?.TUNNEL_PUBLIC_ORIGIN)
@@ -99,7 +105,10 @@ export default function SynapseTunnelPage() {
   useEffect(() => {
     void loadInitial();
     const timer = setInterval(() => { void loadStatus(); }, 5000);
-    return () => clearInterval(timer);
+    return () => {
+      clearInterval(timer);
+      connectionGeneration.current += 1;
+    };
   }, [loadInitial, loadStatus]);
 
   const matchingZone = useMemo(() => {
@@ -107,15 +116,19 @@ export default function SynapseTunnelPage() {
   }, [form.hostname, zones]);
 
   const openWizard = () => {
+    connectionGeneration.current += 1;
     setForm({ ...EMPTY_FORM, zone: matchingZone || '' });
     setIssued(null);
+    setConnectionTest({ status: 'idle', attempts: 0, error: '' });
     setFormError('');
     setWizard({ step: 1 });
   };
 
   const closeWizard = () => {
+    connectionGeneration.current += 1;
     setWizard(null);
     setIssued(null);
+    setConnectionTest({ status: 'idle', attempts: 0, error: '' });
     setForm(EMPTY_FORM);
     setFormError('');
   };
@@ -188,7 +201,8 @@ export default function SynapseTunnelPage() {
       }
 
       setIssued({ token, connectorId, routeId, hostname, publicOrigin });
-      setWizard({ step: 3, done: true });
+      setConnectionTest({ status: 'idle', attempts: 0, error: '' });
+      setWizard({ step: 3, done: false });
       setNotice(d.created);
       await loadStatus();
     } catch (err) {
@@ -261,6 +275,61 @@ export default function SynapseTunnelPage() {
     } catch {
       setFormError('Clipboard access is unavailable. Select and copy the token manually.');
     }
+  };
+
+  const copyCommand = async () => {
+    if (!script) return;
+    try {
+      await navigator.clipboard.writeText(script);
+      setNotice(t.copied);
+    } catch {
+      setFormError(d.clipboardUnavailable);
+    }
+  };
+
+  const startConnectionTest = async () => {
+    if (!issued?.connectorId) return;
+    const generation = ++connectionGeneration.current;
+    const started = Date.now();
+    let attempts = 0;
+    let lastError = '';
+    setConnectionTest({ status: 'testing', attempts: 0, error: '' });
+    while (generation === connectionGeneration.current && Date.now() - started < 60_000) {
+      attempts += 1;
+      try {
+        const payload = await Promise.race([
+          request(edgePath('tunnel', `/v1/connectors/${encodeURIComponent(issued.connectorId)}`)),
+          delay(8_000).then(() => { throw new Error('Connection status request timed out'); }),
+        ]);
+        if (generation !== connectionGeneration.current) return;
+        if (payload?.connector?.connected) {
+          setConnectionTest({
+            status: 'success', attempts, error: '', connectedAt: payload.connector.connectedAt || new Date().toISOString(),
+          });
+          setWizard((current) => current ? { ...current, done: true } : current);
+          setNotice(d.connectionSuccess);
+          await loadStatus();
+          return;
+        }
+      } catch (err) {
+        if (generation !== connectionGeneration.current) return;
+        lastError = errorText(err);
+        if ([401, 403, 404].includes(Number(err?.status))) {
+          setConnectionTest({ status: 'error', attempts, error: lastError });
+          return;
+        }
+      }
+      setConnectionTest({ status: 'testing', attempts, error: lastError });
+      await delay(1_500);
+    }
+    if (generation === connectionGeneration.current) {
+      setConnectionTest({ status: 'timeout', attempts, error: lastError });
+    }
+  };
+
+  const stopConnectionTest = () => {
+    connectionGeneration.current += 1;
+    setConnectionTest((current) => ({ ...current, status: 'idle' }));
   };
 
   let script = '';
@@ -359,12 +428,42 @@ export default function SynapseTunnelPage() {
                     <Btn kind="secondary" onClick={copyToken}>{t.copy}</Btn>
                   </div>
                 </Field>
-                <Btn kind="success" onClick={closeWizard}>{d.savedToken}</Btn>
+                <Btn kind="success" onClick={closeWizard}>{connectionTest.status === 'success' ? d.finish : d.savedToken}</Btn>
               </div>
               <div>
-                <h3 className="font-medium text-main-text">{d.runTitle}</h3>
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="font-medium text-main-text">{d.runTitle}</h3>
+                  {script && <Btn kind="secondary" onClick={copyCommand}>{d.copyCommand}</Btn>}
+                </div>
                 <p className="mt-1 text-xs text-normal-text">{d.runHint}</p>
                 {script ? <pre className="mt-3 overflow-x-auto rounded-2xl bg-slate-900 p-4 text-xs leading-5 text-slate-100"><code>{script}</code></pre> : <div className="mt-3 rounded-2xl bg-red-50 p-4 text-sm text-red-700">{d.publicOriginMissing}</div>}
+
+                <div className={`mt-4 rounded-2xl border p-4 ${
+                  connectionTest.status === 'success' ? 'border-emerald-300 bg-emerald-50' :
+                    connectionTest.status === 'testing' ? 'border-amber-300 bg-amber-50' :
+                      ['timeout', 'error'].includes(connectionTest.status) ? 'border-red-300 bg-red-50' : 'border-slate-200 bg-slate-50'
+                }`} aria-live="polite">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <h4 className="text-sm font-medium text-main-text">{d.connectionTest}</h4>
+                    <Badge tone={connectionTest.status === 'success' ? 'green' : connectionTest.status === 'testing' ? 'amber' : ['timeout', 'error'].includes(connectionTest.status) ? 'red' : 'gray'}>
+                      {connectionTest.status === 'success' ? d.connectionSuccess : connectionTest.status === 'testing' ? d.testingConnection : connectionTest.status === 'timeout' ? d.connectionTimeout : connectionTest.status === 'error' ? d.connectionError : t.disconnected}
+                    </Badge>
+                  </div>
+                  <p className="mt-2 text-xs leading-5 text-normal-text">
+                    {connectionTest.status === 'success' ? d.connectionSuccessHint :
+                      connectionTest.status === 'testing' ? d.connectionTestingHint :
+                        connectionTest.status === 'timeout' ? d.connectionTimeoutHint :
+                          connectionTest.status === 'error' ? d.connectionErrorHint : d.connectionIdle}
+                  </p>
+                  {connectionTest.status === 'testing' && <p className="mt-1 text-[11px] text-normal-text">{d.connectionAttempts}: {connectionTest.attempts}</p>}
+                  {connectionTest.error && <p className="mt-2 break-all font-mono text-[11px] text-red-700">{connectionTest.error}</p>}
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <Btn onClick={startConnectionTest} loading={connectionTest.status === 'testing'} disabled={connectionTest.status === 'testing'}>
+                      {connectionTest.status === 'testing' ? d.testingConnection : ['success', 'timeout', 'error'].includes(connectionTest.status) ? d.testAgain : d.testConnection}
+                    </Btn>
+                    {connectionTest.status === 'testing' && <Btn kind="secondary" onClick={stopConnectionTest}>{d.stopTest}</Btn>}
+                  </div>
+                </div>
               </div>
             </div>
           )}

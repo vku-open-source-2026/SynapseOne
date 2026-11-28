@@ -84,6 +84,9 @@ Format based on Keep a Changelog; versioning follows SemVer.
 
 ### Fixed
 
+- **Tenant edge Console flow:** preserve the service `/v1` prefix in DNS/Tunnel
+  gateway paths, ignore stale zone deep links outside the current org, and add a
+  guided 60-second connector test with live success/timeout/error feedback.
 - **SDK 0.10.2 release defects:** restored the missing JavaScript
   `ocs/search/warehouse/lakehouse` package exports, aligned legacy flat types
   with runtime wrappers, made Python Search callable, documented workflow

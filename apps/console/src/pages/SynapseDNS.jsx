@@ -59,6 +59,8 @@ export default function SynapseDNSPage() {
       if (!selected && nextZones.length) {
         setSearchParams({ zone: nextZones[0].name }, { replace: true });
       } else if (selected && !nextZones.some((item) => item.name === selected)) {
+        setZone(null);
+        setError(null);
         setSearchParams({}, { replace: true });
       }
     } catch (err) {
@@ -70,6 +72,9 @@ export default function SynapseDNSPage() {
 
   const loadZone = useCallback(async () => {
     if (!selected) { setZone(null); return; }
+    // Wait until the tenant-scoped list confirms ownership. A stale deep link
+    // from the former platform page must not produce a transient cross-org 404.
+    if (!zones.some((item) => item.name === selected)) { setZone(null); return; }
     setZoneLoading(true);
     setError(null);
     try {
@@ -81,7 +86,7 @@ export default function SynapseDNSPage() {
     } finally {
       setZoneLoading(false);
     }
-  }, [request, selected]);
+  }, [request, selected, zones]);
 
   useEffect(() => { void load(); }, [load]);
   useEffect(() => { void loadZone(); }, [loadZone]);
